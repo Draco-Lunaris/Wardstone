@@ -15,11 +15,14 @@
 # The `down -v` matters: the volume is ephemeral by design (see below), so
 # dropping it is how the database is reset between runs.
 #
-# The credentials match the ones the DB-gated suites expect by default
-# (`ws_core::db::connect` falls back to
+# The credentials match the ones the DB-gated suites expect by default:
+# each of those suites' `database_url()` helper falls back to
 # `postgres://wardstone:wardstone@localhost:5432/wardstone_test` when
-# `DATABASE_URL` is unset), so `docker compose up` alone is enough to run
-# them.
+# `DATABASE_URL` is unset. (`ws_core::db::connect` itself reads no
+# environment variable — it takes the URL as an argument — so the
+# fallback lives in the test suites, not in the production connect
+# path.) With the credentials above, `docker compose up` alone is enough
+# to run the suites.
 #
 # Postgres 18: the migrations (001-004) use `gen_random_uuid()`, which
 # Postgres 13+ provides built in — no pgcrypto extension and no

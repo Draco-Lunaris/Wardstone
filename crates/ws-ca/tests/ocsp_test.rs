@@ -165,15 +165,15 @@ fn openssl_ocsp(
 
 /// The number of times `needle` occurs in `haystack`.
 ///
-/// Only sound for needles long enough not to occur by chance in the
-/// response's random parts. It is used here only for the two 20-byte
-/// SHA-1 `certID` hashes, where a coincidental second occurrence is
-/// not a realistic concern. The short patterns — the `certStatus` tags
-/// and the reason code — are read structurally instead (see
-/// [`cert_status_tlv`] and [`revocation_reason_code`]): the response
-/// embeds the CA certificate, whose DER is freshly random on every run
-/// and carries a coincidental `80 00` pair in roughly 0.4% of
-/// responses, which a byte count would misread as a second status.
+/// **Only for the fixed-length 20-byte SHA-1 `certID` hashes**, which
+/// are the only needles this helper is called with. A short needle is
+/// unsafe here: the response embeds the CA certificate, whose DER is
+/// freshly random on every run, so a short byte pattern collides with
+/// the certificate's bytes in roughly 0.4% of responses — a count
+/// would then report a second, spurious occurrence. The short patterns
+/// — the `certStatus` tags and the reason code — are therefore read
+/// structurally instead (see [`cert_status_tlv`],
+/// [`empty_cert_status_tlv`], and [`revocation_reason_code`]).
 fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > haystack.len() {
         return 0;
@@ -184,8 +184,15 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-/// One DER TLV: its tag octet, its content, and the total length of the
-/// encoded form.
+/// One DER TLV: its tag octet, its content, the total length of the
+/// encoded form, and the offset at which it starts.
+///
+/// The offset is what makes the walk usable for locating a field
+/// *positionally*: a raw byte scan for a pattern cannot tell the
+/// `certStatus` tag from a coincidental occurrence elsewhere in the
+/// response (the embedded CA certificate is freshly random on every
+/// run), but the walk knows exactly where each field sits.
+#[derive(Debug, PartialEq, Eq)]
 struct Tlv<'a> {
     /// The identifier octet.
     tag: u8,
@@ -193,6 +200,9 @@ struct Tlv<'a> {
     content: &'a [u8],
     /// The number of bytes the whole TLV occupies.
     total_len: usize,
+    /// The offset of the TLV's first octet within the buffer it was
+    /// read from.
+    offset: usize,
 }
 
 /// Read the DER TLV at the start of `bytes`.
@@ -200,7 +210,11 @@ struct Tlv<'a> {
 /// Handles the definite-form long length only, which is all DER uses.
 /// A malformed or truncated input is a typed `None` (the caller decides
 /// whether that is a failure).
-fn read_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
+///
+/// `offset` is the position of `bytes` within the enclosing buffer; it
+/// is carried into the returned [`Tlv`] so a caller can locate the
+/// field it just read.
+fn read_tlv_at(bytes: &[u8], offset: usize) -> Option<Tlv<'_>> {
     let tag = *bytes.first()?;
     let first_len = *bytes.get(1)?;
     let (len, header_len) = if first_len < 0x80 {
@@ -223,7 +237,13 @@ fn read_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
         tag,
         content,
         total_len: header_len + len,
+        offset,
     })
+}
+
+/// Read the DER TLV at the start of `bytes`, at offset zero.
+fn read_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
+    read_tlv_at(bytes, 0)
 }
 
 /// The `certStatus` TLV of the response's single `SingleResponse`.
@@ -257,70 +277,95 @@ fn cert_status_tlv(response: &[u8]) -> Option<Tlv<'_>> {
         return None;
     }
     let mut outer_content = outer.content;
+    let mut outer_offset = outer.offset + outer.total_len - outer.content.len();
     // responseStatus: ENUMERATED 0.
-    let status = read_tlv(outer_content)?;
+    let status = read_tlv_at(outer_content, outer_offset)?;
     if status.tag != 0x0a {
         return None;
     }
     outer_content = &outer_content[status.total_len..];
+    outer_offset += status.total_len;
     // responseBytes: [0] EXPLICIT (constructed) wrapping the SEQUENCE.
-    let response_bytes = read_tlv(outer_content)?;
+    let response_bytes = read_tlv_at(outer_content, outer_offset)?;
     if response_bytes.tag != 0xa0 {
         return None;
     }
-    let bytes_seq = read_tlv(response_bytes.content)?;
+    // ResponseBytes: SEQUENCE { responseType OID, response OCTET STRING }.
+    let bytes_seq = read_tlv_at(
+        response_bytes.content,
+        response_bytes.offset + response_bytes.total_len - response_bytes.content.len(),
+    )?;
     if bytes_seq.tag != 0x30 {
         return None;
     }
-    // ResponseBytes: SEQUENCE { responseType OID, response OCTET STRING }.
     let mut rb = bytes_seq.content;
-    let oid = read_tlv(rb)?;
+    let mut rb_offset = bytes_seq.offset + bytes_seq.total_len - bytes_seq.content.len();
+    let oid = read_tlv_at(rb, rb_offset)?;
     if oid.tag != 0x06 {
         return None;
     }
     rb = &rb[oid.total_len..];
-    let octets = read_tlv(rb)?;
+    rb_offset += oid.total_len;
+    let octets = read_tlv_at(rb, rb_offset)?;
     if octets.tag != 0x04 {
         return None;
     }
     // The BasicOCSPResponse, DER-encoded inside the OCTET STRING.
-    let basic = read_tlv(octets.content)?;
+    let basic = read_tlv_at(
+        octets.content,
+        octets.offset + octets.total_len - octets.content.len(),
+    )?;
     if basic.tag != 0x30 {
         return None;
     }
     // BasicOCSPResponse: SEQUENCE { tbsResponseData, sigAlg, sig, certs? }.
-    let tbs = read_tlv(basic.content)?;
+    let tbs = read_tlv_at(
+        basic.content,
+        basic.offset + basic.total_len - basic.content.len(),
+    )?;
     if tbs.tag != 0x30 {
         return None;
     }
     // ResponseData: SEQUENCE { responderID [1], producedAt, responses }.
     let mut rd = tbs.content;
-    let responder_id = read_tlv(rd)?;
+    let mut rd_offset = tbs.offset + tbs.total_len - tbs.content.len();
+    let responder_id = read_tlv_at(rd, rd_offset)?;
     if responder_id.tag != 0xa1 {
         return None;
     }
     rd = &rd[responder_id.total_len..];
-    let produced_at = read_tlv(rd)?;
+    rd_offset += responder_id.total_len;
+    let produced_at = read_tlv_at(rd, rd_offset)?;
     if produced_at.tag != 0x18 {
         return None;
     }
     rd = &rd[produced_at.total_len..];
+    rd_offset += produced_at.total_len;
     // responses: SEQUENCE OF SingleResponse.
-    let responses = read_tlv(rd)?;
+    let responses = read_tlv_at(rd, rd_offset)?;
     if responses.tag != 0x30 {
         return None;
     }
     // The first (and only) SingleResponse.
-    let single = read_tlv(responses.content)?;
+    let single = read_tlv_at(
+        responses.content,
+        responses.offset + responses.total_len - responses.content.len(),
+    )?;
     if single.tag != 0x30 {
         return None;
     }
     // SingleResponse: SEQUENCE { certID SEQUENCE, certStatus CHOICE, ... }.
-    let cert_id = read_tlv(single.content)?;
+    let cert_id = read_tlv_at(
+        single.content,
+        single.offset + single.total_len - single.content.len(),
+    )?;
     if cert_id.tag != 0x30 {
         return None;
     }
-    read_tlv(&single.content[cert_id.total_len..])
+    read_tlv_at(
+        &single.content[cert_id.total_len..],
+        single.offset + single.total_len - single.content.len() + cert_id.total_len,
+    )
 }
 
 /// The `certStatus` tag of the response's single `SingleResponse`.
@@ -328,6 +373,28 @@ fn cert_status_tlv(response: &[u8]) -> Option<Tlv<'_>> {
 /// Structural counterpart of [`cert_status_tlv`]: the tag octet only.
 fn cert_status_tag(response: &[u8]) -> Option<u8> {
     cert_status_tlv(response).map(|tlv| tlv.tag)
+}
+
+/// The `certStatus` TLV of the response, asserting that it is the
+/// **empty** encoding of `tag`.
+///
+/// RFC 6960's `CertStatus` CHOICE has three alternatives, and two of
+/// them are the *empty* implicit tagging of a context-specific tag:
+/// `good` is `[0] IMPLICIT NULL` and `unknown` is `[2] IMPLICIT NULL`
+/// — each exactly two octets on the wire (`80 00` and `82 00`). The
+/// `revoked` alternative legitimately carries content, so this helper
+/// applies to the two empty ones only.
+///
+/// Checking the tag alone is not enough: a `good` status illegally
+/// carrying content (`80 03 02 01 05`) has the right tag but is not the
+/// empty encoding, and no client would accept it. The length check
+/// pins the whole TLV — tag octet plus the zero-length header.
+fn empty_cert_status_tlv(response: &[u8], tag: u8) -> Option<Tlv<'_>> {
+    let tlv = cert_status_tlv(response)?;
+    if tlv.tag != tag || tlv.total_len != 2 {
+        return None;
+    }
+    Some(tlv)
 }
 
 /// The revocation reason code carried by a `revoked` response's
@@ -420,7 +487,15 @@ fn test_ocsp_response_certid_hashes_the_issuer() {
     assert_eq!(
         cert_status_tag(&response),
         Some(0x80),
-        "the good certStatus must be the empty [0] alternative"
+        "the good certStatus must be the [0] alternative"
+    );
+    // ... and it must be the *empty* encoding: exactly the two octets
+    // `80 00`. A `good` status carrying illegal content would have the
+    // right tag but the wrong length.
+    assert_eq!(
+        empty_cert_status_tlv(&response, 0x80).map(|tlv| tlv.total_len),
+        Some(2),
+        "the good certStatus must be the empty [0] alternative (80 00)"
     );
 
     // The response is a SEQUENCE.
@@ -549,7 +624,15 @@ fn test_ocsp_response_reports_unknown_to_openssl() {
     assert_eq!(
         cert_status_tag(&response),
         Some(0x82),
-        "the unknown certStatus must be the empty [2] alternative"
+        "the unknown certStatus must be the [2] alternative"
+    );
+    // ... and it must be the *empty* encoding: exactly the two octets
+    // `82 00`. A `unknown` status carrying illegal content would have the
+    // right tag but the wrong length.
+    assert_eq!(
+        empty_cert_status_tlv(&response, 0x82).map(|tlv| tlv.total_len),
+        Some(2),
+        "the unknown certStatus must be the empty [2] alternative (82 00)"
     );
 
     if let Some(text) = openssl_ocsp("status-unknown", &root.cert_pem, &leaf.cert_pem, &response) {
@@ -562,6 +645,99 @@ fn test_ocsp_response_reports_unknown_to_openssl() {
             "the response signature must verify:\n{text}"
         );
     }
+}
+
+/// The empty-status assertion discriminates: a `good` status must be
+/// exactly the two octets `80 00`, so a `[0]`-tagged TLV that carries
+/// content is rejected even though its tag is right.
+///
+/// This is the regression guard for the assertion itself. It builds a
+/// real `good` response, checks that the empty encoding holds, and then
+/// mutates the response's `certStatus` in place — replacing the empty
+/// `80 00` with a `good` status that illegally carries an INTEGER
+/// (`80 03 02 01 05`) — and checks that the same assertion now fails.
+/// A tag-only check would accept the mutated response, so the mutated
+/// case is the one that proves the length check earns its place.
+#[test]
+fn test_empty_cert_status_assertion_rejects_a_non_empty_status() {
+    let mut ks = temp_keystore("empty-status-discriminates");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+
+    let response = build_ocsp_response(
+        &root.cert_pem,
+        root.private_key_der.as_slice(),
+        LEAF_SERIAL,
+        &OcspResponseSpec {
+            status: OcspStatus::Good,
+            this_update: Utc::now(),
+            next_update: Utc::now() + Duration::hours(24),
+            revoked_at: None,
+            reason: None,
+        },
+    )
+    .expect("build the OCSP response");
+
+    // The real response: the good status is the empty [0] alternative,
+    // in its structural position, exactly two octets long.
+    let good = cert_status_tlv(&response).expect("the response carries a certStatus");
+    assert_eq!(good.tag, 0x80, "the good status is the [0] alternative");
+    assert_eq!(good.total_len, 2, "the good status is the empty encoding");
+    assert_eq!(
+        empty_cert_status_tlv(&response, 0x80).map(|tlv| tlv.total_len),
+        Some(2),
+        "the empty-status check accepts the real good status"
+    );
+
+    // Mutate: the `good` status now illegally carries an INTEGER
+    // (`80 03 02 01 05` instead of `80 00`). The tag is unchanged, so
+    // a tag-only check would still pass — the length check must not.
+    //
+    // The mutation site is the `certStatus` field's *structural*
+    // position, taken from the walk — not a raw byte scan for `80 00`.
+    // A scan would sometimes land in the embedded CA certificate, whose
+    // DER is freshly random and carries a coincidental `80 00` in
+    // roughly 0.4% of responses, and the mutation would then hit the
+    // wrong bytes.
+    let mut tampered = response.clone();
+    let position = good.offset;
+    assert_eq!(
+        &tampered[position..position + 2],
+        [0x80, 0x00],
+        "the structural position holds the empty [0] status"
+    );
+    tampered.splice(position..position + 2, [0x80, 0x03, 0x02, 0x01, 0x05]);
+
+    // The structural position is unchanged: the tag is still the [0]
+    // alternative...
+    assert_eq!(
+        cert_status_tag(&tampered),
+        Some(0x80),
+        "the tampered status keeps its tag"
+    );
+    // ... but the empty-encoding check now rejects it.
+    assert_eq!(
+        empty_cert_status_tlv(&tampered, 0x80),
+        None,
+        "a [0] status carrying content is not the empty encoding"
+    );
+    assert_eq!(
+        empty_cert_status_tlv(&tampered, 0x80).map(|tlv| tlv.total_len),
+        None,
+        "the empty-status check must reject a non-empty [0] TLV"
+    );
+    // The mutated response is not the empty encoding: its certStatus is
+    // five octets long, and it no longer satisfies the "exactly 80 00"
+    // property the real response has.
+    let mutated = cert_status_tlv(&tampered).expect("the tampered response still parses");
+    assert_eq!(mutated.tag, 0x80);
+    assert_eq!(
+        mutated.total_len, 5,
+        "the tampered status carries content and is therefore longer"
+    );
+    assert_ne!(
+        mutated.total_len, 2,
+        "a non-empty [0] TLV must not pass the empty-encoding check"
+    );
 }
 
 /// A CA key that does not match the CA certificate is a typed error, not
