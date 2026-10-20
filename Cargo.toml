@@ -51,3 +51,8 @@ sha2 = { version = "0.10.9" }
 tracing = { version = "0.1.44" }
 thiserror = { version = "2.0.21" }
 anyhow = { version = "1.0.104" }
+
+# Timestamp type of rcgen's CertificateParams (not_before/not_after):
+# issue.rs converts caller chrono instants to time::OffsetDateTime at the
+# rcgen boundary. Already resolved in the lock via rcgen.
+time = { version = "0.3.55", default-features = false, features = ["std"] }

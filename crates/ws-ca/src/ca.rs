@@ -268,7 +268,7 @@ fn generate_rsa(bits: usize) -> Result<KeyPair, CaError> {
 /// AlgorithmIdentifier padding still pair correctly. Any failure —
 /// unparseable PEM, unparseable key, or a genuine mismatch — is
 /// [`CaError::X509`] with a static message.
-fn ensure_parent_key_matches_cert(
+pub(crate) fn ensure_parent_key_matches_cert(
     parent_cert_pem: &str,
     parent_key: &ZeroizingKey,
 ) -> Result<(), CaError> {
@@ -357,7 +357,10 @@ fn new_serial() -> Result<SerialNumber, CaError> {
 /// registers no `Drop`, so without this wrapper the plaintext DER would
 /// linger on the heap after signing. The signing traits delegate
 /// unchanged.
-struct ZeroizingKey(KeyPair);
+///
+/// `pub(crate)`: shared with [`crate::issue::sign_leaf_with`], which holds
+/// the same zeroize-on-drop guarantee for the CA key while signing leaves.
+pub(crate) struct ZeroizingKey(pub(crate) KeyPair);
 
 impl std::ops::Deref for ZeroizingKey {
     type Target = KeyPair;

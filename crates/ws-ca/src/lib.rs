@@ -3,6 +3,7 @@
 
 pub mod ca;
 pub mod error;
+pub mod issue;
 pub mod keystore;
 
 /// Re-export of [`ws_core::models::ca::KeyType`] so downstream crates can
