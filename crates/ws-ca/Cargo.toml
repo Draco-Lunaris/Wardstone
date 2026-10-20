@@ -8,6 +8,11 @@ rust-version.workspace = true
 base64 = { workspace = true }
 chacha20poly1305 = { workspace = true, features = ["zeroize"] }
 chrono = { workspace = true }
+# DER primitives for the hand-rolled TBSCertList/CertificateList encoder in
+# crl.rs. rcgen 0.14 does ship a CRL builder, but the Task-7 ruling pins a
+# hand-rolled encoder (der value types + raw TLVs; no x509-cert, no der
+# derive feature), so these primitives are the direct dependency.
+der = { workspace = true, features = ["std", "oid"] }
 rand = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 rsa = { workspace = true, features = ["getrandom"] }

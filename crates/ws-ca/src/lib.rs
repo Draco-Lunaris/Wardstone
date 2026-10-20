@@ -2,6 +2,7 @@
 //! issuance, and revocation primitives.
 
 pub mod ca;
+pub mod crl;
 pub mod error;
 pub mod issue;
 pub mod keystore;

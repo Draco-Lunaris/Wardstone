@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono"] }
+# "ipnet" adds the std::net::IpAddr <-> inet binding (and its array form)
+# used by the certificates table's san_ips inet[] column (migration 002).
+sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono", "ipnet"] }
 thiserror = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }

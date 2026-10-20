@@ -75,7 +75,7 @@ async fn connect_runs_migrations() {
 async fn migration_count_guard_rejects_stale_db() {
     let _db = lock_db().await;
     let url = database_url();
-    // Ensure migration 001 is applied (idempotent) so there is a row to delete.
+    // Ensure the migrations are applied (idempotent) so there are rows to delete.
     let pool = connect(&url)
         .await
         .expect("initial connect should leave the database migrated");
@@ -114,7 +114,7 @@ async fn migration_count_guard_rejects_stale_db() {
         matches!(
             err,
             CoreError::Migration {
-                expected: 1,
+                expected: REQUIRED_MIGRATION_COUNT,
                 found: 0
             }
         ),
