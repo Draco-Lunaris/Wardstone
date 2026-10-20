@@ -49,9 +49,11 @@ use ws_core::error::CoreError;
 use ws_core::models::audit::{ActorType, AuditEntry};
 use ws_core::models::ca::{CaModel, KeyType};
 use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_core::models::ocsp::{OcspResponseModel, OcspStatus};
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
+use ws_core::repo::ocsp_repo::OcspRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
@@ -87,6 +89,17 @@ const ADVISORY_KEY_AUDIT: i64 = 0x0057_4144_5354_0005;
 /// Tenant name the audit tests own; deleted before asserts (audit rows
 /// first, then the tenant — `audit_log.tenant_id` references `tenants`).
 const AUDIT_TENANT: &str = "rt-audit-tenant";
+
+/// Postgres advisory-lock key for this suite's OCSP-response tests: the
+/// same key family with the suite marker bumped to 0x0007
+/// (`0x0057_4144_5354_0007`), a disjoint row set (its own tenant name).
+const ADVISORY_KEY_OCSP: i64 = 0x0057_4144_5354_0007;
+
+/// Tenant and CA names this suite owns for the OCSP-response tests;
+/// deleted before asserts (OCSP responses first — they reference the CA
+/// — then the CA, then the tenant).
+const OCSP_TENANT: &str = "rt-ocsp-tenant";
+const OCSP_CA_NAME: &str = "rt-ocsp-ca";
 
 /// In-process serialization, the same whole-body lock pattern as
 /// `db_test.rs`: the harness runs tests on separate threads. A tokio mutex
@@ -770,4 +783,129 @@ async fn test_audit_roundtrip() {
     // The three actors cover every `actor_type` variant's column encoding
     // (System/User decode against the first listing above; AcmeAccount here).
     assert_eq!(listed_after[0].actor_type, ActorType::AcmeAccount);
+}
+
+/// An OCSP response row roundtrips through `insert` and `get_latest`:
+/// the stored response bytes come back verbatim, the status column
+/// decodes, and `get_latest` returns the most recently published
+/// response for the (ca_id, serial) pair — not the older one. A second
+/// insert of the same response (same ca, serial and this_update) is a
+/// typed duplicate, never a silent overwrite. Cleans up before
+/// asserting: OCSP responses first (they reference the CA), then the CA,
+/// then the tenant.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_ocsp_response_roundtrip() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_OCSP).await;
+
+    // Sweep debris from any previously crashed run: OCSP responses first
+    // (they reference the CA), then the CA, then the tenant.
+    for sql in [
+        "DELETE FROM ocsp_responses WHERE ca_id IN \
+         (SELECT id FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1))",
+        "DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(OCSP_TENANT)
+            .execute(&pool)
+            .await
+            .expect("sweep stale OCSP-suite rows");
+    }
+
+    let tenant = TenantRepo::new(&pool)
+        .insert(OCSP_TENANT)
+        .await
+        .expect("insert the test tenant for OCSP rows");
+    let ca = CaModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        name: OCSP_CA_NAME.to_string(),
+        subject: "CN=Wardstone Test OCSP CA".to_string(),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: ts("2026-01-01T00:00:00Z"),
+        not_after: ts("2027-01-01T00:00:00Z"),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".to_string(),
+        key_file: "/var/lib/wardstone/keys/rt-ocsp-ca.pem".to_string(),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    CaRepo::new(&pool)
+        .insert(&ca)
+        .await
+        .expect("insert the test CA row");
+
+    let older = OcspResponseModel {
+        id: uuid::Uuid::new_v4(),
+        ca_id: ca.id,
+        serial: 0x1234,
+        status: OcspStatus::Good,
+        this_update: ts("2026-01-01T00:00:00Z"),
+        next_update: ts("2026-01-02T00:00:00Z"),
+        resp_der: vec![0x30, 0x00],
+    };
+    let newer = OcspResponseModel {
+        id: uuid::Uuid::new_v4(),
+        ca_id: ca.id,
+        serial: older.serial,
+        status: OcspStatus::Revoked,
+        this_update: ts("2026-01-03T00:00:00Z"),
+        next_update: ts("2026-01-04T00:00:00Z"),
+        resp_der: vec![0x30, 0x03, 0x02, 0x01, 0x00],
+    };
+
+    let ocsp = OcspRepo::new(&pool);
+    let first_insert = ocsp.insert(&older).await;
+    let second_insert = ocsp.insert(&newer).await;
+    let latest = ocsp.get_latest(ca.id, newer.serial).await;
+    let missing = ocsp.get_latest(ca.id, 0x9999).await;
+    let duplicate = ocsp.insert(&newer).await;
+
+    // Cleanup BEFORE asserting: OCSP responses first (they reference the
+    // CA), then the CA, then the tenant.
+    for (sql, id) in [
+        ("DELETE FROM ocsp_responses WHERE ca_id = $1", ca.id),
+        ("DELETE FROM cas WHERE id = $1", ca.id),
+        ("DELETE FROM tenants WHERE id = $1", tenant.id),
+    ] {
+        sqlx::query(sql)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("delete the inserted OCSP-suite rows");
+    }
+    release_advisory(&mut advisory, ADVISORY_KEY_OCSP).await;
+
+    first_insert.expect("insert the older OCSP response");
+    second_insert.expect("insert the newer OCSP response");
+    let latest = latest
+        .expect("get_latest")
+        .expect("a response is present after insert");
+    assert_eq!(
+        latest.id, newer.id,
+        "get_latest returns the most recently published response"
+    );
+    assert_eq!(latest.status, OcspStatus::Revoked);
+    assert_eq!(latest.ca_id, ca.id);
+    assert_eq!(latest.serial, newer.serial);
+    assert_eq!(latest.this_update, newer.this_update);
+    assert_eq!(latest.next_update, newer.next_update);
+    assert_eq!(
+        latest.resp_der, newer.resp_der,
+        "the stored response bytes come back verbatim"
+    );
+    assert!(
+        missing.expect("get_latest for an unknown serial").is_none(),
+        "a serial without a response has no latest response"
+    );
+    let duplicate = duplicate.expect_err("re-inserting the same response must be rejected");
+    assert!(
+        matches!(duplicate, CoreError::Duplicate),
+        "unexpected error: {duplicate:?}"
+    );
 }

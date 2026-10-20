@@ -2249,6 +2249,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "sqlx",
  "thiserror",
@@ -2280,6 +2281,17 @@ version = "0.1.0"
 [[package]]
 name = "ws-worker"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "ws-ca",
+ "ws-core",
+]
 
 [[package]]
 name = "x509-parser"

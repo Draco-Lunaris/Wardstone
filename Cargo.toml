@@ -47,6 +47,11 @@ rsa = { version = "0.9.10" }
 # code. Already resolved in the lock via sqlx.
 sha2 = { version = "0.10.9" }
 
+# SHA-1 for the OCSP certID hashes: RFC 6960 section 4.1.1 makes SHA-1
+# mandatory to implement for OCSP responders. Already resolved in the
+# lock via sqlx-mysql.
+sha1 = { version = "0.10.7" }
+
 # Errors / observability
 tracing = { version = "0.1.44" }
 thiserror = { version = "2.0.21" }

@@ -3,4 +3,5 @@
 pub mod audit_repo;
 pub mod ca_repo;
 pub mod certificate_repo;
+pub mod ocsp_repo;
 pub mod tenant_repo;

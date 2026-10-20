@@ -29,9 +29,10 @@
 //!   a minimal positive DER INTEGER (`Uint` strips leading zero bytes
 //!   and its encoder re-adds the `0x00` sign octet when the high bit is
 //!   set, matching what stock OpenSSL writes); `revocationDate` is the
+//!   entry's own revocation instant (RFC 5280 section 5.1), not the
 //!   build instant. A `None` reason emits no entry extension at all; a
 //!   reason emits a single non-critical `reasonCode` (2.5.29.21)
-//!   extension whose value is the RFC 5280 section 5.3.1 ENUMERATED
+//!   extension whose value is RFC 5280 section 5.3.1's ENUMERATED
 //!   code. An empty `revocations` list omits the whole field.
 //! - `crlExtensions`: exactly one non-critical `authorityKeyIdentifier`
 //!   (2.5.29.35) whose keyIdentifier is the CA certificate's SKI — the
@@ -136,6 +137,10 @@ pub struct RevocationEntry {
     pub serial: u128,
     /// Revocation reason; `None` emits no entry extension at all.
     pub reason: Option<CrlReason>,
+    /// When the certificate was revoked — the entry's `revocationDate`
+    /// (RFC 5280 section 5.1). This is the instant the revocation
+    /// happened, not the instant the CRL was built.
+    pub revoked_at: DateTime<Utc>,
 }
 
 /// What one emitted CRL contains.
@@ -211,7 +216,9 @@ pub fn build_crl(ca_cert_pem: &str, ca_key_der: &[u8], spec: &CrlSpec) -> Result
     let mut entries = Vec::with_capacity(spec.revocations.len());
     for entry in &spec.revocations {
         let serial = serial_tlv(entry.serial)?;
-        let revocation_date = time_tlv(&issued_at)?;
+        // The entry's revocationDate is when the certificate was revoked
+        // (RFC 5280 section 5.1), not when this CRL was built.
+        let revocation_date = time_tlv(&entry.revoked_at)?;
         let mut content = [serial, revocation_date].concat();
         if let Some(reason) = entry.reason {
             // crlEntryExtensions: a SEQUENCE holding the reasonCode
@@ -313,9 +320,10 @@ fn time_tlv(dt: &DateTime<Utc>) -> Result<Vec<u8>, CaError> {
 
 /// A certificate serial as a minimal positive DER INTEGER: `Uint` strips
 /// leading zero bytes and its encoder re-adds a `0x00` sign octet when the
-/// value's high bit is set, so both the short form (`0x00ff…` encodes to 9
-/// content bytes) and the full-width high-bit form (`0x8000…01` encodes to
-/// 17) match what stock OpenSSL writes.
+/// value's high bit is set, so both the short form (`0x00ff…` encodes to 8
+/// content bytes: 7 value bytes after the leading zero is stripped, plus
+/// the sign octet) and the full-width high-bit form (`0x8000…01` encodes
+/// to 17) match what stock OpenSSL writes.
 fn serial_tlv(serial: u128) -> Result<Vec<u8>, CaError> {
     Uint::new(&serial.to_be_bytes())
         .map_err(der_err)?

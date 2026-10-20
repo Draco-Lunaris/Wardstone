@@ -76,13 +76,30 @@ fn root_spec() -> CaSpec {
     }
 }
 
+/// The revocation instant of the fixture entry at `index`: one fixed
+/// instant, one hour apart per entry, so every entry carries a distinct
+/// date that the test can pin against the value the fixture supplied
+/// (RFC 5280 section 5.1: the entry's revocationDate is when the
+/// certificate was revoked, not when the CRL was built).
+fn revoked_at(index: usize) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+        .expect("valid fixed test timestamp")
+        .with_timezone(&chrono::Utc)
+        + chrono::Duration::hours(index as i64)
+}
+
 /// The CRL fixture: three revocations, next update 24h out.
 fn crl_spec() -> CrlSpec {
     CrlSpec {
         revocations: SERIALS
             .iter()
             .zip(REASONS.iter())
-            .map(|(&serial, &reason)| RevocationEntry { serial, reason })
+            .enumerate()
+            .map(|(index, (&serial, &reason))| RevocationEntry {
+                serial,
+                reason,
+                revoked_at: revoked_at(index),
+            })
             .collect(),
         next_update: chrono::Duration::hours(24),
     }
@@ -189,12 +206,13 @@ fn test_crl_lists_all_serials() {
         }
     }
 
-    // Entry revocation dates are the CRL's issue instant (the entry model
-    // carries no per-cert timestamp of its own).
-    for entry in &entries {
+    // Entry revocation dates are the instants the fixture supplied — the
+    // moment each certificate was revoked, not the CRL's issue instant.
+    for (index, entry) in entries.iter().enumerate() {
         assert_eq!(
             entry.revocation_date.timestamp(),
-            file.issued_at.timestamp()
+            revoked_at(index).timestamp(),
+            "entry {index} must carry its own revocation date"
         );
     }
 

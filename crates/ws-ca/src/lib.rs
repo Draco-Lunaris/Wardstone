@@ -6,6 +6,7 @@ pub mod crl;
 pub mod error;
 pub mod issue;
 pub mod keystore;
+pub mod ocsp;
 pub mod serial;
 
 /// Re-export of [`ws_core::models::ca::KeyType`] so downstream crates can

@@ -18,6 +18,9 @@ rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 rsa = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# SHA-1 for the OCSP certID hashes (RFC 6960 section 4.1.1 makes SHA-1
+# mandatory to implement for OCSP responders).
+sha1 = { workspace = true }
 # PgPool + queries for Task 8's used_serials allocation (migration 001's
 # table). ws-ca deliberately does NOT use ws-core models here: a raw sqlx
 # INSERT keeps the serial allocator independent of ws-core's repo surface,
@@ -39,6 +42,11 @@ zeroize = { workspace = true }
 # Recomputes rcgen's legacy deterministic serial for the creation tests'
 # serial-number regression pin; production code never digests anything.
 sha2 = { workspace = true }
+# SHA-1 in the OCSP test: the test recomputes the certID hashes to prove
+# the response identifies its issuer.
+sha1 = { workspace = true }
+# The OCSP test mints a leaf CSR with rcgen.
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 # Async test bodies for tests/serial_test.rs (DB-backed allocation suite);
 # the suite connects through ws_core::db::connect, already a main dep.
 tokio = { workspace = true }
