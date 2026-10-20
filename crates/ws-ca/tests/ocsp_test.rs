@@ -164,6 +164,16 @@ fn openssl_ocsp(
 }
 
 /// The number of times `needle` occurs in `haystack`.
+///
+/// Only sound for needles long enough not to occur by chance in the
+/// response's random parts. It is used here only for the two 20-byte
+/// SHA-1 `certID` hashes, where a coincidental second occurrence is
+/// not a realistic concern. The short patterns — the `certStatus` tags
+/// and the reason code — are read structurally instead (see
+/// [`cert_status_tlv`] and [`revocation_reason_code`]): the response
+/// embeds the CA certificate, whose DER is freshly random on every run
+/// and carries a coincidental `80 00` pair in roughly 0.4% of
+/// responses, which a byte count would misread as a second status.
 fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > haystack.len() {
         return 0;
@@ -172,6 +182,187 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .windows(needle.len())
         .filter(|window| *window == needle)
         .count()
+}
+
+/// One DER TLV: its tag octet, its content, and the total length of the
+/// encoded form.
+struct Tlv<'a> {
+    /// The identifier octet.
+    tag: u8,
+    /// The content octets (the length header excluded).
+    content: &'a [u8],
+    /// The number of bytes the whole TLV occupies.
+    total_len: usize,
+}
+
+/// Read the DER TLV at the start of `bytes`.
+///
+/// Handles the definite-form long length only, which is all DER uses.
+/// A malformed or truncated input is a typed `None` (the caller decides
+/// whether that is a failure).
+fn read_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
+    let tag = *bytes.first()?;
+    let first_len = *bytes.get(1)?;
+    let (len, header_len) = if first_len < 0x80 {
+        (first_len as usize, 2usize)
+    } else {
+        let count = (first_len & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            // Indefinite length is BER, not DER; more than four length
+            // octets is beyond any structure in this response.
+            return None;
+        }
+        let mut len = 0usize;
+        for byte in bytes.get(2..2 + count)? {
+            len = (len << 8) | *byte as usize;
+        }
+        (len, 2 + count)
+    };
+    let content = bytes.get(header_len..header_len + len)?;
+    Some(Tlv {
+        tag,
+        content,
+        total_len: header_len + len,
+    })
+}
+
+/// The `certStatus` TLV of the response's single `SingleResponse`.
+///
+/// The response is walked structurally, following RFC 6960's grammar:
+///
+/// ```text
+/// OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED,
+///                              responseBytes [0] EXPLICIT SEQUENCE {
+///                                responseType OID,
+///                                response OCTET STRING } }
+/// BasicOCSPResponse ::= SEQUENCE { tbsResponseData ResponseData,
+///                                  signatureAlgorithm AlgorithmIdentifier,
+///                                  signature BIT STRING,
+///                                  certs [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+/// ResponseData ::= SEQUENCE { responderID [1] EXPLICIT Name,
+///                             producedAt GeneralizedTime,
+///                             responses SEQUENCE OF SingleResponse }
+/// SingleResponse ::= SEQUENCE { certID SEQUENCE, certStatus CHOICE,
+///                                thisUpdate GeneralizedTime, ... }
+/// ```
+///
+/// Walking the grammar is what makes the check exact: a raw byte scan
+/// cannot tell the `good` tag (`80 00`) from a coincidental `80 00`
+/// inside the embedded CA certificate — which is freshly random on
+/// every run and carries such a pair in roughly 0.4% of responses.
+fn cert_status_tlv(response: &[u8]) -> Option<Tlv<'_>> {
+    // OCSPResponse: SEQUENCE { ENUMERATED, [0] EXPLICIT ResponseBytes }.
+    let outer = read_tlv(response)?;
+    if outer.tag != 0x30 {
+        return None;
+    }
+    let mut outer_content = outer.content;
+    // responseStatus: ENUMERATED 0.
+    let status = read_tlv(outer_content)?;
+    if status.tag != 0x0a {
+        return None;
+    }
+    outer_content = &outer_content[status.total_len..];
+    // responseBytes: [0] EXPLICIT (constructed) wrapping the SEQUENCE.
+    let response_bytes = read_tlv(outer_content)?;
+    if response_bytes.tag != 0xa0 {
+        return None;
+    }
+    let bytes_seq = read_tlv(response_bytes.content)?;
+    if bytes_seq.tag != 0x30 {
+        return None;
+    }
+    // ResponseBytes: SEQUENCE { responseType OID, response OCTET STRING }.
+    let mut rb = bytes_seq.content;
+    let oid = read_tlv(rb)?;
+    if oid.tag != 0x06 {
+        return None;
+    }
+    rb = &rb[oid.total_len..];
+    let octets = read_tlv(rb)?;
+    if octets.tag != 0x04 {
+        return None;
+    }
+    // The BasicOCSPResponse, DER-encoded inside the OCTET STRING.
+    let basic = read_tlv(octets.content)?;
+    if basic.tag != 0x30 {
+        return None;
+    }
+    // BasicOCSPResponse: SEQUENCE { tbsResponseData, sigAlg, sig, certs? }.
+    let tbs = read_tlv(basic.content)?;
+    if tbs.tag != 0x30 {
+        return None;
+    }
+    // ResponseData: SEQUENCE { responderID [1], producedAt, responses }.
+    let mut rd = tbs.content;
+    let responder_id = read_tlv(rd)?;
+    if responder_id.tag != 0xa1 {
+        return None;
+    }
+    rd = &rd[responder_id.total_len..];
+    let produced_at = read_tlv(rd)?;
+    if produced_at.tag != 0x18 {
+        return None;
+    }
+    rd = &rd[produced_at.total_len..];
+    // responses: SEQUENCE OF SingleResponse.
+    let responses = read_tlv(rd)?;
+    if responses.tag != 0x30 {
+        return None;
+    }
+    // The first (and only) SingleResponse.
+    let single = read_tlv(responses.content)?;
+    if single.tag != 0x30 {
+        return None;
+    }
+    // SingleResponse: SEQUENCE { certID SEQUENCE, certStatus CHOICE, ... }.
+    let cert_id = read_tlv(single.content)?;
+    if cert_id.tag != 0x30 {
+        return None;
+    }
+    read_tlv(&single.content[cert_id.total_len..])
+}
+
+/// The `certStatus` tag of the response's single `SingleResponse`.
+///
+/// Structural counterpart of [`cert_status_tlv`]: the tag octet only.
+fn cert_status_tag(response: &[u8]) -> Option<u8> {
+    cert_status_tlv(response).map(|tlv| tlv.tag)
+}
+
+/// The revocation reason code carried by a `revoked` response's
+/// `certStatus`, read structurally.
+///
+/// A `revoked` status is the [1] alternative; its content is the
+/// `revocationTime` (GeneralizedTime) optionally followed by the
+/// `revocationReason` extension — the [0] EXPLICIT ENUMERATED of
+/// RFC 5280 section 5.3.1. The reason is located by walking the
+/// `certStatus` content, never by scanning the whole response for a byte
+/// pattern: the response embeds a freshly random CA certificate, and a
+/// coincidental match in it would be indistinguishable from the real
+/// thing.
+fn revocation_reason_code(response: &[u8]) -> Option<u8> {
+    let status = cert_status_tlv(response)?;
+    if status.tag != 0xa1 {
+        return None;
+    }
+    // The content: revocationTime, then the optional reason extension.
+    let mut content = status.content;
+    let revoked_at = read_tlv(content)?;
+    if revoked_at.tag != 0x18 {
+        return None;
+    }
+    content = &content[revoked_at.total_len..];
+    // The reason extension: [0] EXPLICIT wrapping the ENUMERATED.
+    let reason = read_tlv(content)?;
+    if reason.tag != 0xa0 {
+        return None;
+    }
+    let enumerated = read_tlv(reason.content)?;
+    if enumerated.tag != 0x0a {
+        return None;
+    }
+    enumerated.content.first().copied()
 }
 
 /// The response's `certID` identifies the issuer by the SHA-1 of its
@@ -221,10 +412,14 @@ fn test_ocsp_response_certid_hashes_the_issuer() {
         "the issuerKeyHash must appear once in the response"
     );
 
-    // The `good` certStatus is the empty [0] IMPLICIT alternative.
+    // The `good` certStatus is the empty [0] IMPLICIT alternative. It is
+    // located structurally, not by counting raw bytes: the response
+    // embeds the CA certificate, whose DER is freshly random on every
+    // run and carries a coincidental `80 00` pair in roughly 0.4% of
+    // responses, which a byte count would misread as a second status.
     assert_eq!(
-        count_occurrences(&response, &[0x80, 0x00]),
-        1,
+        cert_status_tag(&response),
+        Some(0x80),
         "the good certStatus must be the empty [0] alternative"
     );
 
@@ -293,10 +488,19 @@ fn test_ocsp_response_reports_revoked_to_openssl() {
     .expect("build the OCSP response");
 
     // The revoked status is the [1] alternative; the reason extension is
-    // the [0] EXPLICIT ENUMERATED of RFC 5280 section 5.3.1.
+    // the [0] EXPLICIT ENUMERATED of RFC 5280 section 5.3.1. Both are
+    // read structurally (see `cert_status_tlv` / `revocation_reason_code`)
+    // rather than by scanning the response's bytes: the response embeds a
+    // freshly random CA certificate, and a coincidental byte-pattern
+    // match inside it would be indistinguishable from the real thing.
     assert_eq!(
-        count_occurrences(&response, &[0x0a, 0x01, CrlReason::KeyCompromise.as_code()]),
-        1,
+        cert_status_tag(&response),
+        Some(0xa1),
+        "the revoked certStatus must be the [1] alternative"
+    );
+    assert_eq!(
+        revocation_reason_code(&response),
+        Some(CrlReason::KeyCompromise.as_code()),
         "the revocation reason must be carried as an ENUMERATED"
     );
 
@@ -338,9 +542,13 @@ fn test_ocsp_response_reports_unknown_to_openssl() {
     )
     .expect("build the OCSP response");
 
+    // The status tag is located structurally (see `cert_status_tag`): a
+    // raw byte count cannot distinguish the `unknown` tag from a
+    // coincidental `82 00` inside the embedded CA certificate, whose DER
+    // is freshly random on every run.
     assert_eq!(
-        count_occurrences(&response, &[0x82, 0x00]),
-        1,
+        cert_status_tag(&response),
+        Some(0x82),
         "the unknown certStatus must be the empty [2] alternative"
     );
 

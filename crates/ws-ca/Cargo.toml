@@ -50,3 +50,9 @@ rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 # Async test bodies for tests/serial_test.rs (DB-backed allocation suite);
 # the suite connects through ws_core::db::connect, already a main dep.
 tokio = { workspace = true }
+# ws-worker for the end-to-end smoke test (tests/smoke_test.rs): the test
+# drives the CRL/OCSP publication job, which lives in ws-worker. This is a
+# DEV-dependency on purpose — the production dependency graph stays
+# ws-ca -> ws-core with no edge to ws-worker, and the dev edge creates no
+# cycle (ws-worker depends on ws-ca's library, not on its test targets).
+ws-worker = { path = "../ws-worker" }

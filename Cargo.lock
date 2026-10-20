@@ -2257,6 +2257,7 @@ dependencies = [
  "tokio",
  "uuid",
  "ws-core",
+ "ws-worker",
  "x509-parser",
  "zeroize",
 ]
