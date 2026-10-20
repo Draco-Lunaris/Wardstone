@@ -7,11 +7,15 @@ rust-version.workspace = true
 [dependencies]
 base64 = { workspace = true }
 chacha20poly1305 = { workspace = true, features = ["zeroize"] }
+chrono = { workspace = true }
 rand = { workspace = true }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+rsa = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+ws-core = { path = "../ws-core" }
+x509-parser = { workspace = true }
 zeroize = { workspace = true }

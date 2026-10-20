@@ -1195,6 +1195,7 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+ "zeroize",
 ]
 
 [[package]]
@@ -2216,13 +2217,17 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
+ "chrono",
  "rand 0.10.3",
  "rcgen",
+ "rsa",
  "serde",
  "serde_json",
  "sqlx",
  "thiserror",
  "uuid",
+ "ws-core",
+ "x509-parser",
  "zeroize",
 ]
 

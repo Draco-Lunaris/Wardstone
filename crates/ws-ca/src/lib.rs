@@ -1,5 +1,12 @@
 //! ws-ca: certificate-authority engine — encrypted key store, CA creation,
 //! issuance, and revocation primitives.
 
+pub mod ca;
 pub mod error;
 pub mod keystore;
+
+/// Re-export of [`ws_core::models::ca::KeyType`] so downstream crates can
+/// consume the key-type enum through `ws-ca` alone (the dependency edge is
+/// ws-ca → ws-core, never the reverse). The same type is also available at
+/// [`ws_ca::ca::KeyType`].
+pub use ca::KeyType;

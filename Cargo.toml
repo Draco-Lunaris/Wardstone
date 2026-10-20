@@ -36,6 +36,11 @@ rand = { version = "0.10.3" }
 argon2 = { version = "0.6.0" }
 zeroize = { version = "1.9.1" }
 base64 = { version = "0.23.1" }
+# RSA key generation: rcgen's default ring backend can parse and sign RSA
+# keys but cannot generate them (rcgen::Error::KeyGenerationUnavailable), so
+# RSA-2048/3072 CA keys are minted with the pure-Rust rsa crate and imported
+# into rcgen as PKCS#8 DER. Already resolved in the lock via sqlx-mysql.
+rsa = { version = "0.9.10" }
 
 # Errors / observability
 tracing = { version = "0.1.44" }
