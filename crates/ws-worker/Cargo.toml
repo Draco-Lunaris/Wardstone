@@ -20,6 +20,9 @@ tokio = { workspace = true }
 # The scheduler's error logging.
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Parsing the published CRL to compare its revoked serials with the
+# database's. Already a workspace pin (ws-ca uses it); no new crate.
+x509-parser = { workspace = true }
 # The CRL and OCSP builders and the encrypted key store.
 ws-ca = { path = "../ws-ca" }
 # The database models, repositories, and typed CoreError.

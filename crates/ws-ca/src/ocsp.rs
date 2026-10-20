@@ -96,9 +96,12 @@ const OID_PKIX_OCSP_BASIC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 /// DER tag octet for SEQUENCE (universal 16, constructed).
 const TAG_SEQUENCE: u8 = 0x30;
 
-/// DER tag octet for the `[0]` context-specific constructed wrapper that
-/// carries the `responderID` byName (EXPLICIT tagging, RFC 6960
-/// section 4.2.1) and the `certs` list.
+/// DER tag octet for the `[0]` context-specific constructed wrapper. It
+/// carries three different things in this response, each in its own
+/// structure: the `certs` list of the `BasicOCSPResponse`, the
+/// `nextUpdate` of a `SingleResponse` (EXPLICIT GeneralizedTime), and
+/// the `revocationReason` extension of a revoked status (EXPLICIT
+/// ENUMERATED). The `responderID` byName uses the `[1]` tag.
 const TAG_CONTEXT_0: u8 = 0xa0;
 
 /// DER tag octet for the `[1]` context-specific constructed wrapper that
@@ -124,7 +127,8 @@ pub struct OcspResponseSpec {
     /// How long the answer stays valid (`nextUpdate`).
     pub next_update: DateTime<Utc>,
     /// The revocation instant, for a `revoked` answer (`None` for the
-    /// other statuses).
+    /// other statuses). A `Revoked` answer without it is a typed error:
+    /// the revocation date is never invented.
     pub revoked_at: Option<DateTime<Utc>>,
     /// The revocation reason, for a `revoked` answer whose reason is
     /// known (`None` emits no reason extension at all).
@@ -140,10 +144,12 @@ pub struct OcspResponseSpec {
 /// (`openssl ocsp -issuer ca.pem -cert leaf.pem -respin resp.der
 /// -text` prints the status and `Response verify OK`).
 ///
-/// Errors: malformed PEM/DER input is [`CaError::X509`]; a signing key
-/// whose algorithm is neither Ed25519 nor RSA is
-/// [`CaError::UnsupportedKeyType`] (the algorithm name only, never key
-/// material); signing failures are [`CaError::Rcgen`].
+/// Errors: malformed PEM/DER input is [`CaError::X509`]; a `Revoked`
+/// answer without a revocation instant is [`CaError::X509`] (the
+/// revocation date is never fabricated); a signing key whose algorithm is
+/// neither Ed25519 nor RSA is [`CaError::UnsupportedKeyType`] (the
+/// algorithm name only, never key material); signing failures are
+/// [`CaError::Rcgen`].
 pub fn build_ocsp_response(
     ca_cert_pem: &str,
     ca_key_der: &[u8],
@@ -244,7 +250,13 @@ fn single_response(
         OcspStatus::Good => vec![TAG_STATUS_GOOD, 0x00],
         OcspStatus::Unknown => vec![TAG_STATUS_UNKNOWN, 0x00],
         OcspStatus::Revoked => {
-            let revoked_at = spec.revoked_at.unwrap_or(spec.this_update);
+            // A revoked answer must carry the real revocation instant.
+            // Falling back to the response's own production time would
+            // publish a revocation date that never happened, so a
+            // missing one is a typed error, never a fabrication.
+            let revoked_at = spec.revoked_at.ok_or_else(|| {
+                CaError::X509("a revoked OCSP response requires the revocation instant".to_owned())
+            })?;
             let mut content = generalized_time(&revoked_at)?;
             if let Some(reason) = spec.reason {
                 // revocationReason: [0] EXPLICIT ENUMERATED, the RFC 5280

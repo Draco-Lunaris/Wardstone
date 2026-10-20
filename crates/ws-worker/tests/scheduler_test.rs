@@ -47,6 +47,7 @@ use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::ocsp_repo::OcspRepo;
 use ws_worker::jobs::regen_crl_and_ocsp;
+use x509_parser::prelude::FromDer;
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST"
 /// (0x5741445354) plus the suite marker 0x0008. Processes taking this
@@ -417,4 +418,428 @@ async fn test_regen_isolates_a_failing_ca() {
     );
     let _ = cert_id;
     let _ = broken_cert_id;
+}
+
+/// A CA row for the given root CA: the row's id is the key pair id, so
+/// the key store holds this CA's key under that id.
+async fn insert_ca(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    root: &ws_ca::ca::CreatedCa,
+    name: &str,
+) -> CaModel {
+    let ca = CaModel {
+        id: root.key_pair_id,
+        tenant_id,
+        name: name.to_string(),
+        subject: format!("CN={name}"),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: chrono::Utc::now() - chrono::Duration::days(1),
+        not_after: chrono::Utc::now() + chrono::Duration::days(365),
+        cert_pem: root.cert_pem.clone(),
+        key_file: "keystore://ca".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+    CaRepo::new(pool)
+        .insert(&ca)
+        .await
+        .expect("insert the test CA row");
+    ca
+}
+
+/// An active (not revoked) certificate row.
+async fn insert_active_cert(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    ca_id: uuid::Uuid,
+    serial: u128,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let model = CertificateModel {
+        id,
+        tenant_id,
+        ca_id,
+        profile_name: "default".to_string(),
+        subject: "CN=active.example".to_string(),
+        serial,
+        serial_hex: format!("{serial:x}"),
+        san_dns: vec!["active.example".to_string()],
+        san_ips: vec![],
+        key_type: "ecdsa-p256".to_string(),
+        not_before: now,
+        not_after: now + chrono::Duration::days(30),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".to_string(),
+        status: CertStatus::Active,
+        revoked_at: None,
+        revocation_reason: None,
+        source: "manual".to_string(),
+        created_at: now,
+    };
+    CertificateRepo::new(pool)
+        .insert(&model)
+        .await
+        .expect("insert the active certificate row");
+    id
+}
+
+/// A revoked certificate row with an explicit revocation instant.
+///
+/// The repository's `revoke` always stamps "now"; this helper writes
+/// the revocation date directly, so a test can reproduce a revocation
+/// that is older than a published CRL.
+async fn insert_revoked_cert_at(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    ca_id: uuid::Uuid,
+    serial: u128,
+    revoked_at: chrono::DateTime<chrono::Utc>,
+) -> uuid::Uuid {
+    let id = insert_active_cert(pool, tenant_id, ca_id, serial).await;
+    sqlx::query(
+        "UPDATE certificates SET status = 'revoked', revoked_at = $2, \
+         revocation_reason = 'key_compromise' WHERE id = $1",
+    )
+    .bind(id)
+    .bind(revoked_at)
+    .execute(pool)
+    .await
+    .expect("revoke the certificate row");
+    id
+}
+
+/// A revoked certificate row whose revocation instant is NULL — data
+/// damage the job must refuse rather than paper over.
+async fn insert_revoked_cert_without_date(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    ca_id: uuid::Uuid,
+    serial: u128,
+) -> uuid::Uuid {
+    let id = insert_active_cert(pool, tenant_id, ca_id, serial).await;
+    sqlx::query(
+        "UPDATE certificates SET status = 'revoked', revoked_at = NULL, \
+         revocation_reason = 'key_compromise' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("revoke the certificate row without a date");
+    id
+}
+
+/// The revoked serials a published CRL lists.
+fn crl_serials(crl_pem: &str) -> Vec<u128> {
+    let (_, block) = x509_parser::pem::parse_x509_pem(crl_pem.as_bytes())
+        .expect("the published CRL is valid PEM");
+    let (_, crl) =
+        x509_parser::revocation_list::CertificateRevocationList::from_der(&block.contents)
+            .expect("the published CRL parses");
+    crl.iter_revoked_certificates()
+        .map(|entry| {
+            entry
+                .serial()
+                .to_string()
+                .parse::<u128>()
+                .expect("a decimal serial")
+        })
+        .collect()
+}
+
+/// The number of CRL rows published for a CA.
+async fn crl_count(pool: &PgPool, ca_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM crls WHERE ca_id = $1")
+        .bind(ca_id)
+        .fetch_one(pool)
+        .await
+        .expect("count the CA's CRL rows")
+}
+
+/// A CA with nothing to do is skipped and not counted: the returned count
+/// is the number of CAs for which work was actually done. Two CAs, one
+/// with a revocation and one with only an active certificate: the count
+/// is 1 and only the revoking CA gets a CRL. Cleans up before
+/// asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_counts_only_cas_with_work() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("counts-only-cas-with-work");
+    let revoking_root = create_root(&root_spec(), &mut keystore).expect("create the first root");
+    let quiet_root = create_root(
+        &CaSpec {
+            name: "rt-worker-ca-quiet".to_owned(),
+            subject: "Wardstone Test Worker Quiet Root".to_owned(),
+            key_type: KeyType::Ed25519,
+            lifetime: CaLifetime::Root,
+        },
+        &mut keystore,
+    )
+    .expect("create the second root");
+
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let revoking = insert_ca(&pool, tenant.id, &revoking_root, WORKER_CA_NAME).await;
+    let quiet = insert_ca(&pool, tenant.id, &quiet_root, "rt-worker-ca-quiet").await;
+
+    insert_revoked_cert(&pool, tenant.id, revoking.id, LEAF_SERIAL).await;
+    insert_active_cert(&pool, tenant.id, quiet.id, BROKEN_SERIAL).await;
+
+    let count = regen_crl_and_ocsp(&pool, &keystore).await;
+
+    let revoking_crls = crl_count(&pool, revoking.id).await;
+    let quiet_crls = crl_count(&pool, quiet.id).await;
+    let total_crls: i64 = sqlx::query_scalar("SELECT count(*) FROM crls")
+        .fetch_one(&pool)
+        .await
+        .expect("count every CRL row");
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(
+        count.expect("the job succeeds"),
+        1,
+        "only the CA with a revocation is counted"
+    );
+    assert_eq!(revoking_crls, 1, "the revoking CA gets a CRL");
+    assert_eq!(quiet_crls, 0, "the CA without a revocation gets no CRL");
+    assert_eq!(total_crls, 1, "exactly one CRL row exists");
+}
+
+/// An expired published CRL is refreshed even when no new revocation
+/// arrived: relying parties must be able to fetch a current CRL.
+/// Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_republishes_expired_crl() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("republishes-expired-crl");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
+
+    // The first run publishes the CRL.
+    let first = regen_crl_and_ocsp(&pool, &keystore).await;
+
+    // Age the published CRL: its next_update is now in the past.
+    sqlx::query("UPDATE crls SET next_update = now() - interval '1 hour' WHERE ca_id = $1")
+        .bind(ca.id)
+        .execute(&pool)
+        .await
+        .expect("age the published CRL");
+
+    let second = regen_crl_and_ocsp(&pool, &keystore).await;
+    let crls = crl_count(&pool, ca.id).await;
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(first.expect("the first run succeeds"), 1);
+    assert_eq!(
+        second.expect("the second run succeeds"),
+        1,
+        "the expired CRL is refreshed"
+    );
+    assert_eq!(crls, 2, "a second CRL row is published");
+}
+
+/// A revocation whose `revoked_at` is older than the published CRL's
+/// issue instant, and which the published CRL does not list, must not be
+/// lost: the CRL's content is compared with the database's, so the CRL
+/// is republished with that serial and the serial gets an OCSP
+/// response. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_republishes_lost_revocation() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("republishes-lost-revocation");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
+
+    // The first run publishes a CRL listing the one revocation.
+    regen_crl_and_ocsp(&pool, &keystore)
+        .await
+        .expect("the first run succeeds");
+
+    // A revocation that happened before that CRL was issued, and that
+    // the CRL therefore does not list.
+    let older = chrono::Utc::now() - chrono::Duration::days(2);
+    insert_revoked_cert_at(&pool, tenant.id, ca.id, BROKEN_SERIAL, older).await;
+
+    let second = regen_crl_and_ocsp(&pool, &keystore).await;
+
+    let newest_crl: String = sqlx::query_scalar(
+        "SELECT crl_pem FROM crls WHERE ca_id = $1 ORDER BY issued_at DESC LIMIT 1",
+    )
+    .bind(ca.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the newest published CRL");
+    let listed = crl_serials(&newest_crl);
+    let lost_response = OcspRepo::new(&pool)
+        .get_latest(
+            ca.id,
+            i64::try_from(BROKEN_SERIAL).expect("serial fits i64"),
+        )
+        .await
+        .expect("get the latest OCSP response for the lost revocation");
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(
+        second.expect("the second run succeeds"),
+        1,
+        "the CA with the lost revocation is republished"
+    );
+    assert!(
+        listed.contains(&BROKEN_SERIAL),
+        "the republished CRL must list the lost revocation: {listed:?}"
+    );
+    assert!(
+        listed.contains(&LEAF_SERIAL),
+        "the republished CRL still lists the earlier revocation: {listed:?}"
+    );
+    assert_eq!(
+        lost_response
+            .expect("an OCSP response exists for the lost revocation")
+            .status,
+        OcspStatus::Revoked,
+        "the lost revocation gets an OCSP response"
+    );
+}
+
+/// A missing OCSP response is republished even when the CRL is current:
+/// the response is repaired on its own, without a new CRL. Cleans up
+/// before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_republishes_missing_ocsp_response() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("republishes-missing-ocsp");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
+
+    regen_crl_and_ocsp(&pool, &keystore)
+        .await
+        .expect("the first run succeeds");
+    let crls_before = crl_count(&pool, ca.id).await;
+
+    // The OCSP response is lost; the CRL stays current.
+    sqlx::query("DELETE FROM ocsp_responses WHERE ca_id = $1 AND serial = $2")
+        .bind(ca.id)
+        .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+        .execute(&pool)
+        .await
+        .expect("delete the OCSP response");
+
+    let second = regen_crl_and_ocsp(&pool, &keystore).await;
+    let crls_after = crl_count(&pool, ca.id).await;
+    let latest = OcspRepo::new(&pool)
+        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+        .await
+        .expect("get the latest OCSP response");
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(
+        second.expect("the second run succeeds"),
+        1,
+        "the CA with the missing OCSP response is counted"
+    );
+    assert_eq!(
+        crls_after, crls_before,
+        "an OCSP-only repair does not publish a new CRL"
+    );
+    assert_eq!(
+        latest.expect("an OCSP response exists again").status,
+        OcspStatus::Revoked,
+        "the missing OCSP response is written again"
+    );
+}
+
+/// A revoked certificate without a revocation date is data damage: the
+/// job fails loudly (a typed error) and publishes nothing for that CA —
+/// the revocation date is never invented and the revocation is never
+/// silently dropped. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_rejects_revocation_without_date() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("rejects-revocation-without-date");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    insert_revoked_cert_without_date(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
+
+    let result = regen_crl_and_ocsp(&pool, &keystore).await;
+    let crls = crl_count(&pool, ca.id).await;
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let err = result.expect_err("a revocation without a date fails the job");
+    assert!(
+        matches!(err, ws_worker::error::WorkerError::Config(_)),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(crls, 0, "no CRL is published for the damaged CA");
 }

@@ -1,9 +1,14 @@
 //! The worker's jobs.
 //!
-//! [`regen_crl_and_ocsp`] is the revocation-publishing job: for every CA
-//! whose revocation list has grown since its latest CRL, it rebuilds the
-//! CRL and publishes one OCSP response per revoked certificate. The
-//! scheduler in [`crate::run_scheduler`] runs it on a fixed interval.
+//! [`regen_crl_and_ocsp`] is the revocation-publishing job: it makes the
+//! CA's published revocation state match the database's truth — it
+//! republishes a CA's CRL when the published one is missing, expired, or
+//! lists a different set of revoked serials than the database does, and
+//! it publishes an OCSP response for every revoked certificate that has
+//! no fresh answer. The scheduler in [`crate::run_scheduler`] runs it on
+//! a fixed interval.
+
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
@@ -15,10 +20,13 @@ use ws_ca::keystore::KeyStore;
 use ws_ca::ocsp::{build_ocsp_response, OcspResponseSpec, OcspStatus};
 use ws_core::models::audit::{ActorType, AuditEntry};
 use ws_core::models::ca::CaModel;
+use ws_core::models::certificate::CertificateModel;
 use ws_core::models::ocsp::OcspResponseModel;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::ocsp_repo::OcspRepo;
+use x509_parser::prelude::FromDer;
+use x509_parser::revocation_list::CertificateRevocationList;
 
 use crate::error::WorkerError;
 
@@ -35,46 +43,84 @@ const AUDIT_ACTION_CRL_BUILT: &str = "crl_built";
 /// The audit actor id of the worker itself.
 const AUDIT_ACTOR_ID: &str = "worker";
 
-/// Rebuild the CRL and OCSP responses of every CA that has revocations
-/// newer than its latest CRL, and return the number of CAs regenerated.
+/// The published CRL of one CA, as the database holds it.
+struct PublishedCrl {
+    /// The expiry instant (`next_update`): after it the CRL is stale and
+    /// relying parties must fetch a new one.
+    next_update: DateTime<Utc>,
+    /// The PEM document.
+    crl_pem: String,
+}
+
+/// What the job decided to do for one CA.
+enum CaPlan {
+    /// Nothing to publish: the published CRL is current and every
+    /// revoked certificate has a fresh OCSP answer.
+    Nothing,
+    /// The CRL must be (re)published, and/or OCSP answers are missing.
+    Publish {
+        /// Whether a new CRL row is needed.
+        publish_crl: bool,
+        /// The revoked certificates that need a fresh OCSP response.
+        stale_ocsp: Vec<CertificateModel>,
+    },
+}
+
+/// Make the published revocation state of every CA match the database's
+/// truth, and return the number of CAs for which something was
+/// published.
 ///
-/// The trigger is "the revocation list grew": a CA whose latest CRL
-/// already covers every revocation is left alone. The *content* of the
-/// rebuilt CRL, however, is every certificate currently revoked for that
-/// CA — not only the newly revoked ones. A CRL that listed only the
-/// delta would drop the older revocations from the CA's latest CRL, so a
-/// relying party fetching it would no longer see them: the published
-/// CRL must always be the complete revocation list.
+/// For each CA the job gathers the published CRL (the latest one, by
+/// issue instant) and the database's currently revoked certificates, and
+/// then decides:
 ///
-/// For each regenerated CA the job
+/// - `crl_missing` — the CA has no published CRL at all;
+/// - `crl_expired` — the published CRL's `next_update` is in the past;
+/// - `content_differs` — the revoked serials listed in the published
+///   CRL are not exactly the revoked serials in the database. The
+///   comparison is made on the *content* of the published CRL (it is
+///   parsed, never counted, never inferred from timestamps): a revocation
+///   that is missing from the published CRL — for instance because it
+///   was recorded with an older `revoked_at` than the CRL's issue
+///   instant — must be republished, or it would be lost forever. A
+///   published CRL that cannot be parsed is treated as differing, and the
+///   condition is logged, because a corrupt published CRL has to be
+///   republished;
+/// - `ocsp_missing` — a revoked certificate has no OCSP response, or
+///   its latest response predates the certificate's revocation, which
+///   makes that answer stale.
 ///
-/// 1. builds the CRL with `ws_ca::crl::build_crl` (24h validity),
-/// 2. stores it in the `crls` table,
-/// 3. builds one OCSP response per revoked certificate (status
-///    `revoked`, 24h validity) and stores it through [`OcspRepo`], and
-/// 4. records an `crl_built` audit entry for the CA.
+/// A new CRL is published when the CRL conditions hold; an OCSP response
+/// is published for every revoked certificate whose answer is missing.
+/// The two are independent: an OCSP-only repair does not need a new CRL,
+/// and a CRL refresh still ensures that every revoked certificate has an
+/// OCSP answer.
 ///
-/// One failing CA never stops the others: the failure is logged (with
-/// the CA id) and the job continues with the next CA, so a CA whose key
-/// is missing cannot keep every other CA's revocation list unpublished.
-/// The first failure is nevertheless reported to the caller, so the
-/// scheduler logs the job as failed and the next tick retries.
+/// The returned count is the number of CAs for which work was actually
+/// done — a CRL published or an OCSP response written. A CA with
+/// nothing to do is skipped and not counted.
 ///
-/// Errors: a missing or unreadable CA key, a DER/encoding failure, and
-/// database failures all surface as typed [`WorkerError`]s — never a
-/// panic, and never a partially written CRL row (the CRL is built in
-/// full before any row is written).
+/// Errors: a revoked certificate without a `revoked_at` is a typed
+/// [`WorkerError::Config`] (the revocation date is never invented, and
+/// the revocation is never silently dropped from the CRL); a missing or
+/// unreadable CA key, a DER/encoding failure, and database failures
+/// surface as typed [`WorkerError`]s. One failing CA never stops the
+/// others: the failure is logged (with the CA id) and the job continues
+/// with the next CA; the first failure is nevertheless reported to the
+/// caller, so the scheduler logs the job as failed and the next tick
+/// retries.
 pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u64, WorkerError> {
     let cas = list_all_cas(pool).await?;
     let certs = CertificateRepo::new(pool);
     let ocsp = OcspRepo::new(pool);
     let audit = AuditRepo::new(pool);
 
-    let mut regenerated = 0u64;
+    let mut published = 0u64;
     let mut first_failure: Option<WorkerError> = None;
     for ca in cas {
         match regen_one_ca(pool, keystore, &ca, &certs, &ocsp, &audit).await {
-            Ok(()) => regenerated += 1,
+            Ok(true) => published += 1,
+            Ok(false) => {}
             Err(err) => {
                 tracing::error!(ca_id = %ca.id, error = %err, "CRL/OCSP regeneration failed for CA");
                 if first_failure.is_none() {
@@ -86,12 +132,11 @@ pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u6
 
     match first_failure {
         Some(err) => Err(err),
-        None => Ok(regenerated),
+        None => Ok(published),
     }
 }
 
-/// Regenerate one CA's CRL and OCSP responses, if its revocation list has
-/// grown since its latest CRL.
+/// Publish what one CA needs, and report whether anything was published.
 async fn regen_one_ca(
     pool: &PgPool,
     keystore: &KeyStore,
@@ -99,64 +144,110 @@ async fn regen_one_ca(
     certs: &CertificateRepo,
     ocsp: &OcspRepo,
     audit: &AuditRepo,
-) -> Result<(), WorkerError> {
-    // The latest CRL's issue instant is the watermark: revocations newer
-    // than it are not yet published. With no CRL at all the watermark is
-    // the epoch, so every revocation counts.
-    let latest_crl = latest_crl_issued_at(pool, ca.id).await?;
-    let since = latest_crl.unwrap_or(DateTime::UNIX_EPOCH);
-    let new_revocations = certs.list_revoked_since(ca.id, since).await?;
-    if new_revocations.is_empty() {
-        return Ok(());
-    }
-
-    // The published CRL carries the complete revocation list.
-    let all_revoked = certs
+) -> Result<bool, WorkerError> {
+    let now = Utc::now();
+    let published_crl = latest_crl(pool, ca.id).await?;
+    let revoked = certs
         .list_revoked_since(ca.id, DateTime::UNIX_EPOCH)
         .await?;
-    let revocations = all_revoked
-        .iter()
-        .map(|cert| RevocationEntry {
-            serial: cert.serial,
-            reason: cert.revocation_reason.as_deref().and_then(reason_from_str),
-            revoked_at: cert.revoked_at.unwrap_or_else(Utc::now),
-        })
-        .collect::<Vec<_>>();
 
+    // A revoked certificate without a revocation instant is data-level
+    // damage: the revocation date must never be invented, and the
+    // revocation must never be silently dropped from the CRL. Fail
+    // loudly, before anything is published for this CA.
+    //
+    // The damage is looked for with its own query: the repository's
+    // `list_revoked_since` filters on `revoked_at >= since`, so a row
+    // with a NULL revocation instant is invisible to it — exactly the
+    // row that has to be caught.
+    let damaged = revoked_without_date(pool, ca.id).await?;
+    if damaged > 0 {
+        return Err(WorkerError::Config(format!(
+            "CA {} has {damaged} revoked certificate(s) without a revocation date",
+            ca.id
+        )));
+    }
+
+    let plan = plan_for(ca, &published_crl, &revoked, ocsp, now).await?;
+    let CaPlan::Publish {
+        publish_crl,
+        stale_ocsp,
+    } = plan
+    else {
+        return Ok(false);
+    };
+
+    // The CA's key is needed for both the CRL and the OCSP responses.
     let ca_key = keystore.load_ca_key(&ca.id)?;
-    let crl = build_crl(
-        &ca.cert_pem,
-        ca_key.as_slice(),
-        &CrlSpec {
-            revocations,
-            next_update: VALIDITY,
-        },
-    )?;
 
-    // The CRL row is written only after the whole CRL exists.
-    sqlx::query(
-        "INSERT INTO crls (id, ca_id, issued_at, next_update, crl_pem) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(ca.id)
-    .bind(crl.issued_at)
-    .bind(crl.next_update)
-    .bind(&crl.crl_pem)
-    .execute(pool)
-    .await?;
+    if publish_crl {
+        let revocations = revoked
+            .iter()
+            .map(|cert| RevocationEntry {
+                serial: cert.serial,
+                reason: cert.revocation_reason.as_deref().and_then(reason_from_str),
+                revoked_at: cert.revoked_at.expect("checked above"),
+            })
+            .collect::<Vec<_>>();
 
-    // One OCSP response per revoked certificate.
-    for cert in &all_revoked {
-        let revoked_at = cert.revoked_at.unwrap_or_else(Utc::now);
+        let crl = build_crl(
+            &ca.cert_pem,
+            ca_key.as_slice(),
+            &CrlSpec {
+                revocations,
+                next_update: VALIDITY,
+            },
+        )?;
+
+        // The CRL row is written only after the whole CRL exists.
+        sqlx::query(
+            "INSERT INTO crls (id, ca_id, issued_at, next_update, crl_pem) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ca.id)
+        .bind(crl.issued_at)
+        .bind(crl.next_update)
+        .bind(&crl.crl_pem)
+        .execute(pool)
+        .await?;
+
+        audit
+            .record(&AuditEntry {
+                id: Uuid::new_v4(),
+                tenant_id: ca.tenant_id,
+                actor_type: ActorType::System,
+                actor_id: AUDIT_ACTOR_ID.to_owned(),
+                action: AUDIT_ACTION_CRL_BUILT.to_owned(),
+                target_type: "ca".to_owned(),
+                target_id: ca.id.to_string(),
+                details: json!({
+                    "ca_name": ca.name,
+                    "revoked": revoked.len(),
+                    "next_update": crl.next_update.to_rfc3339(),
+                }),
+                created_at: Utc::now(),
+            })
+            .await?;
+    }
+
+    // One OCSP response per certificate whose answer is missing or
+    // stale. The response is published with its own window: the answer
+    // is produced now and stays valid for 24 hours.
+    for cert in &stale_ocsp {
+        let revoked_at = cert.revoked_at.expect("checked above");
+        let this_update = now;
+        let next_update = now
+            .checked_add_signed(VALIDITY)
+            .ok_or_else(|| WorkerError::Config("OCSP validity window out of range".to_owned()))?;
         let response = build_ocsp_response(
             &ca.cert_pem,
             ca_key.as_slice(),
             cert.serial,
             &OcspResponseSpec {
                 status: OcspStatus::Revoked,
-                this_update: crl.issued_at,
-                next_update: crl.next_update,
+                this_update,
+                next_update,
                 revoked_at: Some(revoked_at),
                 reason: cert.revocation_reason.as_deref().and_then(reason_from_str),
             },
@@ -172,32 +263,109 @@ async fn regen_one_ca(
             ca_id: ca.id,
             serial,
             status: OcspStatus::Revoked,
-            this_update: crl.issued_at,
-            next_update: crl.next_update,
+            this_update,
+            next_update,
             resp_der: response,
         })
         .await?;
     }
 
-    audit
-        .record(&AuditEntry {
-            id: Uuid::new_v4(),
-            tenant_id: ca.tenant_id,
-            actor_type: ActorType::System,
-            actor_id: AUDIT_ACTOR_ID.to_owned(),
-            action: AUDIT_ACTION_CRL_BUILT.to_owned(),
-            target_type: "ca".to_owned(),
-            target_id: ca.id.to_string(),
-            details: json!({
-                "ca_name": ca.name,
-                "revoked": all_revoked.len(),
-                "next_update": crl.next_update.to_rfc3339(),
-            }),
-            created_at: Utc::now(),
-        })
-        .await?;
+    Ok(true)
+}
 
-    Ok(())
+/// Decide what one CA needs published.
+async fn plan_for(
+    ca: &CaModel,
+    published_crl: &Option<PublishedCrl>,
+    revoked: &[CertificateModel],
+    ocsp: &OcspRepo,
+    now: DateTime<Utc>,
+) -> Result<CaPlan, WorkerError> {
+    // The OCSP answers that are missing or stale: a certificate with no
+    // answer at all, or one whose latest answer predates the
+    // revocation (such an answer says "good" about a certificate that
+    // was already revoked when it was made).
+    let mut stale_ocsp = Vec::new();
+    for cert in revoked {
+        let serial = i64::try_from(cert.serial).map_err(|_| {
+            WorkerError::Config(format!(
+                "certificate serial {} exceeds the bigint serial column range",
+                cert.serial
+            ))
+        })?;
+        let latest = ocsp.get_latest(ca.id, serial).await?;
+        let revoked_at = cert.revoked_at.expect("checked by the caller");
+        let needs_response = match latest {
+            None => true,
+            Some(response) => response.this_update < revoked_at,
+        };
+        if needs_response {
+            stale_ocsp.push(cert.clone());
+        }
+    }
+
+    let publish_crl = match published_crl {
+        // No published CRL at all. There is something to publish only
+        // when the CA has revoked certificates: a CA with no revocations
+        // has no revocation state to publish, and an empty CRL would be
+        // work without meaning.
+        None => !revoked.is_empty(),
+        Some(crl) => {
+            // The published CRL is expired.
+            let expired = crl.next_update < now;
+            // The published CRL must list exactly the database's revoked
+            // serials. The comparison is made on the parsed content: a
+            // CRL that cannot be parsed cannot be trusted, so it has to
+            // be republished.
+            let published_serials = match parse_crl_serials(&crl.crl_pem) {
+                Some(serials) => serials,
+                None => {
+                    tracing::warn!(
+                        ca_id = %ca.id,
+                        "the published CRL could not be parsed; republishing"
+                    );
+                    return Ok(CaPlan::Publish {
+                        publish_crl: true,
+                        stale_ocsp,
+                    });
+                }
+            };
+            expired || published_serials != revoked_serials(revoked)
+        }
+    };
+
+    if !publish_crl && stale_ocsp.is_empty() {
+        return Ok(CaPlan::Nothing);
+    }
+    Ok(CaPlan::Publish {
+        publish_crl,
+        stale_ocsp,
+    })
+}
+
+/// The set of revoked serials the database holds for a CA.
+fn revoked_serials(revoked: &[CertificateModel]) -> BTreeSet<u128> {
+    revoked.iter().map(|cert| cert.serial).collect()
+}
+
+/// The set of revoked serials a published CRL lists, or `None` when the
+/// published CRL cannot be parsed (a corrupt row, a truncated PEM).
+///
+/// The serials are compared as sets: the CRL's content decides whether
+/// it is still current, never a timestamp and never a count.
+fn parse_crl_serials(crl_pem: &str) -> Option<BTreeSet<u128>> {
+    let (_, block) = x509_parser::pem::parse_x509_pem(crl_pem.as_bytes()).ok()?;
+    let (_, crl) = CertificateRevocationList::from_der(&block.contents).ok()?;
+    let mut serials = BTreeSet::new();
+    for entry in crl.iter_revoked_certificates() {
+        // The serial is a big integer; the decimal form is parsed back
+        // into the u128 the rest of the code uses. A serial that does
+        // not fit cannot be compared with the database's serials, so the
+        // CRL is treated as unparsable.
+        let serial = entry.serial().to_string().parse::<u128>().ok()?;
+        serials.insert(serial);
+    }
+    Some(serials)
 }
 
 /// Every CA in the database, across all tenants.
@@ -253,17 +421,39 @@ async fn list_all_cas(pool: &PgPool) -> Result<Vec<CaModel>, WorkerError> {
         .collect()
 }
 
-/// The issue instant of a CA's latest CRL, or `None` when it has none.
-async fn latest_crl_issued_at(
-    pool: &PgPool,
-    ca_id: Uuid,
-) -> Result<Option<DateTime<Utc>>, WorkerError> {
-    let latest: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT max(issued_at) FROM crls WHERE ca_id = $1")
-            .bind(ca_id)
-            .fetch_one(pool)
-            .await?;
-    Ok(latest)
+/// The number of a CA's revoked certificates that carry no revocation
+/// instant — data damage the job refuses to publish around.
+async fn revoked_without_date(pool: &PgPool, ca_id: Uuid) -> Result<i64, WorkerError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM certificates WHERE ca_id = $1 AND status = 'revoked' \
+         AND revoked_at IS NULL",
+    )
+    .bind(ca_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// A CA's latest published CRL, or `None` when it has none.
+async fn latest_crl(pool: &PgPool, ca_id: Uuid) -> Result<Option<PublishedCrl>, WorkerError> {
+    #[derive(sqlx::FromRow)]
+    struct CrlRow {
+        next_update: DateTime<Utc>,
+        crl_pem: String,
+    }
+
+    let row: Option<CrlRow> = sqlx::query_as(
+        "SELECT next_update, crl_pem FROM crls WHERE ca_id = $1 \
+         ORDER BY issued_at DESC LIMIT 1",
+    )
+    .bind(ca_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| PublishedCrl {
+        next_update: row.next_update,
+        crl_pem: row.crl_pem,
+    }))
 }
 
 /// Map a stored revocation reason string onto the RFC 5280 reason code

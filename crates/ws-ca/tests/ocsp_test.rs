@@ -392,6 +392,34 @@ fn test_ocsp_response_rejects_mismatched_ca_key() {
     );
 }
 
+/// A `revoked` answer without a revocation instant is a typed error: the
+/// revocation date must never be invented (it would publish a revocation
+/// that never happened).
+#[test]
+fn test_ocsp_response_rejects_revoked_without_revocation_time() {
+    let mut ks = temp_keystore("revoked-without-time");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+
+    let result = build_ocsp_response(
+        &root.cert_pem,
+        root.private_key_der.as_slice(),
+        LEAF_SERIAL,
+        &OcspResponseSpec {
+            status: OcspStatus::Revoked,
+            this_update: Utc::now(),
+            next_update: Utc::now() + Duration::hours(24),
+            revoked_at: None,
+            reason: Some(CrlReason::KeyCompromise),
+        },
+    );
+
+    let err = result.expect_err("a revoked response without a revocation date is rejected");
+    assert!(
+        matches!(err, ws_ca::error::CaError::X509(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
 /// The `resp_der` bytes the builder produces are a complete DER SEQUENCE
 /// whose length header matches the content (a truncated or over-long
 /// encoding would make every client fail to parse it).
