@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Shared dependency versions. Exact caret pins chosen for the Plan 1 tech stack;
+# bump deliberately, one version per concern, and re-verify `cargo check
+# --workspace` after any change here.
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154" }
+
+# Database (numbered sqlx migrations; REQUIRED_MIGRATION_COUNT convention)
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres"] }
+
+# Async runtime
+tokio = { version = "1.54.0", features = ["full"] }
+
+# Identifiers / time
+uuid = { version = "1.28.0", features = ["v4"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+
+# Certificate authority
+rcgen = { version = "0.14.10" }
+x509-parser = { version = "0.18.1" }
+der = { version = "0.8.2" }
+
+# Crypto: envelope encryption (XChaCha20-Poly1305 DEK under master KEK)
+chacha20poly1305 = { version = "0.11.0" }
+rand = { version = "0.10.3" }
+argon2 = { version = "0.6.0" }
+zeroize = { version = "1.9.1" }
+base64 = { version = "0.23.1" }
+
+# Errors / observability
+tracing = { version = "0.1.44" }
+thiserror = { version = "2.0.21" }
+anyhow = { version = "1.0.104" }

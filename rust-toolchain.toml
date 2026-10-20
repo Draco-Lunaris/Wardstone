@@ -1,0 +1,4 @@
+# Pin the toolchain so local and CI builds agree. `stable` tracks the current
+# stable release; bump deliberately when the repo is ready to move toolchains.
+[toolchain]
+channel = "stable"
