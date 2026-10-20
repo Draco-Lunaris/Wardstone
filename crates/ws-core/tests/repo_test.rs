@@ -28,13 +28,14 @@
 //! Each test body holds a session-level Postgres advisory lock for its whole
 //! duration, so any other process using the same key serializes against it
 //! (the in-process [`DB_TEST_LOCK`] mutex mirrors `db_test.rs`'s pattern and
-//! serializes this binary's tests against each other). Two keys are in use,
-//! one per disjoint row set: [`ADVISORY_KEY`] (suite marker 0x0003) for the
-//! tenant and CA tests, [`ADVISORY_KEY_CERTS`] (marker 0x0004) for the
-//! certificate tests, which own a tenant name of their own. Plain `cargo
-//! test` runs each integration-test binary sequentially and `db_test.rs`
-//! does not insert tenant rows, so that pair is additionally safe by
-//! construction.
+//! serializes this binary's tests against each other). Three keys are in
+//! use, one per disjoint row set: [`ADVISORY_KEY`] (suite marker 0x0003)
+//! for the tenant and CA tests, [`ADVISORY_KEY_CERTS`] (marker 0x0004) for
+//! the certificate tests, and [`ADVISORY_KEY_AUDIT`] (marker 0x0005) for
+//! the audit-log tests, each of which owns a tenant name of its own. Plain
+//! `cargo test` runs each integration-test binary sequentially and
+//! `db_test.rs` does not insert tenant rows, so that pair is additionally
+//! safe by construction.
 
 use std::sync::OnceLock;
 
@@ -45,8 +46,10 @@ use tokio::sync::Mutex;
 
 use ws_core::db::connect;
 use ws_core::error::CoreError;
+use ws_core::models::audit::{ActorType, AuditEntry};
 use ws_core::models::ca::{CaModel, KeyType};
 use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
@@ -75,6 +78,15 @@ const ROOT_CA_NAME: &str = "rt-root-ca";
 /// before asserts (certificates first, then the CA, then the tenant).
 const CERTS_TENANT: &str = "rt-cert-tenant";
 const CERT_CA_NAME: &str = "rt-cert-ca";
+
+/// Postgres advisory-lock key for this suite's audit-log tests: the same
+/// key family with the suite marker bumped to 0x0005
+/// (`0x0057_4144_5354_0005`), a disjoint row set (its own tenant name).
+const ADVISORY_KEY_AUDIT: i64 = 0x0057_4144_5354_0005;
+
+/// Tenant name the audit tests own; deleted before asserts (audit rows
+/// first, then the tenant — `audit_log.tenant_id` references `tenants`).
+const AUDIT_TENANT: &str = "rt-audit-tenant";
 
 /// In-process serialization, the same whole-body lock pattern as
 /// `db_test.rs`: the harness runs tests on separate threads. A tokio mutex
@@ -560,4 +572,177 @@ async fn list_expiring_picks_up_upcoming() {
         expiring[0].not_after < expiring[1].not_after,
         "ascending not_after order"
     );
+}
+
+/// One audit entry fixture: `cert_issued` by default, with the caller's
+/// action labels, actor, target, and details map.
+fn audit_entry(
+    tenant_id: uuid::Uuid,
+    actor_type: ActorType,
+    actor_id: &str,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    details: serde_json::Value,
+) -> AuditEntry {
+    AuditEntry {
+        id: uuid::Uuid::new_v4(),
+        tenant_id,
+        actor_type,
+        actor_id: actor_id.to_string(),
+        action: action.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_id.to_string(),
+        details,
+        created_at: ts("2026-06-15T12:30:00Z"),
+    }
+}
+
+/// Sweep any rows a previously crashed run of the audit tests may have left
+/// behind under this suite's owned tenant name: audit_log rows first (they
+/// reference the tenant), then the tenant itself.
+async fn sweep_audit_rows(pool: &PgPool) {
+    for sql in [
+        "DELETE FROM audit_log WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(AUDIT_TENANT)
+            .execute(pool)
+            .await
+            .expect("sweep stale audit-suite rows");
+    }
+}
+
+/// Recording two `cert_issued` entries makes `list_by_tenant` return both,
+/// newest first (`created_at desc`); a further `record` appends (three rows
+/// after three records — append-only demonstrated, no update or overwrite).
+/// `record` deliberately ignores the model's `created_at` (the database
+/// `now()` default owns the column), so rows read back with a wall-clock
+/// timestamp, not the fixture one. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_audit_roundtrip() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUDIT).await;
+
+    sweep_audit_rows(&pool).await;
+
+    let tenant = TenantRepo::new(&pool)
+        .insert(AUDIT_TENANT)
+        .await
+        .expect("insert test tenant for audit rows");
+
+    let first = audit_entry(
+        tenant.id,
+        ActorType::User,
+        "op-user-1",
+        "cert_issued",
+        "certificate",
+        "0199aaaa-0000-7000-8000-000000000001",
+        serde_json::json!({ "profile": "default" }),
+    );
+    let second = audit_entry(
+        tenant.id,
+        ActorType::System,
+        "worker",
+        "cert_issued",
+        "certificate",
+        "0199aaaa-0000-7000-8000-000000000002",
+        serde_json::json!({ "profile": "default", "san_count": 2 }),
+    );
+    let third = audit_entry(
+        tenant.id,
+        ActorType::AcmeAccount,
+        "acme-acct-42",
+        "cert_issued",
+        "certificate",
+        "0199aaaa-0000-7000-8000-000000000003",
+        serde_json::json!({}),
+    );
+
+    let audit = AuditRepo::new(&pool);
+    let first_insert = audit.record(&first).await;
+    let second_insert = audit.record(&second).await;
+    let listed = audit.list_by_tenant(tenant.id, 0, 10).await;
+    let append = audit.record(&third).await;
+    let listed_after = audit.list_by_tenant(tenant.id, 0, 10).await;
+    // Appending the exact same entry again (same primary key) must be
+    // rejected, not silently overwritten: append-only has no upsert path.
+    let duplicate_append = audit.record(&first).await;
+    let count_after_duplicate: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE tenant_id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(-1);
+
+    // Cleanup BEFORE asserting: this tenant's audit rows, then the tenant.
+    sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the inserted audit rows");
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the test tenant");
+    release_advisory(&mut advisory, ADVISORY_KEY_AUDIT).await;
+
+    first_insert.expect("record the first audit entry");
+    second_insert.expect("record the second audit entry");
+
+    let listed = listed.expect("list_by_tenant after two records");
+    assert_eq!(listed.len(), 2, "two records must produce two rows");
+    // Newest first: `second` was recorded strictly later than `first`, and
+    // the stored `created_at` values are the database's `now()` — not the
+    // fixtures' fixed timestamps, which `record` must ignore.
+    assert_eq!(listed[0].id, second.id);
+    assert_eq!(listed[1].id, first.id);
+    assert!(
+        listed[0].created_at >= listed[1].created_at,
+        "created_at desc order"
+    );
+    assert_ne!(
+        listed[0].created_at, second.created_at,
+        "record must not bind the client timestamp; the DB default owns created_at"
+    );
+    // Everything but the DB-owned created_at roundtrips exactly.
+    assert_eq!(listed[0].tenant_id, second.tenant_id);
+    assert_eq!(listed[0].actor_type, second.actor_type);
+    assert_eq!(listed[0].actor_id, second.actor_id);
+    assert_eq!(listed[0].action, second.action);
+    assert_eq!(listed[0].target_type, second.target_type);
+    assert_eq!(listed[0].target_id, second.target_id);
+    assert_eq!(listed[0].details, second.details);
+    assert_eq!(listed[1].details, first.details);
+
+    append.expect("a further record appends");
+    let listed_after = listed_after.expect("list_by_tenant after the third record");
+    assert_eq!(
+        listed_after.len(),
+        3,
+        "a further record appends a third row (append-only)"
+    );
+    assert_eq!(listed_after[0].id, third.id);
+    assert_eq!(listed_after[2].id, first.id);
+
+    let duplicate_append = duplicate_append.expect_err(
+        "re-recording an entry with the same id must hit the pk and be typed, never overwrite",
+    );
+    assert!(
+        matches!(duplicate_append, CoreError::Duplicate),
+        "unexpected error: {duplicate_append:?}"
+    );
+    assert_eq!(
+        count_after_duplicate, 3,
+        "the rejected duplicate must not add a row"
+    );
+    // The three actors cover every `actor_type` variant's column encoding.
+    assert_eq!(listed_after[0].actor_type, ActorType::AcmeAccount);
+    let _ = (listed_after[1].actor_type, ActorType::System);
 }

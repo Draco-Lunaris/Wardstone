@@ -18,7 +18,13 @@ rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 rsa = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true }
+# PgPool + queries for Task 8's used_serials allocation (migration 001's
+# table). ws-ca deliberately does NOT use ws-core models here: a raw sqlx
+# INSERT keeps the serial allocator independent of ws-core's repo surface,
+# so the dep graph stays acyclic. Only the "uuid" feature extra is needed
+# (binding Uuid parameters); the workspace pin supplies runtime+postgres,
+# and ws-core's migrate/macros features unify across the graph.
+sqlx = { workspace = true, features = ["uuid"] }
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
@@ -33,3 +39,6 @@ zeroize = { workspace = true }
 # Recomputes rcgen's legacy deterministic serial for the creation tests'
 # serial-number regression pin; production code never digests anything.
 sha2 = { workspace = true }
+# Async test bodies for tests/serial_test.rs (DB-backed allocation suite);
+# the suite connects through ws_core::db::connect, already a main dep.
+tokio = { workspace = true }
