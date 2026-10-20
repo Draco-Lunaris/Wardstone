@@ -19,3 +19,8 @@ uuid = { workspace = true }
 ws-core = { path = "../ws-core" }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# Recomputes rcgen's legacy deterministic serial for the creation tests'
+# serial-number regression pin; production code never digests anything.
+sha2 = { workspace = true }

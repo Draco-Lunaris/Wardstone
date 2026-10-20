@@ -22,8 +22,9 @@
 //!   `keyCertSign | cRLSign` critical; AuthorityKeyIdentifier copied from
 //!   the parent's SubjectKeyIdentifier.
 //! - SKI is rcgen's default (RFC 7093 method 1: truncated SHA-256 of the
-//!   subject public key info); serial numbers are rcgen's hash-derived
-//!   20-byte defaults.
+//!   subject public key info); serial numbers are 16 fresh OS-entropy
+//!   bytes, never rcgen's deterministic hash-derived default (`new_serial`
+//!   documents why).
 //!
 //! # Key material handling
 //!
@@ -49,8 +50,8 @@ use chrono::{Datelike, Utc};
 use rand::{rngs::SysRng, TryRng};
 use rcgen::{
     date_time_ymd, BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SignatureAlgorithm, SigningKey,
-    PKCS_ED25519,
+    IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SerialNumber, SignatureAlgorithm,
+    SigningKey, PKCS_ED25519,
 };
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::{rand_core::OsRng, RsaPrivateKey};
@@ -154,6 +155,11 @@ pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, 
 /// pathlen:0` (critical) — it may sign leaves but no further sub-CAs —
 /// KeyUsage `keyCertSign | cRLSign` (critical, no digitalSignature), and
 /// an AuthorityKeyIdentifier equal to the parent's SubjectKeyIdentifier.
+///
+/// The keystore must already have a master key — call
+/// [`KeyStore::ensure_master_key`] during bootstrap; per the keystore's
+/// contract, storing without one fails with [`CaError::Corrupt`] rather
+/// than silently generating a master.
 pub fn create_sub_ca(
     parent_cert_pem: &str,
     parent_key_der: &[u8],
@@ -178,9 +184,9 @@ pub fn create_sub_ca(
     persist(&key_pair, cert, keystore)
 }
 
-/// Common [`CertificateParams`]: subject CN, validity window, rcgen
-/// defaults for everything else (SKI derivation, serial number, no SANs
-/// or extended key usages — CAs carry none).
+/// Common [`CertificateParams`]: subject CN, validity window, fresh
+/// OS-entropy serial, rcgen defaults for everything else (SKI
+/// derivation; no SANs or extended key usages — CAs carry none).
 fn base_params(spec: &CaSpec) -> Result<CertificateParams, CaError> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, spec.subject.clone());
@@ -188,6 +194,7 @@ fn base_params(spec: &CaSpec) -> Result<CertificateParams, CaError> {
     let (nb, na) = validity_window(&spec.lifetime)?;
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
+    params.serial_number = Some(new_serial()?);
     params.not_before = date_time_ymd(nb.0, nb.1, nb.2);
     params.not_after = date_time_ymd(na.0, na.1, na.2);
     Ok(params)
@@ -319,6 +326,29 @@ fn new_key_pair_id() -> Result<Uuid, CaError> {
         .try_fill_bytes(bytes.as_mut())
         .map_err(std::io::Error::from)?;
     Ok(uuid::Builder::from_random_bytes(*bytes).into_uuid())
+}
+
+/// Fresh certificate serial number: 16 bytes of OS entropy, typed (entropy
+/// failure is [`CaError::Io`], never a panic). The serial is public
+/// certificate content, so the bytes need no zeroization.
+///
+/// [`CertificateParams::serial_number`] is always set explicitly because
+/// rcgen's default when it is unset is deterministic — SHA-256 of the
+/// subject public key truncated to 20 bytes — so two certificates sharing
+/// a key pair (e.g. any future renewal path) would collide, violating
+/// RFC 5280 §4.1.2.2 per-issuer serial uniqueness and breaking revocation
+/// keyed on (issuer, serial). Sixteen random bytes carry 128 bits of
+/// entropy (above the CA/B Forum's 64-bit floor) within RFC 5280's
+/// 20-octet bound; rcgen serializes the value with yasna's
+/// positive-INTEGER writer, which prepends a leading zero octet when the
+/// high bit is set, so raw random bytes always encode as a positive DER
+/// INTEGER.
+fn new_serial() -> Result<SerialNumber, CaError> {
+    let mut bytes = [0u8; 16];
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(std::io::Error::from)?;
+    Ok(SerialNumber::from_slice(&bytes))
 }
 
 /// rcgen [`KeyPair`] that zeroizes rcgen's serialized PKCS#8 copy when

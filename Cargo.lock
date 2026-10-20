@@ -2223,6 +2223,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "uuid",

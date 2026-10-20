@@ -8,6 +8,7 @@
 
 use std::fs;
 
+use sha2::{Digest, Sha256};
 use ws_ca::ca::{create_root, create_sub_ca, CaLifetime, CaSpec, KeyType};
 use ws_ca::keystore::KeyStore;
 use x509_parser::certificate::X509Certificate;
@@ -46,6 +47,47 @@ fn aki_bytes(cert: &X509Certificate<'_>) -> Vec<u8> {
             _ => None,
         })
         .expect("AuthorityKeyIdentifier extension with keyIdentifier present")
+}
+
+/// Whether the certificate's SubjectKeyIdentifier extension is marked
+/// critical (RFC 5280 requires SKI to be non-critical).
+fn ski_critical(cert: &X509Certificate<'_>) -> bool {
+    cert.iter_extensions()
+        .find_map(|ext| match ext.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(_) => Some(ext.critical),
+            _ => None,
+        })
+        .expect("SubjectKeyIdentifier extension present")
+}
+
+/// Pin the serial-number policy: a positive integer of at most 20 octets
+/// (RFC 5280 §4.1.2.2) that is NOT rcgen's deterministic default — which,
+/// when `CertificateParams::serial_number` is left unset, is SHA-256 of the
+/// subject public key bits truncated to 20 bytes with the sign bit cleared
+/// (verified against rcgen 0.14.10's `serialize_der_with_signer`). A
+/// regressed serial reproduces that value exactly and fails here.
+fn assert_random_serial(cert: &X509Certificate<'_>) {
+    let serial = cert.serial.to_bytes_be();
+    assert!(
+        serial.iter().any(|&b| b != 0),
+        "serial must be a positive integer"
+    );
+    assert!(
+        serial.len() <= 20,
+        "serial exceeds RFC 5280's 20-octet bound"
+    );
+
+    let spki = cert.public_key();
+    let bits: &[u8] = &spki.subject_public_key.data;
+    let mut legacy = Sha256::digest(bits).to_vec();
+    legacy.truncate(20);
+    legacy[0] &= 0x7f;
+    let legacy = &legacy[legacy.iter().take_while(|&&b| b == 0).count()..];
+    assert_ne!(
+        serial.as_slice(),
+        legacy,
+        "serial is rcgen's public-key-derived default, not OS entropy"
+    );
 }
 
 #[test]
@@ -87,6 +129,11 @@ fn test_create_root_ed25519_roundtrip() {
     assert!(ku.value.digital_signature());
     assert!(ku.value.key_cert_sign());
     assert!(ku.value.crl_sign());
+
+    // SKI is non-critical (RFC 5280), and the serial carries OS entropy —
+    // the pin fails if the serial regresses to rcgen's key-derived default.
+    assert!(!ski_critical(&cert), "root SKI must be non-critical");
+    assert_random_serial(&cert);
 
     // The root really is Ed25519-signed (id-Ed25519)
     assert_eq!(
@@ -149,11 +196,16 @@ fn test_create_sub_ca_signed_by_root() {
     assert!(bc.value.ca);
     assert_eq!(bc.value.path_len_constraint, Some(0));
 
-    // KeyUsage keyCertSign | cRLSign (no digitalSignature on sub-CAs)
+    // KeyUsage keyCertSign | cRLSign, critical (no digitalSignature on sub-CAs)
     let ku = sub_cert.key_usage().unwrap().unwrap();
+    assert!(ku.critical, "sub-CA KeyUsage must be critical");
     assert!(ku.value.key_cert_sign());
     assert!(ku.value.crl_sign());
     assert!(!ku.value.digital_signature());
+
+    // SKI non-critical; serial carries OS entropy, not the key-derived default
+    assert!(!ski_critical(&sub_cert), "sub-CA SKI must be non-critical");
+    assert_random_serial(&sub_cert);
 
     // The sub-CA's AKI is the root's SKI (compare parsed extensions)
     assert_eq!(aki_bytes(&sub_cert), ski_bytes(&root_cert));
@@ -197,6 +249,9 @@ fn test_create_root_rsa2048() {
     assert!(ku.value.key_cert_sign());
     assert!(ku.value.crl_sign());
     assert!(ku.value.digital_signature());
+
+    // The same OS-entropy serial policy covers RSA roots (regression pin)
+    assert_random_serial(&cert);
 
     // Really an RSA-2048 key: the parsed public key reports 2048 bits and
     // the certificate is signed with sha256WithRSAEncryption.
