@@ -6,11 +6,12 @@
 //! atomic INSERT (one statement = one implicit transaction) before
 //! returning it — the transactional contract: a serial is yielded only
 //! after it persisted, and a serial whose INSERT failed is never handed
-//! out. The `used_serials` primary key `(ca_id, serial)` is the
-//! uniqueness enforcement: per-CA (RFC 5280 §4.1.2.2 per-issuer serial
-//! uniqueness), so a serial used by one CA can never be handed to another
-//! CA, and two concurrent allocations for the same CA cannot both commit
-//! the same draw — the loser's INSERT errors, not overwrite.
+//! out. The `used_serials` primary key `(ca_id, serial)` enforces
+//! uniqueness **per CA** — RFC 5280 §4.1.2.2 per-issuer serial uniqueness,
+//! the same semantics as `certificates UNIQUE (ca_id, serial)`: two CAs
+//! draw from independent spaces, cross-CA serial reuse is legal and
+//! expected, and two concurrent allocations for the same CA cannot both
+//! commit the same draw — the loser's INSERT errors, not overwrites.
 //!
 //! # Serial range
 //!

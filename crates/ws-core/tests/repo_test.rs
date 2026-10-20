@@ -698,28 +698,44 @@ async fn test_audit_roundtrip() {
 
     let listed = listed.expect("list_by_tenant after two records");
     assert_eq!(listed.len(), 2, "two records must produce two rows");
-    // Newest first: `second` was recorded strictly later than `first`, and
-    // the stored `created_at` values are the database's `now()` — not the
-    // fixtures' fixed timestamps, which `record` must ignore.
-    assert_eq!(listed[0].id, second.id);
-    assert_eq!(listed[1].id, first.id);
+    // Newest first: the stored `created_at` values are the database's
+    // `now()` — not the fixtures' fixed timestamps, which `record` must
+    // ignore. The two records can commit in the same `now()` microsecond,
+    // and the `id` tiebreaker is random, so a strict position assert would
+    // flake; instead the exact pair of ids must be the first two rows as a
+    // set, and the desc ordering still pinned on `created_at`.
+    let top_two: std::collections::HashSet<_> = [listed[0].id, listed[1].id].into_iter().collect();
+    assert_eq!(
+        top_two,
+        [first.id, second.id].into_iter().collect(),
+        "the two recorded entries are exactly the first two rows"
+    );
     assert!(
         listed[0].created_at >= listed[1].created_at,
         "created_at desc order"
     );
+    // Distinct commits land strictly desc; a same-microsecond tie is not an
+    // error, so this only asserts what the ordering guarantees.
+    if listed[0].created_at > listed[1].created_at {
+        assert_eq!(listed[0].id, second.id, "strictly later commit lists first");
+    }
     assert_ne!(
         listed[0].created_at, second.created_at,
         "record must not bind the client timestamp; the DB default owns created_at"
     );
-    // Everything but the DB-owned created_at roundtrips exactly.
-    assert_eq!(listed[0].tenant_id, second.tenant_id);
-    assert_eq!(listed[0].actor_type, second.actor_type);
-    assert_eq!(listed[0].actor_id, second.actor_id);
-    assert_eq!(listed[0].action, second.action);
-    assert_eq!(listed[0].target_type, second.target_type);
-    assert_eq!(listed[0].target_id, second.target_id);
-    assert_eq!(listed[0].details, second.details);
-    assert_eq!(listed[1].details, first.details);
+    // Everything but the DB-owned created_at roundtrips exactly: both rows
+    // against their fixtures, modulo created_at (asserted above), matched
+    // position-agnostically by id.
+    for row in &listed {
+        let fixture = if row.id == second.id { &second } else { &first };
+        assert_eq!(row.tenant_id, fixture.tenant_id);
+        assert_eq!(row.actor_type, fixture.actor_type);
+        assert_eq!(row.actor_id, fixture.actor_id);
+        assert_eq!(row.action, fixture.action);
+        assert_eq!(row.target_type, fixture.target_type);
+        assert_eq!(row.target_id, fixture.target_id);
+        assert_eq!(row.details, fixture.details);
+    }
 
     append.expect("a further record appends");
     let listed_after = listed_after.expect("list_by_tenant after the third record");
@@ -728,8 +744,17 @@ async fn test_audit_roundtrip() {
         3,
         "a further record appends a third row (append-only)"
     );
+    // The third record is the newest row; the other two are the original
+    // pair, in either order (same-microsecond tie makes position flaky).
     assert_eq!(listed_after[0].id, third.id);
-    assert_eq!(listed_after[2].id, first.id);
+    let trailing_two: std::collections::HashSet<_> = [listed_after[1].id, listed_after[2].id]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        trailing_two,
+        [first.id, second.id].into_iter().collect(),
+        "the original pair fills the trailing rows"
+    );
 
     let duplicate_append = duplicate_append.expect_err(
         "re-recording an entry with the same id must hit the pk and be typed, never overwrite",
@@ -742,7 +767,7 @@ async fn test_audit_roundtrip() {
         count_after_duplicate, 3,
         "the rejected duplicate must not add a row"
     );
-    // The three actors cover every `actor_type` variant's column encoding.
+    // The three actors cover every `actor_type` variant's column encoding
+    // (System/User decode against the first listing above; AcmeAccount here).
     assert_eq!(listed_after[0].actor_type, ActorType::AcmeAccount);
-    let _ = (listed_after[1].actor_type, ActorType::System);
 }
