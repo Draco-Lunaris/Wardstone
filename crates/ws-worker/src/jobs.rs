@@ -4,9 +4,12 @@
 //! CA's published revocation state match the database's truth — it
 //! republishes a CA's CRL when the published one is missing, expired, or
 //! lists a different set of revoked serials than the database does, and
-//! it publishes an OCSP response for every revoked certificate that has
-//! no fresh answer. The scheduler in [`crate::run_scheduler`] runs it on
-//! a fixed interval.
+//! it publishes an OCSP response for every revoked certificate whose
+//! stored answer is missing or stale (an answer that predates the
+//! revocation, or whose validity window has lapsed). A CA with no
+//! revocations still publishes an empty CRL: a relying party must be
+//! able to fetch a current document. The scheduler in
+//! [`crate::run_scheduler`] runs it on a fixed interval.
 
 use std::collections::BTreeSet;
 
@@ -52,6 +55,19 @@ struct PublishedCrl {
     crl_pem: String,
 }
 
+/// A revoked certificate together with the instant it was revoked.
+///
+/// The revocation instant is not optional here: a revoked row without
+/// one is data damage, and the job refuses to publish around it rather
+/// than inventing a date.
+#[derive(Debug, Clone)]
+struct RevokedCert {
+    /// The certificate row.
+    cert: CertificateModel,
+    /// When the certificate was revoked.
+    revoked_at: DateTime<Utc>,
+}
+
 /// What the job decided to do for one CA.
 enum CaPlan {
     /// Nothing to publish: the published CRL is current and every
@@ -62,7 +78,7 @@ enum CaPlan {
         /// Whether a new CRL row is needed.
         publish_crl: bool,
         /// The revoked certificates that need a fresh OCSP response.
-        stale_ocsp: Vec<CertificateModel>,
+        stale_ocsp: Vec<RevokedCert>,
     },
 }
 
@@ -87,8 +103,9 @@ enum CaPlan {
 ///   condition is logged, because a corrupt published CRL has to be
 ///   republished;
 /// - `ocsp_missing` — a revoked certificate has no OCSP response, or
-///   its latest response predates the certificate's revocation, which
-///   makes that answer stale.
+///   its latest response predates the certificate's revocation, or that
+///   response's validity window has lapsed: each of those answers is
+///   stale and must be replaced.
 ///
 /// A new CRL is published when the CRL conditions hold; an OCSP response
 /// is published for every revoked certificate whose answer is missing.
@@ -147,7 +164,7 @@ async fn regen_one_ca(
 ) -> Result<bool, WorkerError> {
     let now = Utc::now();
     let published_crl = latest_crl(pool, ca.id).await?;
-    let revoked = certs
+    let revoked_rows = certs
         .list_revoked_since(ca.id, DateTime::UNIX_EPOCH)
         .await?;
 
@@ -168,6 +185,24 @@ async fn regen_one_ca(
         )));
     }
 
+    // The revocation instants are taken here, once: a revoked row
+    // without one is data damage, and the value is turned into a typed
+    // error at the point where it is needed (never a panic).
+    let revoked = revoked_rows
+        .iter()
+        .map(|cert| {
+            Ok(RevokedCert {
+                cert: cert.clone(),
+                revoked_at: cert.revoked_at.ok_or_else(|| {
+                    WorkerError::Config(format!(
+                        "revoked certificate {} of CA {} has no revocation date",
+                        cert.serial, ca.id
+                    ))
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, WorkerError>>()?;
+
     let plan = plan_for(ca, &published_crl, &revoked, ocsp, now).await?;
     let CaPlan::Publish {
         publish_crl,
@@ -184,9 +219,13 @@ async fn regen_one_ca(
         let revocations = revoked
             .iter()
             .map(|cert| RevocationEntry {
-                serial: cert.serial,
-                reason: cert.revocation_reason.as_deref().and_then(reason_from_str),
-                revoked_at: cert.revoked_at.expect("checked above"),
+                serial: cert.cert.serial,
+                reason: cert
+                    .cert
+                    .revocation_reason
+                    .as_deref()
+                    .and_then(reason_from_str),
+                revoked_at: cert.revoked_at,
             })
             .collect::<Vec<_>>();
 
@@ -235,7 +274,6 @@ async fn regen_one_ca(
     // stale. The response is published with its own window: the answer
     // is produced now and stays valid for 24 hours.
     for cert in &stale_ocsp {
-        let revoked_at = cert.revoked_at.expect("checked above");
         let this_update = now;
         let next_update = now
             .checked_add_signed(VALIDITY)
@@ -243,19 +281,23 @@ async fn regen_one_ca(
         let response = build_ocsp_response(
             &ca.cert_pem,
             ca_key.as_slice(),
-            cert.serial,
+            cert.cert.serial,
             &OcspResponseSpec {
                 status: OcspStatus::Revoked,
                 this_update,
                 next_update,
-                revoked_at: Some(revoked_at),
-                reason: cert.revocation_reason.as_deref().and_then(reason_from_str),
+                revoked_at: Some(cert.revoked_at),
+                reason: cert
+                    .cert
+                    .revocation_reason
+                    .as_deref()
+                    .and_then(reason_from_str),
             },
         )?;
-        let serial = i64::try_from(cert.serial).map_err(|_| {
+        let serial = i64::try_from(cert.cert.serial).map_err(|_| {
             WorkerError::Config(format!(
                 "certificate serial {} exceeds the bigint serial column range",
-                cert.serial
+                cert.cert.serial
             ))
         })?;
         ocsp.insert(&OcspResponseModel {
@@ -277,27 +319,27 @@ async fn regen_one_ca(
 async fn plan_for(
     ca: &CaModel,
     published_crl: &Option<PublishedCrl>,
-    revoked: &[CertificateModel],
+    revoked: &[RevokedCert],
     ocsp: &OcspRepo,
     now: DateTime<Utc>,
 ) -> Result<CaPlan, WorkerError> {
     // The OCSP answers that are missing or stale: a certificate with no
-    // answer at all, or one whose latest answer predates the
-    // revocation (such an answer says "good" about a certificate that
-    // was already revoked when it was made).
+    // answer at all, one whose latest answer predates the revocation
+    // (such an answer says "good" about a certificate that was already
+    // revoked when it was made), or one whose validity window has
+    // lapsed (a lapsed answer must not be served any more).
     let mut stale_ocsp = Vec::new();
     for cert in revoked {
-        let serial = i64::try_from(cert.serial).map_err(|_| {
+        let serial = i64::try_from(cert.cert.serial).map_err(|_| {
             WorkerError::Config(format!(
                 "certificate serial {} exceeds the bigint serial column range",
-                cert.serial
+                cert.cert.serial
             ))
         })?;
         let latest = ocsp.get_latest(ca.id, serial).await?;
-        let revoked_at = cert.revoked_at.expect("checked by the caller");
         let needs_response = match latest {
             None => true,
-            Some(response) => response.this_update < revoked_at,
+            Some(response) => response.this_update < cert.revoked_at || response.next_update < now,
         };
         if needs_response {
             stale_ocsp.push(cert.clone());
@@ -305,11 +347,13 @@ async fn plan_for(
     }
 
     let publish_crl = match published_crl {
-        // No published CRL at all. There is something to publish only
-        // when the CA has revoked certificates: a CA with no revocations
-        // has no revocation state to publish, and an empty CRL would be
-        // work without meaning.
-        None => !revoked.is_empty(),
+        // No published CRL at all: the CA must publish one, even when it
+        // has revoked nothing. A relying party that fetches the CA's
+        // CRL must receive a current document — "this CA has revoked
+        // nothing" and "this CA has no CRL" must not be
+        // indistinguishable — and RFC 5280 section 5's distribution
+        // model assumes a periodically refreshed artifact.
+        None => true,
         Some(crl) => {
             // The published CRL is expired.
             let expired = crl.next_update < now;
@@ -344,8 +388,8 @@ async fn plan_for(
 }
 
 /// The set of revoked serials the database holds for a CA.
-fn revoked_serials(revoked: &[CertificateModel]) -> BTreeSet<u128> {
-    revoked.iter().map(|cert| cert.serial).collect()
+fn revoked_serials(revoked: &[RevokedCert]) -> BTreeSet<u128> {
+    revoked.iter().map(|cert| cert.cert.serial).collect()
 }
 
 /// The set of revoked serials a published CRL lists, or `None` when the

@@ -559,9 +559,11 @@ async fn crl_count(pool: &PgPool, ca_id: uuid::Uuid) -> i64 {
 
 /// A CA with nothing to do is skipped and not counted: the returned count
 /// is the number of CAs for which work was actually done. Two CAs, one
-/// with a revocation and one with only an active certificate: the count
-/// is 1 and only the revoking CA gets a CRL. Cleans up before
-/// asserting.
+/// with a revocation and one with only an active certificate: the first
+/// run publishes a CRL for both (a CA with no revocations still
+/// publishes an empty CRL — a relying party must be able to fetch a
+/// current document), and the second run has nothing left to do, so the
+/// count is 0. Cleans up before asserting.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn test_regen_counts_only_cas_with_work() {
@@ -596,8 +598,7 @@ async fn test_regen_counts_only_cas_with_work() {
     insert_revoked_cert(&pool, tenant.id, revoking.id, LEAF_SERIAL).await;
     insert_active_cert(&pool, tenant.id, quiet.id, BROKEN_SERIAL).await;
 
-    let count = regen_crl_and_ocsp(&pool, &keystore).await;
-
+    let first = regen_crl_and_ocsp(&pool, &keystore).await;
     let revoking_crls = crl_count(&pool, revoking.id).await;
     let quiet_crls = crl_count(&pool, quiet.id).await;
     let total_crls: i64 = sqlx::query_scalar("SELECT count(*) FROM crls")
@@ -605,17 +606,36 @@ async fn test_regen_counts_only_cas_with_work() {
         .await
         .expect("count every CRL row");
 
+    // The second run: both CAs are current, so nothing is published.
+    let second = regen_crl_and_ocsp(&pool, &keystore).await;
+    let total_crls_after: i64 = sqlx::query_scalar("SELECT count(*) FROM crls")
+        .fetch_one(&pool)
+        .await
+        .expect("count every CRL row again");
+
     delete_worker_rows(&pool, tenant.id).await;
     release_advisory(&mut advisory, ADVISORY_KEY).await;
 
     assert_eq!(
-        count.expect("the job succeeds"),
-        1,
-        "only the CA with a revocation is counted"
+        first.expect("the first run succeeds"),
+        2,
+        "both CAs are counted: both published a CRL"
     );
     assert_eq!(revoking_crls, 1, "the revoking CA gets a CRL");
-    assert_eq!(quiet_crls, 0, "the CA without a revocation gets no CRL");
-    assert_eq!(total_crls, 1, "exactly one CRL row exists");
+    assert_eq!(
+        quiet_crls, 1,
+        "the CA without a revocation publishes an empty CRL"
+    );
+    assert_eq!(total_crls, 2, "one CRL row per CA");
+    assert_eq!(
+        second.expect("the second run succeeds"),
+        0,
+        "a CA with nothing to do is skipped and not counted"
+    );
+    assert_eq!(
+        total_crls_after, total_crls,
+        "the second run publishes nothing"
+    );
 }
 
 /// An expired published CRL is refreshed even when no new revocation
@@ -842,4 +862,92 @@ async fn test_regen_rejects_revocation_without_date() {
         "unexpected error: {err:?}"
     );
     assert_eq!(crls, 0, "no CRL is published for the damaged CA");
+}
+
+/// An OCSP answer whose validity window has lapsed is stale and must be
+/// replaced, even while the CRL is current: a lapsed answer must not be
+/// served any more. The refresh happens on its own — no new CRL is
+/// published — and the stored answer ends up with a future `next_update`.
+/// Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_refreshes_expired_ocsp_response() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("refreshes-expired-ocsp");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
+
+    regen_crl_and_ocsp(&pool, &keystore)
+        .await
+        .expect("the first run succeeds");
+    let crls_before = crl_count(&pool, ca.id).await;
+    let responses_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ocsp_responses WHERE ca_id = $1 AND serial = $2")
+            .bind(ca.id)
+            .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the OCSP responses");
+
+    // The answer's validity window lapses; the CRL stays current.
+    sqlx::query(
+        "UPDATE ocsp_responses SET next_update = now() - interval '1 hour' \
+         WHERE ca_id = $1 AND serial = $2",
+    )
+    .bind(ca.id)
+    .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+    .execute(&pool)
+    .await
+    .expect("age the OCSP response");
+
+    let second = regen_crl_and_ocsp(&pool, &keystore).await;
+    let crls_after = crl_count(&pool, ca.id).await;
+    let responses_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ocsp_responses WHERE ca_id = $1 AND serial = $2")
+            .bind(ca.id)
+            .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+            .fetch_one(&pool)
+            .await
+            .expect("count the OCSP responses again");
+    let latest = OcspRepo::new(&pool)
+        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+        .await
+        .expect("get the latest OCSP response");
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(
+        second.expect("the second run succeeds"),
+        1,
+        "the CA with the lapsed answer is counted"
+    );
+    assert_eq!(
+        responses_after,
+        responses_before + 1,
+        "a fresh OCSP response is written"
+    );
+    assert_eq!(
+        crls_after, crls_before,
+        "the OCSP refresh does not publish a new CRL"
+    );
+    let latest = latest.expect("an OCSP response exists");
+    assert_eq!(latest.status, OcspStatus::Revoked);
+    assert!(
+        latest.next_update > chrono::Utc::now(),
+        "the refreshed answer has a future next_update: {:?}",
+        latest.next_update
+    );
 }
