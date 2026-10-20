@@ -8,7 +8,12 @@
 //! stored answer is missing or stale (an answer that predates the
 //! revocation, or whose validity window has lapsed). A CA with no
 //! revocations still publishes an empty CRL: a relying party must be
-//! able to fetch a current document. The scheduler in
+//! able to fetch a current document.
+//!
+//! A CA row whose key file is not in the key store is treated as a CA
+//! that is not provisioned yet: when it owes nobody a document it is
+//! skipped with a warning, and when relying parties depend on a document
+//! of its the missing key is reported as a failure. The scheduler in
 //! [`crate::run_scheduler`] runs it on a fixed interval.
 
 use std::collections::BTreeSet;
@@ -19,6 +24,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use ws_ca::ca::KeyType;
 use ws_ca::crl::{build_crl, CrlReason, CrlSpec, RevocationEntry};
+use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_ca::ocsp::{build_ocsp_response, OcspResponseSpec, OcspStatus};
 use ws_core::models::audit::{ActorType, AuditEntry};
@@ -119,13 +125,13 @@ enum CaPlan {
 ///
 /// Errors: a revoked certificate without a `revoked_at` is a typed
 /// [`WorkerError::Config`] (the revocation date is never invented, and
-/// the revocation is never silently dropped from the CRL); a missing or
-/// unreadable CA key, a DER/encoding failure, and database failures
-/// surface as typed [`WorkerError`]s. One failing CA never stops the
-/// others: the failure is logged (with the CA id) and the job continues
-/// with the next CA; the first failure is nevertheless reported to the
-/// caller, so the scheduler logs the job as failed and the next tick
-/// retries.
+/// the revocation is never silently dropped from the CRL); a CA whose key
+/// is missing while it owes a document, a damaged CA key, a
+/// DER/encoding failure, and database failures surface as typed
+/// [`WorkerError`]s. One failing CA never stops the others: the failure
+/// is logged (with the CA id) and the job continues with the next CA; the
+/// first failure is nevertheless reported to the caller, so the scheduler
+/// logs the job as failed and the next tick retries.
 pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u64, WorkerError> {
     let cas = list_all_cas(pool).await?;
     let certs = CertificateRepo::new(pool);
@@ -213,7 +219,37 @@ async fn regen_one_ca(
     };
 
     // The CA's key is needed for both the CRL and the OCSP responses.
-    let ca_key = keystore.load_ca_key(&ca.id)?;
+    //
+    // A CA row whose key file is simply not there is a CA that is not
+    // provisioned yet (its row was created before the key was stored,
+    // or the worker points at a different key directory). Whether that
+    // is a failure depends on what the CA owes:
+    //
+    // - It owes nothing (no revocations and no published CRL, so no
+    //   relying party can be holding a document of its): the CA is
+    //   skipped with a warning, not counted, and does not fail the
+    //   job. Reporting a failure for it on every tick would be a
+    //   permanent false alarm.
+    // - It owes something (it has revocations, or it has a published
+    //   CRL that relying parties depend on): the missing key is a real
+    //   failure and is reported.
+    //
+    // Every other key error (a damaged key file, a master key that does
+    // not match) is data damage, and is a failure in both cases.
+    let ca_key = match keystore.load_ca_key(&ca.id) {
+        Ok(key) => key,
+        Err(CaError::NotFound) => {
+            if revoked.is_empty() && published_crl.is_none() {
+                tracing::warn!(
+                    ca_id = %ca.id,
+                    "skipping a CA whose key is not in the key store and which owes no document"
+                );
+                return Ok(false);
+            }
+            return Err(WorkerError::Ca(CaError::NotFound));
+        }
+        Err(err) => return Err(WorkerError::Ca(err)),
+    };
 
     if publish_crl {
         let revocations = revoked

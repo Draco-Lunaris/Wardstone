@@ -32,6 +32,7 @@
 //! mirrors the ws-core pattern for future tests added to this binary.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use sqlx::pool::PoolConnection;
@@ -110,13 +111,23 @@ fn database_url() -> String {
     })
 }
 
-/// Per-test temp keystore, mirroring the ws-ca suites' pattern: unique
-/// per test name and process id, swept before use so stale runs can't
-/// interfere.
-fn temp_keystore(test_name: &str) -> KeyStore {
+/// The directory a test's key store lives in: unique per test name and
+/// process id, swept before use so stale runs can't interfere.
+fn temp_keystore_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ws-worker-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let mut ks = KeyStore::open(&dir).expect("open the test key store");
+    dir
+}
+
+/// A fresh key store in a fresh directory.
+fn temp_keystore(test_name: &str) -> KeyStore {
+    open_keystore(&temp_keystore_dir(test_name))
+}
+
+/// A key store in an existing directory (the master key is created if it
+/// is not there yet).
+fn open_keystore(dir: &Path) -> KeyStore {
+    let mut ks = KeyStore::open(dir).expect("open the test key store");
     ks.ensure_master_key().expect("create the master key");
     ks
 }
@@ -950,4 +961,194 @@ async fn test_regen_refreshes_expired_ocsp_response() {
         "the refreshed answer has a future next_update: {:?}",
         latest.next_update
     );
+}
+
+/// A CA row whose id is not in the key store — a CA that is not
+/// provisioned yet (its row exists, its key does not).
+async fn insert_unprovisioned_ca(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    cert_pem: &str,
+    name: &str,
+) -> CaModel {
+    let ca = CaModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id,
+        name: name.to_string(),
+        subject: format!("CN={name}"),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: chrono::Utc::now() - chrono::Duration::days(1),
+        not_after: chrono::Utc::now() + chrono::Duration::days(365),
+        cert_pem: cert_pem.to_string(),
+        key_file: "keystore://ca".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+    CaRepo::new(pool)
+        .insert(&ca)
+        .await
+        .expect("insert the unprovisioned CA row");
+    ca
+}
+
+/// A CA row whose key is not in the key store, that owes nobody a
+/// document (no revocations, no published CRL), is simply not
+/// provisioned yet: the job skips it with a warning, publishes nothing
+/// for it, does not count it, and does not fail — while the other CAs
+/// still publish. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_skips_unprovisioned_ca_without_documents() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("skips-unprovisioned-ca");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let healthy = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    // A CA row whose key was never stored: the key store has no
+    // envelope for this id.
+    let unprovisioned = insert_unprovisioned_ca(
+        &pool,
+        tenant.id,
+        &root.cert_pem,
+        "rt-worker-ca-unprovisioned",
+    )
+    .await;
+
+    insert_revoked_cert(&pool, tenant.id, healthy.id, LEAF_SERIAL).await;
+
+    let result = regen_crl_and_ocsp(&pool, &keystore).await;
+
+    let healthy_crls = crl_count(&pool, healthy.id).await;
+    let unprovisioned_crls = crl_count(&pool, unprovisioned.id).await;
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let count = result.expect("an unprovisioned CA that owes nothing is not a failure");
+    assert_eq!(count, 1, "only the healthy CA is counted");
+    assert_eq!(healthy_crls, 1, "the healthy CA published its CRL");
+    assert_eq!(
+        unprovisioned_crls, 0,
+        "the unprovisioned CA publishes nothing"
+    );
+}
+
+/// A CA row whose key is not in the key store, but that owes a document
+/// (it has a revoked certificate), is a real failure: the job reports
+/// it, publishes nothing for that CA, and the other CAs still publish.
+/// Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_fails_for_unprovisioned_ca_with_revocation() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("fails-for-unprovisioned-ca");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let healthy = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+    let unprovisioned = insert_unprovisioned_ca(
+        &pool,
+        tenant.id,
+        &root.cert_pem,
+        "rt-worker-ca-unprovisioned",
+    )
+    .await;
+
+    insert_revoked_cert(&pool, tenant.id, healthy.id, LEAF_SERIAL).await;
+    insert_revoked_cert(&pool, tenant.id, unprovisioned.id, BROKEN_SERIAL).await;
+
+    let result = regen_crl_and_ocsp(&pool, &keystore).await;
+
+    let healthy_crls = crl_count(&pool, healthy.id).await;
+    let unprovisioned_crls = crl_count(&pool, unprovisioned.id).await;
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let err = result.expect_err("a CA that owes a document but has no key fails the job");
+    assert!(
+        matches!(
+            err,
+            ws_worker::error::WorkerError::Ca(ws_ca::error::CaError::NotFound)
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        unprovisioned_crls, 0,
+        "nothing is published for the CA that cannot sign"
+    );
+    assert_eq!(
+        healthy_crls, 1,
+        "the other CAs still publish (per-CA isolation)"
+    );
+}
+
+/// A CA whose key file is damaged is data damage, not provisioning lag:
+/// the job fails even when the CA owes nobody a document. Cleans up
+/// before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_regen_fails_for_ca_with_corrupt_key() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let dir = temp_keystore_dir("fails-for-corrupt-key");
+    let mut keystore = open_keystore(&dir);
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+
+    // Damage the stored key envelope: the bytes are no longer a valid
+    // envelope, so loading the key fails with a damage error rather
+    // than a "not there" error.
+    let envelope = dir.join("ca").join(format!("{}.key", root.key_pair_id));
+    fs::write(&envelope, b"not a valid envelope").expect("damage the key envelope");
+
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
+        .insert(WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    // The CA owes nothing: no revocations and no published CRL.
+    let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
+
+    let result = regen_crl_and_ocsp(&pool, &keystore).await;
+    let crls = crl_count(&pool, ca.id).await;
+
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let err = result.expect_err("a damaged CA key is always a failure");
+    assert!(
+        matches!(
+            err,
+            ws_worker::error::WorkerError::Ca(ws_ca::error::CaError::Corrupt)
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(crls, 0, "nothing is published for the damaged CA");
 }
