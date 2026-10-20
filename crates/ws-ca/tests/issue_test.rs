@@ -17,6 +17,7 @@ use std::net::IpAddr;
 
 use chrono::SubsecRound;
 use x509_parser::certificate::X509Certificate;
+use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::FromDer;
@@ -93,6 +94,81 @@ v8z7P00NHG2HBsSNMp+5B9aa7lD6vRlEvfpcPsfRNdak5dgXUWHcqgVhTg1TiuVL
 ypsP3kJLr1HF/p4DBxpb/Gnz5613SzowbnajpcHDtCZwGsI1dfxTwWOJJBoGLI1s
 hOmyT3A3NyXBAUGZ7ioKrqPEBgXzgFX97fgp4kEuJhJA+m8jpYNUBsJgxzpVKTKb
 y7WFhKvmfcqLCOv9pCnpmyPI5CULBKgFHKBXPVDWUezvopdYfaPTgcig
+-----END CERTIFICATE REQUEST-----
+";
+
+/// The untampered sibling of `TAMPERED_SIG_CSR_PEM` (below): an
+/// openssl-minted P-256 CSR whose self-signature verifies
+/// (`openssl req -verify`: OK, checked at generation time).
+const TAMPER_ORIGINAL_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIHbMIGCAgEAMCAxHjAcBgNVBAMMFXRhbXBlci10YXJnZXQuZXhhbXBsZTBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABMHzpmaOqaDsDfWgcgLIxtrGqQtfeL6kKRjq
+t4hFMr/Cl/ID32JLGEhk2/7jERLYl4mkqtWcPxizPra+tpG1qj2gADAKBggqhkjO
+PQQDAgNIADBFAiEA02tVMMue0OnlAqOWJ6a9FRl1pTwxZKvrqqRndhvE1MkCIHM5
+RP+nQ4lKKTq3bTEuPgjdZ7dvg2tmF2VaTScmgNIc
+-----END CERTIFICATE REQUEST-----
+";
+
+/// `TAMPER_ORIGINAL_CSR_PEM` with exactly one bit flipped inside the
+/// signature value: the low bit of the ECDSA `s` integer's final byte
+/// (DER offset 221 / 0x1c -> 0x1d, flipped offline before re-encoding).
+/// Every DER length prefix is untouched, so the structure still
+/// parses — only the signature is wrong (`openssl req -verify`: "self-
+/// signature verify failure", `openssl asn1parse`: clean, checked at
+/// generation time). Deterministic by construction: no base64 padding
+/// mechanics involved.
+const TAMPERED_SIG_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIHbMIGCAgEAMCAxHjAcBgNVBAMMFXRhbXBlci10YXJnZXQuZXhhbXBsZTBZMBMGByqGSM49AgEG
+CCqGSM49AwEHA0IABMHzpmaOqaDsDfWgcgLIxtrGqQtfeL6kKRjqt4hFMr/Cl/ID32JLGEhk2/7j
+ERLYl4mkqtWcPxizPra+tpG1qj2gADAKBggqhkjOPQQDAgNIADBFAiEA02tVMMue0OnlAqOWJ6a9
+FRl1pTwxZKvrqqRndhvE1MkCIHM5RP+nQ4lKKTq3bTEuPgjdZ7dvg2tmF2VaTScmgNId
+-----END CERTIFICATE REQUEST-----
+";
+
+/// Algorithm-matrix fixtures: fresh openssl-minted CSRs, one per supported
+/// algorithm (all `openssl req -verify` OK at generation time), each
+/// issued against in the matrix test. Distinct from the rejection
+/// fixtures above: these must reach full issuance.
+const MATRIX_ED25519_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIGgMFQCAQAwITEfMB0GA1UEAwwWbWF0cml4LWVkMjU1MTkuZXhhbXBsZTAqMAUG
+AytlcAMhADPIIKp0e4Rn8/KWicQ7WVqmQp62U3bpX/BSX9wRRoB8oAAwBQYDK2Vw
+A0EArLGLjYf2zxEHdOkEXWK4YjpFJKKJh+Pe3onfZUcuCrZEjrEJXbyKWYjtXFJN
+AdnWyhiuIFgTVSSmDWxWyYUdAA==
+-----END CERTIFICATE REQUEST-----
+";
+
+const MATRIX_P384_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIIBFjCBnQIBADAeMRwwGgYDVQQDDBNtYXRyaXgtcDM4NC5leGFtcGxlMHYwEAYH
+KoZIzj0CAQYFK4EEACIDYgAEsztf8B8cfrMObll3ZAzKtffwpi5OcC6cYrUY+lOK
+QfEZzGS6Z2I1nt2hyqNwjinemYQcRXb+lBF6iv16/EWhngW0d/N2deu4a2Mojzc2
+WNXlh1X3fQlaGvjlXnskoitJoAAwCgYIKoZIzj0EAwIDaAAwZQIwQDpp6rMsjC9j
+zzKc895b3nwpewuB2VGOq4qyVCHHkCsNA6vv7WskR0LOV59unBEwAjEAo8c0bMHs
+eLsUpYh1F00KHrIzic75oiFGRC7vfadCKhUwnVNeES8SpNUMFhgANWeF
+-----END CERTIFICATE REQUEST-----
+";
+
+/// Dedicated RSA-2048 issuance fixture (no SANs): its modulus has its MSB
+/// set (0xB1...), so x509-parser's sign-octet-counting key_size() reports
+/// the full 2048 bits and the size gate passes exactly at the floor.
+const MATRIX_RSA2048_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIICZTCCAU0CAQAwIDEeMBwGA1UEAwwVbWF0cml4LXJzMjA0OC5leGFtcGxlMIIB
+IjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsflBbE4WQBnDJhiGtEu+E2u8
+4bsuu4bZYGNMBFxyhbFXPdojwhmfuuL1e5N2AV5qVE+3NFl+vT6t9eBer3zfqQPK
+10pStfx5uyRpF/yk03LYG85XkQPjMK2MwC/cAq99VuWTnOXrnuuv8Xi2BUC0JGNb
+QBd22/GesP1VGfCipxqhizKqBXnV4j67E0IbUiTdMsJ6ns/GePg0j/XJoNJlzEgh
+IR7zGAnlN1w7Ka65cDPah62ke6V3Onw/xsYdBDAjngXB+X0rzCCZtueBcWfOKm/V
+HuvbbrFs9m2vWBGQmD5P9ir52fVey2oL9S3h9sZ2Gtl3jnL2q6ywzQzHdXgD4QID
+AQABoAAwDQYJKoZIhvcNAQELBQADggEBAE0Y+tmzJ1LIqGaT40/7rWSWWYmPPp8I
+Vii3kWWgjklEkM3v0nAQ0/nzpyLAWeiWjDKdIKQsr2vmqFXYQ0zWmOL6cIon5EQE
+k3qwzHedBrnXMO/MSS670KBTf5tZPbWqW+5OOWCDp2e/qM9vulR9vTGOICzYRmXX
+gy9zt0EtkDHzd0iC9wgHIRIJ3mw7SWmTDEgGgx39FPj6oDb7lYJA3sXK684cOewP
+td77SW39sAaaAwWsG3ipFo3Sv/0hBY0rK+wZhqpF77BHnpezCKSG2livtN97n9Zt
+Ll3dytFzElBbATfhvMNZiQtOoNzRdPORzup05EW8j/b/GrIIpjr8DOg=
 -----END CERTIFICATE REQUEST-----
 ";
 
@@ -311,33 +387,19 @@ fn test_issue_from_csr_rejects_bad_signature() {
     let mut ks = temp_keystore("reject-bad-sig");
     let root = ed25519_root(&mut ks);
 
-    // Take a valid, supported (P-256) CSR and flip the last base64 payload
-    // character: byte count is unchanged, so every DER length prefix stays
-    // intact and the structure still parses — only the signature bit
-    // string content is corrupted. The pinned requirement is that the CA
+    // A openssl-minted P-256 CSR whose *signature value* was tampered at
+    // the byte level before encoding (the low bit of the ECDSA `s`
+    // integer's final byte, flipped offline): every DER length prefix is
+    // untouched, so the structure still parses — only the signature is
+    // wrong (`openssl req -verify` reports "self-signature verify failure"
+    // for this exact blob and OK for TAMPER_ORIGINAL). The tamper lands in
+    // the signature field deterministically on every run, independent of
+    // base64 padding mechanics: the pinned requirement is that the CA
     // verifies the CSR's self-signature before signing and fails typed.
-    let csr = mint_p256_csr(Some("tampered.example"), &[]);
-    let end = csr.rfind("-----END").unwrap();
-    // The last *data* character before the PEM footer (skips base64 '='
-    // padding): flipping it changes the CSR's final decoded byte, which
-    // lives inside the signature bit string, while the DER's length
-    // prefixes stay intact so the structure still parses.
-    let payload = csr[..end].trim_end().trim_end_matches('=');
-    let last_char_pos = payload.len() - 1;
-    let ch = csr.as_bytes()[last_char_pos];
-    assert!(
-        !b"=\n\r".contains(&ch),
-        "fixture sanity: flipped char is data"
-    );
-    let replacement = if ch == b'A' { 'B' } else { 'A' };
-    let mut tampered = csr.clone();
-    tampered.replace_range(last_char_pos..last_char_pos + 1, &replacement.to_string());
-    assert_ne!(tampered, csr, "tamper must change the payload");
-
     let err = ws_ca::issue::sign_leaf_with(
         &root.cert_pem,
         &root.private_key_der,
-        &tampered,
+        TAMPERED_SIG_CSR_PEM,
         &LeafSpec {
             sans: vec![],
             key_usages: vec![],
@@ -352,6 +414,24 @@ fn test_issue_from_csr_rejects_bad_signature() {
         "a CSR whose self-signature does not verify must be X509 naming the \
          signature failure, got {err:?}"
     );
+
+    // Provenance: the untampered sibling (identical except that one bit)
+    // verifies and issues, so the rejection above is attributable to the
+    // signature tamper alone, not to the CSR's structure.
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        TAMPER_ORIGINAL_CSR_PEM,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: None,
+            subject_cn: None,
+            serial: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(issued.serial, 2);
 }
 
 #[test]
@@ -643,6 +723,118 @@ fn test_issue_leaf_serial_encodes_edge_values() {
         ws_ca::issue::sign_leaf_with(&root.cert_pem, &root.private_key_der, &csr, &spec_for(2000))
             .unwrap();
     assert_ne!(a.serial, b.serial);
+}
+
+/// Issue a leaf from an openssl-minted CSR of `alg`, and pin the full
+/// algorithm mapping: the leaf's SPKI (algorithm OIDs + key bits) equals
+/// the CSR's SPKI byte-for-byte, the root's key verifies the leaf's
+/// signature, and the returned algorithm label round-trips through
+/// `validate_csr`. This exercises `alg_name`'s OID arms and
+/// `csr_public_key_data`'s algorithm mapping for every supported family
+/// from a second, independent encoder.
+fn issue_from_matrix_csr(root: &ws_ca::ca::CreatedCa, csr_pem: &str, expected_alg: &str) {
+    let info = validate_csr(csr_pem).unwrap();
+    assert_eq!(info.public_key_alg, expected_alg);
+
+    let spec = LeafSpec {
+        sans: vec![],
+        key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
+        not_after: None,
+        subject_cn: None,
+        serial: 77,
+    };
+    let issued =
+        ws_ca::issue::sign_leaf_with(&root.cert_pem, &root.private_key_der, csr_pem, &spec)
+            .unwrap();
+    assert_eq!(issued.serial, 77);
+
+    let cert = parse_cert(&issued.cert_pem);
+    let (_, csr_pem_block) = parse_x509_pem(csr_pem.as_bytes()).unwrap();
+    let (_, csr) = X509CertificationRequest::from_der(csr_pem_block.contents.as_slice()).unwrap();
+    let csr_spki = &csr.certification_request_info.subject_pki;
+    // SPKI byte equality: leaf carries the requester's key, field by field.
+    assert_eq!(
+        cert.public_key().algorithm.algorithm,
+        csr_spki.algorithm.algorithm,
+        "{expected_alg}: leaf and CSR SPKI algorithm OIDs must match"
+    );
+    assert_eq!(
+        cert.public_key().subject_public_key.data,
+        csr_spki.subject_public_key.data,
+        "{expected_alg}: leaf key bits must be the CSR's"
+    );
+
+    // The root's public key verifies the leaf's signature.
+    let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
+    let root_cert = root_pem.parse_x509().unwrap();
+    cert.verify_signature(Some(root_cert.public_key()))
+        .expect("{expected_alg} leaf must verify under the root's key");
+}
+
+#[test]
+fn test_issue_leaf_algorithm_matrix_from_openssl_csrs() {
+    let mut ks = temp_keystore("alg-matrix");
+    let root = ed25519_root(&mut ks);
+
+    // One leaf per supported algorithm, each from a fresh openssl-minted
+    // fixture (all `openssl req -verify` OK at generation time).
+    issue_from_matrix_csr(&root, MATRIX_ED25519_CSR_PEM, "Ed25519");
+    issue_from_matrix_csr(&root, MATRIX_P384_CSR_PEM, "ECDSA P-384");
+    issue_from_matrix_csr(&root, MATRIX_RSA2048_CSR_PEM, "RSA");
+}
+
+#[test]
+fn test_issue_leaf_rejects_not_after_before_not_before() {
+    let mut ks = temp_keystore("past-not-after");
+    let root = ed25519_root(&mut ks);
+    let csr = mint_p256_csr(Some("expired.example"), &[]);
+
+    // An already-past not_after would issue an expired-on-arrival leaf:
+    // typed rejection, never issuance. Two days back lands strictly before
+    // not_before (midnight UTC yesterday); one day back would be inside
+    // the window (yesterday's time-of-day is after midnight yesterday).
+    let past = (chrono::Utc::now() - chrono::Duration::days(2)).trunc_subsecs(0);
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: Some(past),
+            subject_cn: None,
+            serial: 5,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::X509(ref msg) if msg.contains("not_after")),
+        "a past not_after must be a typed X509 rejection, got {err:?}"
+    );
+
+    // not_after exactly at not_before (midnight yesterday) is likewise a
+    // non-positive window.
+    let midnight_yesterday = {
+        let nb = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        nb.and_hms_opt(0, 0, 0).unwrap().and_utc()
+    };
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: Some(midnight_yesterday),
+            subject_cn: None,
+            serial: 6,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::X509(ref msg) if msg.contains("not_after")),
+        "not_after == not_before must be a typed X509 rejection, got {err:?}"
+    );
 }
 
 #[test]

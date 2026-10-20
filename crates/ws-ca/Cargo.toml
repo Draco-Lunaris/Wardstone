@@ -18,7 +18,10 @@ thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 ws-core = { path = "../ws-core" }
-x509-parser = { workspace = true }
+# "verify" enables x509-parser's ring-backed signature verification (used
+# for the CSR proof-of-possession check in issue.rs); rcgen's ring feature
+# also enables it transitively, declared here explicitly for the direct API.
+x509-parser = { workspace = true, features = ["verify"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]

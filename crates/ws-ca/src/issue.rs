@@ -401,6 +401,16 @@ pub fn sign_leaf_with(
     // clock-skew margin); not_after is the spec instant or, unset, exactly
     // the leaf lifetime later. Both ends are whole seconds.
     let (not_before, not_after) = validity_window(spec.not_after)?;
+    // Sanity: an explicit not_after at or before not_before would issue an
+    // already-invalid leaf (negative window); reject it typed rather than
+    // mint a certificate no relying party would trust.
+    if not_after.unix_timestamp() <= not_before.unix_timestamp() {
+        return Err(CaError::X509(format!(
+            "leaf not_after ({}) is not after not_before ({})",
+            not_after.unix_timestamp(),
+            not_before.unix_timestamp()
+        )));
+    }
 
     // Public key: the CSR's own, verbatim (pinned requirement 2).
     let public_key = csr_public_key_data(&alg, &spki.subject_public_key.data)?;
@@ -455,6 +465,12 @@ fn gate_supported_key(alg: &str, spki: &SubjectPublicKeyInfo<'_>) -> Result<(), 
         )));
     }
     if alg == "RSA" {
+        // x509-parser's RSAPublicKey::key_size() counts the DER sign octet
+        // as modulus data (it strips only a leading zero byte), so an
+        // MSB-clear 2048-bit modulus reports 2040 bits. That undercount is
+        // conservative here — it over-rejects at the exact 2048 boundary —
+        // and stays that way on purpose; do not "fix" it into a permissive
+        // check.
         let bits = match spki.parsed() {
             Ok(x509_parser::public_key::PublicKey::RSA(rsa)) => rsa.key_size(),
             // A SPKI the RSA parser cannot crack cannot be signed for.
