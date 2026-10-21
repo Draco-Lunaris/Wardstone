@@ -260,19 +260,33 @@ fn openssl_crl_verify(crl_pem: &str, ca_pem: &str) -> String {
 /// bytes are written to a scratch file first (`-respin` reads DER from
 /// a file).
 ///
-/// The CA is passed as `-CAfile` as well as `-issuer`: it is the trust
-/// anchor for verifying the responder's own signature. OpenSSL 3.0.22
-/// and later resolve the responder certificate embedded in the response
-/// against the trust store, so a self-signed test root that is in no
-/// store fails with "ocsp_verify_signer: certificate verify error:
-/// Verify error: self-signed certificate" even though the response is
-/// valid. Older releases skipped that check. Passing `-CAfile` is
-/// correct for every version and is what a real client does.
-fn openssl_ocsp_parse(ca_pem: &str, leaf_pem: &str, resp_der: &[u8]) -> String {
+/// `issuer_pem` is the CA the response is about; `anchor_pem` is the
+/// trust anchor the responder's certificate is verified against. They
+/// differ when the responder is an intermediate: the responder
+/// certificate embedded in the response is the sub-CA, and a sub-CA is
+/// not self-signed, so it has to chain to the root to be trusted.
+///
+/// The anchor is not optional on newer OpenSSL. 3.0.22 and later
+/// resolve the responder certificate embedded in the response against
+/// the trust store, so a self-signed test root that is in no store fails
+/// with "ocsp_verify_signer: certificate verify error: Verify error:
+/// self-signed certificate", and an intermediate with no anchor fails
+/// with "unable to get local issuer certificate" — even though the
+/// response itself is perfectly valid. Older releases (3.0.13) skipped
+/// that check. Passing the anchor is correct for every version and is
+/// what a real client does.
+fn openssl_ocsp_parse(
+    issuer_pem: &str,
+    anchor_pem: &str,
+    leaf_pem: &str,
+    resp_der: &[u8],
+) -> String {
     let ca_path = temp_path("ocsp-ca.pem");
+    let anchor_path = temp_path("ocsp-anchor.pem");
     let leaf_path = temp_path("ocsp-leaf.pem");
     let resp_path = temp_path("ocsp-resp.der");
-    fs::write(&ca_path, ca_pem).expect("write the CA certificate for openssl");
+    fs::write(&ca_path, issuer_pem).expect("write the CA certificate for openssl");
+    fs::write(&anchor_path, anchor_pem).expect("write the trust anchor for openssl");
     fs::write(&leaf_path, leaf_pem).expect("write the leaf certificate for openssl");
     fs::write(&resp_path, resp_der).expect("write the OCSP response for openssl");
     let out = Command::new("openssl")
@@ -284,10 +298,11 @@ fn openssl_ocsp_parse(ca_pem: &str, leaf_pem: &str, resp_der: &[u8]) -> String {
         .arg("-respin")
         .arg(&resp_path)
         .arg("-CAfile")
-        .arg(&ca_path)
+        .arg(&anchor_path)
         .arg("-text")
         .output();
     let _ = fs::remove_file(&ca_path);
+    let _ = fs::remove_file(&anchor_path);
     let _ = fs::remove_file(&leaf_path);
     let _ = fs::remove_file(&resp_path);
     let out = out.expect("spawn openssl ocsp");
@@ -749,7 +764,12 @@ async fn test_end_to_end_ca_forest() {
     );
     assert!(latest_ocsp.next_update > latest_ocsp.this_update);
     if openssl_available() {
-        let text = openssl_ocsp_parse(&sub.cert_pem, &issued.cert_pem, &latest_ocsp.resp_der);
+        let text = openssl_ocsp_parse(
+            &sub.cert_pem,
+            &root.cert_pem,
+            &issued.cert_pem,
+            &latest_ocsp.resp_der,
+        );
         eprintln!("openssl ocsp -text output:\n{text}");
         assert!(
             text.contains("revoked"),
