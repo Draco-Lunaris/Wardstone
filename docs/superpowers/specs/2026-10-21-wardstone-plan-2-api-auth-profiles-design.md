@@ -274,6 +274,12 @@ codebase. The house pattern is a flat enum with `is_admin()`/`can_write()`
 (`pm-auth/src/rbac.rs`); Wardstone's certificate permissions are finer than
 write/read, so the shape is extended.
 
+**The table is read at request time.** A session carries only the user's role;
+resolving a user's capabilities reads `role_capabilities`. The `role_capabilities()`
+function is the **seed source** — the one place a bundle is defined — and
+`seed_role_capabilities()` writes it idempotently. The Rust function is not the
+runtime authority; the table is.
+
 **The mapping lives in a table** (`role_capabilities`), not an enum column, because
 per-token capability storage is required anyway and one storage model keeps the
 concept in one place. A user's capabilities are those of their role; **a user cannot
@@ -321,6 +327,15 @@ check is uniform across all three; the audit write is uniform, one code path, so
 `actor_type` and `auth_method` are fields of the same type rather than special cases
 at each call site; and the three methods differ in exactly one place — **how the actor
 was resolved**.
+
+**Where the type lives: `ws-core`.** The vocabulary — `Capability`, `Role`,
+`ActorType`, `AuthMethod`, and the actor itself — is defined in `ws-core` (which
+owns the schema and the repositories that store these values) and **re-exported by
+`ws-auth`**. The alternative — defining them in `ws-auth` and having `ws-core` use
+them — makes `ws-core → ws-auth` while `ws-auth → ws-core`, a Cargo cycle that does
+not build. The spec's "the one `ActorType` enum in `ws-core/src/models/audit.rs`" is
+honoured: the definition moves to `ws-core/src/models/rbac.rs` and `models/audit.rs`
+re-exports it, so the audit row and the actor can never disagree.
 
 ### API tokens are first-class service identities
 
@@ -452,9 +467,11 @@ only in test fixtures. This plan is where the real writers land.
   `ActorType` enum (`ws-core/src/models/audit.rs:16-23`) is closed and its `from_str`
   rejects unknown strings**, so it gains two variants in the same change.
 - **`auth_method`** — a first-class column, NOT NULL: one value per authentication
-  method — `session`, `api_token`, `one_shot`, and **`system`** for the worker's own
-  writes. (The worker is an actor, not an authentication method, but its rows need a
-  value inside the declared set, and `system` is the honest one.)
+  method — `session`, `api_token`, `one_shot`, `acme_account`, and **`system`** for the
+  worker's own writes. (The worker is an actor, not an authentication method, but its
+  rows need a value inside the declared set, and `system` is the honest one.
+  `acme_account` mirrors the `ActorType` value so the column set and the enum stay
+  in step when ACME lands.)
 - **Session identity** — its own column, nullable (null for machine actors). The house
   has no `sessions` table (only `refresh_tokens`), so the session id is the refresh
   token's id.
@@ -668,6 +685,11 @@ permits.
 so every `issue` holder can use every profile; the specific-vs-generic split is a UX
 choice for all issuers, not a boundary.
 
+**The subject CN is a permitted name too.** It is checked against the same pattern
+list as the SANs — otherwise a certificate could carry a subject the profile does not
+allow while its SANs look clean. Proposing **no** SANs is a different artifact, not
+a subset, and is rejected.
+
 ### Rate limiting
 
 The house pattern's `GovernorLayer` per router (the product spec requires rate limiting
@@ -681,14 +703,26 @@ New tables for this plan:
 
 - `users` — the house schema, ported, with `tenant_id` (the product spec: every table
   carries it), plus a `role`. The house `users` table also carries `email TEXT NOT
-  UNIQUE`, `auth_provider NOT NULL DEFAULT 'local'`, `password_hash`, `totp_secret`,
-  `webauthn_credential`, `mfa_enabled`, `azure_oid`, `is_active`,
-  `force_password_reset`, and `last_login_at` — the port keeps the columns the
-  feature set needs. **The house's global uniqueness on `username` and `email` is
+  UNIQUE`, `auth_provider NOT NULL DEFAULT 'local'`, `password_hash`,
+  `totp_secret_encrypted` + `totp_secret_nonce` (the house's **current** spelling
+  after `020_encrypt_secrets_at_rest.sql` — the TOTP secret is encrypted at rest
+  under its own secret-encryption key), `webauthn_credential`, `mfa_enabled`,
+  `azure_oid`, `oidc_sub`, `is_active`, `force_password_reset`,
+  `failed_login_attempts`, `locked_until`, and `last_login_at` — the port keeps the
+  columns the feature set needs. `role` and `auth_provider` are **TEXT** (the house
+  uses enum types; text keeps the capability model extensible without a type
+  migration). **The house's global uniqueness on `username` and `email` is
   narrowed to per-tenant** (`UNIQUE (tenant_id, username)`, `UNIQUE (tenant_id,
   email)`) — otherwise two tenants cannot both have an `admin@example.com`, which
-  the product spec's tenancy shape explicitly allows.
-- `user_groups`, `refresh_tokens` — house ports, with `tenant_id`.
+  the product spec's tenancy shape explicitly allows. The house's globally-unique
+  `azure_oid` is narrowed per-tenant for the same reason.
+
+**WebAuthn is not implemented in this plan.** The auth surface this plan scopes is
+"JWT + refresh tokens, argon2id password hashing, TOTP MFA, OIDC SSO, RBAC, and
+account lockout" — WebAuthn is not on that list, and the house's `mfa_webauthn.rs`
+is a **stub** with no verification functions to port. The `webauthn_credential`
+column is ported for schema compatibility, but no code path writes or reads it.
+- `refresh_tokens` — house port, with `tenant_id`.
 - `oidc_config` — the house table is a **single-row** table
   (`id INTEGER PRIMARY KEY CHECK (id = 1)`, `linux-patch-manager/migrations/014_oidc_provider.sql:24`).
   Porting it per-tenant means dropping that check and keying it by `tenant_id`; the
@@ -703,16 +737,32 @@ New tables for this plan:
 - `profiles` — id, tenant_id, name, description, current revision.
 - `profile_revisions` — id, profile_id, revision, the constraint set as **typed
   columns**, created_at, actor.
-- `setup_state` — whether the tenant has been created (or the equivalent marker).
+
+**There is no `user_groups` table in v1.** The house's `user_groups` references a
+`groups` table Wardstone does not have, so porting it verbatim would fail with
+"relation groups does not exist". Wardstone v1 has **roles, not groups**.
+
+**No `setup_state` table.** Whether the tenant exists (a query on `tenants`) is the
+marker — the spec's "or the equivalent marker" — and no agent should add a
+`setup_state` table.
+
+**The OIDC subject lives in `users.oidc_sub`**, unique per tenant. The house added
+the same column for Keycloak/custom providers
+(`linux-patch-manager/migrations/014_oidc_provider.sql:20`) because the *subject*,
+not the email, is the stable identity — and the email is optional in an OIDC
+identity. The callback's lookup rule is: match by `oidc_sub`; if absent, link by
+verified email; if that fails too, create the user.
 
 **Lockout is two columns, not a table.** The house `012_account_lockout.sql` adds
 `failed_login_attempts INTEGER NOT NULL DEFAULT 0` and `locked_until TIMESTAMPTZ` to
 `users` — ported as columns, not a separate `login_attempts` table.
 
-`certificates.profile_name` (free-form text) is **replaced** by a FK to the immutable
-revision row — the revision *is* the policy record, so pointing at it is the honest
-representation. The profile's name survives only as a denormalised label on the
-revision row.
+`certificates.profile_name` (free-form text) **gains a sibling FK** to the
+immutable revision row — the revision *is* the policy record, so pointing at it is
+the honest representation, and the free-form column survives as a denormalised
+display label. **The column is not dropped in this plan:** dropping it needs a
+separate migration after the code stops referencing it, and the Global Constraints
+forbid editing an applied migration. The drop is deferred to a later plan.
 
 **Existing rows.** `certificates.profile_name` is `NOT NULL` and existing rows carry
 free-form labels matching no profile. The FK is added **nullable**, and existing rows

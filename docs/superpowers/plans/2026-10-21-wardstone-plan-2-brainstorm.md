@@ -555,6 +555,186 @@ already covers with the root-trust page.
 
 ---
 
+## Builder check — findings that CORRECT the record above
+
+A fresh builder read this record plus the spec, Plan 1's plan, and the Plan 1
+code, and reported where it would have to guess. Four of its findings
+correct something this record got wrong or left contradictory. Those
+corrections are listed first; the rest are answered below or are plan-level
+work.
+
+### C1. D8 and D12/D13/D17 contradict each other — resolved
+
+D8 said "the API never touches private key material… no key-export
+endpoint to gate," for any role including admin. D12 then defined an
+admin-only `generate_leaf_key` that *returns* the key, and D17 requires CA
+private keys to be exportable. D8 was written before D12 and was never
+revisited.
+
+**Resolution:** D8 holds for **leaf** keys on the normal path, and is
+**superseded** by D12/D13 for the admin-only generation path, and by D17 for
+CA-key export. The accurate statement is:
+
+> The API never *stores* leaf private key material. The normal issuance
+> path never *has* it. An admin-only endpoint may *generate* a leaf key,
+> use it to sign, and return it once — never persisted (D13). CA private
+> keys are exportable for backup while the server retains its copy (D17).
+
+### C2. The house `refresh_tokens` precedent is SHA-256, not Argon2id
+
+This record's grounded note claimed the house stores "an Argon2id hash" of
+the refresh token. **Verified false**: `pm-auth/src/refresh.rs:11,46,100,153`
+uses `sha2::Sha256` throughout, despite the migration's comment claiming
+Argon2id. So the precedent for hashing a *bearer* credential in this
+house is SHA-256, not a password KDF.
+
+**Consequence:** the "what KDF do we hash API tokens with" question is now
+open and needs a deliberate answer rather than a port. (Argon2id is
+deliberately slow and is for *passwords* — a high-entropy random token
+needs no KDF slowdown, and SHA-256 of a 256-bit random token is the
+standard practice. But it should be a decision, not an accident.)
+
+### C3. `ws-ca` has NO EKU support at all — the profile model's EKU dimension needs engine work
+
+Verified: `LeafSpec` has no EKU field, and `sign_leaf_with` never sets
+`params.extended_key_usages`. rcgen 0.14.10 supports it
+(`CertificateParams::extended_key_usages`), so the change is small — but it
+is a change to **Plan 1's CA engine**, not a Plan 2 addition.
+
+Related and sharper: **an empty EKU list is MORE permissive than
+`serverAuth`**, and the same holds for an empty key-usage list (RFC 5280
+§4.2.1.3: an absent extension means unrestricted). Plan 1 sets
+`params.key_usages = spec.key_usages.clone()` unconditionally, so an empty
+list currently yields a certificate with **no KeyUsage extension** —
+unrestricted. That is the same reading Plan 1's own `ensure_issuer_is_ca`
+already applies (ca.rs:234). So D24's claim that the exact-model "removes
+the trap by construction" is **only true if empty lists are illegal**. The
+profile validator must therefore forbid empty EKU and empty key-usage
+lists, and `sign_leaf_with` should refuse them too.
+
+### C4. D22's pattern-syntax rule misclassifies bare IPv4
+
+D22 says "a pattern containing `/` or `:` is an IP or CIDR pattern;
+otherwise a DNS name." But `10.0.0.5` contains neither, so it takes the
+DNS branch and can never match an IP SAN — while D3 says the default
+profile covers "the admin's **IPs**/CIDRs." (A bare IPv6 `fe80::1` does
+contain `:` and is fine.)
+
+**Resolution:** the rule needs a third branch — **try to parse the pattern
+as an IP literal first**; if it parses, it is an IP pattern; else if it
+contains `/`, it is a CIDR; else it is a DNS name.
+
+### C5. D1's and D3's "ceiling" vocabulary is stale
+
+D1 and D3 speak of a "lifetime cap," an "IP allowlist," and a "wildcard
+policy" as separate fields. D22 and D24 superseded all three (one pattern
+list; exact values, not ceilings). D3's cross-reference to "per the wildcard
+policy" dangles, because D22 deleted the wildcard-policy field. The
+profile model is D22 + D24; the older wording should be read as historical.
+
+---
+
+## Builder check — open questions, triaged
+
+**Decisions still needed from the owner (Tier 1):**
+
+1. **Plan 2's deliverable boundary** — the Scope section says "API, auth,
+   profiles, web UI deferred," but D18/D19 put a setup *page* in `ws-web`
+   behind a TLS listener, and Plan 1's own preview promised Plan 2 =
+   "Bootstrap, profiles, auth, API, UI… frontend scaffold + auth pages,
+   Root Trust page, compose bundle." Three different scopes. Also open:
+   are user-management, CA-management, and tenant-creation endpoints in
+   Plan 2? And is the full house auth surface in scope (JWT + refresh +
+   argon2 + TOTP + OIDC SSO + lockout), or a scoped subset with TOTP/OIDC
+   deferred?
+2. **The final capability set** — D7's table is explicitly labelled
+   "provisional" and is missing `generate_leaf_key` (D12),
+   `manage_api_tokens` (D16), and **any read capability** (a viewer must
+   read certificates, so a read capability is implied but unnamed). Also:
+   is the role→capability mapping a table or an enum column, and may a
+   user's capabilities exceed their role's bundle?
+3. **The profile's relationship to the CSR and the subject** — Plan 1 takes
+   SANs from `LeafSpec` (not the CSR) and the CN from the CSR. If the
+   request body carries the names, must they equal the CSR's SANs or is the
+   CSR's SAN extension ignored? And is the subject CN itself a permitted
+   name under the profile, or exempt? (A subject carrying a name the
+   profile does not permit is a real policy hole.)
+4. **Which key algorithms a profile may pin, and how a CSR's key is
+   compared** — a new leaf-key enum, or an extension of the CA `KeyType`
+   enum? Does a profile pin "RSA" (any size ≥2048) or a specific size?
+   (Today `CsrInfo` cannot distinguish RSA-2048 from RSA-3072.) And must
+   the admin-only generation path be able to generate P-256?
+5. **The SAN pattern matching semantics** — does `*.example.com` match
+   `example.com` itself, and how many labels deep (`a.b.example.com`)?
+   Is matching case-insensitive? Does the bare `*` admit IP SANs as well
+   as DNS names?
+6. **The built-in default profiles' content, and how they get seeded** —
+   built-ins cannot be seeded by a migration (the default tenant is
+   created by setup, and Plan 1's `connect` depends on `tenants` being
+   empty on a fresh DB), so they are created by bootstrap code — which then
+   needs a per-tenant seeding path for the second tenant the spec allows.
+7. **A one-shot token's identity and authoriser** — D15 says "no
+   identity," yet something must authorise the CSR submission. What is the
+   `actor_type` for a one-shot-issued certificate, and does the audit row
+   record the human who minted the token?
+
+**Answered by ruling (no owner input needed):**
+
+- *`auth_method` column values and nullability* — follow `actor_type`'s
+  shape: one value per auth method (`session`, `api_token`, `one_shot`),
+  NOT NULL, since every audit row has an actor. Session identity is a
+  first-class column (D11) — the house has no `sessions` table, so the
+  session id is the refresh token's id.
+- *`certificates.profile_name`* — replaced by a FK to the immutable
+  revision row (`profile_revision_id uuid`), because D21's "the revision IS
+  the policy record" argument supports pointing at the revision itself.
+  The name survives only as a denormalised label on the revision row.
+  The revision's constraint set is stored as **typed columns**, not a jsonb
+  blob — the same reasoning D21 applied to the audit log.
+- *The profile↔actor binding* — **not a feature in v1.** The capability
+  set is the only scoping mechanism, so every `issue` holder can use every
+  profile. D26's specific-vs-generic error split is therefore a UX choice
+  for all issuers, and its "narrower profile" paragraph is superseded.
+- *Exact lifetime vs the issuer clamp* — the API **pre-checks and refuses**
+  ("this profile's lifetime exceeds the issuing CA's remaining life") rather
+  than silently issuing a shortened cert, because a cert that does not
+  match its profile violates D24. The API reads the CA's `not_after` to
+  make that check.
+- *The D21 race mechanism* — **optimistic concurrency**, confirmed. The
+  issuance reads the revision it validated against and the write carries
+  it; a mismatch is detected and the issuance retried against the new
+  revision. (The "conditional UPDATE" does take a row lock, so "no lock on
+  the hot path" is only partly true — the correctness argument, not the
+  lock-freedom, is the reason to prefer it.)
+- *`allocate_serial` and the transaction* — it **joins the issuance
+  transaction**; a rolled-back issuance burns a serial, which is
+  acceptable and is the conservative choice (serials are never reused).
+  Its signature changes to take the executor.
+- *Repo executor shape* — **executor as a parameter** on every method
+  (not a repo-over-executor), because the house pattern constructs repos
+  over a pool and this preserves that. It is a signature change across
+  Plan 1's five repos and `ws-ca`, not a pure widening — D20's wording
+  was too optimistic.
+- *The setup cert's key* — a **dedicated keystore slot**, not per-boot
+  regeneration: per-boot regeneration means the operator re-verifies a new
+  fingerprint on every restart, which defeats the fingerprint-verification
+  UX D19 proposes. This extends `KeyStore` with a setup-key slot.
+
+**Plan-level work (not questions):** the `cas.parent_id` tenant-consistency
+FK (migration 006 already provides `cas (id, tenant_id)` unique, so the
+composite FK closes it in the same idiom); a shared `paging()` helper with
+a maximum (Plan 2 adds three more repos); the audit action vocabulary and
+the `details` jsonb shape.
+
+**Note from the check:** the workspace has no `axum`, `tower`, or
+`jsonwebtoken` dependency yet and `ws-auth`/`ws-api`/`ws-web` are empty
+stubs — so Plan 2 introduces the HTTP and JWT stack from scratch, while
+the auth *schema* is a genuine port of `pm-auth` (`users`, `user_groups`,
+`refresh_tokens`, `oidc_config`, plus `012_account_lockout.sql`'s
+`failed_login_attempts`/`locked_until`).
+
+---
+
 ## Grounded notes (verified in the tree)
 
 - The **only** production audit write in the entire codebase today is the
