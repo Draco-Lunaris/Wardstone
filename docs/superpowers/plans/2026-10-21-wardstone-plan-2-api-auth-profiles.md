@@ -793,7 +793,7 @@ Subject: `feat(ws-web): TLS front door, API proxy, and the first-run setup page`
 
 **Notes for the implementer:**
 - The spec's anti-goal is that the UI and the API are **separate processes, independently restartable** — hence two modes, not one process with two listeners. The compose file (Task 13) runs them as two services.
-- The binary owns the process lifecycle: it initializes the pool (`ws_core::db::connect`), loads the JWT keys (`JwtKeys::load`), opens the keystore, and then serves.
+- The binary owns the process lifecycle: it initializes the pool (`ws_core::db::connect`), loads **or creates** the JWT keys (`JwtKeys::load_or_create` — on a virgin volume the keys must exist before the setup page can be served), opens the keystore, and then serves.
 
 - [ ] **Step 1: Write the failing test**
 
