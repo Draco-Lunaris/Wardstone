@@ -24,7 +24,7 @@
 # path.) With the credentials above, `docker compose up` alone is enough
 # to run the suites.
 #
-# Postgres 18: the migrations (001-005) use `gen_random_uuid()`, which
+# Postgres 18: the migrations (001-006) use `gen_random_uuid()`, which
 # Postgres 13+ provides built in — no pgcrypto extension and no
 # superuser-only setup step are needed.
 

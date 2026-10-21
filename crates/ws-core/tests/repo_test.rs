@@ -86,6 +86,22 @@ const CERT_CA_NAME: &str = "rt-cert-ca";
 /// (`0x0057_4144_5354_0005`), a disjoint row set (its own tenant name).
 const ADVISORY_KEY_AUDIT: i64 = 0x0057_4144_5354_0005;
 
+/// Postgres advisory-lock key for this suite's tenant-consistency tests:
+/// the same key family with the suite marker bumped to 0x000a
+/// (`0x0057_4144_5354_000a`), a disjoint row set (its own two tenant
+/// names), so a process holding one key never waits on the other's rows.
+const ADVISORY_KEY_TENANT_FK: i64 = 0x0057_4144_5354_000a;
+
+/// The two tenant names this suite owns for the tenant-consistency tests;
+/// deleted before asserts (child rows first, then the CAs, then the
+/// tenants).
+const TENANT_FK_TENANT_A: &str = "rt-tenantfk-a";
+const TENANT_FK_TENANT_B: &str = "rt-tenantfk-b";
+
+/// The CA name this suite owns for the tenant-consistency tests (unique
+/// per tenant, so the same name may be used under both tenants).
+const TENANT_FK_CA_NAME: &str = "rt-tenantfk-ca";
+
 /// Tenant name the audit tests own; deleted before asserts (audit rows
 /// first, then the tenant — `audit_log.tenant_id` references `tenants`).
 const AUDIT_TENANT: &str = "rt-audit-tenant";
@@ -929,5 +945,201 @@ async fn test_ocsp_response_roundtrip() {
             .expect("the stored row's tenant_id is not NULL"),
         tenant.id,
         "the stored row carries the tenant id it was written with"
+    );
+}
+
+/// The tenant-consistency invariant of migration 006: a child row of `cas`
+/// may not name a `tenant_id` that differs from its own CA's tenant. The
+/// `tenant_id` column is a DENORMALIZED copy of `cas.tenant_id`, and
+/// nothing but the database enforces that the copy is right — without the
+/// composite foreign key a row naming another tenant's id would show up in
+/// that tenant's `CertificateRepo::list_by_tenant` listing, a silent
+/// cross-tenant leak.
+///
+/// The composite foreign key is `DEFERRABLE INITIALLY DEFERRED`, so the
+/// check fires at COMMIT. In autocommit mode a single statement is its own
+/// transaction, so the violation is reported against that statement — which
+/// is how the two rejected inserts below are observed.
+///
+/// Cleans up before asserting: child rows first, then the CAs, then the
+/// tenants.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn tenant_fk_rejects_mismatched_tenant_child_row() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_TENANT_FK).await;
+
+    // Sweep debris from any previously crashed run: child rows first (they
+    // reference the CA), then the CA rows, then the tenants.
+    for sql in [
+        "DELETE FROM ocsp_responses WHERE ca_id IN \
+         (SELECT id FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1))",
+        "DELETE FROM crls WHERE ca_id IN \
+         (SELECT id FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1))",
+        "DELETE FROM used_serials WHERE ca_id IN \
+         (SELECT id FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1))",
+        "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        for name in [TENANT_FK_TENANT_A, TENANT_FK_TENANT_B] {
+            sqlx::query(sql)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("sweep stale tenant-consistency rows");
+        }
+    }
+
+    // Two tenants, and a CA that belongs to tenant A.
+    let tenants = TenantRepo::new(&pool);
+    let tenant_a = tenants
+        .insert(TENANT_FK_TENANT_A)
+        .await
+        .expect("insert tenant A for the tenant-consistency rows");
+    let tenant_b = tenants
+        .insert(TENANT_FK_TENANT_B)
+        .await
+        .expect("insert tenant B for the tenant-consistency rows");
+
+    let ca = CaModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant_a.id,
+        name: TENANT_FK_CA_NAME.to_string(),
+        subject: "CN=Wardstone Test Tenant-FK CA".to_string(),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: ts("2026-01-01T00:00:00Z"),
+        not_after: ts("2027-01-01T00:00:00Z"),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".to_string(),
+        key_file: "/var/lib/wardstone/keys/rt-tenantfk-ca.pem".to_string(),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    CaRepo::new(&pool)
+        .insert(&ca)
+        .await
+        .expect("insert the CA row that belongs to tenant A");
+
+    // The hole: a `used_serials` row that names tenant B but points at
+    // tenant A's CA. The single-column `tenant_id REFERENCES tenants(id)`
+    // foreign key is satisfied (tenant B exists) — only the composite
+    // foreign key can reject this.
+    let drifted_serial =
+        sqlx::query("INSERT INTO used_serials (tenant_id, ca_id, serial) VALUES ($1, $2, $3)")
+            .bind(tenant_b.id)
+            .bind(ca.id)
+            .bind(4_242_i64)
+            .execute(&pool)
+            .await;
+
+    // The same hole in the table that `CertificateRepo::list_by_tenant`
+    // filters on: a certificate row that would show up in tenant B's
+    // listing while its CA belongs to tenant A.
+    let drifted_certificate = sqlx::query(
+        "INSERT INTO certificates (id, tenant_id, ca_id, profile_name, subject, serial, \
+         serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+         revoked_at, revocation_reason, source, created_at) \
+         VALUES ($1, $2, $3, 'default', 'CN=leaf.example', $4, $5, '{}'::text[], '{}'::inet[], \
+         'ed25519', $6, $7, $8, 'active', NULL, NULL, 'manual', $9)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tenant_b.id)
+    .bind(ca.id)
+    .bind(4_243_i64)
+    .bind("1093")
+    .bind(ts("2026-01-01T00:00:00Z"))
+    .bind(ts("2026-12-01T00:00:00Z"))
+    .bind("-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n")
+    .bind(ts("2026-06-15T12:30:00Z"))
+    .execute(&pool)
+    .await;
+
+    // The control: the same insert naming tenant A — the CA's own tenant —
+    // must be accepted.
+    let consistent_serial =
+        sqlx::query("INSERT INTO used_serials (tenant_id, ca_id, serial) VALUES ($1, $2, $3)")
+            .bind(tenant_a.id)
+            .bind(ca.id)
+            .bind(4_244_i64)
+            .execute(&pool)
+            .await;
+
+    // The row counts, read before cleanup so a rejected insert cannot have
+    // left anything behind. Scoped to this test's own CA, so a row another
+    // suite owns cannot perturb the count.
+    let used_serials_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM used_serials WHERE ca_id = $1")
+            .bind(ca.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count this CA's used_serials rows");
+    let certificates_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM certificates WHERE ca_id = $1")
+            .bind(ca.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count this CA's certificate rows");
+
+    // Cleanup BEFORE asserting: child rows, then the CA, then the tenants.
+    for sql in [
+        "DELETE FROM used_serials WHERE ca_id = $1",
+        "DELETE FROM certificates WHERE ca_id = $1",
+        "DELETE FROM cas WHERE id = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(ca.id)
+            .execute(&pool)
+            .await
+            .expect("delete the tenant-consistency rows");
+    }
+    for id in [tenant_a.id, tenant_b.id] {
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("delete the tenant-consistency tenants");
+    }
+    release_advisory(&mut advisory, ADVISORY_KEY_TENANT_FK).await;
+
+    // Both drifted inserts are rejected with a foreign-key violation.
+    for (label, constraint, outcome) in [
+        ("used_serials", "used_serials_ca_tenant_fk", drifted_serial),
+        (
+            "certificates",
+            "certificates_ca_tenant_fk",
+            drifted_certificate,
+        ),
+    ] {
+        let err = outcome.expect_err("a child row naming another tenant's id must be rejected");
+        let sqlx::Error::Database(db_err) = &err else {
+            panic!("{label}: expected a database error, got {err:?}");
+        };
+        assert_eq!(
+            db_err.code().as_deref(),
+            Some("23503"),
+            "{label}: expected a foreign-key violation (SQLSTATE 23503), got {err:?}"
+        );
+        assert_eq!(
+            db_err.constraint(),
+            Some(constraint),
+            "{label}: expected the composite tenant/CA foreign key to be the one violated, \
+             got {err:?}"
+        );
+    }
+
+    // The consistent insert is accepted, and the two rejected ones left no
+    // rows behind.
+    consistent_serial.expect("a child row naming the CA's own tenant must be accepted");
+    assert_eq!(
+        used_serials_count, 1,
+        "only the consistent used_serials row may exist"
+    );
+    assert_eq!(
+        certificates_count, 0,
+        "the rejected certificate row must not exist"
     );
 }
