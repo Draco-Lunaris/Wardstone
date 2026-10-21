@@ -842,6 +842,7 @@ async fn test_ocsp_response_roundtrip() {
 
     let older = OcspResponseModel {
         id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
         ca_id: ca.id,
         serial: 0x1234,
         status: OcspStatus::Good,
@@ -851,6 +852,7 @@ async fn test_ocsp_response_roundtrip() {
     };
     let newer = OcspResponseModel {
         id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
         ca_id: ca.id,
         serial: older.serial,
         status: OcspStatus::Revoked,
@@ -865,6 +867,15 @@ async fn test_ocsp_response_roundtrip() {
     let latest = ocsp.get_latest(ca.id, newer.serial).await;
     let missing = ocsp.get_latest(ca.id, 0x9999).await;
     let duplicate = ocsp.insert(&newer).await;
+    // The column itself, read back from the table: the model roundtrip
+    // above proves the model carries the tenant, this proves the ROW
+    // does (a `tenant_id` that the INSERT silently dropped would still
+    // read back from the model).
+    let stored_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM ocsp_responses WHERE id = $1")
+            .bind(newer.id)
+            .fetch_one(&pool)
+            .await;
 
     // Cleanup BEFORE asserting: OCSP responses first (they reference the
     // CA), then the CA, then the tenant.
@@ -891,6 +902,10 @@ async fn test_ocsp_response_roundtrip() {
         "get_latest returns the most recently published response"
     );
     assert_eq!(latest.status, OcspStatus::Revoked);
+    assert_eq!(
+        latest.tenant_id, tenant.id,
+        "the stored response carries the tenant it was written for"
+    );
     assert_eq!(latest.ca_id, ca.id);
     assert_eq!(latest.serial, newer.serial);
     assert_eq!(latest.this_update, newer.this_update);
@@ -907,5 +922,12 @@ async fn test_ocsp_response_roundtrip() {
     assert!(
         matches!(duplicate, CoreError::Duplicate),
         "unexpected error: {duplicate:?}"
+    );
+    assert_eq!(
+        stored_tenant
+            .expect("read the stored tenant_id column")
+            .expect("the stored row's tenant_id is not NULL"),
+        tenant.id,
+        "the stored row carries the tenant id it was written with"
     );
 }

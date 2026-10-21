@@ -26,6 +26,7 @@ pub struct OcspRepo {
 #[derive(sqlx::FromRow)]
 struct OcspResponseRow {
     id: Uuid,
+    tenant_id: Uuid,
     ca_id: Uuid,
     serial: i64,
     status: String,
@@ -46,10 +47,11 @@ impl OcspRepo {
     /// a silent overwrite.
     pub async fn insert(&self, response: &OcspResponseModel) -> Result<(), CoreError> {
         sqlx::query(
-            "INSERT INTO ocsp_responses (id, ca_id, serial, status, this_update, next_update, \
-             resp_der) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO ocsp_responses (id, tenant_id, ca_id, serial, status, this_update, \
+             next_update, resp_der) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(response.id)
+        .bind(response.tenant_id)
         .bind(response.ca_id)
         .bind(response.serial)
         .bind(response.status.as_str())
@@ -71,7 +73,7 @@ impl OcspRepo {
         serial: i64,
     ) -> Result<Option<OcspResponseModel>, CoreError> {
         let row: Option<OcspResponseRow> = sqlx::query_as(
-            "SELECT id, ca_id, serial, status, this_update, next_update, resp_der \
+            "SELECT id, tenant_id, ca_id, serial, status, this_update, next_update, resp_der \
              FROM ocsp_responses WHERE ca_id = $1 AND serial = $2 \
              ORDER BY this_update DESC LIMIT 1",
         )
@@ -98,6 +100,7 @@ impl OcspResponseRow {
             .map_err(|err| CoreError::Config(format!("invalid status in row: {err}")))?;
         Ok(OcspResponseModel {
             id: self.id,
+            tenant_id: self.tenant_id,
             ca_id: self.ca_id,
             serial: self.serial,
             status,

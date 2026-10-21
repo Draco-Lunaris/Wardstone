@@ -8,7 +8,7 @@
 //!
 //! One `#[tokio::test]` walks the whole flow once:
 //!
-//! 1. Connect to Postgres (all four migrations applied).
+//! 1. Connect to Postgres (all five migrations applied).
 //! 2. Create the default tenant.
 //! 3. Create an Ed25519 root CA and an Ed25519 sub-CA under it, both
 //!    with their private keys in an encrypted key store.
@@ -480,7 +480,7 @@ async fn test_end_to_end_ca_forest() {
         .expect("record the sub-CA creation");
 
     // --- The leaf: a serial, a CSR, and an issued certificate ---------
-    let serial = allocate_serial(sub.key_pair_id, &pool)
+    let serial = allocate_serial(sub.key_pair_id, tenant.id, &pool)
         .await
         .expect("allocate a serial for the sub-CA");
     let csr_pem = mint_csr();
@@ -577,6 +577,18 @@ async fn test_end_to_end_ca_forest() {
     .fetch_one(&pool)
     .await
     .expect("read the published CRL");
+    // The published rows' tenant ids, read back from the columns.
+    let crl_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM crls WHERE ca_id = $1 LIMIT 1")
+            .bind(sub.key_pair_id)
+            .fetch_one(&pool)
+            .await;
+    let used_serial_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM used_serials WHERE ca_id = $1 AND serial = $2")
+            .bind(sub.key_pair_id)
+            .bind(i64::try_from(serial).expect("the serial fits the bigint column"))
+            .fetch_one(&pool)
+            .await;
     let ocsp = OcspRepo::new(&pool);
     let latest_ocsp = ocsp
         .get_latest(
@@ -681,6 +693,20 @@ async fn test_end_to_end_ca_forest() {
     assert!(
         listed.contains(&serial),
         "the published CRL lists the revoked serial {serial:x}: {listed:?}"
+    );
+    assert_eq!(
+        crl_tenant
+            .expect("read the published CRL's tenant_id")
+            .expect("the published CRL row exists"),
+        tenant.id,
+        "the published CRL carries the tenant it was published for"
+    );
+    assert_eq!(
+        used_serial_tenant
+            .expect("read the used serial's tenant_id")
+            .expect("the used serial row exists"),
+        tenant.id,
+        "the used serial carries the tenant it was allocated for"
     );
     assert_eq!(
         crl.issuer().as_raw(),

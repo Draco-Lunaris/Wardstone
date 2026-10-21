@@ -274,12 +274,15 @@ async fn regen_one_ca(
             },
         )?;
 
-        // The CRL row is written only after the whole CRL exists.
+        // The CRL row is written only after the whole CRL exists. Its
+        // `tenant_id` is the CA's own tenant: a CRL is published for a
+        // CA, and a CA belongs to exactly one tenant.
         sqlx::query(
-            "INSERT INTO crls (id, ca_id, issued_at, next_update, crl_pem) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO crls (id, tenant_id, ca_id, issued_at, next_update, crl_pem) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::new_v4())
+        .bind(ca.tenant_id)
         .bind(ca.id)
         .bind(crl.issued_at)
         .bind(crl.next_update)
@@ -338,6 +341,7 @@ async fn regen_one_ca(
         })?;
         ocsp.insert(&OcspResponseModel {
             id: Uuid::new_v4(),
+            tenant_id: ca.tenant_id,
             ca_id: ca.id,
             serial,
             status: OcspStatus::Revoked,

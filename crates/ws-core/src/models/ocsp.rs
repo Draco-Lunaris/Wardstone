@@ -78,7 +78,7 @@ impl FromStr for OcspStatus {
 }
 
 /// One row of `ocsp_responses`: a stored OCSP response for one
-/// certificate of one CA.
+/// certificate of one CA, owned by one tenant.
 ///
 /// `serial` is the certificate's integer serial — the column is
 /// `bigint`, so the repository converts and a value beyond i64 is a
@@ -87,6 +87,8 @@ impl FromStr for OcspStatus {
 pub struct OcspResponseModel {
     /// Primary key (chosen by the caller, not a database default).
     pub id: Uuid,
+    /// Owning tenant (`tenants.id`, insert-time FK).
+    pub tenant_id: Uuid,
     /// The responding CA (`cas.id`, insert-time FK).
     pub ca_id: Uuid,
     /// The certificate's serial number (the `serial bigint` column).

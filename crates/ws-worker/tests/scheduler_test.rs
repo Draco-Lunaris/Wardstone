@@ -283,10 +283,24 @@ async fn test_scheduler_regenerates_on_revocation() {
         .fetch_one(&pool)
         .await
         .expect("count the CA's CRL rows");
+    // The published rows' tenant ids, read back from the columns: the
+    // CRL and the OCSP response are published for a CA, and a CA
+    // belongs to exactly one tenant.
+    let crl_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM crls WHERE ca_id = $1 LIMIT 1")
+            .bind(ca.id)
+            .fetch_one(&pool)
+            .await;
     let latest = OcspRepo::new(&pool)
         .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
         .await
         .expect("get the latest OCSP response");
+    let ocsp_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM ocsp_responses WHERE ca_id = $1 AND serial = $2")
+            .bind(ca.id)
+            .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+            .fetch_one(&pool)
+            .await;
     let audit_actions: Vec<String> =
         sqlx::query_scalar("SELECT action FROM audit_log WHERE tenant_id = $1 AND target_id = $2")
             .bind(tenant.id)
@@ -309,8 +323,22 @@ async fn test_scheduler_regenerates_on_revocation() {
         "exactly the one CA with a new revocation is regenerated"
     );
     assert_eq!(crl_count, 1, "a CRL row is written for the CA");
+    assert_eq!(
+        crl_tenant
+            .expect("read the published CRL's tenant_id")
+            .expect("the published CRL row exists"),
+        tenant.id,
+        "the published CRL carries the CA's tenant"
+    );
     let latest = latest.expect("an OCSP response exists for the revoked serial");
     assert_eq!(latest.status, OcspStatus::Revoked);
+    assert_eq!(
+        ocsp_tenant
+            .expect("read the published OCSP response's tenant_id")
+            .expect("the published OCSP response row exists"),
+        tenant.id,
+        "the published OCSP response carries the CA's tenant"
+    );
     assert_eq!(latest.ca_id, ca.id);
     assert_eq!(
         latest.serial,

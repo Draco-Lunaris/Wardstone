@@ -189,7 +189,7 @@ async fn test_serial_allocation_unique() {
     let mut serials = Vec::with_capacity(100);
     let mut allocation_error: Option<String> = None;
     for _ in 0..100 {
-        match allocate_serial(ca_id, &pool).await {
+        match allocate_serial(ca_id, tenant_id, &pool).await {
             Ok(serial) => serials.push(serial),
             Err(err) => {
                 allocation_error = Some(err.to_string());
@@ -241,7 +241,7 @@ async fn test_serial_allocation_persists() {
 
     let (ca_id, tenant_id) = insert_serial_fixture(&pool).await;
 
-    let allocated = allocate_serial(ca_id, &pool).await;
+    let allocated = allocate_serial(ca_id, tenant_id, &pool).await;
     let stored: Result<Vec<i64>, sqlx::Error> =
         sqlx::query_scalar("SELECT serial FROM used_serials WHERE ca_id = $1")
             .bind(ca_id)
@@ -262,5 +262,44 @@ async fn test_serial_allocation_persists() {
         stored,
         vec![allocated],
         "the allocated serial must persist before allocate_serial returns"
+    );
+}
+
+/// The tenancy contract: the `used_serials` row is attributable to the
+/// tenant the allocation was made for. The allocator writes the tenant id
+/// the caller supplied (it never looks the CA up), and the row carries it
+/// — migration 005 makes every table tenant-attributable. Cleans up
+/// before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_serial_allocation_records_the_tenant() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_serial_rows(&pool).await;
+
+    let (ca_id, tenant_id) = insert_serial_fixture(&pool).await;
+
+    let allocated = allocate_serial(ca_id, tenant_id, &pool).await;
+    // The column itself, read back from the table.
+    let stored_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
+        sqlx::query_scalar("SELECT tenant_id FROM used_serials WHERE ca_id = $1 AND serial = $2")
+            .bind(ca_id)
+            .bind(i64::try_from(allocated.expect("allocate one serial")).expect("serial fits i64"))
+            .fetch_one(&pool)
+            .await;
+
+    // Cleanup BEFORE asserting.
+    delete_serial_rows(&pool, ca_id, tenant_id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let stored_tenant = stored_tenant.expect("query the stored tenant_id");
+    assert_eq!(
+        stored_tenant,
+        Some(tenant_id),
+        "the used_serials row carries the tenant it was allocated for"
     );
 }

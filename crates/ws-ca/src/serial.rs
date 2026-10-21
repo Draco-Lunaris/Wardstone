@@ -39,6 +39,14 @@
 //! beyond astronomical and signals something pathological (e.g. a table
 //! seeded with near-all values in tests); exhaustion is a typed
 //! [`CaError::Worker`], never a panic or infinite loop.
+//!
+//! # Tenancy
+//!
+//! The `used_serials` row carries the owning `tenant_id` (migration 005
+//! makes every table tenant-attributable). The caller supplies it: the
+//! CA a serial is drawn for belongs to exactly one tenant, and the
+//! caller is the one that knows which. ws-ca reads no `cas` row to find
+//! out, so an allocation costs one INSERT and no extra query.
 
 use rand::{rngs::SysRng, TryRng};
 use sqlx::PgPool;
@@ -64,12 +72,19 @@ const SERIAL_MASK: u128 = i64::MAX as u128;
 /// two CAs draw from independent spaces (RFC 5280 per-issuer uniqueness)
 /// and cross-CA reuse is legal and expected.
 ///
+/// `tenant_id` is the owning tenant of the CA. The `used_serials` row
+/// carries it (migration 005 makes every table tenant-attributable), so
+/// the row can be attributed to a tenant without a lookup: the caller
+/// knows which tenant owns the CA. ws-ca deliberately does not read
+/// ws-core's model surface, and a `cas` lookup here would put a query on
+/// every allocation.
+///
 /// Errors: [`CaError::Io`] on OS-entropy failure (typed, never a panic —
 /// `SysRng::try_fill_bytes` is the pinned idiom), [`CaError::Db`] on
 /// database failure other than a unique violation, and
 /// [`CaError::Worker`]="serial allocation exhausted after 8 attempts" if
 /// `MAX_ATTEMPTS` draws all collided.
-pub async fn allocate_serial(ca_id: Uuid, pool: &PgPool) -> Result<u128, CaError> {
+pub async fn allocate_serial(ca_id: Uuid, tenant_id: Uuid, pool: &PgPool) -> Result<u128, CaError> {
     // Attempt loop: each iteration is one complete generate+persist cycle.
     // No transaction is held open across attempts — the INSERT is a single
     // statement and atomically commits or not on its own; the retry
@@ -79,11 +94,14 @@ pub async fn allocate_serial(ca_id: Uuid, pool: &PgPool) -> Result<u128, CaError
         // Serial 0 is not a legal RFC 5280 serial; treat it as a collision
         // and retry with fresh randomness (discard the draw, never return 0).
         if serial.value() != 0 {
-            let insert = sqlx::query("INSERT INTO used_serials (ca_id, serial) VALUES ($1, $2)")
-                .bind(ca_id)
-                .bind(serial.as_i64()?)
-                .execute(pool)
-                .await;
+            let insert = sqlx::query(
+                "INSERT INTO used_serials (tenant_id, ca_id, serial) VALUES ($1, $2, $3)",
+            )
+            .bind(tenant_id)
+            .bind(ca_id)
+            .bind(serial.as_i64()?)
+            .execute(pool)
+            .await;
             match insert {
                 Ok(_) => return Ok(serial.0),
                 Err(err) if is_unique_violation(&err) => continue, // retried draw
