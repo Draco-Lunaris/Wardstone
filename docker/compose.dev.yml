@@ -1,0 +1,109 @@
+# Wardstone development / test database.
+#
+# This is a LOCAL DEV AND TEST database only — a throwaway Postgres for the
+# DB-gated test suites and for local poking at the schema. It is not the
+# production bundle: the production compose file (Wardstone + Postgres, one
+# image, `ui`/`api` invocation modes) arrives in a later plan.
+#
+# Usage:
+#
+#   docker compose -f docker/compose.dev.yml up -d
+#   DATABASE_URL=postgres://wardstone:wardstone@localhost:5432/wardstone_test \
+#       cargo test --workspace -- --include-ignored
+#   docker compose -f docker/compose.dev.yml down -v
+#
+# The `down -v` matters: the volume is ephemeral by design (see below), so
+# dropping it is how the database is reset between runs.
+#
+# The credentials match the ones the DB-gated suites expect by default:
+# each of those suites' `database_url()` helper falls back to
+# `postgres://wardstone:wardstone@localhost:5432/wardstone_test` when
+# `DATABASE_URL` is unset. (`ws_core::db::connect` itself reads no
+# environment variable — it takes the URL as an argument — so the
+# fallback lives in the test suites, not in the production connect
+# path.) With the credentials above, `docker compose up` alone is enough
+# to run the suites.
+#
+# Postgres 18: the migrations (001-006) use `gen_random_uuid()`, which
+# Postgres 13+ provides built in — no pgcrypto extension and no
+# superuser-only setup step are needed.
+
+name: wardstone-dev
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: wardstone-dev-postgres
+    environment:
+      POSTGRES_USER: wardstone
+      POSTGRES_PASSWORD: wardstone
+      POSTGRES_DB: wardstone_test
+    # Faster durability for a throwaway dev database: this instance holds
+    # no data worth losing, and skipping the fsyncs buys a much snappier
+    # test loop.
+    #
+    # These are set on the SERVER command line, not through `PGOPTIONS`:
+    # `fsync` and `full_page_writes` are sighup-level parameters, which
+    # means a client session may NOT change them (a session can only
+    # override `user`-level parameters such as `synchronous_commit`), so
+    # passing them in `PGOPTIONS` makes every connection fail with
+    # `FATAL: parameter "fsync" cannot be changed now`.
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    ports:
+      # Bound to localhost on purpose: a development database is not
+      # something to expose to the LAN, and nothing outside this host
+      # needs to reach it.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Ephemeral by design: the data lives in a named volume that
+      # `docker compose down -v` throws away, so a dev database can never
+      # be mistaken for a source of truth.
+      #
+      # The mount point is `/var/lib/postgresql`, NOT
+      # `/var/lib/postgresql/data`: Postgres 18 moved PGDATA to
+      # `/var/lib/postgresql/18/docker` and its entrypoint refuses to
+      # start when it finds data at the old path ("there appears to be
+      # PostgreSQL data in: /var/lib/postgresql/data"). Mounting the
+      # parent directory is what the image's own guidance asks for.
+      - wardstone-dev-pgdata:/var/lib/postgresql
+    healthcheck:
+      # `pg_isready` alone reports "accepting connections" before the
+      # init scripts have finished, so the check also runs a real query
+      # against the database the tests use.
+      #
+      # The check goes over TCP (`-h 127.0.0.1`): the local unix socket
+      # is governed by peer authentication, which the `postgres` user
+      # inside the container satisfies but a `psql -U wardstone` over
+      # the socket does not. The password is spelled out rather than
+      # taken from the environment — the image's entrypoint unsets the
+      # `POSTGRES_*` variables before handing over to the server, and
+      # this file already carries the password in the clear (it is a
+      # throwaway development database).
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U wardstone -d wardstone_test && PGPASSWORD=wardstone psql -h 127.0.0.1 -U wardstone -d wardstone_test -c 'SELECT 1' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    # The container's own logs are all this service needs; the dev
+    # database keeps no application logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wardstone-dev-pgdata:
+    name: wardstone-dev-pgdata

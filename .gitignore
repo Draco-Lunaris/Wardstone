@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Frontend (built by later plans)
+node_modules/
+/frontend/dist
+
+# Local secrets
+.env

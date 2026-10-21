@@ -1,0 +1,26 @@
+[package]
+name = "ws-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# "ipnet" adds the std::net::IpAddr <-> inet binding (and its array form)
+# used by the certificates table's san_ips inet[] column (migration 002).
+sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono", "ipnet"] }
+# jsonb decode/encode for the audit_log details column (migration 003).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+# "serde" lets AuditEntry (models/audit.rs) derive Serialize/Deserialize
+# over its uuid fields (snake_case DTO pin).
+uuid = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+# Audit-entry fixtures (json! macro) in tests/repo_test.rs.
+serde_json = { workspace = true }

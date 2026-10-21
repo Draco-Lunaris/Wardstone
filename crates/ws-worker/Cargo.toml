@@ -1,0 +1,29 @@
+[package]
+name = "ws-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Instants for the validity windows and the audit entries.
+chrono = { workspace = true }
+# The audit entries' `details` object.
+serde_json = { workspace = true }
+# PgPool in the job and scheduler signatures, plus the direct typed
+# INSERTs into `crls` and the all-CA query (the repositories cover the
+# rest). "macros" enables the FromRow derive; "uuid"/"chrono" the
+# parameter and column types.
+sqlx = { workspace = true, features = ["macros", "uuid", "chrono"] }
+thiserror = { workspace = true }
+# The scheduler's interval timer.
+tokio = { workspace = true }
+# The scheduler's error logging.
+tracing = { workspace = true }
+uuid = { workspace = true }
+# Parsing the published CRL to compare its revoked serials with the
+# database's. Already a workspace pin (ws-ca uses it); no new crate.
+x509-parser = { workspace = true }
+# The CRL and OCSP builders and the encrypted key store.
+ws-ca = { path = "../ws-ca" }
+# The database models, repositories, and typed CoreError.
+ws-core = { path = "../ws-core" }

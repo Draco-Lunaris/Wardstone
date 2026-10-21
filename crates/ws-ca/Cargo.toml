@@ -1,0 +1,58 @@
+[package]
+name = "ws-ca"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
+chrono = { workspace = true }
+# DER primitives for the hand-rolled TBSCertList/CertificateList encoder in
+# crl.rs. rcgen 0.14 does ship a CRL builder, but the Task-7 ruling pins a
+# hand-rolled encoder (der value types + raw TLVs; no x509-cert, no der
+# derive feature), so these primitives are the direct dependency.
+der = { workspace = true, features = ["std", "oid"] }
+rand = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+rsa = { workspace = true, features = ["getrandom"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# SHA-1 for the OCSP certID hashes (RFC 6960 section 4.1.1 makes SHA-1
+# mandatory to implement for OCSP responders).
+sha1 = { workspace = true }
+# PgPool + queries for Task 8's used_serials allocation (migration 001's
+# table). ws-ca deliberately does NOT use ws-core models here: a raw sqlx
+# INSERT keeps the serial allocator independent of ws-core's repo surface,
+# so the dep graph stays acyclic. Only the "uuid" feature extra is needed
+# (binding Uuid parameters); the workspace pin supplies runtime+postgres,
+# and ws-core's migrate/macros features unify across the graph.
+sqlx = { workspace = true, features = ["uuid"] }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+ws-core = { path = "../ws-core" }
+# "verify" enables x509-parser's ring-backed signature verification (used
+# for the CSR proof-of-possession check in issue.rs); rcgen's ring feature
+# also enables it transitively, declared here explicitly for the direct API.
+x509-parser = { workspace = true, features = ["verify"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# Recomputes rcgen's legacy deterministic serial for the creation tests'
+# serial-number regression pin; production code never digests anything.
+sha2 = { workspace = true }
+# SHA-1 in the OCSP test: the test recomputes the certID hashes to prove
+# the response identifies its issuer.
+sha1 = { workspace = true }
+# The OCSP test mints a leaf CSR with rcgen.
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+# Async test bodies for tests/serial_test.rs (DB-backed allocation suite);
+# the suite connects through ws_core::db::connect, already a main dep.
+tokio = { workspace = true }
+# ws-worker for the end-to-end smoke test (tests/smoke_test.rs): the test
+# drives the CRL/OCSP publication job, which lives in ws-worker. This is a
+# DEV-dependency on purpose — the production dependency graph stays
+# ws-ca -> ws-core with no edge to ws-worker, and the dev edge creates no
+# cycle (ws-worker depends on ws-ca's library, not on its test targets).
+ws-worker = { path = "../ws-worker" }
