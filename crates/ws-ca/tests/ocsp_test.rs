@@ -575,7 +575,11 @@ fn test_ocsp_response_reports_revoked_to_openssl() {
     );
     assert_eq!(
         revocation_reason_code(&response),
-        Some(CrlReason::KeyCompromise.as_code()),
+        Some(
+            CrlReason::KeyCompromise
+                .as_code()
+                .expect("reason code is emittable")
+        ),
         "the revocation reason must be carried as an ENUMERATED"
     );
 
@@ -654,10 +658,19 @@ fn test_ocsp_response_reports_unknown_to_openssl() {
 /// This is the regression guard for the assertion itself. It builds a
 /// real `good` response, checks that the empty encoding holds, and then
 /// mutates the response's `certStatus` in place — replacing the empty
-/// `80 00` with a `good` status that illegally carries an INTEGER
+/// `80 00` with a `good` status that carries an INTEGER
 /// (`80 03 02 01 05`) — and checks that the same assertion now fails.
 /// A tag-only check would accept the mutated response, so the mutated
 /// case is the one that proves the length check earns its place.
+///
+/// The mutated fixture is a DELIBERATELY MALFORMED DER document: the
+/// splice grows the response by three octets without updating the
+/// enclosing length headers, so the mutated response is not
+/// well-formed DER as a whole. That is incidental — the point of the
+/// fixture is the `certStatus` ENCODING (a `good` alternative that
+/// carries content), not the document's overall well-formedness, and
+/// the assertion under test is the length check on the `certStatus`
+/// TLV, which is exactly what the mutation violates.
 #[test]
 fn test_empty_cert_status_assertion_rejects_a_non_empty_status() {
     let mut ks = temp_keystore("empty-status-discriminates");
@@ -688,9 +701,15 @@ fn test_empty_cert_status_assertion_rejects_a_non_empty_status() {
         "the empty-status check accepts the real good status"
     );
 
-    // Mutate: the `good` status now illegally carries an INTEGER
+    // Mutate: the `good` status now carries an INTEGER
     // (`80 03 02 01 05` instead of `80 00`). The tag is unchanged, so
     // a tag-only check would still pass — the length check must not.
+    //
+    // The splice grows the document by three octets without updating the
+    // enclosing length headers, so the mutated response is deliberately
+    // malformed DER as a whole. That is incidental: the fixture's point
+    // is the `certStatus` encoding, and the assertion under test is the
+    // length check on that TLV.
     //
     // The mutation site is the `certStatus` field's *structural*
     // position, taken from the walk — not a raw byte scan for `80 00`.
@@ -738,6 +757,40 @@ fn test_empty_cert_status_assertion_rejects_a_non_empty_status() {
         mutated.total_len, 2,
         "a non-empty [0] TLV must not pass the empty-encoding check"
     );
+}
+
+/// A `revoked` OCSP answer carrying the `removeFromCRL` reason is
+/// REFUSED.
+///
+/// RFC 5280 section 5.3.1 code 8 means "the certificate was revoked and
+/// is now reinstated" — a verifier reads it as GOOD, the opposite of a
+/// revoked answer. The CRL builder refuses the same reason, so the two
+/// revocation channels cannot contradict each other.
+#[test]
+fn test_ocsp_response_refuses_remove_from_crl_reason() {
+    let mut ks = temp_keystore("refuses-remove-from-crl");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+
+    let err = build_ocsp_response(
+        &root.cert_pem,
+        root.private_key_der.as_slice(),
+        LEAF_SERIAL,
+        &OcspResponseSpec {
+            status: OcspStatus::Revoked,
+            this_update: Utc::now(),
+            next_update: Utc::now() + Duration::hours(24),
+            revoked_at: Some(Utc::now()),
+            reason: Some(CrlReason::RemoveFromCRL),
+        },
+    )
+    .expect_err("a removeFromCRL reason must be refused");
+    match err {
+        ws_ca::error::CaError::X509(msg) => assert!(
+            msg.contains("removeFromCRL"),
+            "the refusal must name the reason, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
 }
 
 /// A CA key that does not match the CA certificate is a typed error, not

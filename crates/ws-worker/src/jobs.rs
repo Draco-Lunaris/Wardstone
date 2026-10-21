@@ -543,6 +543,16 @@ async fn latest_crl(pool: &PgPool, ca_id: Uuid) -> Result<Option<PublishedCrl>, 
 /// example `key_compromise`); a reason this build does not know (a
 /// value written by a newer release) is `None` — the response then
 /// carries no reason extension, which RFC 6960 allows.
+///
+/// `remove_from_crl` is deliberately NOT mapped: RFC 5280 section 5.3.1
+/// code 8 means "revoked and now reinstated", so encoding it for a row
+/// that is still `status='revoked'` would make the CRL and the OCSP
+/// answer contradict the database. A revocation is terminal in this
+/// plan, so a stored `remove_from_crl` yields no reason extension (the
+/// entry still says "revoked") rather than a false "not revoked". The
+/// CRL builder and the OCSP builder independently refuse the reason,
+/// so the two channels cannot disagree even if one is reached through
+/// a different path.
 fn reason_from_str(reason: &str) -> Option<CrlReason> {
     match reason {
         "unspecified" => Some(CrlReason::Unspecified),
@@ -552,7 +562,7 @@ fn reason_from_str(reason: &str) -> Option<CrlReason> {
         "superseded" => Some(CrlReason::Superseded),
         "cessation_of_operation" => Some(CrlReason::CessationOfOperation),
         "certificate_hold" => Some(CrlReason::CertificateHold),
-        "remove_from_crl" => Some(CrlReason::RemoveFromCRL),
+        "remove_from_crl" => None,
         "privilege_withdrawn" => Some(CrlReason::PrivilegeWithdrawn),
         "aa_compromise" => Some(CrlReason::AaCompromise),
         _ => None,

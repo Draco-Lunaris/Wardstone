@@ -144,6 +144,70 @@ fn build_fixture_crl(root: &ws_ca::ca::CreatedCa) -> ws_ca::crl::CrlFile {
     build_crl(&root.cert_pem, root.private_key_der.as_slice(), &crl_spec()).unwrap()
 }
 
+/// A CRL entry with the `removeFromCRL` reason is REFUSED.
+///
+/// RFC 5280 section 5.3.1 code 8 means "the certificate was revoked and
+/// is now reinstated" — a verifier reads it as GOOD. Encoding it for an
+/// entry that is still revoked would make the CRL say "not revoked"
+/// while the database says `revoked`, and the CRL and the OCSP answer
+/// would contradict each other. A revocation is terminal in this plan,
+/// so the builder refuses the reason instead of emitting it.
+#[test]
+fn test_crl_refuses_remove_from_crl_reason() {
+    let mut ks = temp_keystore("refuses-remove-from-crl");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+
+    let spec = CrlSpec {
+        revocations: vec![RevocationEntry {
+            serial: 0x42,
+            reason: Some(CrlReason::RemoveFromCRL),
+            revoked_at: revoked_at(0),
+        }],
+        next_update: chrono::Duration::hours(24),
+    };
+
+    let err = build_crl(&root.cert_pem, root.private_key_der.as_slice(), &spec)
+        .expect_err("a removeFromCRL entry must be refused");
+    match err {
+        ws_ca::error::CaError::X509(msg) => assert!(
+            msg.contains("removeFromCRL"),
+            "the refusal must name the reason, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
+/// A CRL entry with serial 0 is REFUSED.
+///
+/// RFC 5280 section 4.1.2.2 requires serial numbers to be positive.
+/// The DER `Uint` encoder would emit `INTEGER 0` for it — a negative
+/// INTEGER under DER's two's-complement reading. The leaf issuance path
+/// already rejects serial 0; the CRL builder must too.
+#[test]
+fn test_crl_refuses_serial_zero() {
+    let mut ks = temp_keystore("refuses-serial-zero");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+
+    let spec = CrlSpec {
+        revocations: vec![RevocationEntry {
+            serial: 0,
+            reason: Some(CrlReason::KeyCompromise),
+            revoked_at: revoked_at(0),
+        }],
+        next_update: chrono::Duration::hours(24),
+    };
+
+    let err = build_crl(&root.cert_pem, root.private_key_der.as_slice(), &spec)
+        .expect_err("a serial-0 entry must be refused");
+    match err {
+        ws_ca::error::CaError::X509(msg) => assert!(
+            msg.contains("positive integer"),
+            "the refusal must name the positivity requirement, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
 /// The built CRL carries every revoked serial in order, with the pinned
 /// v2 structure: bare-INTEGER version, issuer byte-identical to the CA
 /// subject, reason-code entry extensions, a non-critical AKI matching the
@@ -201,7 +265,7 @@ fn test_crl_lists_all_serials() {
                     !critical,
                     "reason-code entry extension must be non-critical"
                 );
-                assert_eq!(code.0, reason.as_code());
+                assert_eq!(code.0, reason.as_code().expect("reason code is emittable"));
             }
         }
     }

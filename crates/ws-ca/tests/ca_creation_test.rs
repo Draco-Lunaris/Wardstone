@@ -10,6 +10,7 @@ use std::fs;
 
 use sha2::{Digest, Sha256};
 use ws_ca::ca::{create_root, create_sub_ca, CaLifetime, CaSpec, KeyType};
+use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::ParsedExtension;
@@ -278,4 +279,181 @@ fn ca_lifetime_durations() {
     assert_eq!(CaLifetime::Root.duration().num_days(), 3650);
     assert_eq!(CaLifetime::SubCa.duration().num_days(), 1825);
     assert_eq!(CaLifetime::Leaf.duration().num_days(), 30);
+}
+
+/// A sub-CA spec (the shape `create_sub_ca` is called with).
+fn sub_spec() -> CaSpec {
+    CaSpec {
+        name: "issuing".to_owned(),
+        subject: "Wardstone Issuing CA".to_owned(),
+        key_type: KeyType::Ed25519,
+        lifetime: CaLifetime::SubCa,
+    }
+}
+
+/// A root CA spec.
+fn root_spec() -> CaSpec {
+    CaSpec {
+        name: "root".to_owned(),
+        subject: "Wardstone Test Root".to_owned(),
+        key_type: KeyType::Ed25519,
+        lifetime: CaLifetime::Root,
+    }
+}
+
+/// An end-entity certificate (a leaf) and its key, used as an ILLEGAL
+/// parent.
+///
+/// The leaf is issued by a root so that it is a real, well-formed
+/// certificate with `BasicConstraints CA:FALSE` — exactly the shape
+/// that must never be usable as an issuer.
+fn end_entity_cert(ks: &mut KeyStore) -> (String, Vec<u8>) {
+    use ws_ca::issue::{sign_leaf_with, LeafSpec, SanEntry};
+
+    let root = create_root(&root_spec(), ks).unwrap();
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "not-a-ca.example");
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        "not-a-ca.example".try_into().unwrap(),
+    )];
+    let csr = params.serialize_request(&key_pair).unwrap();
+
+    let issued = sign_leaf_with(
+        &root.cert_pem,
+        root.private_key_der.as_slice(),
+        &csr.pem().unwrap(),
+        &LeafSpec {
+            sans: vec![SanEntry::Dns("not-a-ca.example".to_owned())],
+            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
+            not_after: None,
+            subject_cn: None,
+            serial: 0x1234,
+        },
+    )
+    .expect("issue the end-entity certificate");
+    // The leaf's private key is the CSR's key (the leaf carries the
+    // requester's key verbatim), so the caller's key pair is the one
+    // that pairs with the issued certificate.
+    (issued.cert_pem, key_pair.serialize_der())
+}
+
+/// A sub-CA under a parent whose `pathLenConstraint` is 0 is REFUSED.
+///
+/// The child would be stamped `CA:TRUE, pathlen:0` under a parent that
+/// already forbids any CA below it, so the resulting chain violates the
+/// parent's own constraint — relying parties reject it ("path length
+/// constraint exceeded").
+#[test]
+fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
+    let mut ks = temp_keystore("sub-under-pathlen0");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks).unwrap();
+    let sub_key = ks.load_ca_key(&sub.key_pair_id).unwrap();
+
+    // The sub-CA carries pathlen:0, so it may not have a CA below it.
+    let (_, sub_pem) = parse_x509_pem(sub.cert_pem.as_bytes()).unwrap();
+    let sub_cert = sub_pem.parse_x509().unwrap();
+    assert_eq!(
+        sub_cert
+            .basic_constraints()
+            .unwrap()
+            .unwrap()
+            .value
+            .path_len_constraint,
+        Some(0)
+    );
+
+    // A sub-sub-CA under it must be refused with a typed error.
+    let err = create_sub_ca(&sub.cert_pem, sub_key.as_slice(), &sub_spec(), &mut ks)
+        .expect_err("a pathlen-0 parent must not be allowed to create a sub-CA");
+    match err {
+        CaError::X509(msg) => assert!(
+            msg.contains("path length constraint"),
+            "the refusal must name the path length constraint, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
+/// A non-CA (end-entity) parent is REFUSED for sub-CA creation.
+#[test]
+fn test_create_sub_ca_under_non_ca_parent_is_refused() {
+    let mut ks = temp_keystore("sub-under-non-ca");
+    let (leaf_pem, leaf_key) = end_entity_cert(&mut ks);
+
+    let err = create_sub_ca(&leaf_pem, &leaf_key, &sub_spec(), &mut ks)
+        .expect_err("an end-entity parent must not be allowed to create a sub-CA");
+    match err {
+        CaError::X509(msg) => assert!(
+            msg.contains("not a CA"),
+            "the refusal must say the parent is not a CA, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
+/// A root parent (no pathLenConstraint) still permits a sub-CA, and so
+/// does a parent with `pathLenConstraint >= 1`.
+#[test]
+fn test_create_sub_ca_permitted_parents_are_allowed() {
+    let mut ks = temp_keystore("sub-permitted-parents");
+    // A root has NO pathLenConstraint: any depth below it is permitted.
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+        .expect("a root parent must permit a sub-CA");
+    assert!(sub.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+
+    // A parent with pathLenConstraint >= 1 permits another CA too. The
+    // Wardstone sub-CA profile stamps pathlen:0, so a pathlen>=1 parent
+    // is minted here with rcgen directly to exercise the rule.
+    let mut permissive = rcgen::CertificateParams::default();
+    permissive
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "permissive.example");
+    permissive.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(3));
+    permissive.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let permissive_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let permissive_cert = permissive.self_signed(&permissive_key).unwrap();
+
+    let err = create_sub_ca(
+        &permissive_cert.pem(),
+        &permissive_key.serialize_der(),
+        &sub_spec(),
+        &mut ks,
+    );
+    assert!(
+        err.is_ok(),
+        "a pathlen>=1 parent must permit a sub-CA, got {err:?}"
+    );
+}
+
+/// A sub-CA's validity is CLAMPED to the parent's `notAfter`: a child
+/// that outlives its issuer is a self-inflicted outage for the rest of
+/// the chain's life.
+#[test]
+fn test_create_sub_ca_validity_is_clamped_to_parent_not_after() {
+    let mut ks = temp_keystore("sub-clamped-validity");
+    let root = create_root(&root_spec(), &mut ks).unwrap();
+    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
+
+    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+        .expect("create the sub-CA");
+
+    let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
+    let root_cert = root_pem.parse_x509().unwrap();
+    let (_, sub_pem) = parse_x509_pem(sub.cert_pem.as_bytes()).unwrap();
+    let sub_cert = sub_pem.parse_x509().unwrap();
+
+    // The sub-CA never outlives the root that issued it.
+    assert!(
+        sub_cert.validity().not_after <= root_cert.validity().not_after,
+        "the sub-CA's notAfter ({}) must not exceed the root's ({})",
+        sub_cert.validity().not_after.timestamp(),
+        root_cert.validity().not_after.timestamp()
+    );
 }

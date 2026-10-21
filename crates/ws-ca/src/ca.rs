@@ -54,7 +54,8 @@ use rcgen::{
     SigningKey, PKCS_ED25519,
 };
 use rsa::pkcs8::EncodePrivateKey;
-use rsa::{rand_core::OsRng, RsaPrivateKey};
+use rsa::rand_core::{self, CryptoRng, RngCore};
+use rsa::RsaPrivateKey;
 use uuid::Uuid;
 use x509_parser::asn1_rs::FromDer;
 use x509_parser::pem::parse_x509_pem;
@@ -133,7 +134,8 @@ pub struct CreatedCa {
 /// than silently generating a master.
 pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, CaError> {
     let key_pair = ZeroizingKey(generate_key_pair(spec.key_type)?);
-    let mut params = base_params(spec)?;
+    // A root is self-signed: there is no issuer to clamp against.
+    let mut params = base_params(spec, None)?;
 
     // Self-signed trust anchor: unconstrained CA (no pathlen).
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -168,10 +170,18 @@ pub fn create_sub_ca(
 ) -> Result<CreatedCa, CaError> {
     let parent_key = ZeroizingKey(KeyPair::try_from(parent_key_der)?);
     ensure_parent_key_matches_cert(parent_cert_pem, &parent_key)?;
+    // The parent must be a CA that is ALLOWED to have a CA below it: a
+    // non-CA parent, or one whose pathLenConstraint is 0, would produce
+    // a chain that relying parties reject (RFC 5280 section 6.1.4).
+    ensure_issuer_is_ca(parent_cert_pem)?;
+    ensure_issuer_permits_sub_ca(parent_cert_pem)?;
 
     let issuer = Issuer::from_ca_cert_pem(parent_cert_pem, &parent_key)?;
     let key_pair = ZeroizingKey(generate_key_pair(spec.key_type)?);
-    let mut params = base_params(spec)?;
+    // The child must not outlive its issuer: cap the requested lifetime
+    // at the parent's own expiry.
+    let parent_not_after = issuer_not_after(parent_cert_pem)?;
+    let mut params = base_params(spec, Some(ymd(&parent_not_after)))?;
 
     // Intermediate: pathlen 0 — may sign leaves but no further sub-CAs.
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -184,14 +194,133 @@ pub fn create_sub_ca(
     persist(&key_pair, cert, keystore)
 }
 
+/// The issuer-side facts a CA certificate carries, extracted once so the
+/// CA-ness, path-length and validity checks all read the same parse.
+struct IssuerFacts {
+    /// `BasicConstraints.ca`.
+    is_ca: bool,
+    /// Whether the KeyUsage includes `keyCertSign` (a certificate with
+    /// NO KeyUsage extension is unrestricted).
+    key_cert_sign: bool,
+    /// `BasicConstraints.pathLenConstraint`, when present.
+    path_len_constraint: Option<u32>,
+    /// The certificate's own `notAfter` instant.
+    not_after: chrono::DateTime<chrono::Utc>,
+}
+
+/// Parse an issuer certificate and extract the facts the CA and leaf
+/// paths need from it.
+fn issuer_facts(issuer_cert_pem: &str) -> Result<IssuerFacts, CaError> {
+    let (_, pem) = parse_x509_pem(issuer_cert_pem.as_bytes())
+        .map_err(|_| CaError::X509("issuer certificate is not valid PEM".to_owned()))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| CaError::X509("issuer certificate failed to parse".to_owned()))?;
+
+    let basic = cert
+        .basic_constraints()
+        .map_err(|_| CaError::X509("issuer certificate extensions are malformed".to_owned()))?;
+    let (is_ca, path_len_constraint) = match basic {
+        Some(bc) => (bc.value.ca, bc.value.path_len_constraint),
+        None => (false, None),
+    };
+
+    let key_usage = cert
+        .key_usage()
+        .map_err(|_| CaError::X509("issuer certificate extensions are malformed".to_owned()))?;
+    // RFC 5280 section 4.2.1.3: the keyUsage extension restricts the
+    // certificate's purposes ONLY when it is present; a certificate with
+    // no keyUsage at all is unrestricted.
+    let key_cert_sign = key_usage.map(|ku| ku.value.key_cert_sign()).unwrap_or(true);
+
+    let not_after = chrono::DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| CaError::X509("issuer certificate notAfter is out of range".to_owned()))?;
+
+    Ok(IssuerFacts {
+        is_ca,
+        key_cert_sign,
+        path_len_constraint,
+        not_after,
+    })
+}
+
+/// Require that the issuer certificate is a CA permitted to sign
+/// certificates: `BasicConstraints.ca` must be true and the KeyUsage
+/// must include `keyCertSign`.
+///
+/// An end-entity certificate is never a valid issuer: a leaf issued by
+/// it produces a chain that relying parties reject ("invalid CA
+/// certificate" / "key usage does not include certificate signing"), so
+/// accepting one would mint a certificate that no verifier honours.
+///
+/// The KeyUsage check follows RFC 5280 section 4.2.1.3: a CA whose
+/// keyUsage omits `keyCertSign` is not permitted to sign certificates.
+/// A CA certificate with NO KeyUsage extension at all is treated as
+/// unrestricted (the extension constrains purposes only when present).
+///
+/// Errors are typed [`CaError::X509`] with static messages — never any
+/// key material.
+pub(crate) fn ensure_issuer_is_ca(issuer_cert_pem: &str) -> Result<(), CaError> {
+    let facts = issuer_facts(issuer_cert_pem)?;
+    if !facts.is_ca {
+        return Err(CaError::X509(
+            "issuer certificate is not a CA (BasicConstraints CA:FALSE)".to_owned(),
+        ));
+    }
+    if !facts.key_cert_sign {
+        return Err(CaError::X509(
+            "issuer certificate is not permitted to sign certificates (keyUsage lacks keyCertSign)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Require that the issuer's `pathLenConstraint` permits another CA
+/// below it.
+///
+/// RFC 5280 section 4.2.1.9: `pathLenConstraint` gives the maximum
+/// number of non-self-issued intermediate certificates that may follow
+/// this certificate in a valid certification path. A parent with
+/// `pathLenConstraint` 0 may therefore have an end-entity below it, but
+/// NOT another CA — issuing one would produce a chain the parent itself
+/// forbids, and relying parties reject it ("path length constraint
+/// exceeded").
+///
+/// A parent with NO pathLenConstraint (a root) permits any depth.
+pub(crate) fn ensure_issuer_permits_sub_ca(issuer_cert_pem: &str) -> Result<(), CaError> {
+    let facts = issuer_facts(issuer_cert_pem)?;
+    if facts.path_len_constraint == Some(0) {
+        return Err(CaError::X509(
+            "issuer certificate's path length constraint does not permit another CA".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The issuing certificate's `notAfter` instant.
+///
+/// Shared by the CA and leaf paths: both clamp the certificate they
+/// mint to the issuer's own expiry, so a certificate never outlives the
+/// CA that issued it.
+pub(crate) fn issuer_not_after(
+    issuer_cert_pem: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, CaError> {
+    Ok(issuer_facts(issuer_cert_pem)?.not_after)
+}
+
 /// Common [`CertificateParams`]: subject CN, validity window, fresh
 /// OS-entropy serial, rcgen defaults for everything else (SKI
 /// derivation; no SANs or extended key usages — CAs carry none).
-fn base_params(spec: &CaSpec) -> Result<CertificateParams, CaError> {
+///
+/// `issuer_not_after` caps the certificate's `not_after` at the issuing
+/// CA's own expiry: a child that outlives its issuer is a
+/// self-inflicted outage for the whole remaining life of the chain.
+fn base_params(spec: &CaSpec, issuer_not_after: Option<Ymd>) -> Result<CertificateParams, CaError> {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, spec.subject.clone());
 
-    let (nb, na) = validity_window(&spec.lifetime)?;
+    let (nb, na) = validity_window(&spec.lifetime, issuer_not_after)?;
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
     params.serial_number = Some(new_serial()?);
@@ -208,12 +337,40 @@ type Ymd = (i32, u8, u8);
 /// `not_before` is midnight UTC one day before today (clock-skew margin),
 /// `not_after` is midnight UTC exactly the lifetime's day count later, so
 /// the parsed certificate spans exactly the pinned day count.
-fn validity_window(lifetime: &CaLifetime) -> Result<(Ymd, Ymd), CaError> {
+///
+/// `issuer_not_after` caps `not_after` at the issuing CA's expiry date.
+/// The cap is applied at DAY granularity: the CA profile puts both ends
+/// at midnight UTC, and midnight of the issuer's own expiry date is
+/// always at or before the issuer's exact `notAfter` instant, so the
+/// clamped child never outlives its issuer.
+///
+/// When the cap leaves no valid window at all (the issuer already
+/// expires before the child could become valid), the request is REFUSED
+/// with a typed [`CaError::X509`] rather than minting a certificate
+/// that is invalid the moment it exists.
+fn validity_window(
+    lifetime: &CaLifetime,
+    issuer_not_after: Option<Ymd>,
+) -> Result<(Ymd, Ymd), CaError> {
     let not_before = Utc::now() - chrono::Duration::days(1);
-    let not_after = not_before
+    let requested = not_before
         .checked_add_signed(lifetime.duration())
         .ok_or_else(|| CaError::X509("certificate validity window out of range".to_owned()))?;
-    Ok((ymd(&not_before), ymd(&not_after)))
+    let nb = ymd(&not_before);
+    let mut na = ymd(&requested);
+    if let Some(cap) = issuer_not_after {
+        if cap < na {
+            na = cap;
+        }
+    }
+    if na <= nb {
+        return Err(CaError::X509(
+            "the issuing CA certificate expires before the requested certificate could become \
+             valid; no validity window is left to issue into"
+                .to_owned(),
+        ));
+    }
+    Ok((nb, na))
 }
 
 /// The UTC calendar date of `dt` as a (year, month, day) triple.
@@ -240,14 +397,50 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
 /// Error mapping (no variant carries key material; `rsa`'s error Display
 /// is static text): generation failure maps to [`CaError::Io`] — the
 /// dominant cause is OS-entropy trouble, matching the variant's
-/// "random source exhaustion" meaning (note `rsa`'s `OsRng` panics on a
-/// hard entropy failure; that is process-fatal territory); PKCS#8
-/// encoding failure maps to [`CaError::X509`]. The `rsa` private key
-/// zeroizes its secret components on drop, and the intermediate PKCS#8
-/// document is handled inside [`Zeroizing`] buffers.
+/// "random source exhaustion" meaning; PKCS#8 encoding failure maps to
+/// [`CaError::X509`]. The `rsa` private key zeroizes its secret
+/// components on drop, and the intermediate PKCS#8 document is handled
+/// inside [`Zeroizing`] buffers.
+///
+/// # Entropy failures
+///
+/// The randomness for this path comes from [`FallibleSysRng`], not from
+/// `rsa`'s bundled `OsRng`. `rsa`'s `OsRng` implements the trait's
+/// infallible `fill_bytes` by PANICKING on an entropy failure; the rest
+/// of ws-ca uses rand 0.10's fallible `try_fill_bytes`, so the two
+/// key-generation paths did not honour the same "never a panic"
+/// property.
+///
+/// The upstream stack consumes randomness ONLY through that trait
+/// method — `num-bigint-dig`'s `gen_prime` calls `fill_bytes` and
+/// offers no error channel of its own. The adapter therefore makes
+/// `fill_bytes` itself non-panicking and detects the failure
+/// out-of-band: on an entropy failure it fills the buffer from a
+/// deterministic fallback stream, records the failure, and the caller
+/// below REFUSES the resulting key with a typed [`CaError::Io`]. The
+/// key is dropped (and its secret components zeroized by `rsa`)
+/// without ever reaching a certificate, the keystore, or a caller.
+///
+/// The residual upstream limitation is thus not a panic risk but a
+/// *reporting* one: the failure is detected after `RsaPrivateKey::new`
+/// returns rather than being returned from within it, because the
+/// pinned `rsa`/`num-bigint-dig` stack has no fallible prime-generation
+/// entry point. The observable behaviour for a caller — a typed error,
+/// no key, no panic, and never a silently weak key — is what a
+/// fallible API would give.
 fn generate_rsa(bits: usize) -> Result<KeyPair, CaError> {
-    let mut rng = OsRng;
-    let key = RsaPrivateKey::new(&mut rng, bits).map_err(|e| {
+    let mut rng = FallibleSysRng::new();
+    let key = RsaPrivateKey::new(&mut rng, bits);
+    if rng.degraded {
+        // The OS entropy source failed during generation: the key was
+        // built from the deterministic fallback stream and MUST NOT be
+        // used. Drop it here (rsa zeroizes the secret components on
+        // drop) and report the real cause.
+        return Err(CaError::Io(std::io::Error::other(
+            "rsa key generation failed: the operating system entropy source was unavailable",
+        )));
+    }
+    let key = key.map_err(|e| {
         CaError::Io(std::io::Error::other(format!(
             "rsa key generation failed: {e}"
         )))
@@ -258,6 +451,123 @@ fn generate_rsa(bits: usize) -> Result<KeyPair, CaError> {
     let der = Zeroizing::new(pkcs8.as_bytes().to_vec());
     Ok(KeyPair::try_from(der.as_slice())?)
 }
+
+/// Label embedded in the degraded-mode fallback seed. Public on purpose:
+/// the fallback stream only exists to keep a broken-entropy run
+/// terminating, and the key it produces is discarded before use, so the
+/// seed's publicity is not a weakness.
+const DEGRADED_SEED_LABEL: &[u8; 24] = b"wardstone-degraded-mode!";
+
+/// Process-wide counter, so two degraded runs in the same process do not
+/// fall back to the same stream.
+static DEGRADED_SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Seed for one instance's degraded-mode fallback stream: a fixed public
+/// label plus a per-instance value derived from a process-wide counter
+/// and the process id.
+fn degraded_seed() -> [u8; 32] {
+    let counter = DEGRADED_SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = u64::from(std::process::id());
+    let mut seed = [0u8; 32];
+    seed[..24].copy_from_slice(DEGRADED_SEED_LABEL);
+    seed[24..].copy_from_slice(&(counter ^ pid.rotate_left(17)).to_le_bytes());
+    seed
+}
+
+/// Adapter presenting rand 0.10's fallible OS entropy source
+/// (`SysRng`) through the rand_core 0.6 traits that `rsa 0.9.10`
+/// accepts (`RngCore` + `CryptoRng`).
+///
+/// `rsa::rand_core` is the re-export of rand_core 0.6 that `rsa` itself
+/// depends on, so implementing these traits against it adds no new
+/// dependency edge to the workspace.
+///
+/// # Why the fallback stream exists
+///
+/// The trait's infallible `fill_bytes` has no error channel, and
+/// `num-bigint-dig`'s `gen_prime` — the only consumer of randomness in
+/// `RsaPrivateKey::new` — calls exactly that method. `fill_bytes`
+/// therefore must return *something*, and it must not panic. It fills
+/// from a deterministic fallback stream and records the failure in
+/// [`Self::degraded`]; the caller then refuses the key. The
+/// alternative — panicking, as `rsa`'s own `OsRng` does — would turn
+/// a broken kernel RNG into a process abort, and the alternative of
+/// silently using the degraded key would mint a predictable CA key.
+/// Both are worse than a typed error, which is what the caller
+/// produces.
+struct FallibleSysRng {
+    /// Set when the OS entropy source failed at least once. The caller
+    /// MUST refuse any key generated by an instance in this state.
+    degraded: bool,
+    /// Deterministic stream used only after an entropy failure. Seeded
+    /// per instance so two degraded runs differ from each other.
+    fallback: rand::rngs::StdRng,
+    /// Bytes requested through the infallible `fill_bytes` path.
+    /// Test-only: it proves that the upstream prime generation really
+    /// consults THIS adapter (and not some other entropy source).
+    #[cfg(test)]
+    filled_bytes: u64,
+}
+
+impl FallibleSysRng {
+    /// A fresh adapter over the OS entropy source.
+    fn new() -> Self {
+        Self {
+            degraded: false,
+            fallback: rand::SeedableRng::from_seed(degraded_seed()),
+            #[cfg(test)]
+            filled_bytes: 0,
+        }
+    }
+}
+
+impl RngCore for FallibleSysRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        self.fill_bytes(&mut buf);
+        u32::from_le_bytes(buf)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        self.fill_bytes(&mut buf);
+        u64::from_le_bytes(buf)
+    }
+
+    /// Never panics. On an entropy failure it fills from the
+    /// deterministic fallback stream and records the failure; the
+    /// caller refuses the key.
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        #[cfg(test)]
+        {
+            self.filled_bytes += dest.len() as u64;
+        }
+        let mut sys = SysRng;
+        if sys.try_fill_bytes(dest).is_err() {
+            self.degraded = true;
+            rand::Rng::fill_bytes(&mut self.fallback, dest);
+        }
+    }
+
+    /// The fallible path: an entropy failure is reported as an error
+    /// AND recorded in [`Self::degraded`]. The buffer is still filled
+    /// (from the fallback stream) so that a caller which ignores the
+    /// error still gets a defined, non-panicking buffer — but the
+    /// recorded flag means the key is refused.
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        let mut sys = SysRng;
+        match sys.try_fill_bytes(dest) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.degraded = true;
+                rand::Rng::fill_bytes(&mut self.fallback, dest);
+                Err(rand_core::Error::new(std::io::Error::from(err)))
+            }
+        }
+    }
+}
+
+impl CryptoRng for FallibleSysRng {}
 
 /// Verify that `parent_key` is the private half of the subject public key
 /// in `parent_cert_pem`, so a mismatched (cert, key) pair cannot silently
@@ -389,5 +699,70 @@ impl PublicKeyData for ZeroizingKey {
 impl SigningKey for ZeroizingKey {
     fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
         self.0.sign(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rsa::traits::PublicKeyParts;
+
+    use super::{FallibleSysRng, RngCore};
+
+    /// The adapter's `try_fill_bytes` is wired to the OS entropy
+    /// source: it fills the whole buffer and reports success.
+    #[test]
+    fn test_fallible_sys_rng_fills_the_whole_buffer() {
+        let mut rng = FallibleSysRng::new();
+        let mut buf = [0u8; 64];
+        rng.try_fill_bytes(&mut buf)
+            .expect("OS entropy is available");
+        assert_eq!(buf.len(), 64, "the whole buffer must be filled");
+        assert!(
+            buf.iter().any(|byte| *byte != 0),
+            "a filled buffer must not be all zeros"
+        );
+        assert!(
+            !rng.degraded,
+            "a healthy entropy source must not be reported as degraded"
+        );
+    }
+
+    /// The adapter does not repeat itself: two draws differ.
+    #[test]
+    fn test_fallible_sys_rng_does_not_repeat() {
+        let mut rng = FallibleSysRng::new();
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        rng.try_fill_bytes(&mut first).unwrap();
+        rng.try_fill_bytes(&mut second).unwrap();
+        assert_ne!(
+            first, second,
+            "two draws from the entropy source must differ"
+        );
+    }
+
+    /// The upstream prime generation really consults THIS adapter.
+    ///
+    /// `rsa::RsaPrivateKey::new` takes the RNG by `&mut`, and
+    /// `num-bigint-dig`'s `gen_prime` calls the trait's infallible
+    /// `fill_bytes` — so the bytes the adapter hands out are the bytes
+    /// the RSA primes are drawn from. Counting the bytes requested
+    /// through `fill_bytes` proves the wiring rather than assuming it.
+    #[test]
+    fn test_rsa_prime_generation_consults_the_adapter() {
+        let mut rng = FallibleSysRng::new();
+        // A small modulus keeps the test quick; the prime search still
+        // draws randomness through the adapter.
+        let key = rsa::RsaPrivateKey::new(&mut rng, 256).expect("generate a small RSA key");
+        assert!(
+            rng.filled_bytes > 0,
+            "the RSA prime generation must draw randomness through the adapter"
+        );
+        assert!(
+            !rng.degraded,
+            "a healthy entropy source must not be reported as degraded"
+        );
+        // The key really is a 256-bit modulus, so the search ran.
+        assert_eq!(key.n().bits(), 256);
     }
 }

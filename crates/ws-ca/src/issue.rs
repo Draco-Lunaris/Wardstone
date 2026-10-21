@@ -63,7 +63,9 @@ use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::x509::SubjectPublicKeyInfo;
 
-use crate::ca::{ensure_parent_key_matches_cert, ZeroizingKey};
+use crate::ca::{
+    ensure_issuer_is_ca, ensure_parent_key_matches_cert, issuer_not_after, ZeroizingKey,
+};
 use crate::error::CaError;
 
 /// One subject alternative name that a leaf may carry.
@@ -352,6 +354,11 @@ pub fn sign_leaf_with(
     // the certificate and the signature from the key are combined.
     let ca_key = ZeroizingKey(KeyPair::try_from(ca_key_der)?);
     ensure_parent_key_matches_cert(ca_cert_pem, &ca_key)?;
+    // The issuer must be a CA permitted to sign certificates: an
+    // end-entity certificate is never a valid issuer, and a leaf signed
+    // by one produces a chain that relying parties reject ("invalid CA
+    // certificate" / "key usage does not include certificate signing").
+    ensure_issuer_is_ca(ca_cert_pem)?;
     let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, &ca_key)?;
 
     // Request side: parse, then gate on the supported algorithm set (name
@@ -400,7 +407,20 @@ pub fn sign_leaf_with(
     // Validity: not_before is midnight UTC one day before today (Task 5's
     // clock-skew margin); not_after is the spec instant or, unset, exactly
     // the leaf lifetime later. Both ends are whole seconds.
+    //
+    // The leaf is CLAMPED to the issuing CA certificate's own notAfter: a
+    // leaf that outlives its issuer is a self-inflicted outage for the
+    // remaining life of the chain (a leaf valid to 2036 under a CA that
+    // dies in 2031). When the clamp leaves no valid window at all, the
+    // request is refused with a typed error rather than minting a
+    // certificate that is invalid the moment it exists.
     let (not_before, not_after) = validity_window(spec.not_after)?;
+    let issuer_not_after = issuer_not_after(ca_cert_pem)?;
+    let not_after = if not_after.unix_timestamp() > issuer_not_after.timestamp() {
+        unix_secs_to_offset(issuer_not_after.timestamp())?
+    } else {
+        not_after
+    };
     // Sanity: an explicit not_after at or before not_before would issue an
     // already-invalid leaf (negative window); reject it typed rather than
     // mint a certificate no relying party would trust.
@@ -465,12 +485,15 @@ fn gate_supported_key(alg: &str, spki: &SubjectPublicKeyInfo<'_>) -> Result<(), 
         )));
     }
     if alg == "RSA" {
-        // x509-parser's RSAPublicKey::key_size() counts the DER sign octet
-        // as modulus data (it strips only a leading zero byte), so an
-        // MSB-clear 2048-bit modulus reports 2040 bits. That undercount is
-        // conservative here — it over-rejects at the exact 2048 boundary —
-        // and stays that way on purpose; do not "fix" it into a permissive
-        // check.
+        // x509-parser's RSAPublicKey::key_size() strips only a leading
+        // zero byte, and a DER INTEGER prepends that sign octet exactly
+        // when the modulus' MSB is set. A 2048-bit modulus has its MSB
+        // set by definition, so it always reports exactly 2048. The
+        // undercount only appears on a modulus of 2041-2047 bits, whose
+        // MSB is clear and which therefore carries NO sign octet: it
+        // reports 8 * 255 = 2040 and is over-rejected here. The check may
+        // over-reject but never over-accept, and stays that way on
+        // purpose; do not "fix" it into a permissive check.
         let bits = match spki.parsed() {
             Ok(x509_parser::public_key::PublicKey::RSA(rsa)) => rsa.key_size(),
             // A SPKI the RSA parser cannot crack cannot be signed for.

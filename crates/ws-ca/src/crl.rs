@@ -87,6 +87,16 @@ const TAG_EXTENSIONS: u8 = 0xa0;
 /// Why a certificate was revoked, as carried in a CRL entry's `reasonCode`
 /// extension (RFC 5280 section 5.3.1). The codes are the ENUMERATED
 /// values; value 7 is unused by the RFC and therefore not represented.
+///
+/// [`CrlReason::RemoveFromCRL`] is part of the RFC's vocabulary but is
+/// NOT emittable for a revoked entry: RFC 5280 section 5.3.1 defines
+/// code 8 as "the certificate was revoked and is now reinstated", so a
+/// verifier reads it as "good" — the opposite of a revoked entry. In
+/// Wardstone a revocation is terminal (there is no reinstatement
+/// workflow in this plan), so emitting code 8 would make the CRL say
+/// "not revoked" while the database still says `revoked`, and the two
+/// revocation channels (CRL and OCSP) would contradict each other.
+/// [`CrlReason::as_code`] therefore refuses it with a typed error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrlReason {
     /// Unspecified (0).
@@ -103,7 +113,8 @@ pub enum CrlReason {
     CessationOfOperation,
     /// Certificate hold (6).
     CertificateHold,
-    /// Remove from CRL (8).
+    /// Remove from CRL (8) — "revoked and now reinstated". Never
+    /// emittable for a revoked entry; see the type's documentation.
     RemoveFromCRL,
     /// Privilege withdrawn (9).
     PrivilegeWithdrawn,
@@ -113,18 +124,27 @@ pub enum CrlReason {
 
 impl CrlReason {
     /// The RFC 5280 section 5.3.1 ENUMERATED value for this reason.
-    pub fn as_code(&self) -> u8 {
+    ///
+    /// [`CrlReason::RemoveFromCRL`] is REFUSED with a typed
+    /// [`CaError::X509`]: code 8 means "revoked and now reinstated",
+    /// which a verifier reads as good, so encoding it for a revoked
+    /// entry would contradict the revocation itself.
+    pub fn as_code(&self) -> Result<u8, CaError> {
         match self {
-            CrlReason::Unspecified => 0,
-            CrlReason::KeyCompromise => 1,
-            CrlReason::CACompromise => 2,
-            CrlReason::AffiliationChanged => 3,
-            CrlReason::Superseded => 4,
-            CrlReason::CessationOfOperation => 5,
-            CrlReason::CertificateHold => 6,
-            CrlReason::RemoveFromCRL => 8,
-            CrlReason::PrivilegeWithdrawn => 9,
-            CrlReason::AaCompromise => 10,
+            CrlReason::Unspecified => Ok(0),
+            CrlReason::KeyCompromise => Ok(1),
+            CrlReason::CACompromise => Ok(2),
+            CrlReason::AffiliationChanged => Ok(3),
+            CrlReason::Superseded => Ok(4),
+            CrlReason::CessationOfOperation => Ok(5),
+            CrlReason::CertificateHold => Ok(6),
+            CrlReason::RemoveFromCRL => Err(CaError::X509(
+                "removeFromCRL (reason code 8) means 'revoked and now reinstated' and must not \
+                 be encoded for a revoked certificate"
+                    .to_owned(),
+            )),
+            CrlReason::PrivilegeWithdrawn => Ok(9),
+            CrlReason::AaCompromise => Ok(10),
         }
     }
 }
@@ -324,7 +344,30 @@ fn time_tlv(dt: &DateTime<Utc>) -> Result<Vec<u8>, CaError> {
 /// content bytes: 7 value bytes after the leading zero is stripped, plus
 /// the sign octet) and the full-width high-bit form (`0x8000…01` encodes
 /// to 17) match what stock OpenSSL writes.
+///
+/// Serial 0 is REFUSED: RFC 5280 section 4.1.2.2 requires serial
+/// numbers to be positive, and `Uint` would encode zero as a
+/// single-octet `INTEGER 0` — a negative INTEGER under DER's
+/// two's-complement reading. A serial is also refused when its encoding
+/// would exceed RFC 5280 section 4.1.2.2's 20-octet ceiling.
 fn serial_tlv(serial: u128) -> Result<Vec<u8>, CaError> {
+    if serial == 0 {
+        return Err(CaError::X509(
+            "CRL entry serial must be a positive integer (RFC 5280 section 4.1.2.2); \
+             serial 0 was supplied"
+                .to_owned(),
+        ));
+    }
+    // A u128 needs at most 16 content octets, plus a leading sign octet
+    // when the high bit is set: 17 octets, comfortably inside RFC 5280's
+    // 20-octet limit. The check is kept explicit so a future widening of
+    // the serial type fails loudly rather than emitting an oversized
+    // INTEGER.
+    if serial.to_be_bytes().len() > 20 {
+        return Err(CaError::X509(
+            "CRL entry serial exceeds the RFC 5280 section 4.1.2.2 limit of 20 octets".to_owned(),
+        ));
+    }
     Uint::new(&serial.to_be_bytes())
         .map_err(der_err)?
         .to_der()
@@ -336,7 +379,7 @@ fn serial_tlv(serial: u128) -> Result<Vec<u8>, CaError> {
 /// in DER), with the value an OCTET STRING wrapping the RFC 5280 section
 /// 5.3.1 ENUMERATED code.
 fn reason_extension_tlv(reason: CrlReason) -> Result<Vec<u8>, CaError> {
-    let enumerated = AnyRef::new(Tag::Enumerated, &[reason.as_code()])
+    let enumerated = AnyRef::new(Tag::Enumerated, &[reason.as_code()?])
         .map_err(der_err)?
         .to_der()
         .map_err(der_err)?;

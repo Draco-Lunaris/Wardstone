@@ -768,7 +768,7 @@ fn issue_from_matrix_csr(root: &ws_ca::ca::CreatedCa, csr_pem: &str, expected_al
     let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
     let root_cert = root_pem.parse_x509().unwrap();
     cert.verify_signature(Some(root_cert.public_key()))
-        .expect("{expected_alg} leaf must verify under the root's key");
+        .unwrap_or_else(|e| panic!("{expected_alg} leaf must verify under the root's key: {e}"));
 }
 
 #[test]
@@ -895,4 +895,109 @@ fn root_cert_spki_public_bytes(root_cert_pem: &str) -> Vec<u8> {
     let (_, pem) = parse_x509_pem(root_cert_pem.as_bytes()).unwrap();
     let cert = pem.parse_x509().unwrap();
     cert.public_key().subject_public_key.data.to_vec()
+}
+
+/// An end-entity certificate and its key, used as an ILLEGAL issuer.
+fn end_entity_issuer(ks: &mut KeyStore) -> (String, Vec<u8>) {
+    let root = ed25519_root(ks);
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "not-a-ca.example");
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        "not-a-ca.example".try_into().unwrap(),
+    )];
+    let csr = params.serialize_request(&key_pair).unwrap();
+
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr.pem().unwrap(),
+        &LeafSpec {
+            sans: vec![SanEntry::Dns("not-a-ca.example".to_owned())],
+            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
+            not_after: None,
+            subject_cn: None,
+            serial: 0x4321,
+        },
+    )
+    .expect("issue the end-entity certificate");
+    (issued.cert_pem, key_pair.serialize_der())
+}
+
+/// An end-entity certificate is never a valid issuer: a leaf signed by
+/// one produces a chain that relying parties reject ("invalid CA
+/// certificate" / "key usage does not include certificate signing").
+#[test]
+fn test_issue_leaf_from_non_ca_issuer_is_refused() {
+    let mut ks = temp_keystore("non-ca-issuer");
+    let (leaf_pem, leaf_key) = end_entity_issuer(&mut ks);
+    let csr = mint_p256_csr(Some("victim.example"), &[]);
+
+    let err = ws_ca::issue::sign_leaf_with(
+        &leaf_pem,
+        &leaf_key,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: None,
+            subject_cn: None,
+            serial: 0x1111,
+        },
+    )
+    .expect_err("an end-entity issuer must be refused");
+    match err {
+        CaError::X509(msg) => assert!(
+            msg.contains("not a CA"),
+            "the refusal must say the issuer is not a CA, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
+/// A leaf's validity is CLAMPED to the issuing CA's `notAfter`: a leaf
+/// that outlives its issuer is a self-inflicted outage for the rest of
+/// the chain's life.
+#[test]
+fn test_issue_leaf_validity_is_clamped_to_ca_not_after() {
+    let mut ks = temp_keystore("leaf-clamped-validity");
+    let root = ed25519_root(&mut ks);
+    let csr = mint_p256_csr(Some("clamped.example"), &[]);
+
+    // Ask for a leaf that outlives the root by decades.
+    let beyond = chrono::Utc::now() + chrono::Duration::days(3650);
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: Some(beyond),
+            subject_cn: None,
+            serial: 0x2222,
+        },
+    )
+    .expect("issue the clamped leaf");
+
+    let ca_not_after = parse_cert(&root.cert_pem).validity().not_after.timestamp();
+    assert_eq!(
+        issued.not_after.timestamp(),
+        ca_not_after,
+        "the leaf's not_after must be clamped to the CA's not_after"
+    );
+    let leaf_not_after = parse_cert(&issued.cert_pem)
+        .validity()
+        .not_after
+        .timestamp();
+    assert_eq!(
+        leaf_not_after, ca_not_after,
+        "the issued certificate's own not_after must match the clamp"
+    );
+    assert!(
+        issued.not_after > issued.not_before,
+        "the clamped window must still be valid"
+    );
 }

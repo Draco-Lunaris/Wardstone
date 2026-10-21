@@ -260,8 +260,11 @@ fn single_response(
             let mut content = generalized_time(&revoked_at)?;
             if let Some(reason) = spec.reason {
                 // revocationReason: [0] EXPLICIT ENUMERATED, the RFC 5280
-                // section 5.3.1 code.
-                let enumerated = AnyRef::new(Tag::Enumerated, &[reason.as_code()])
+                // section 5.3.1 code. `as_code` refuses `removeFromCRL`
+                // (code 8), which means "revoked and now reinstated" —
+                // the two revocation channels must not disagree about
+                // whether the certificate is still revoked.
+                let enumerated = AnyRef::new(Tag::Enumerated, &[reason.as_code()?])
                     .map_err(der_err)?
                     .to_der()
                     .map_err(der_err)?;

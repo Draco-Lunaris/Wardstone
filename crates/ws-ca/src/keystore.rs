@@ -87,13 +87,26 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// Open (creating if missing, mode 0700 on unix) the keys directory.
+    /// Open (creating if missing) the keys directory and enforce mode 0700
+    /// on unix.
+    ///
+    /// The mode is enforced on EVERY open, not only at creation: a
+    /// pre-existing directory (volume restore, operator-created, backup
+    /// restore) keeps whatever mode it had, and a 0755 keys directory
+    /// leaves the master KEK and every CA private-key envelope
+    /// world-readable — silently defeating the protection the format
+    /// depends on. Tightening on every open is what makes the guarantee
+    /// hold for a directory Wardstone did not create.
+    ///
     /// Does NOT generate the master key — call
     /// [`ensure_master_key`](Self::ensure_master_key) for that.
     ///
     /// Errors if the path is unusable: an unwritable parent, a regular file
-    /// where a directory belongs, or an unreadable directory all surface as
-    /// [`CaError::Io`].
+    /// where a directory belongs, an unreadable directory, or a failure to
+    /// set the directory mode all surface as [`CaError::Io`]. A keys
+    /// directory that cannot be protected is a hard error, never a
+    /// warning: continuing with a permissive directory would hand the
+    /// master KEK to every local user.
     pub fn open(dir: &Path) -> Result<Self, CaError> {
         if !dir.exists() {
             fs::create_dir_all(dir)?;
@@ -103,6 +116,13 @@ impl KeyStore {
         // Readability probe: actually open the directory (also rejects a
         // regular file sitting at the path with a typed io error).
         fs::read_dir(dir)?;
+        // Tighten the mode on every open, for a directory that already
+        // existed. The probe above has established that the path is a
+        // readable directory, so this only ever narrows the permissions
+        // — and a failure to do so is fatal rather than tolerated, because
+        // an unprotected keys directory is a key disclosure.
+        #[cfg(unix)]
+        set_permissions(dir, 0o700)?;
         Ok(KeyStore {
             dir: dir.to_path_buf(),
         })
@@ -571,6 +591,54 @@ mod tests {
         let _ks = KeyStore::open(&dir).unwrap();
         let mode = fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A keys directory that ALREADY existed with a permissive mode is
+    /// tightened on open, not only at creation.
+    ///
+    /// This is the regression guard for the "pre-existing directory
+    /// keeps whatever mode it had" defect: a restored volume, an
+    /// operator-created directory, or a backup restore could leave the
+    /// keys directory at 0755, which makes the master KEK and every CA
+    /// private-key envelope world-readable. The keystore must narrow
+    /// the mode on EVERY open.
+    #[cfg(unix)]
+    #[test]
+    fn test_existing_keys_dir_is_tightened_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_keys_dir("dir-perms-existing");
+        // Create the directory by hand at a permissive mode — the
+        // situation the defect describes.
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the fixture must start permissive, or the test proves nothing"
+        );
+
+        // Open the keystore on it and store a CA key, so the directory
+        // really is a live keys directory.
+        let mut ks = KeyStore::open(&dir).unwrap();
+        ks.ensure_master_key().unwrap();
+        let ca_id = Uuid::new_v4();
+        ks.store_ca_key(&ca_id, &random_bytes::<32>()).unwrap();
+
+        // The mode is narrowed on the FIRST open...
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // ...and stays narrowed when the directory is opened again, even
+        // after an operator (or a restore) loosened it once more.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _reopened = KeyStore::open(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "re-opening the keystore must re-tighten the keys directory"
+        );
     }
 
     #[test]
