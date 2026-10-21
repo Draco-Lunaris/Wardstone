@@ -435,10 +435,27 @@ fn test_create_sub_ca_permitted_parents_are_allowed() {
 /// A sub-CA's validity is CLAMPED to the parent's `notAfter`: a child
 /// that outlives its issuer is a self-inflicted outage for the rest of
 /// the chain's life.
+///
+/// The parent here is deliberately SHORT-LIVED (30 days, via
+/// [`CaLifetime::Leaf`]) while the requested sub-CA lifetime is the
+/// pinned 5 years, so the clamp actually bites. A parent whose window
+/// comfortably exceeds the requested lifetime would make this assertion
+/// vacuous: the clamp would be a no-op and the test would pass even with
+/// the clamp removed. The test therefore also asserts that the child's
+/// span is SHORTER than the requested one — which is only true if the
+/// clamp ran.
 #[test]
 fn test_create_sub_ca_validity_is_clamped_to_parent_not_after() {
     let mut ks = temp_keystore("sub-clamped-validity");
-    let root = create_root(&root_spec(), &mut ks).unwrap();
+    // A 30-day root: CA:TRUE and unconstrained (so it may issue a
+    // sub-CA), but it expires long before the requested 5-year sub-CA.
+    let short_lived_root_spec = CaSpec {
+        name: "short-lived-root".to_owned(),
+        subject: "Wardstone Short Lived Root".to_owned(),
+        key_type: KeyType::Ed25519,
+        lifetime: CaLifetime::Leaf,
+    };
+    let root = create_root(&short_lived_root_spec, &mut ks).unwrap();
     let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
 
     let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
@@ -449,11 +466,114 @@ fn test_create_sub_ca_validity_is_clamped_to_parent_not_after() {
     let (_, sub_pem) = parse_x509_pem(sub.cert_pem.as_bytes()).unwrap();
     let sub_cert = sub_pem.parse_x509().unwrap();
 
-    // The sub-CA never outlives the root that issued it.
+    // The fixture's premise: the parent really is short-lived, so the
+    // clamp has something to do. Without this, the test could pass
+    // vacuously.
+    let parent_span =
+        root_cert.validity().not_after.timestamp() - root_cert.validity().not_before.timestamp();
+    let requested_span = CaLifetime::SubCa.duration().num_seconds();
     assert!(
-        sub_cert.validity().not_after <= root_cert.validity().not_after,
-        "the sub-CA's notAfter ({}) must not exceed the root's ({})",
-        sub_cert.validity().not_after.timestamp(),
-        root_cert.validity().not_after.timestamp()
+        parent_span < requested_span,
+        "the fixture parent must be short-lived ({parent_span}s) relative to the requested \
+         sub-CA lifetime ({requested_span}s), or the clamp is a no-op"
     );
+
+    // The clamp: the child's notAfter EQUALS the parent's, not merely
+    // "<=" it. An unclamped child would carry the requested 5-year
+    // window and outlive its issuer.
+    assert_eq!(
+        sub_cert.validity().not_after.timestamp(),
+        root_cert.validity().not_after.timestamp(),
+        "the sub-CA's notAfter must be clamped to the parent's"
+    );
+
+    // And the child's window is the parent's, not the requested one.
+    let child_span =
+        sub_cert.validity().not_after.timestamp() - sub_cert.validity().not_before.timestamp();
+    assert!(
+        child_span < requested_span,
+        "the clamped sub-CA spans {child_span}s, which must be shorter than the requested \
+         {requested_span}s"
+    );
+}
+
+/// A CA:TRUE issuer whose KeyUsage is cRLSign only (no `keyCertSign`) is
+/// REFUSED as a parent — for both sub-CA creation and leaf issuance.
+///
+/// RFC 5280 section 4.2.1.3: a CA whose keyUsage omits `keyCertSign` is
+/// not permitted to sign certificates. The `BasicConstraints.ca` half of
+/// that rule is covered by the non-CA-parent test; this one covers the
+/// keyUsage half, which a refactor that dropped the keyUsage check (or
+/// flipped the "no keyUsage extension means unrestricted" default) would
+/// otherwise let through unnoticed.
+#[test]
+fn test_issuer_without_key_cert_sign_is_refused() {
+    // A CA:TRUE certificate whose KeyUsage is cRLSign only.
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "crl-signer-only.example");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::CrlSign];
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let cert = params.self_signed(&key).unwrap();
+
+    // Assert the fixture's own properties, so the test cannot pass
+    // vacuously (e.g. because rcgen silently added keyCertSign, or
+    // because the certificate is not a CA at all).
+    let (_, pem) = parse_x509_pem(cert.pem().as_bytes()).unwrap();
+    let parsed = pem.parse_x509().unwrap();
+    let basic = parsed.basic_constraints().unwrap().unwrap();
+    assert!(
+        basic.value.ca,
+        "the fixture must be CA:TRUE, or it would be refused for the wrong reason"
+    );
+    let key_usage = parsed.key_usage().unwrap().unwrap();
+    assert!(
+        !key_usage.value.key_cert_sign(),
+        "the fixture must NOT have keyCertSign, or it would be refused for the wrong reason"
+    );
+    assert!(key_usage.value.crl_sign());
+
+    let mut ks = temp_keystore("issuer-without-key-cert-sign");
+
+    // As a parent for a sub-CA: refused.
+    let err = create_sub_ca(&cert.pem(), &key.serialize_der(), &sub_spec(), &mut ks)
+        .expect_err("an issuer without keyCertSign must not create a sub-CA");
+    match err {
+        CaError::X509(msg) => assert!(
+            msg.contains("keyCertSign"),
+            "the refusal must name the missing keyCertSign, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+
+    // As an issuer for a leaf: refused.
+    use ws_ca::issue::{sign_leaf_with, LeafSpec};
+    let csr_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut csr_params = rcgen::CertificateParams::default();
+    csr_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "victim.example");
+    let csr = csr_params.serialize_request(&csr_key).unwrap();
+    let err = sign_leaf_with(
+        &cert.pem(),
+        &key.serialize_der(),
+        &csr.pem().unwrap(),
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            not_after: None,
+            subject_cn: None,
+            serial: 0x2468,
+        },
+    )
+    .expect_err("an issuer without keyCertSign must not issue a leaf");
+    match err {
+        CaError::X509(msg) => assert!(
+            msg.contains("keyCertSign"),
+            "the refusal must name the missing keyCertSign, got: {msg}"
+        ),
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
 }

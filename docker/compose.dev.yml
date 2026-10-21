@@ -43,10 +43,11 @@ services:
     # test loop.
     #
     # These are set on the SERVER command line, not through `PGOPTIONS`:
-    # `fsync` and `full_page_writes` are sighup-level (session-overridable)
-    # parameters that a client session cannot change, so passing them in
-    # `PGOPTIONS` makes every connection fail with `FATAL: parameter
-    # "fsync" cannot be changed now`.
+    # `fsync` and `full_page_writes` are sighup-level parameters, which
+    # means a client session may NOT change them (a session can only
+    # override `user`-level parameters such as `synchronous_commit`), so
+    # passing them in `PGOPTIONS` makes every connection fail with
+    # `FATAL: parameter "fsync" cannot be changed now`.
     command:
       - postgres
       - -c

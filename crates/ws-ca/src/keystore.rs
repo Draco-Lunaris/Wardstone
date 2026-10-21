@@ -98,12 +98,18 @@ impl KeyStore {
     /// depends on. Tightening on every open is what makes the guarantee
     /// hold for a directory Wardstone did not create.
     ///
+    /// The `ca/` subdirectory is tightened the same way whenever it
+    /// already exists. It is NOT created here (it is created on the
+    /// first key store, at mode 0700): a restored volume that already
+    /// carries it gets the same narrowing as the parent, so the CA-id
+    /// filenames are not exposed to local users.
+    ///
     /// Does NOT generate the master key — call
     /// [`ensure_master_key`](Self::ensure_master_key) for that.
     ///
     /// Errors if the path is unusable: an unwritable parent, a regular file
     /// where a directory belongs, an unreadable directory, or a failure to
-    /// set the directory mode all surface as [`CaError::Io`]. A keys
+    /// set a directory mode all surface as [`CaError::Io`]. A keys
     /// directory that cannot be protected is a hard error, never a
     /// warning: continuing with a permissive directory would hand the
     /// master KEK to every local user.
@@ -123,6 +129,15 @@ impl KeyStore {
         // an unprotected keys directory is a key disclosure.
         #[cfg(unix)]
         set_permissions(dir, 0o700)?;
+        // The `ca/` subdirectory gets the same treatment when it is
+        // already there (a restored volume). It is not created here.
+        #[cfg(unix)]
+        {
+            let ca_dir = dir.join(CA_SUBDIR);
+            if ca_dir.is_dir() {
+                set_permissions(&ca_dir, 0o700)?;
+            }
+        }
         Ok(KeyStore {
             dir: dir.to_path_buf(),
         })
@@ -205,9 +220,16 @@ impl KeyStore {
         let ca_dir = self.dir.join(CA_SUBDIR);
         if !ca_dir.exists() {
             fs::create_dir_all(&ca_dir)?;
-            #[cfg(unix)]
-            set_permissions(&ca_dir, 0o700)?;
         }
+        // Tighten the subdirectory's mode on every store, exactly as
+        // `open` tightens the parent: a restored volume leaves `ca/` at
+        // whatever mode it had, and a world-readable `ca/` exposes the
+        // CA-id filenames (the envelope files themselves are written
+        // 0600, so this is consistency hardening rather than a key
+        // disclosure). A failure to set the mode is a typed io error,
+        // never a permissive directory.
+        #[cfg(unix)]
+        set_permissions(&ca_dir, 0o700)?;
         write_private(&self.ca_key_path(ca_id), json.as_bytes())?;
         Ok(())
     }
@@ -602,6 +624,10 @@ mod tests {
     /// keys directory at 0755, which makes the master KEK and every CA
     /// private-key envelope world-readable. The keystore must narrow
     /// the mode on EVERY open.
+    ///
+    /// The `ca/` subdirectory is covered too: a restored volume leaves it
+    /// at whatever mode it had, and a world-readable `ca/` exposes the
+    /// CA-id filenames to local users.
     #[cfg(unix)]
     #[test]
     fn test_existing_keys_dir_is_tightened_to_0700() {
@@ -638,6 +664,27 @@ mod tests {
             mode & 0o777,
             0o700,
             "re-opening the keystore must re-tighten the keys directory"
+        );
+
+        // The `ca/` subdirectory is created at 0700 by the store...
+        let ca_dir = dir.join("ca");
+        let ca_mode = fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(ca_mode & 0o777, 0o700);
+
+        // ...and a restored volume that left it permissive is re-tightened
+        // by the next open, exactly like the parent directory.
+        fs::set_permissions(&ca_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::metadata(&ca_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the fixture must start permissive, or the test proves nothing"
+        );
+        let _reopened = KeyStore::open(&dir).unwrap();
+        let ca_mode = fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(
+            ca_mode & 0o777,
+            0o700,
+            "re-opening the keystore must re-tighten the ca/ subdirectory"
         );
     }
 
