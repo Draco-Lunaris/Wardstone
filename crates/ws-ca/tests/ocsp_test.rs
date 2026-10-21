@@ -110,6 +110,17 @@ fn parse_ca_cert(pem: &str) -> X509Certificate<'static> {
 /// Run `openssl ocsp` over the response and return its output, or `None`
 /// when the OpenSSL binary is not installed (the caller then skips the
 /// interop assertions).
+///
+/// The issuer is passed twice: as `-issuer` (which cert the answer is
+/// about) and as `-CAfile` (the trust anchor for verifying the
+/// responder's own signature). The second one is not optional on newer
+/// OpenSSL: 3.0.22 and later resolve the responder certificate embedded in
+/// the response against the trust store, so a self-signed test root that is
+/// in no store fails with "ocsp_verify_signer: certificate verify error:
+/// Verify error: self-signed certificate" even though the response itself
+/// is perfectly valid. Older releases (3.0.13) skipped that check and
+/// reported "Response verify OK" either way. Passing `-CAfile` is correct
+/// for every version and is what a real client does.
 fn openssl_ocsp(
     test_name: &str,
     ca_pem: &str,
@@ -131,6 +142,8 @@ fn openssl_ocsp(
         .arg(&leaf_path)
         .arg("-respin")
         .arg(&resp_path)
+        .arg("-CAfile")
+        .arg(&ca_path)
         .arg("-text")
         .output();
     let _ = fs::remove_file(&ca_path);

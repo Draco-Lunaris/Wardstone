@@ -259,6 +259,15 @@ fn openssl_crl_verify(crl_pem: &str, ca_pem: &str) -> String {
 /// <resp_der> -text` and return its combined output. The response
 /// bytes are written to a scratch file first (`-respin` reads DER from
 /// a file).
+///
+/// The CA is passed as `-CAfile` as well as `-issuer`: it is the trust
+/// anchor for verifying the responder's own signature. OpenSSL 3.0.22
+/// and later resolve the responder certificate embedded in the response
+/// against the trust store, so a self-signed test root that is in no
+/// store fails with "ocsp_verify_signer: certificate verify error:
+/// Verify error: self-signed certificate" even though the response is
+/// valid. Older releases skipped that check. Passing `-CAfile` is
+/// correct for every version and is what a real client does.
 fn openssl_ocsp_parse(ca_pem: &str, leaf_pem: &str, resp_der: &[u8]) -> String {
     let ca_path = temp_path("ocsp-ca.pem");
     let leaf_path = temp_path("ocsp-leaf.pem");
@@ -274,6 +283,8 @@ fn openssl_ocsp_parse(ca_pem: &str, leaf_pem: &str, resp_der: &[u8]) -> String {
         .arg(&leaf_path)
         .arg("-respin")
         .arg(&resp_path)
+        .arg("-CAfile")
+        .arg(&ca_path)
         .arg("-text")
         .output();
     let _ = fs::remove_file(&ca_path);
