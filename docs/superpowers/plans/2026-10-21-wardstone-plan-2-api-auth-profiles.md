@@ -6,8 +6,12 @@
 
 **Architecture:** Extends the six-crate workspace Plan 1 built, plus a seventh crate for the binary. `ws-core` gains the shared access vocabulary (capabilities, roles, actor types) and the schema for users, credentials, and profiles; `ws-auth` gains the house auth pattern (JWT + refresh tokens, argon2id, TOTP, OIDC) and depends on `ws-core`; `ws-api` gains an axum REST surface over `/api/v1/`; `ws-web` gains the TLS front door that path-proxies the API and serves the first-run setup page; a new `wardstone` crate produces the single binary with its `ui`/`api` invocation modes. `ws-ca` gains EKU support, a leaf-key enum, a refusal instead of a silent clamp, and a keystore slot for the setup certificate.
 
-**Dependency graph (acyclic — this is a hard constraint):**
-`ws-core` ← `ws-auth` ← `ws-api` ← `ws-web` ← `wardstone`, and `ws-ca` ← `ws-core`. Nothing depends on `ws-auth` except `ws-api`, `ws-web`, and `wardstone`.
+**Dependency graph (acyclic — this is a hard constraint).** The full edge list:
+`ws-ca → ws-core`; `ws-auth → ws-core`; `ws-api → ws-core, ws-auth, ws-ca`; `ws-web → ws-core, ws-auth, ws-api, ws-ca`; `wardstone → ws-core, ws-auth, ws-api, ws-web`.
+**`ws-core` depends on nothing but `ws-ca` is not required by it — and `ws-core` must never depend on `ws-auth`, `ws-api`, or `ws-web`.** Anything `ws-core` needs from those crates moves into `ws-core` (or `ws-ca`) instead. In particular:
+- The **access vocabulary** (`Capability`, `Role`, `ActorType`, `AuthMethod`, `Actor`) lives in `ws-core`, so `ws-auth` re-exports it rather than defining it.
+- The **refusal type** `Actor::require` returns is `CoreError`, not `ws-auth`'s `AuthError` — `ws-core` cannot name a `ws-auth` type without closing the cycle. `AuthError` stays in `ws-auth` for its own flows, and `ws-api` maps it.
+- The **built-in default profiles** (`default_profiles`) live in `ws-core`, so both `ws-api` and `ws-web` call the same function without either depending on the other.
 
 **Tech Stack:** Rust (edition 2021, rust-version 1.85), axum + tower + tower-http, jsonwebtoken, argon2, totp-rs, reqwest, sqlx 0.8 (Postgres, numbered migrations, `REQUIRED_MIGRATION_COUNT`), rcgen 0.14.10, x509-parser 0.18.1, der 0.8.2, chacha20poly1305 0.11 (already pinned — used for the secret-encryption helper), sha2, sha1, tokio, uuid v4, chrono, serde/serde_json, tracing, thiserror.
 
@@ -26,7 +30,7 @@
 - House rule: no AI co-author attribution in commits. Short conventional-commit subjects.
 - Migration convention: every migration is a new numbered file; `REQUIRED_MIGRATION_COUNT` in `crates/ws-core/src/db.rs` bumps with each one. **Never edit an applied migration** — sqlx checksums migration files as SHA-384 over the raw bytes, so even a trailing-newline change breaks every deployed database. Note that `connect()` runs the migrations *before* the count check, so a count mismatch in a deployed database surfaces as `CoreError::Migration` after the migrations succeed.
 - DB-gated tests are `#[ignore]`d and run with `-- --include-ignored` against a live Postgres. The test database is `postgres://wardstone:wardstone@localhost:5432/wardstone_test`.
-- **Test-suite conventions** (from `crates/ws-core/tests/repo_test.rs:12-38`): every DB-gated suite takes a **unique advisory-lock key** from the `0x0057_4144_5354_00xx` family and **sweeps its own rows first** (FK order), because `db_test.rs` asserts `tenants` is empty after the suite runs. The keys in use: `0003` (ca suite), `0004` (certificate suite), `0005` (audit suite), `0006` (serial suite), `0007` (ocsp suite), `0008` (worker suite), `0009` (smoke suite). **This plan's new suites take:** `000a` (schema suite, ws-core), `000b` (ws-core repo additions), `000c` (ws-auth service identity), `000d` (ws-auth one-shot), `000e` (ws-api), `000f` (ws-web setup), `0010` (e2e).
+- **Test-suite conventions** (from `crates/ws-core/tests/repo_test.rs:12-38`): every DB-gated suite takes a **unique advisory-lock key** from the `0x0057_4144_5354_00xx` family and **sweeps its own rows first** (FK order), because `db_test.rs` asserts `tenants` is empty after the suite runs. **The keys already in use are `0003` through `000a`** (verified by grep: `0003`, `0004`, `0005`, `0006`, `0007`, `0008`, `0009`, `000a` — `000a` is the tenant-FK lock in `repo_test.rs:93`). **This plan's new suites take:** `000b` (schema suite, ws-core), `000c` (ws-core repo additions), `000d` (ws-auth service identity), `000e` (ws-auth one-shot), `000f` (ws-api), `0010` (ws-web setup), `0011` (e2e).
 
 ## Review Focus
 
@@ -60,17 +64,18 @@ The five input classes the spec implies that task tests may not cover, with the 
   - `ws_auth::jwt::RefreshClaims` — `user_id: Uuid`, `jti: String`, `exp: i64`.
   - `ws_auth::jwt::issue_access_token(&AccessClaims, &JwtKeys) -> Result<String, AuthError>`.
   - `ws_auth::jwt::validate_access_token(&str, &JwtKeys) -> Result<AccessClaims, AuthError>`.
-  - `ws_auth::jwt::JwtKeys` — `signing_key_pem: String`, `verification_key_pem: String`, `ttl_secs: i64`. `JwtKeys::from_ed25519_pem(&str) -> Result<Self, AuthError>` — takes the **private** PEM and derives the verification key from it. `JwtKeys::load(dir: &Path) -> Result<Self, AuthError>` — reads `<dir>/jwt-signing-key.pem` (the Ed25519 private key, mode 0600) and derives the verification key; returns `AuthError::Config` if the file is missing (the key is provisioned at setup — Task 11).
+  - `ws_auth::jwt::JwtKeys` — `signing_key_pem: String`, `verification_key_pem: String`, `ttl_secs: i64`. `JwtKeys::load_or_create(dir: &Path) -> Result<Self, AuthError>` — **reads the two key files if they exist, and generates them if they do not**: `<dir>/jwt-signing-key.pem` (the Ed25519 **private** key, mode 0600) and `<dir>/jwt-verify-key.pem` (the public key). The house keeps exactly these two files (`pm-auth/src/jwt.rs:129-130` produces the public one with `openssl pkey -pubout`), and **`jsonwebtoken`'s `DecodingKey::from_ed_pem` accepts only an Ed25519 *public*-key PEM** — a private PKCS#8 PEM is rejected with `InvalidKeyFormat` — so the verification key cannot be derived by the library and the two-file layout is the correct one. Generating the pair on first boot is what makes the setup page reachable at all: the binary loads the keys **before** the setup form exists, so the keys must be creatable on a virgin volume.
+    **Operational note to carry into the docs:** losing `jwt-verify-key.pem` invalidates every issued token (users re-login); losing both means new tokens are signed with a different key. Neither is a data-loss event — the CA keys are separate.
 
 **Notes for the implementer:**
 - The house pattern is `linux-patch-manager/crates/pm-auth` — read `jwt.rs` and `password.rs` first. The house uses Ed25519 keys in PEM form; keep that. The house's `AccessClaims` uses `sub: String`; this plan diverges with `user_id: Uuid` — the house's `AccessClaims::user_id()` helper is replaced by reading the field.
 - The house hashes **refresh tokens with SHA-256** (`pm-auth/src/refresh.rs:11,46,100,153`), not argon2id, despite the migration's comment claiming otherwise. **SHA-256 is correct for bearer tokens** — argon2id's slowness is for user-chosen passwords.
-- **Workspace dependencies to add:** `axum`, `tower`, `tower-http`, `jsonwebtoken`, `hmac`, `reqwest`, `totp-rs`, `base32`, `governor`, `tower_governor`, `rustls`, `tokio-rustls`, `axum-server`, `reqwest`. `argon2` (0.6.0), `sha2` (0.10.9), `base64` (0.23.1), `sha1`, `chacha20poly1305` (0.11.0), and `sqlx` are **already pinned** — do not re-add them. The house pins `jsonwebtoken = { version = "10", features = ["rust_crypto"] }` and `totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }` — match those.
+- **Workspace dependencies to add:** `axum`, `tower`, `tower-http`, `jsonwebtoken`, `hmac`, `reqwest`, `totp-rs`, `base32`, `governor`, `tower_governor`, `rustls`, `tokio-rustls`, `axum-server`, and **`hex`**. `argon2` (0.6.0), `sha2` (0.10.9), `base64` (0.23.1), `sha1`, `chacha20poly1305` (0.11.0), `sqlx`, `rand`, `uuid`, `chrono`, `serde`, `serde_json`, `thiserror`, and `zeroize` are **already pinned** — do not re-add them to `[workspace.dependencies]`, but `ws-auth/Cargo.toml` must reference the ones it uses with `workspace = true`: `argon2`, `base32`? (no — `totp-rs` provides base32), `chacha20poly1305`? (no — `ws-auth` does not encrypt; `ws-core`'s `SecretBox` does), `hex`, `jsonwebtoken`, `rand`, `serde`, `serde_json`, `sha2`, `thiserror`, `tokio`, `uuid`, `chrono`, `hmac`, `reqwest`, `totp-rs`, `ws-core`. The house pins `jsonwebtoken = { version = "10", features = ["rust_crypto"] }`, `totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }`, and `hex = "0.4"` — match those.
 - `ws-auth` gains a `ws-core` dependency in Task 2 (for the shared vocabulary); it is added to `ws-auth/Cargo.toml` in Task 2, not here.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/ws-auth/tests/jwt_test.rs`: an access token validates and carries its claims; a token signed by a different key is `TokenInvalid`; an expired token is `TokenExpired`; a tampered payload is `TokenInvalid`; `JwtKeys::from_ed25519_pem` derives a verification key that validates the token it signed; `JwtKeys::load` on a missing file is `AuthError::Config`. In `crates/ws-auth/tests/password_test.rs`: `hash_password` then `verify_password` returns true for the right password and false for the wrong one; two hashes of the same password differ (salted); the hash is a PHC argon2id string.
+In `crates/ws-auth/tests/jwt_test.rs`: an access token validates and carries its claims; a token signed by a different key is `TokenInvalid`; an expired token is `TokenExpired`; a tampered payload is `TokenInvalid`; `JwtKeys::load_or_create` on a missing directory **generates** the key pair, and a second call **returns the same keys** (it does not regenerate); the generated signing key file is mode 0600; a token signed with the loaded keys validates. In `crates/ws-auth/tests/password_test.rs`: `hash_password` then `verify_password` returns true for the right password and false for the wrong one; two hashes of the same password differ (salted); the hash is a PHC argon2id string.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -113,7 +118,8 @@ Expected: PASS.
   - `ws_core::models::rbac::Actor` — the one actor type: `actor_type: ActorType`, `actor_id: String`, `auth_method: AuthMethod`, `capabilities: Vec<Capability>`, `session_id: Option<Uuid>`, `tenant_id: Uuid`, `minted_by: Option<String>` (the human who minted a one-shot token; `None` for other actors).
   - `ws_core::models::rbac::role_capabilities(role: Role) -> &'static [Capability]` — the bundles: `Admin` → **every** capability; `Issuer` → `[Issue, ReadCertificates, ReadCas, ReadProfiles]`; `Viewer` → `[ReadCertificates, ReadCas, ReadProfiles, ReadAudit]`.
   - `ws_core::models::rbac::Actor::can(&self, cap: Capability) -> bool`.
-  - `ws_core::models::rbac::Actor::require(&self, cap: Capability) -> Result<(), AuthError>` — `Err(AuthError::Forbidden)` when the capability is absent.
+  - `ws_core::models::rbac::Actor::require(&self, cap: Capability) -> Result<(), CoreError>` — `Err(CoreError::Forbidden)` when the capability is absent. **It returns `CoreError`, not `ws-auth`'s `AuthError`** — `ws-core` cannot name a `ws-auth` type without creating the cycle `ws-core → ws-auth → ws-core`. `CoreError` gains a `Forbidden` variant for this.
+  - `ws_core::models::profile::default_profiles(domain: &str, cidrs: &[String]) -> Vec<ProfileRevisionModel>` — the built-in profiles: `web-server` (key type `rsa2048`, key usages `digital_signature` + `key_encipherment`, EKU `server_auth`, lifetime 30 days) and `web-server-ecdsa` (key type `ecdsa-p256`, key usages `digital_signature`, EKU `server_auth`, lifetime 30 days), both with the SAN pattern list `[domain, *.domain, …cidrs]`. **The key usages are not optional** — Task 7 makes an empty list illegal, so a profile without them could issue nothing. Lives in `ws-core` so `ws-api` and `ws-web` can both call it without either depending on the other.
   - `ws_core::crypto::SecretBox` — `seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8> /*nonce*/), CoreError>` and `open(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Zeroizing<Vec<u8>>, CoreError>`, using **chacha20poly1305** (already a workspace pin) with a key read from a file. `SecretBox::load(path: &Path) -> Result<Self, CoreError>` reads a 32-byte key from `<path>`; `SecretBox::create(path: &Path) -> Result<Self, CoreError>` generates and writes it with mode 0600 if absent. The key file is the TOTP/WebAuthn secret-encryption key, created at setup under the keys volume.
 
 **Notes for the implementer:**
@@ -123,7 +129,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/ws-core/tests/rbac_test.rs`: `Admin` holds every capability (assert the set equals the full enum list, so a new capability cannot be added without deciding admin's bundle); `Issuer` holds `Issue` but not `ManageProfiles`; `Viewer` holds `ReadAudit` but not `Issue`; `Actor::can` reflects the capability list; `Actor::require` returns `Err(AuthError::Forbidden)` for an absent capability and `Ok` for a present one; every `Capability`, `Role`, `ActorType`, and `AuthMethod` round-trips through `as_str`/`from_str`, **and each `as_str()` equals its serde name**. A separate `crates/ws-core/tests/crypto_test.rs`: `SecretBox::seal` then `open` round-trips; `open` with a tampered ciphertext is a typed error; `create` then `load` round-trips; the key file is mode 0600.
+In `crates/ws-core/tests/rbac_test.rs`: `Admin` holds every capability (assert the set equals the full enum list, so a new capability cannot be added without deciding admin's bundle); `Issuer` holds `Issue` but not `ManageProfiles`; `Viewer` holds `ReadAudit` but not `Issue`; `Actor::can` reflects the capability list; `Actor::require` returns `Err(CoreError::Forbidden)` for an absent capability and `Ok` for a present one; every `Capability`, `Role`, `ActorType`, and `AuthMethod` round-trips through `as_str`/`from_str`, **and each `as_str()` equals its serde name**. A separate `crates/ws-core/tests/crypto_test.rs`: `SecretBox::seal` then `open` round-trips; `open` with a tampered ciphertext is a typed error; `create` then `load` round-trips; the key file is mode 0600.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -152,7 +158,7 @@ Subject: `feat(ws-core): capability vocabulary, actor types, and the secret-encr
 - Test: `crates/ws-auth/tests/mfa_totp_test.rs`
 
 **Interfaces:**
-- Consumes: Task 1's `AuthError`; Task 2's `SecretBox`.
+- Consumes: Task 1's `AuthError`.
 - Produces:
   - `ws_auth::mfa_totp::generate_secret() -> Result<String, AuthError>` — base32 secret, 20 bytes.
   - `ws_auth::mfa_totp::verify_code(&str /*username*/, &str /*secret*/, &str /*code*/) -> Result<bool, AuthError>` — the house signature (`pm-auth/src/mfa_totp.rs:52`).
@@ -199,7 +205,7 @@ Subject: `feat(ws-auth): TOTP MFA and generic OIDC SSO`.
 - Create: `crates/ws-core/migrations/007_users_and_credentials.sql`
 - Create: `crates/ws-core/migrations/008_profiles.sql`
 - Modify: `crates/ws-core/src/db.rs` (`REQUIRED_MIGRATION_COUNT` 6 → 8)
-- Test: `crates/ws-core/tests/schema_test.rs`
+- Test: `crates/ws-core/tests/schema_test.rs` (advisory lock `0x0057_4144_5354_000c`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -207,7 +213,7 @@ Subject: `feat(ws-auth): TOTP MFA and generic OIDC SSO`.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/ws-core/tests/schema_test.rs` (DB-gated, `#[ignore]`d, advisory lock `0x0057_4144_5354_000a`, sweeping its own rows): after `connect()`, `users`, `refresh_tokens`, `oidc_config`, `service_identities`, `service_identity_capabilities`, `one_shot_tokens`, `one_shot_token_capabilities`, `role_capabilities`, `profiles`, `profile_revisions` all exist; `users` has `tenant_id` and its `username`/`email` uniqueness is **per-tenant**; `audit_log` has `auth_method` (NOT NULL) and `session_id` (nullable); `certificates` has a nullable `profile_revision_id` FK; `cas` has a composite FK from `(parent_id, tenant_id)`.
+In `crates/ws-core/tests/schema_test.rs` (DB-gated, `#[ignore]`d, advisory lock `0x0057_4144_5354_000c`, sweeping its own rows): after `connect()`, `users`, `refresh_tokens`, `oidc_config`, `service_identities`, `service_identity_capabilities`, `one_shot_tokens`, `one_shot_token_capabilities`, `role_capabilities`, `profiles`, `profile_revisions` all exist; `users` has `tenant_id` and its `username`/`email` uniqueness is **per-tenant**; `audit_log` has `auth_method` (NOT NULL) and `session_id` (nullable); `certificates` has a nullable `profile_revision_id` FK; `cas` has a composite FK from `(parent_id, tenant_id)`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -243,7 +249,8 @@ CREATE TABLE users (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (tenant_id, username),
     UNIQUE (tenant_id, email),
-    UNIQUE (tenant_id, oidc_sub)
+    UNIQUE (tenant_id, oidc_sub),
+    UNIQUE (tenant_id, azure_oid)
 );
 ```
 Notes: the house's `username`/`email` are **globally** UNIQUE (`001_initial_schema.sql:87,89`); narrowed to per-tenant here. The house's `azure_oid` is globally UNIQUE — **narrowed to per-tenant as well**, so a second tenant is not blocked by another tenant's Azure id. The two lockout columns come from the house's `012_account_lockout.sql`, not `001`. `role` and `auth_provider` are **TEXT** (the house uses enum types; Wardstone uses text so the capability model can extend without a type migration). `oidc_sub` is the generic OIDC subject (the house added it in `014_oidc_provider.sql:20`); it is the stable identity — the email is not.
@@ -260,18 +267,11 @@ Notes: the house's `username`/`email` are **globally** UNIQUE (`001_initial_sche
 
 **There is no `user_groups` table and no groups model in v1** — Wardstone v1 has roles, not groups. (The house's `user_groups` references a `groups` table Wardstone does not have; porting it verbatim would fail with "relation groups does not exist".)
 
-**The audit_log changes, in the order that works on a non-empty table:**
-```sql
-ALTER TABLE audit_log ADD COLUMN auth_method TEXT NULL;
-ALTER TABLE audit_log ADD COLUMN session_id uuid NULL;
-UPDATE audit_log SET auth_method = CASE actor_type
-    WHEN 'user' THEN 'session'
-    WHEN 'system' THEN 'system'
-    ELSE 'system' END
-  WHERE auth_method IS NULL;
-ALTER TABLE audit_log ALTER COLUMN auth_method SET NOT NULL;
-```
-The `CASE` covers **every** `actor_type` value the closed enum has (`user`, `acme_account`, `system`) — a partial backfill would leave rows NULL and the `SET NOT NULL` would abort the migration. `acme_account` maps to `system` until ACME lands (Plan 4), at which point `AuthMethod::AcmeAccount` takes over.
+**The `audit_log` changes are NOT in this migration.** They land in **Task 5's** migration
+(`009_audit_auth_method.sql`), in the same task that changes the `AuditEntry` model and
+the worker's insert — so the schema change and every code change that satisfies it
+land together, and there is never a window where the database has a NOT NULL column
+the code does not populate. The migration content is specified in Task 5.
 
 **008 — profiles.**
 ```sql
@@ -311,7 +311,7 @@ ALTER TABLE cas
 The `cas` composite FK is well-founded: `cas` already carries `cas_id_tenant_key UNIQUE (id, tenant_id)` from migration 006.
 
 **The legacy backfill for existing `certificates.profile_name` values** (in this same migration 008, since the column stays):
-`certificates.profile_name` is `NOT NULL` today (`002_certificates_and_revocation.sql:21`) and holds free-form labels matching no profile. The backfill creates, per tenant, one `profiles` row named `legacy`, and **one `profile_revisions` row per distinct label** — numbered **1, 2, 3… in a deterministic order** (the uniqueness constraint is `(profile_id, revision)`, so every legacy revision needs its own number), each carrying the label as its `name`, `is_legacy = true`, and a permissive constraint set that is never used for issuance. `profiles.current_revision_id` points at the **highest-numbered** legacy revision. Every `certificates` row is repointed at the revision matching its label.
+`certificates.profile_name` is `NOT NULL` today (`002_certificates_and_revocation.sql:21`) and holds free-form labels matching no profile. The backfill creates, per tenant, one `profiles` row named `legacy`, and **one `profile_revisions` row per distinct label** — numbered **1, 2, 3… in a deterministic order** (the uniqueness constraint is `(profile_id, revision)`, so every legacy revision needs its own number), each carrying the label as its `name` and `is_legacy = true`. The NOT NULL constraint columns are filled with **explicit values**, not defaults: `key_type = 'rsa2048'`, `key_usages = ARRAY['digital_signature','key_encipherment']`, `eku = ARRAY['server_auth']`, `lifetime_days = 30`, and `san_patterns` = the tenant's default domain scope where one exists, otherwise `ARRAY['*']`. The constraint set is never used for issuance — it exists so the row is complete and readable, and `is_legacy` marks it as such. `profiles.current_revision_id` points at the **highest-numbered** legacy revision. Every `certificates` row is repointed at the revision matching its label.
 
 **The `certificates.profile_name` column is RETAINED** as a denormalised label. It is not dropped in this plan: dropping it requires a separate migration after the code stops referencing it, and the spec's Global Constraints forbid editing an applied migration. The authority for a certificate's policy is `profile_revision_id`; `profile_name` is display only. (Deferred to a later plan.)
 
@@ -328,9 +328,11 @@ Subject: `feat(db): users, credentials, profiles, and tenant-scoped audit column
 
 ---
 
-### Task 5: `ws-core` models and repositories for the new schema
+### Task 5: `ws-core` models, repositories, and the audit auth-method migration
 
 **Files:**
+- Create: `crates/ws-core/migrations/009_audit_auth_method.sql`
+- Modify: `crates/ws-core/src/db.rs` (`REQUIRED_MIGRATION_COUNT` 8 → 9)
 - Create: `crates/ws-core/src/models/user.rs`
 - Create: `crates/ws-core/src/models/profile.rs`
 - Create: `crates/ws-core/src/models/credential.rs`
@@ -339,26 +341,49 @@ Subject: `feat(db): users, credentials, profiles, and tenant-scoped audit column
 - Create: `crates/ws-core/src/repo/profile_repo.rs`
 - Create: `crates/ws-core/src/repo/credential_repo.rs`
 - Create: `crates/ws-core/src/repo/role_repo.rs`
+- Create: `crates/ws-core/src/repo/refresh_repo.rs`
+- Create: `crates/ws-core/src/repo/oidc_repo.rs`
 - Create: `crates/ws-core/src/profile_match.rs`
 - Modify: `crates/ws-core/src/repo/mod.rs`
-- Modify: `crates/ws-core/src/models/audit.rs` (`AuditEntry` gains `auth_method` and `session_id`; the `ActorType` definition moves to `models/rbac.rs` and is re-exported here)
+- Modify: `crates/ws-core/src/models/audit.rs` (`AuditEntry` gains `auth_method` and `session_id`; the `ActorType` definition and its `FromStr`/`UnknownActorType` error live in `models/rbac.rs` — Task 2's — and `models/audit.rs` re-exports them)
 - Modify: `crates/ws-core/src/repo/audit_repo.rs` (binds the new columns)
-- Modify: `crates/ws-core/src/models/certificate.rs` and `src/repo/certificate_repo.rs` (gain `profile_revision_id`; keep `profile_name` as the display label)
-- **Modify: the four Plan 1 call sites that construct `AuditEntry` or `CertificateModel` by struct literal** — `crates/ws-worker/src/jobs.rs:294`, `crates/ws-ca/tests/smoke_test.rs:385` and `:534`, `crates/ws-worker/tests/scheduler_test.rs:199`, and the in-file unit test in `crates/ws-core/src/models/audit.rs:131`. These are hard compile errors when the models gain fields, and they are not optional.
-- Test: extend `crates/ws-core/tests/repo_test.rs` (advisory lock `0x0057_4144_5354_000b`); create `crates/ws-core/tests/profile_match_test.rs`
+- Modify: `crates/ws-core/src/models/certificate.rs` and `src/repo/certificate_repo.rs` (gain `profile_revision_id: Option<Uuid>`; keep `profile_name` as the display label)
+- **Modify: every construction site of `AuditEntry` or `CertificateModel` in the workspace** — there are **8** `AuditEntry` literals and **7** `CertificateModel` literals, including the `try_into_model` conversions in `audit_repo.rs` and `certificate_repo.rs`. The known sites: `crates/ws-worker/src/jobs.rs:294`, `crates/ws-ca/tests/smoke_test.rs:385` and `:530`, `crates/ws-worker/tests/scheduler_test.rs:199` and `:500`, `crates/ws-core/src/models/audit.rs:131`, plus the two `try_into_model` conversions. **Grep for them** — the list is not closed, and each one is a hard compile error once the models gain fields.
+- Test: extend `crates/ws-core/tests/repo_test.rs` (advisory lock `0x0057_4144_5354_000d`); create `crates/ws-core/tests/profile_match_test.rs`
 
 **Interfaces:**
-- Consumes: Task 4's schema; Task 2's `Capability`, `Role`, `ActorType`, `AuthMethod`, `Actor`.
+- Consumes: Task 4's schema; Task 2's `Capability`, `Role`, `ActorType`, `AuthMethod`, `Actor`, `SecretBox`.
+- Produces:
+  - **Migration `009_audit_auth_method.sql`** — the audit columns land HERE, with the code that populates them:
+    ```sql
+    ALTER TABLE audit_log ADD COLUMN auth_method TEXT NULL;
+    ALTER TABLE audit_log ADD COLUMN session_id uuid NULL;
+    UPDATE audit_log SET auth_method = CASE actor_type
+        WHEN 'user' THEN 'session'
+        WHEN 'system' THEN 'system'
+        ELSE 'system' END
+      WHERE auth_method IS NULL;
+    ALTER TABLE audit_log ALTER COLUMN auth_method SET NOT NULL;
+    ```
+    The `CASE` covers **every** `actor_type` value the closed enum has (`user`, `acme_account`, `system`) — a partial backfill would leave rows NULL and the `SET NOT NULL` would abort the migration. `acme_account` maps to `system` until ACME lands (Plan 4). `session_id` stays **nullable** (null for machine actors) and needs no backfill.
+  - `ws_core::models::credential::RefreshTokenModel` — id, tenant_id, user_id, token_hash, issued_at, last_used_at, expires_at, revoked, revoked_at, user_agent, ip_address.
+  - `ws_core::models::credential::OidcConfigModel` — tenant_id, provider_type, display_name, discovery_url, client_id, client_secret, redirect_uri, scopes.
+  - `ws_core::repo::refresh_repo::RefreshTokenRepo` — stateless, `RefreshTokenRepo::new()`. `insert`, `get_by_hash`, `rotate` (revoke the old, insert the new), `revoke`, `touch_last_used`, `purge_expired`.
+  - `ws_core::repo::oidc_repo::OidcConfigRepo` — stateless, `OidcConfigRepo::new()`. `get(tenant_id)`, `upsert(config)`.
+  - `ws_core::repo::user_repo::UserRepo` — **stateless**: `#[derive(Default)] pub struct UserRepo;` with `UserRepo::new() -> Self { Self::default() }` (a bare `new()` with no arguments trips `clippy::new_without_default`, and `clippy -D warnings` is a house rule). `insert(&self, executor: impl PgExecutor<'_>, u: &UserModel) -> Result<(), CoreError>`; `get_by_username(executor, tenant_id, username)`; `get_by_id(executor, id)`; `get_by_oidc_sub(executor, tenant_id, sub)`; `get_by_email(executor, tenant_id, email)`; `list_by_tenant(executor, tenant_id, page, page_size)`; `update_role(executor, id, role)`; `deactivate(executor, id)`; `record_failed_login(executor, id)`; `clear_failed_logins(executor, id)`; `lock_until(executor, id, until)`.
 - Produces:
   - `ws_core::models::user::UserModel` — id, tenant_id, username, display_name, email, role, auth_provider, password_hash (Option), totp_secret_encrypted (Option), totp_secret_nonce (Option), webauthn_credential (Option), mfa_enabled, azure_oid (Option), oidc_sub (Option), is_active, force_password_reset, failed_login_attempts, locked_until (Option), last_login_at (Option), created_at, updated_at.
   - `ws_core::models::profile::ProfileModel` — id, tenant_id, name, description, current_revision_id (Option), created_at.
   - `ws_core::models::profile::ProfileRevisionModel` — id, profile_id, revision, name, key_type, key_usages (Vec<String>), eku (Vec<String>), lifetime_days (i32), san_patterns (Vec<String>), is_legacy, created_at, actor_id.
   - `ws_core::models::credential::ServiceIdentityModel` — id, tenant_id, name, description, created_by, token_hash, created_at, expires_at, revoked_at, last_used_at.
   - `ws_core::models::credential::OneShotTokenModel` — id, tenant_id, minted_by, token_hash, created_at, expires_at, used_at.
-  - `ws_core::repo::user_repo::UserRepo` — **stateless**: `UserRepo::new()`. `insert(&self, executor: impl PgExecutor<'_>, u: &UserModel) -> Result<(), CoreError>`; `get_by_username(executor, tenant_id, username)`; `get_by_id(executor, id)`; `get_by_oidc_sub(executor, tenant_id, sub)`; `get_by_email(executor, tenant_id, email)`; `list_by_tenant(executor, tenant_id, page, page_size)`; `update_role(executor, id, role)`; `deactivate(executor, id)`; `record_failed_login(executor, id)`; `clear_failed_logins(executor, id)`; `lock_until(executor, id, until)`.
+  - `ws_core::repo::user_repo::UserRepo` — **stateless**: `#[derive(Default)] pub struct UserRepo;` with `UserRepo::new() -> Self { Self::default() }` (a bare `new()` with no arguments trips `clippy::new_without_default`, and `clippy -D warnings` is a house rule). `insert(&self, executor: impl PgExecutor<'_>, u: &UserModel) -> Result<(), CoreError>`; `get_by_username(executor, tenant_id, username)`; `get_by_id(executor, id)`; `get_by_oidc_sub(executor, tenant_id, sub)`; `get_by_email(executor, tenant_id, email)`; `list_by_tenant(executor, tenant_id, page, page_size)`; `update_role(executor, id, role)`; `deactivate(executor, id)`; `record_failed_login(executor, id)`; `clear_failed_logins(executor, id)`; `lock_until(executor, id, until)`.
   - `ws_core::repo::profile_repo::ProfileRepo` — stateless, `ProfileRepo::new()`. `insert_profile(executor, p)`; `insert_revision(executor, r)`; `get_profile(executor, id)`; `get_revision(executor, id)`; `current_revision(executor, profile_id)`; `list_by_tenant(executor, tenant_id, page, page_size)`; `list_revisions(executor, profile_id)`; `update(executor, profile_id, new_revision) -> Result<(), CoreError>` — **the optimistic-concurrency write**: `UPDATE profiles SET current_revision_id = $new WHERE id = $id AND current_revision_id = $expected`, and `Ok(())` only when a row was affected — a zero-row update means the revision moved and the caller retries. `delete(executor, id)`.
   - `ws_core::repo::credential_repo::CredentialRepo` — stateless, `CredentialRepo::new()`. `insert_service_identity(executor, s)`; `get_service_identity_by_hash(executor, hash)`; `list_service_identities(executor, tenant_id, page, page_size)`; `revoke_service_identity(executor, id)`; `set_service_identity_capabilities(executor, id, caps)`; `service_identity_capabilities(executor, id)`; `insert_one_shot_token(executor, t)`; `get_one_shot_by_hash(executor, hash)`; **`consume_one_shot_by_hash(executor, hash) -> Result<Option<OneShotTokenModel>, CoreError>`** — the lookup-and-mark in ONE statement: `UPDATE one_shot_tokens SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING id, tenant_id, minted_by, created_at, expires_at, used_at`. A row count of zero means the token was already used, expired, or unknown; one means this caller consumed it. **Two concurrent consumers cannot both succeed.**
-  - `ws_core::repo::role_repo::RoleRepo` — stateless, `RoleRepo::new()`. `capabilities_for_role(executor, role) -> Result<Vec<Capability>, CoreError>` — **reads the `role_capabilities` table**; this is the runtime authority. `seed_role_capabilities(executor) -> Result<(), CoreError>` — writes the bundles from `ws_core::models::rbac::role_capabilities()` and is **idempotent** (`ON CONFLICT (role, capability) DO NOTHING`).
+  - `ws_core::repo::role_repo::RoleRepo` — stateless, `#[derive(Default)] pub struct RoleRepo;` with `new()`. `capabilities_for_role(executor, role) -> Result<Vec<Capability>, CoreError>` — **reads the `role_capabilities` table**; this is the runtime authority. `seed_role_capabilities(executor) -> Result<(), CoreError>` — writes the bundles from `ws_core::models::rbac::role_capabilities()` and is **idempotent** (`ON CONFLICT (role, capability) DO NOTHING`).
+    **The table is seeded by migration 007**, not by this method: the seed rows are part of the schema, so a fresh database is never in a state where every role resolves to no capabilities. `seed_role_capabilities()` remains available for an operator who edits the table by hand and wants to restore the defaults.
+  - `ws_core::models::rbac::KeyUsagePurpose` — a **Wardstone** enum, not rcgen's: `DigitalSignature`, `KeyEncipherment`, `DataEncipherment`, `KeyAgreement`, `KeyCertSign`, `CrlSign`, `ContentCommitment`, `EncipherOnly`, `DecipherOnly`. `as_str()` returns **exactly** `digital_signature`, `key_encipherment`, `data_encipherment`, `key_agreement`, `key_cert_sign`, `crl_sign`, `content_commitment`, `encipher_only`, `decipher_only` (snake_case, matching the house style — the RFC 5280 aliases like `digitalSignature` are **not** used). `from_str`. And `to_rcgen(&self) -> rcgen::KeyUsagePurpose` — the conversion from the stored strings to the engine's type. **`LeafSpec.key_usages` becomes `Vec<KeyUsagePurpose>`** (Wardstone's), not rcgen's type, so the profile's `TEXT[]` and the engine's value come from one vocabulary.
+  - `ws_core::repo::paging(page: u32, page_size: u32) -> Result<(i64, i64), CoreError>` — **the shared helper, created HERE** (Task 5 needs it for its `list_by_tenant` methods; Task 6 replaces Plan 1's two copies with it). It returns `(limit, offset)`, matching the two existing copies (`certificate_repo.rs:261-266` and `audit_repo.rs:129-134`, both ending `Ok((i64::from(page_size), offset))` and both called as `let (limit, offset) = paging(page, page_size)?;` then `LIMIT $2 OFFSET $3`). It **clamps `page_size` to a maximum of 500**, and the clamped value is used in **both** the limit and the offset. Conversion is via `i64::try_from`, returning `CoreError::Config` on overflow.
   - `ws_core::profile_match::san_is_permitted(patterns: &[String], san: &str) -> Result<bool, CoreError>` — **the pattern matcher**, and the only place SAN-permission logic lives. `san` is either a DNS name or an IP literal; the function parses it and matches it against the profile's pattern list:
     - A pattern that parses as an **IP literal** is an IP pattern; a pattern containing `/` is a **CIDR** pattern; anything else is a **DNS name** pattern.
     - A DNS pattern matches **exactly** that name (case-insensitively). `example.com` does not match `sub.example.com`.
@@ -370,12 +395,14 @@ Subject: `feat(db): users, credentials, profiles, and tenant-scoped audit column
 
 **Notes for the implementer:**
 - **Every repository is stateless and every method takes an executor** — `executor: impl PgExecutor<'_>`. The repositories hold no `PgPool`; the caller passes `&pool` or `&mut *tx`. This is what lets a mutation and its audit row share one transaction. The bound needs the explicit lifetime (`impl PgExecutor<'_>`) — a bare `impl PgExecutor` does not compile (E0726). And inside a transaction, pass **`&mut *tx`** (the deref to `&mut PgConnection`): `&mut Transaction` does not implement `PgExecutor` in sqlx 0.8.6.
-- `AuditRepo::record` binds an explicit column list, so it must bind `auth_method` (NOT NULL) and `session_id`. The **worker** must supply `auth_method = 'system'` — Task 13 changes that call.
+- `AuditRepo::record` binds an explicit column list, so it must bind `auth_method` (NOT NULL) and `session_id`. **The worker sets `auth_method: AuthMethod::System` at its audit write in THIS task** — the worker's `crl_built` write is one of the construction sites listed above, and it must be updated here, in the same task that makes the column NOT NULL. (Task 13 then only *asserts* the value; it does not change the call site.)
 - The `users` table stores the TOTP secret **encrypted** with Task 2's `SecretBox` (`totp_secret_encrypted` + `totp_secret_nonce`, the house's column names). The helper is Task 2's; this task carries the two columns.
 
 - [ ] **Step 1: Write the failing tests**
 
-Extend `crates/ws-core/tests/repo_test.rs` (advisory lock `0x0057_4144_5354_000b`): a user inserts and reads back with its per-tenant uniqueness (a second tenant may reuse the same username and email); a failed login increments `failed_login_attempts` and sets `locked_until`; a profile inserts with a revision and `update` appends revision 2 and repoints `current_revision_id` while revision 1 remains retrievable; **`update` with a stale expected revision affects zero rows and returns an error** (the optimistic-concurrency property); a service identity stores capabilities and reads them back; a one-shot token is retrievable by hash, and **`consume_one_shot_by_hash` succeeds once and then returns `None`**; `RoleRepo::capabilities_for_role` returns the Task 2 bundles read from the table; `seed_role_capabilities` is idempotent; an audit entry round-trips with `auth_method` and `session_id`.
+Extend `crates/ws-core/tests/repo_test.rs` (advisory lock `0x0057_4144_5354_000d`): a user inserts and reads back with its per-tenant uniqueness (a second tenant may reuse the same username and email); a failed login increments `failed_login_attempts` and sets `locked_until`; a profile inserts with a revision and `update` appends revision 2 and repoints `current_revision_id` while revision 1 remains retrievable; **`update` with a stale expected revision affects zero rows and returns an error** (the optimistic-concurrency property); a service identity stores capabilities and reads them back; a one-shot token is retrievable by hash, and **`consume_one_shot_by_hash` succeeds once and then returns `None`**; `RoleRepo::capabilities_for_role` returns the Task 2 bundles read from the table (which migration 007 seeded); `seed_role_capabilities` is idempotent; a refresh token round-trips and rotates; an OIDC config round-trips; an audit entry round-trips with `auth_method` and `session_id`; **the worker's `crl_built` row is written with `auth_method = 'system'`** and survives the NOT NULL constraint.
+
+`paging()` (created in this task): `paging(0, 10)` returns `Ok((10, 0))` — **limit first, offset second**; `paging(0, 10_000)` returns `Ok((500, 0))` (clamped); `paging(0, u32::MAX)` returns `Ok((500, 0))`; `paging(2, 10)` returns `Ok((10, 20))` — the offset is `page * page_size`, so with the clamped page size it is `2 * 10 = 20`.
 
 **In a new `crates/ws-core/tests/profile_match_test.rs`** (pure, not DB-gated) — the matcher's rules, exhaustively: `example.com` matches `example.com` but **not** `sub.example.com`; `*.example.com` matches `a.example.com` and `a.b.example.com` but **not** `example.com`; matching is case-insensitive (`EXAMPLE.com` matches `example.com`); `10.0.0.0/8` matches `10.1.2.3` but not `11.0.0.1`; the IP pattern `10.0.0.5` matches that address; a bare `*` matches any DNS name but **not** an IP literal; `0.0.0.0/0` matches every IPv4 address; an unparsable pattern is a typed error rather than a silent non-match.
 
@@ -401,16 +428,14 @@ Subject: `feat(db): user, profile, and credential models and repositories`.
 
 **Files:**
 - Modify: all five Plan 1 repositories (`tenant_repo.rs`, `ca_repo.rs`, `certificate_repo.rs`, `audit_repo.rs`, `ocsp_repo.rs`) — become **stateless** (`pub struct AuditRepo;`) with `AuditRepo::new()`, and every method takes `executor: impl PgExecutor<'_>`
-- Modify: `crates/ws-core/src/repo/mod.rs` (a shared `paging()` helper with a maximum, replacing the two copies)
+- Modify: `crates/ws-core/src/repo/mod.rs` (the two existing `paging()` copies are replaced by Task 5's shared helper)
 - Modify: `crates/ws-ca/src/serial.rs` (`allocate_serial` takes the executor)
-- **Modify: every call site of the five repositories** — `crates/ws-core/tests/repo_test.rs`, `crates/ws-ca/tests/smoke_test.rs`, `crates/ws-ca/tests/serial_test.rs`, `crates/ws-worker/src/jobs.rs:136-139`, `crates/ws-worker/tests/scheduler_test.rs`
+- **Modify: every call site of the five repositories** — `crates/ws-core/tests/repo_test.rs`, `crates/ws-ca/tests/smoke_test.rs`, `crates/ws-worker/src/jobs.rs:137-139` (the repos are constructed at 137-139; 136 is `list_all_cas`), `crates/ws-worker/tests/scheduler_test.rs`. (`crates/ws-ca/tests/serial_test.rs` constructs no repository, but it **does** need editing for `allocate_serial`'s new signature.)
 - Test: extend `crates/ws-core/tests/repo_test.rs`
 
 **Interfaces:**
-- Consumes: Task 5's executor-style repos.
-- Produces:
-  - `ws_core::repo::paging(page: u32, page_size: u32) -> Result<(i64, i64), CoreError>` — the shared helper. **It returns `(limit, offset)`**, matching the two existing copies (`certificate_repo.rs:261-266` and `audit_repo.rs:129-134`, both of which end with `Ok((i64::from(page_size), offset))` and are called as `let (limit, offset) = paging(page, page_size)?;` then `LIMIT $2 OFFSET $3`). It **clamps `page_size` to a maximum of 500** and converts via `i64::try_from`, returning `CoreError::Config` on overflow.
-  - Every Plan 1 repo method now takes `executor: impl PgExecutor<'_>`.
+- Consumes: Task 5's executor-style repos and its shared `paging()` helper.
+- Produces: every Plan 1 repo method now takes `executor: impl PgExecutor<'_>`.
 
 **Notes for the implementer:**
 - The repos' `pool: PgPool` field and `new(&PgPool)` constructors become dead once every method takes an executor — and `clippy -D warnings` (a house rule) fails on unused struct fields. **The repos become stateless**: `pub struct AuditRepo;` with `AuditRepo::new()`. Update every construction site (listed above) to `AuditRepo::new()` and pass `&pool` (or `&mut *tx`) at each call.
@@ -420,12 +445,12 @@ Subject: `feat(db): user, profile, and credential models and repositories`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Extend `crates/ws-core/tests/repo_test.rs`: `paging(0, 10)` returns `Ok((10, 0))` — **limit first, offset second**; `paging(0, 10_000)` returns `Ok((500, 0))` (clamped); `paging(0, u32::MAX)` returns `Ok((500, 0))`; `paging(2, 10)` returns `Ok((10, 10))`. A repository method called with `&mut *tx` and one called with `&pool` both work (proving the generic executor).
+Extend `crates/ws-core/tests/repo_test.rs`: a repository method called with `&mut *tx` and one called with `&pool` both work (proving the generic executor); the two Plan 1 repos' `list_by_tenant` methods still return the right page after the widening. (`paging()`'s own tests live in Task 5, where the helper is created.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `DATABASE_URL=... cargo test -p ws-core --test repo_test -- --include-ignored`
-Expected: FAIL — `paging` is not shared and the repos are not stateless.
+Expected: FAIL — the Plan 1 repos are not yet stateless.
 
 - [ ] **Step 3: Widen the repositories and the serial allocator**
 
@@ -448,15 +473,17 @@ Subject: `refactor(db): stateless executor-agnostic repositories and a bounded p
 - Modify: `crates/ws-ca/src/lib.rs` (adds `pub mod leafkey;`)
 - Modify: `crates/ws-ca/src/ca.rs` (leaf key generation for every pinnable algorithm)
 - Modify: `crates/ws-ca/src/keystore.rs` (a setup-key slot; `has_stored_keys` counts it)
-- Test: extend `crates/ws-ca/tests/issue_test.rs`; extend `crates/ws-ca/tests/keystore_test.rs`
+- Test: extend `crates/ws-ca/tests/issue_test.rs`; extend `crates/ws-ca/tests/ca_creation_test.rs` (**there is no `keystore_test.rs`** — the keystore tests live in `ca_creation_test.rs`, where `ensure_master_key` is already exercised)
 
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `ws_ca::leafkey::LeafKeyType` — `Rsa2048`, `Rsa3072`, `EcdsaP256`, `EcdsaP384`, `Ed25519`. `as_str()` returns **exactly** `rsa2048`, `rsa3072`, `ecdsa-p256`, `ecdsa-p384`, `ed25519` — the same spellings Plan 1's test fixtures already write into `certificates.key_type` (`crates/ws-ca/tests/smoke_test.rs:540` writes `"ecdsa-p256"`), so existing rows stay parseable — and `from_str`.
+  - `ws_ca::leafkey::LeafKeyType` — `Rsa2048`, `Rsa3072`, `EcdsaP256`, `EcdsaP384`, `Ed25519`. `as_str()` returns **exactly** `rsa2048`, `rsa3072`, `ecdsa-p256`, `ecdsa-p384`, `ed25519` — the same spellings Plan 1's test fixtures already write into `certificates.key_type` (`crates/ws-ca/tests/smoke_test.rs:540` writes `"ecdsa-p256"`), so existing rows stay parseable — and `from_str`. **The hyphenated spellings are not serde's snake_case** (`EcdsaP256` would serialize as `ecdsa_p256`), so this enum carries **explicit `#[serde(rename = "…")]` attributes** on each variant so that `as_str()` and the serde name stay identical, as the plan's Global Constraints require.
   - `ws_ca::leafkey::generate_leaf_key(LeafKeyType) -> Result<(rcgen::KeyPair, Vec<u8> /*PKCS#8 DER*/), CaError>` — the key and its DER. For RSA, the DER comes from the **existing** `generate_rsa` helper in `ca.rs` (the `rsa` crate — rcgen's ring backend cannot generate RSA); for Ed25519 and the ECDSA curves, from rcgen's `KeyPair::generate_for(&PKCS_ED25519 / &PKCS_ECDSA_P256_SHA256 / &PKCS_ECDSA_P384_SHA384)` and `key_pair.serialize_der()`.
   - `ws_ca::issue::ExtKeyUsagePurpose` — `ServerAuth`, `ClientAuth`, `CodeSigning`, `EmailProtection`, `OcspSigning`, `TimeStamping`. `as_str()` returns **exactly** `server_auth`, `client_auth`, `code_signing`, `email_protection`, `ocsp_signing`, `time_stamping` (snake_case, matching the house style — **not** the RFC 5280 OID aliases like `serverAuth`). `from_str`. And `to_rcgen(&self) -> rcgen::ExtendedKeyUsagePurpose` — rcgen 0.14.10's enum has the same variants plus `Any` and `Other(Vec<u64>)`; **omitting those two is deliberate** (a profile cannot express "any EKU" or an unknown OID), and the conversion is a total match over Wardstone's six variants.
   - `ws_ca::issue::LeafSpec` — `sans: Vec<SanEntry>`, `key_usages: Vec<KeyUsagePurpose>`, **`ekus: Vec<ExtKeyUsagePurpose>`**, **`key_type: LeafKeyType`**, **`lifetime: chrono::Duration`** (the certificate's **span**), `subject_cn: Option<String>`, `serial: u128`. The old `not_after: Option<DateTime<Utc>>` is **replaced** by `lifetime`.
+  - `ws_ca::issue::KeyUsagePurpose` — a **Wardstone** enum (not rcgen's), mirroring `ExtKeyUsagePurpose`: `DigitalSignature`, `KeyEncipherment`, `DataEncipherment`, `KeyAgreement`, `KeyCertSign`, `CrlSign`, `ContentCommitment`, `EncipherOnly`, `DecipherOnly`. `as_str()` returns **exactly** `digital_signature`, `key_encipherment`, `data_encipherment`, `key_agreement`, `key_cert_sign`, `crl_sign`, `content_commitment`, `encipher_only`, `decipher_only` (snake_case; the RFC 5280 aliases like `digitalSignature` are **not** used). `from_str`. And `to_rcgen(&self) -> rcgen::KeyUsagePurpose` — the conversion from the stored strings to the engine's type. **This is the same vocabulary `ws-core`'s `KeyUsagePurpose` and the profile's `key_usages TEXT[]` use** — one vocabulary across the profile, the API, and the engine, so nothing has to translate between spellings.
+  - `ws_ca::issue::ExtKeyUsagePurpose::to_rcgen(&self) -> rcgen::ExtendedKeyUsagePurpose` — rcgen 0.14.10's enum has the same variants plus `Any` and `Other(Vec<u64>)`; **omitting those two is deliberate** (a profile cannot express "any EKU" or an unknown OID), so the conversion is a total match over Wardstone's six variants.
   - `ws_ca::keystore::KeyStore::store_setup_key(&mut self, der: &[u8]) -> Result<(), CaError>` / `load_setup_key(&self) -> Result<Zeroizing<Vec<u8>>, CaError>` — the setup certificate's key, stored as an envelope **exactly like a CA key** (encrypted at rest under the master KEK), at `<dir>/ca/setup.key` — inside the directory `has_stored_keys` scans, with a `.key` suffix. Its envelope's associated data is **not** a CA id; it is the fixed literal `wardstone-setup-key/v1`.
 
 **Notes for the implementer:**
@@ -465,7 +492,7 @@ Subject: `refactor(db): stateless executor-agnostic repositories and a bounded p
 - **Empty EKU and key-usage lists are illegal** — an absent extension is *more* permissive than `serverAuth` (RFC 5280 §4.2.1.3). `sign_leaf_with` refuses them with a typed error. This needs EKU support: `params.extended_key_usages`.
 - `rcgen` 0.14.10 can generate P-256 and P-384 (`KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)` / `PKCS_ECDSA_P384_SHA384`); Plan 1's `generate_key_pair` (`ca.rs:387-392`) handles only Ed25519 and RSA. The RSA path keeps using the `rsa` crate.
 - **`has_stored_keys` scans only `ca/` for `*.key`** (`keystore.rs:328-344`), and it is what stops `ensure_master_key` from minting a fresh master over an existing store (`keystore.rs:167-169` returns `Corrupt`). The setup key therefore **must** be inside that directory with a `.key` suffix — the plan commits to `<dir>/ca/setup.key`, not to extending the scan.
-- Every `LeafSpec` literal in Plan 1's suites needs the new fields: `crates/ws-ca/tests/issue_test.rs` and `crates/ws-ca/tests/smoke_test.rs`. The new fields are **not** `Default`-able on the struct as a whole — give `LeafSpec` a `Default` impl so the existing literals can be updated minimally.
+- **Every `LeafSpec` literal in Plan 1's suites needs the new fields** — there are **21** of them, across `crates/ws-ca/tests/issue_test.rs`, `crates/ws-ca/tests/smoke_test.rs`, `crates/ws-ca/tests/ca_creation_test.rs` (two, at ~:328 and ~:563), and `crates/ws-ca/tests/ocsp_test.rs` (one, at ~:82). **Grep for `LeafSpec {`** — the list is not closed. Do **not** derive `Default` on `LeafSpec`: a derived default would yield empty `ekus` and `key_usages` and a zero `lifetime` — exactly what this task refuses — plus `serial = 0`, an illegal RFC 5280 serial. Update each literal explicitly.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -495,7 +522,7 @@ Subject: `feat(ws-ca): EKU support, pinnable leaf keys, refusal over silent clam
 - Create: `crates/ws-auth/src/service_identity.rs`
 - Create: `crates/ws-auth/src/refresh.rs`
 - Modify: `crates/ws-auth/src/lib.rs`
-- Test: `crates/ws-auth/tests/service_identity_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000c`)
+- Test: `crates/ws-auth/tests/service_identity_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000d`)
 
 **Interfaces:**
 - Consumes: Task 2's vocabulary; Task 5's repos.
@@ -537,7 +564,7 @@ Subject: `feat(ws-auth): service identities, API tokens, and refresh tokens`.
 **Files:**
 - Create: `crates/ws-auth/src/one_shot.rs`
 - Modify: `crates/ws-auth/src/lib.rs`
-- Test: `crates/ws-auth/tests/one_shot_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000d`)
+- Test: `crates/ws-auth/tests/one_shot_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000e`)
 
 **Interfaces:**
 - Consumes: Task 5's `consume_one_shot_by_hash`; Task 2's vocabulary.
@@ -582,7 +609,7 @@ Subject: `feat(ws-auth): single-use one-shot tokens for the token-gated pull flo
 - Create: `crates/ws-api/src/error.rs`
 - Create: `crates/ws-api/src/auth_middleware.rs`
 - Create: `crates/ws-api/src/routes/{mod,auth,certificates,profiles,cas,audit,users,credentials,tenants,root_trust,health}.rs`
-- Test: `crates/ws-api/tests/api_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000e`)
+- Test: `crates/ws-api/tests/api_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000f`)
 
 **Interfaces:**
 - Consumes: Tasks 2, 5, 6, 7, 8, 9.
@@ -590,8 +617,10 @@ Subject: `feat(ws-auth): single-use one-shot tokens for the token-gated pull flo
   - `ws_api::AppState` — pool, repos, `JwtKeys`, config (the setup hostname/SAN value, the keys dir, rate limits, the admin CIDRs collected at setup).
   - `ws_api::router(state: AppState) -> axum::Router` — the whole API, versioned under `/api/v1/`.
   - `ws_api::error::ApiError` — `#[derive(thiserror::Error)]` + `IntoResponse`. Status mapping: `BadRequest` 400, `Unauthorized` 401, `Forbidden` 403, `NotFound` 404, `Conflict` 409, `RateLimited` 429, `Internal` 500. The JSON body is `{"error": {"code": "...", "message": "..."}}` with `#[serde(rename_all = "snake_case")]`.
-  - `ws_api::error::from_core_error(err: CoreError) -> ApiError` — the mapping table: `CoreError::Database` → `Internal` 500; `CoreError::Migration` → `Internal` 500; `CoreError::Duplicate` → `Conflict` 409; **`CoreError::Config` → `Internal` 500** (a corrupt stored profile is a server-side data problem, not a client error); and `AuthError::Forbidden` → `Forbidden` 403, `AuthError::BadCredentials`/`TokenInvalid`/`TokenExpired` → `Unauthorized` 401, `AuthError::RateLimited` → `RateLimited` 429.
-  - `ws_api::auth_middleware::Actor` — an axum extractor resolving the `Authorization: Bearer` header to a `ws_core::models::rbac::Actor`. **It is the same type as `ws_core::models::rbac::Actor` — a re-export, not a second actor type.**
+  - `ws_api::error::from_core_error(err: CoreError) -> ApiError` — the mapping table: `CoreError::Database` → `Internal` 500; `CoreError::Migration` → `Internal` 500; `CoreError::Duplicate` → `Conflict` 409; `CoreError::Forbidden` → `Forbidden` 403; **`CoreError::Config` → `Internal` 500** (a corrupt stored profile is a server-side data problem, not a client error).
+  - `impl From<AuthError> for ApiError` — a **separate** conversion, because `AuthError` lives in `ws-auth` and cannot be produced by a function taking a `CoreError`: `AuthError::Forbidden` → `Forbidden` 403; `AuthError::BadCredentials`/`TokenInvalid`/`TokenExpired`/`MfaRequired`/`MfaInvalid` → `Unauthorized` 401; `AuthError::AccountLocked`/`AccountDisabled` → `Forbidden` 403; `AuthError::RateLimited` → `RateLimited` 429; `AuthError::NotFound` → `NotFound` 404; `AuthError::Config`/`Crypto` → `Internal` 500. **Every handler's `?` needs one of these two conversions** — `actor.require(...)` returns `CoreError::Forbidden`, and the auth flows return `AuthError`.
+  - A rejected SAN (a name the profile does not permit) is `ApiError::BadRequest` 400 with the code `not_permitted_by_profile` — distinct from `Forbidden` 403, which means "you may not do this at all".
+  - `ws_api::auth_middleware::AuthActor` — an axum extractor resolving the `Authorization: Bearer` header. It is a **newtype wrapper** `pub struct AuthActor(pub ws_core::models::rbac::Actor)` implementing `FromRequestParts`. The wrapper is necessary: axum's `FromRequestParts` is a foreign trait and `ws_core::models::rbac::Actor` is a foreign type, so implementing the extractor for it directly violates the orphan rule (E0117). The wrapper is the *only* thing in ws-api — the actor type itself remains single-sourced in `ws-core`, and `AuthActor` derefs to it.
   - `ws_api::routes::auth` — `POST /api/v1/auth/login` (username + password, plus a TOTP code when MFA is enabled; returns an access token and a refresh token; sets `AccessClaims.sid` to the refresh token's id), `POST /api/v1/auth/refresh` (rotates the refresh token), `POST /api/v1/auth/logout` (revokes it), `GET /api/v1/auth/me`, `POST /api/v1/auth/totp/enroll` (returns the secret and provisioning URI), `POST /api/v1/auth/totp/activate` (verifies the first code and stores the encrypted secret), `POST /api/v1/auth/totp/deactivate`, `GET /api/v1/auth/oidc/{provider}/start`, `GET /api/v1/auth/oidc/{provider}/callback` (the OIDC code exchange; the identity is matched by `oidc_sub`, else linked by verified email, else a new user is created).
   - `ws_api::routes::certificates::issue_certificate` — `POST /api/v1/certificates`. Body: `{ profile_id, subject_cn, sans: Vec<String>, csr_pem }` for the CSR path; `{ profile_id, subject_cn, sans }` for the admin-only server-key-generation path. Response: the certificate PEM, serial, and (generation path only) the private key.
   - `ws_api::routes::certificates::issue_certificate_one_shot` — `POST /api/v1/certificates/pull`, gated by a one-shot token in the `Authorization` header. Body: `{ profile_id, subject_cn, sans, csr_pem }`. It **claims the one-shot token and inserts the certificate in one transaction** (Task 9's `claim_one_shot`).
@@ -601,7 +630,7 @@ Subject: `feat(ws-auth): single-use one-shot tokens for the token-gated pull flo
   - `ws_api::routes::cas::export_ca_key` — `POST /api/v1/cas/{id}/export-key`, gated by `export_ca_keys` (admin-only). Returns the CA's private key **once** for backup; the server keeps its copy. Writes a `ca_key_exported` audit row. Redacted from logs; `Cache-Control: no-store`.
   - `ws_api::routes::root_trust::download_root_cert` — `GET /api/v1/root-trust/ca.crt`, gated by `read_cas`. Returns the CA **certificate** PEM — never the key.
   - `ws_api::routes::health` — `GET /healthz` (liveness) and `GET /metrics` (Prometheus text format).
-  - `ws_api::routes::tenants::create_tenant` — `POST /api/v1/tenants`, gated by `manage_system`; creates a tenant **and seeds its built-in default profiles** (Task 11's seeding function, reused).
+  - `ws_api::routes::tenants::create_tenant` — `POST /api/v1/tenants`, gated by `manage_system`; creates a tenant **and seeds its built-in default profiles** by calling `ws_core::models::profile::default_profiles` (Task 2's).
 
   **The route → required capability table** (each entry is a test in Task 10's suite):
 
@@ -610,28 +639,45 @@ Subject: `feat(ws-auth): single-use one-shot tokens for the token-gated pull flo
   | `POST /api/v1/auth/login`, `/refresh`, `/oidc/*` | none (public) |
   | `GET /api/v1/auth/me` | any authenticated actor |
   | `GET /api/v1/certificates` | `read_certificates` |
-  | `POST /api/v1/certificates` | `issue` |
+  | `GET /api/v1/certificates/{id}` | `read_certificates` |
+  | `POST /api/v1/certificates` — **CSR path** | `issue` |
+  | `POST /api/v1/certificates` — **server-key-generation path** | `generate_leaf_key` (**admin-only**) |
   | `POST /api/v1/certificates/pull` | `issue` (one-shot token) |
   | `POST /api/v1/certificates/{id}/revoke` | `issue` |
   | `GET /api/v1/profiles` | `read_profiles` |
+  | `GET /api/v1/profiles/{id}/revisions` | `read_profiles` |
   | `POST /api/v1/profiles`, `PUT /api/v1/profiles/{id}` | `manage_profiles` |
   | `GET /api/v1/cas` | `read_cas` |
-  | `POST /api/v1/cas/{id}/export-key` | `export_ca_keys` |
+  | `POST /api/v1/cas` — create a CA | `manage_cas` (admin-only) |
+  | `POST /api/v1/cas/{id}/export-key` | `export_ca_keys` (admin-only) |
   | `GET /api/v1/root-trust/ca.crt` | `read_cas` |
   | `GET /api/v1/audit` | `read_audit` |
   | `GET /api/v1/users` | `read_users` |
   | `POST /api/v1/users` | `manage_users` |
   | `GET /api/v1/service-identities` | `read_service_identities` |
   | `POST /api/v1/service-identities` | `manage_api_tokens` |
+  | `GET /api/v1/one-shot-tokens` | `read_service_identities` |
   | `POST /api/v1/one-shot-tokens` | `manage_one_shot_tokens` |
   | `POST /api/v1/tenants` | `manage_system` |
+  | `GET /api/v1/healthz`, `/metrics` | none (public) |
+
+  **Two routes are separate capabilities, not one.** `POST /api/v1/certificates` serves
+  both the CSR path (`issue`) and the server-key-generation path
+  (`generate_leaf_key`) — the handler inspects the body and checks the capability
+  that path needs. An `Issuer` holds `issue` and must therefore be able to reach the
+  CSR path **without** being able to reach the key-generation path; the table's two
+  rows are what the test asserts, and a single row would hide that gap.
+
+  **`POST /api/v1/cas`** creates a CA (root or sub-CA) and is gated by `manage_cas` —
+  it is what writes the `ca_created` audit action. Without it the action vocabulary
+  would name something nobody writes.
 
   **The audit action vocabulary** — the exact strings, used by every mutating handler and asserted by the tests:
 
   | Action | Written by | target_type / target_id | `details` keys |
   |---|---|---|---|
-  | `ca_created` | CA creation | `ca` / the CA id | `key_type`, `is_root` |
-  | `cert_issued` | issuance | `certificate` / the certificate id | `profile_id`, `profile_revision_id`, `serial`, `sans` |
+  | `ca_created` | CA creation (`POST /api/v1/cas`) | `ca` / the CA id | `key_type`, `is_root` |
+  | `cert_issued` | issuance | `certificate` / the certificate id | `profile_id`, `profile_revision_id`, `serial`, `sans`, `minted_by` (the minting user's id, for a one-shot-issued certificate; absent otherwise) |
   | `key_generated` | the server-key-generation path | `certificate` / the certificate id | `profile_id`, `key_type` — **never the key** |
   | `cert_revoked` | revocation | `certificate` / the certificate id | `reason` |
   | `ca_key_exported` | CA key export | `ca` / the CA id | `reason` — **never the key** |
@@ -642,6 +688,13 @@ Subject: `feat(ws-auth): single-use one-shot tokens for the token-gated pull flo
   | `one_shot_token_minted` | one-shot minting | `one_shot_token` / the id | `expires_at` |
   | `tenant_created` | tenant creation | `tenant` / the tenant id | — |
   | `setup_completed` | the setup flow | `tenant` / the tenant id | `domain`, `admin_cidrs` |
+  | `crl_built` | **the worker** (already in production since Plan 1) | `ca` / the CA id | `revoked_count` |
+
+  **`crl_built` is in the vocabulary** — the worker has written it since Plan 1, so the
+  table is not a vocabulary without it. And **`minted_by`** in `cert_issued` is how the
+  spec's "the human who minted the token" requirement is met: it is the minting
+  user's id, rendered as its hyphenated uuid string, and it is present only for a
+  one-shot-issued certificate.
 
 **Notes for the implementer:**
 - **The audit write-side contract.** Every mutating handler opens one transaction, does its mutation and its audit `record` inside it, and commits once — so the entry and the change commit together or not at all (the Review Focus item 4). `AuditRepo::record` takes the executor (Task 6), so this is possible.
@@ -682,7 +735,7 @@ Subject: `feat(ws-api): REST API with capability checks and transactional audit`
 - Create: `crates/ws-web/src/lib.rs`
 - Create: `crates/ws-web/src/proxy.rs`
 - Create: `crates/ws-web/src/setup/{mod,page,tls}.rs`
-- Test: `crates/ws-web/tests/setup_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_000f`)
+- Test: `crates/ws-web/tests/setup_test.rs` (DB-gated, advisory lock `0x0057_4144_5354_0010`)
 
 **Interfaces:**
 - Consumes: Task 10's router; Task 7's setup-key slot; Task 5's repos; **Task 7's `ws-ca` root-CA creation** (so `ws-web` depends on `ws-ca`).
@@ -691,8 +744,7 @@ Subject: `feat(ws-api): REST API with capability checks and transactional audit`
   - `ws_web::setup::SetupFields` — `admin_username: String`, `admin_password: String`, `default_domain: String`, `admin_cidrs: Vec<String>`, `server_hostname: String`.
   - `ws_web::setup::setup_router(state: SetupState) -> axum::Router` — the setup page (GET) and the setup submit (POST). **Mounted only while the tenant does not exist** — the caller checks `tenant_exists(pool)` and mounts the router or does not.
   - `ws_web::setup::tls::setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String /*PEM*/, String /*sha256 fingerprint hex*/), CaError>` — the self-signed certificate for the **configured SAN** (`server_hostname`), stored under the setup-key slot, with its SHA-256 fingerprint returned for display. The certificate is self-signed (the root CA does not exist yet), with the SAN from `SetupFields.server_hostname` when known, and a placeholder SAN otherwise.
-  - `ws_web::setup::run_setup(fields: &SetupFields, pool: &PgPool, keystore: &mut KeyStore) -> Result<(), CaError>` — creates the tenant, the root CA (writing its key to the keystore), the admin user (argon2id hash), the two default profiles, and the audit entries; then mints the server's own leaf from the new CA.
-  - `ws_web::setup::default_profiles(domain: &str, cidrs: &[String]) -> Vec<ProfileRevisionModel>` — the built-in profiles: `web-server` (key type `rsa2048`, key usages `digital_signature` + `key_encipherment`, EKU `server_auth`, lifetime 30 days) and `web-server-ecdsa` (key type `ecdsa-p256`, key usages `digital_signature`, EKU `server_auth`, lifetime 30 days), both with the SAN pattern list `[domain, *.domain, …cidrs]`. **The key usages are not optional** — Task 7 makes an empty list illegal, so a profile without them could issue nothing.
+  - `ws_web::setup::run_setup(fields: &SetupFields, pool: &PgPool, keystore: &mut KeyStore) -> Result<(), CaError>` — creates the tenant, the root CA (writing its key to the keystore), the admin user (argon2id hash), the two default profiles (via `ws_core::models::profile::default_profiles`), and the audit entries; then mints the server's own leaf from the new CA.
 
 **Notes for the implementer:**
 - **The setup endpoint is not routed once the tenant exists** (the Review Focus item 5) — not merely refused. The router is mounted conditionally, on a check of whether the default tenant exists.
@@ -730,7 +782,7 @@ Subject: `feat(ws-web): TLS front door, API proxy, and the first-run setup page`
 **Files:**
 - Create: `crates/wardstone/Cargo.toml`
 - Create: `crates/wardstone/src/main.rs`
-- Modify: `Cargo.toml` (workspace members include `crates/wardstone` — the workspace already globs `crates/*`, so no change is needed)
+- Modify: `Cargo.toml` — **no change needed**: the workspace already globs `crates/*`, so the new crate is a member automatically
 
 **Interfaces:**
 - Consumes: Task 11's `ws-web`; Task 10's `ws-api`.
@@ -765,35 +817,29 @@ Subject: `feat(wardstone): single binary with ui and api invocation modes`.
 
 ---
 
-### Task 13: the worker's `auth_method`, and the production compose bundle
+### Task 13: the production compose bundle
 
 **Files:**
-- Modify: `crates/ws-worker/src/jobs.rs` (the `crl_built` audit write supplies `auth_method = 'system'`)
 - Create: `docker/compose.yml` (the production bundle)
 - Create: `docker/README.md` (the two variants and the operations notes)
 - Modify: `docker/compose.dev.yml` (one line: its header says the production file "arrives in a later plan" — update that once Task 13 lands)
 
 **Interfaces:**
-- Consumes: Task 5's `AuditEntry`; Task 12's binary.
-- Produces: the worker's audit write that satisfies the `NOT NULL` column, and the production compose file.
+- Consumes: Task 12's binary.
+- Produces: the production compose file.
 
 **Notes for the implementer:**
-- `audit_log.auth_method` is `NOT NULL` and `AuditRepo::record` binds an explicit column list, so **the worker's insert fails without this change** — it is not optional.
+- The worker's `auth_method` was already set in **Task 5** (the task that made the column NOT NULL). This task only *asserts* that value in a regression test.
 - The compose file follows the spec: `ws-web` and `ws-api` are **separate services** running the same image with different commands (`wardstone ui` / `wardstone api`), plus a Postgres service. `ws-web` publishes the only port to the LAN; `ws-api` publishes **none** and is reached over the internal network. The keys volume is mounted at `/var/lib/wardstone/keys/` with the key files mode 0600, owned by the container user.
-- **Two variants, one file:** the Bundled variant is the file as written (with its own Postgres service); the **External** variant is the same file with the Postgres service removed and `DATABASE_URL` pointed at an existing database. `docker/README.md` documents both, and documents that an External deployment may front `ws-api` directly behind its own reverse proxy.
+- **Two variants, one file:** the Bundled variant is the file as written (with its own Postgres service); the **External** variant is the same file with the Postgres service removed and `DATABASE_URL` pointed at an existing database. `docker/README.md` documents both, and documents that an External deployment may front `ws-api` directly behind their own reverse proxy.
 - The environment contract: `DATABASE_URL`, `WARDSTONE_KEYS_DIR`, `WARDSTONE_SERVER_HOSTNAME`, `WARDSTONE_API_URL`, `WARDSTONE_BIND`.
 - The existing `docker/compose.dev.yml` is the dev/test database and stays as it is (minus the one header line).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the regression test**
 
-Extend the worker suite (`crates/ws-worker/tests/scheduler_test.rs`): the worker's `crl_built` audit row is written with `auth_method = 'system'` and `actor_type = 'system'`, and the row survives the NOT NULL constraint (the test fails loudly today if the column is missing from the insert).
+Extend the worker suite (`crates/ws-worker/tests/scheduler_test.rs`): the worker's `crl_built` audit row is written with `auth_method = 'system'` and `actor_type = 'system'`, and the row survives the NOT NULL constraint. **This is a regression guard, not a red-first test** — the value was set in Task 5, so the test passes as written. (If it fails, Task 5's worker edit was wrong.)
 
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `DATABASE_URL=... cargo test -p ws-worker --test scheduler_test -- --include-ignored`
-Expected: FAIL — the insert omits `auth_method` and violates the NOT NULL constraint.
-
-- [ ] **Step 3: Fix the worker's audit write and write the compose bundle**
+- [ ] **Step 2: Write the compose bundle and its README**
 
 - [ ] **Step 4: Run the full gate**
 
@@ -823,7 +869,7 @@ Subject: `fix(worker): audit auth_method, and add the production compose bundle`
 
 - [ ] **Step 1: Write the test**
 
-One `#[tokio::test] #[ignore]` (advisory lock `0x0057_4144_5354_0010`): mount the setup router and the API router over a live pool; run setup (admin, domain, CIDRs, hostname); authenticate as the admin; create a profile; issue a leaf from a CSR; assert the certificate parses, is signed by the root, carries the profile's EKU and key usages, and its span equals the profile's lifetime exactly; revoke it; assert the audit trail shows `ca_created`, `cert_issued`, `cert_revoked` in order with the right `auth_method`; create a service identity, use it to issue a second leaf, and assert the audit row's `actor_type` is `api_token`; assert the setup route is gone.
+One `#[tokio::test] #[ignore]` (advisory lock `0x0057_4144_5354_0011`): mount the setup router and the API router over a live pool; run setup (admin, domain, CIDRs, hostname); authenticate as the admin; create a profile; issue a leaf from a CSR; assert the certificate parses, is signed by the root, carries the profile's EKU and key usages, and its span equals the profile's lifetime exactly; revoke it; assert the audit trail shows `ca_created`, `cert_issued`, `cert_revoked` in order with the right `auth_method`; create a service identity, use it to issue a second leaf, and assert the audit row's `actor_type` is `api_token`; assert the setup route is gone.
 
 - [ ] **Step 2: Run it, fixing mismatches in the owning task's code**
 

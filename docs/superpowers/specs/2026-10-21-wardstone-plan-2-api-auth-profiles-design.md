@@ -128,8 +128,13 @@ neither the caller nor the auditor can see it happened.)
   lists, and `sign_leaf_with` refuses them too. **This requires a change to Plan 1's
   engine** — `LeafSpec` has no EKU field today and `sign_leaf_with` never sets
   `params.extended_key_usages`.
-- A profile is written for a key type: an ECDSA profile carries `digitalSignature`
-  only; an RSA profile carries `digitalSignature` + `keyEncipherment`.
+- A profile is written for a key type: an ECDSA profile carries `digital_signature`
+  only; an RSA profile carries `digital_signature` + `key_encipherment`.
+- **The stored vocabulary is snake_case, not the RFC 5280 aliases.** The values above
+  are the literal strings written to `profile_revisions.key_usages` / `.eku`, and they
+  are the same strings `as_str()` returns and the same names serde emits. The RFC
+  aliases (`digitalSignature`, `keyEncipherment`, `serverAuth`) are the *OID names*,
+  not the stored form.
 
 ### Pattern list
 
@@ -202,8 +207,8 @@ meaningful):
 
 | Name | Key type | Key usages | EKU | Lifetime | SAN patterns |
 |---|---|---|---|---|---|
-| `web-server` | RSA-2048 | digitalSignature, keyEncipherment | serverAuth | 30 days | the setup domain, `*.domain`, the admin's IPs/CIDRs |
-| `web-server-ecdsa` | ECDSA P-256 | digitalSignature | serverAuth | 30 days | the same |
+| `web-server` | `rsa2048` | `digital_signature`, `key_encipherment` | `server_auth` | 30 days | the setup domain, `*.domain`, the admin's IPs/CIDRs |
+| `web-server-ecdsa` | `ecdsa-p256` | `digital_signature` | `server_auth` | 30 days | the same |
 
 The **SAN pattern list is bootstrap-scoped** (D3): the setup collects the operator's
 domain and admin CIDRs, and the default profiles permit exactly those. This is
@@ -586,13 +591,25 @@ api`) — the product spec's call, and it keeps the anti-goal (one process's fai
 taking down the other) while keeping one Dockerfile and one CI lane.
 
 ```
-ws-auth    — users, sessions, TOTP, OIDC, RBAC/capabilities, service identities
+wardstone  — the binary; `wardstone ui` and `wardstone api` invocation modes
+ws-auth    — users, sessions, TOTP, OIDC, service identities
 ws-api     — the REST API (/api/v1/) and, later, ACME
 ws-web     — TLS front door; path-proxies /api/v1/* to ws-api; serves the setup page
-ws-core    — domain models, repos, migrations (extended)
+ws-core    — domain models, repos, migrations (extended); owns the access vocabulary
 ws-ca      — CA engine (extended: EKU support, leaf key generation, setup-key slot)
 ws-worker  — background jobs (unchanged in this plan)
 ```
+
+**The dependency graph is acyclic, and the edges are a hard constraint:**
+`ws-ca → ws-core`; `ws-auth → ws-core`; `ws-api → ws-core, ws-auth, ws-ca`;
+`ws-web → ws-core, ws-auth, ws-api, ws-ca`; `wardstone → ws-core, ws-auth, ws-api, ws-web`.
+**`ws-core` depends on nothing but the standard library and its own deps** — it must
+never depend on `ws-auth`, `ws-api`, or `ws-web`. Anything `ws-core` needs from
+those crates moves into `ws-core` (or `ws-ca`) instead: the **access vocabulary**
+(`Capability`, `Role`, `ActorType`, `AuthMethod`, `Actor`) lives in `ws-core` and is
+re-exported by `ws-auth`; `Actor::require` returns `CoreError`, not `ws-auth`'s
+`AuthError`; and the **built-in default profiles** live in `ws-core` so both `ws-api`
+and `ws-web` can call them without either depending on the other.
 
 **`ws-web` publishes the only port to the LAN; `ws-api` publishes none.** Its only
 front door is `ws-web`, over the internal compose network. This keeps one TLS listener
@@ -611,9 +628,15 @@ widening, as an earlier draft of this document claimed. Plan 1's repos each hold
 `PgPool` and execute against `&self.pool`; the executor becomes a parameter on every
 method.*
 
-**`allocate_serial` joins the issuance transaction.** A rolled-back issuance burns a
-serial, which is acceptable and conservative — serials are never reused. Its signature
-changes to take the executor.
+**`allocate_serial` joins the issuance transaction.** A rolled-back issuance
+**releases** its serial rather than burning it: because the serial INSERT and the
+certificate INSERT share one transaction, a rollback takes the serial row with it, and
+the next issuance may draw the same number. That is safe — the earlier certificate was
+never issued, so no two live certificates can share a serial, and the
+`(ca_id, serial)` unique constraint still prevents it. Its signature changes to take
+the executor, and its retry loop uses `ON CONFLICT DO NOTHING` with a row-count check
+(a unique violation would abort the enclosing transaction, so the existing
+`is_unique_violation` path cannot run inside one).
 
 ### Issuing a certificate
 
