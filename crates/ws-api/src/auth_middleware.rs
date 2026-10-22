@@ -1,4 +1,4 @@
-//! The bearer-credential extractor: one `Authorization` header, three
+//! The bearer-credential extractor: one `Authorization` header, two
 //! credential shapes, one resolved [`Actor`].
 //!
 //! Bearer resolution order (the plan's pin):
@@ -9,9 +9,12 @@
 //!    bundle (the `role_capabilities` table is the runtime authority);
 //! 2. a value starting **`ws_at_` is an API token** (`ws-auth`'s service
 //!    identity resolution, carrying the token's granted capabilities);
-//! 3. a value starting **`ws_ot_` is a one-shot token** — looked up but
-//!    NOT claimed (`consume_one_shot` is lookup-only): only the pull
-//!    handler claims it, so a stray bearer can never burn a token;
+//! 3. a value starting **`ws_ot_` is a one-shot token** — refused here
+//!    with 401 WITHOUT a lookup: a one-shot redeems ONLY at the pull
+//!    route (`/certificates/pull`), whose handler claims it inside its
+//!    issuance transaction. Resolving it here would hand a fixed
+//!    `Issue` grant to every authenticated route, so the rejection is
+//!    static — a stray bearer never burns the token and never resolves;
 //! 4. anything else is 401.
 //!
 //! [`AuthActor`] is a newtype wrapper around `ws_core`'s [`Actor`]:
@@ -31,7 +34,6 @@ use axum::http::request::Parts;
 use uuid::Uuid;
 
 use ws_auth::jwt::validate_access_token;
-use ws_auth::one_shot::consume_one_shot;
 use ws_auth::service_identity::authenticate_token;
 use ws_core::models::rbac::{Actor, ActorType};
 use ws_core::repo::credential_repo::CredentialRepo;
@@ -100,11 +102,19 @@ pub async fn resolve_bearer_actor(
         return resolve_api_token_actor(app, token).await;
     }
     if token.starts_with(ws_auth::one_shot::TOKEN_PREFIX) {
-        return resolve_one_shot_actor(app, token).await;
+        // A one-shot token is a pull-route credential: it redeems ONLY at
+        // the certificate pull route, whose handler claims it inside its
+        // issuance transaction. Here it is 401 WITHOUT a lookup — a stray
+        // bearer never burns, and resolving it (lookup-only as that would
+        // be) would hand its fixed `Issue` grant to this route.
+        return Err(ApiError::Unauthorized(
+            "credentials not accepted here (one-shot tokens redeem only at the \
+             certificate pull route)"
+                .to_string(),
+        ));
     }
     Err(ApiError::Unauthorized(
-        "unrecognized credential shape (expected a session JWT, ws_at_ token, or ws_ot_ token)"
-            .to_string(),
+        "unrecognized credential shape (expected a session JWT or ws_at_ token)".to_string(),
     ))
 }
 
@@ -149,17 +159,6 @@ async fn resolve_api_token_actor(app: &AppState, token: &str) -> Result<Actor, A
         .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::Unauthorized("api token is unknown, revoked, or expired".to_string())
-        })
-}
-
-/// The one-shot path: LOOKUP-ONLY (`consume_one_shot` never marks the
-/// token used). Only the pull handler claims it, inside its transaction.
-async fn resolve_one_shot_actor(app: &AppState, token: &str) -> Result<Actor, ApiError> {
-    consume_one_shot(token, &app.pool, &CredentialRepo::new())
-        .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError::Unauthorized("one-shot token is unknown, used, or expired".to_string())
         })
 }
 

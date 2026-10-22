@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::Router;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -1085,6 +1085,66 @@ async fn one_shot_pull_issues_exactly_once() {
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
+
+    fx.cleanup().await;
+}
+
+/// A one-shot token is a pull-route credential ONLY: the direct issuance
+/// route `POST /api/v1/certificates` — reachable with an issue-capable
+/// actor — refuses the one-shot bearer with 401 (the middleware never
+/// resolves `ws_ot_` credentials, so the route cannot mint from them),
+/// and the rejected bearer does not burn the token: the row's `used_at`
+/// stays NULL, so the legitimate pull can still redeem it later.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn one_shot_bearer_refused_on_issuance_route_not_burned() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    // Mint a valid one-shot token through its route.
+    let res = post_json(
+        &fx,
+        "/api/v1/one-shot-tokens",
+        Some(&admin_token(&fx)),
+        json!({"ttl_minutes": 10}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let one_shot = body["token"].as_str().unwrap().to_string();
+    assert!(one_shot.starts_with("ws_ot_"));
+
+    // The direct issuance route refuses the one-shot bearer outright.
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&one_shot),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "direct.wardstone.test",
+            "sans": ["direct.wardstone.test"],
+            "csr_pem": mint_csr("direct.wardstone.test", &["direct.wardstone.test"])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // The rejected bearer never burned the token: the row is unclaimed.
+    let rows: Vec<(Option<DateTime<Utc>>,)> =
+        sqlx::query_as("SELECT used_at FROM one_shot_tokens WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read the one-shot row after the refused bearer");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].0.is_none(),
+        "a one-shot bearer refused by the issuance route must not burn the token"
+    );
 
     fx.cleanup().await;
 }

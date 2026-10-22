@@ -8,10 +8,11 @@
 //! - `error` — [`ApiError`]: one enum, one JSON body shape
 //!   (`{"error": {"code", "message"}}`), and the two conversion tables
 //!   (`CoreError` and `AuthError`) every handler's `?` flows through.
-//! - `auth_middleware` — the bearer extractor: one header, three
-//!   credential shapes (session JWT, `ws_at_` API token, `ws_ot_`
-//!   one-shot token — looked up but never claimed), one [`Actor`],
-//!   wrapped in the orphan-rule-required newtype.
+//! - `auth_middleware` — the bearer extractor: one header, two
+//!   credential shapes (session JWT, `ws_at_` API token), one [`Actor`],
+//!   wrapped in the orphan-rule-required newtype. A `ws_ot_` one-shot
+//!   bearer is refused here without a lookup: it redeems only at the
+//!   certificate pull route.
 //! - `routes` — the route tree with the capability checks carried in the
 //!   handlers (the plan's route→capability table is the test suite's
 //!   oracle) and the audit write-side contract: every mutation commits
