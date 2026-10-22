@@ -50,7 +50,7 @@ use ws_ca::error::CaError;
 use session::relay::relay_router;
 use session::store::SessionStore;
 
-pub use proxy::api_router;
+pub use proxy::{api_router, api_router_with_auth_limit};
 pub use setup::{
     run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
 };
@@ -76,10 +76,12 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
 /// 15-minute [`DEFAULT_SESSION_TTL`] for the binary); tests that need a
 /// handle on the SAME store instance use [`web_router_with_store`].
 ///
-/// `rate_limit` is the GCRA configuration the binary parsed for the
-/// `/auth/ui` routes (`Some` — the per-client-IP limiter mounted on the
-/// relay nest; Task 13); the existing binary env contract feeds it, and
-/// tests that run `web_router` pass `None` (no limiter — an in-process
+/// `rate_limit` is the GCRA configuration the binary parsed for the web
+/// front door's auth surfaces (`Some` — the per-client-IP limiter
+/// mounted on BOTH the `/auth/ui` relay nest AND the proxied
+/// `POST /api/v1/auth/login`/`/refresh` routes; the ui binary always
+/// configures it); the existing binary env contract feeds it, and tests
+/// that run `web_router` pass `None` (no limiter — an in-process
 /// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
 /// the same reason ws-api's tests disable its layer).
 pub async fn web_router(
@@ -111,8 +113,9 @@ pub async fn web_router(
 /// structural instead of a promise, and it is how the session_test suite
 /// inspects store contents alongside a live router.
 ///
-/// `rate_limit` threads to [`relay_router`]'s `/auth/ui` GCRA nest layer
-/// (see [`web_router`]).
+/// `rate_limit` threads to BOTH auth surfaces — [`relay_router`]'s
+/// `/auth/ui` GCRA nest and the proxy's `/api/v1/auth` limiter scope (see
+/// [`web_router`] and [`session_router_with_store`]).
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
@@ -122,14 +125,6 @@ pub async fn web_router_with_store(
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
-    // The ONE store instance rides BOTH routers: as the relay routes'
-    // state (mint/rotate/kill) and as an Extension on the proxy router
-    // (read-only injection). The `Option<Extension<_>>` extractor in the
-    // proxy handler keeps `api_router` usable standalone (no store: zero
-    // injection, the machine-token surface is untouched).
-    let api = api_router(api_base_url).layer(Extension(store.clone()));
-    let relay = relay_router(store, api_base_url, rate_limit);
-    let mut app = Router::new().merge(relay).merge(api);
     // The setup mounting contract, structurally: BOTH branches live in
     // this one if/else, so either the setup routes or their explicit 404
     // replacement ([`setup_unmounted_router`]) is mounted — never
@@ -137,16 +132,16 @@ pub async fn web_router_with_store(
     // fallback below catches any extension-less GET, so an unmounted
     // `/setup` left to it would answer 200 + index.html instead of the
     // plain 404 the setup/e2e suites pin (404, not 403).
-    if !tenant_exists(&pool).await? {
-        app = app.merge(setup_router(SetupState {
+    let app = if !tenant_exists(&pool).await? {
+        session_router_with_store(store, api_base_url, rate_limit).merge(setup_router(SetupState {
             pool,
             keys_dir,
             fingerprint,
             hostname,
-        }));
+        }))
     } else {
-        app = app.merge(setup_unmounted_router());
-    }
+        session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())
+    };
     // The SPA router rides LAST: `fallback_service` runs only when no
     // earlier route matched (the precedence the ui-serve suite pins), so
     // the API proxy, the relay, and the setup surface above are never
@@ -154,6 +149,29 @@ pub async fn web_router_with_store(
     // carries its own route tree (`/`, `/assets/*`, the SPA catch-all) and
     // its own routing.
     Ok(app.fallback_service(ui::ui_router()))
+}
+
+/// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay
+/// nest and the `/api/v1` proxy (its auth routes limiter-scoped per
+/// `rate_limit`) merged — every web-fronted route EXCEPT the setup
+/// surface and the SPA fallback, which need the tenant check. Public so
+/// the rate-limit suite can drive the COMPOSED stack (relay AND proxy in
+/// one router, the precedence the real front door serves — static auth
+/// routes over the catch-all) without a database.
+///
+/// The ONE store instance rides BOTH: as the relay routes' state
+/// (mint/rotate/kill) and as an `Extension` on the proxy router
+/// (read-only injection). The `Option<Extension<_>>` extractor in the
+/// proxy handler keeps `api_router` usable standalone (no store: zero
+/// injection, the machine-token surface is untouched).
+pub fn session_router_with_store(
+    store: std::sync::Arc<SessionStore>,
+    api_base_url: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let api = api_router_with_auth_limit(api_base_url, rate_limit).layer(Extension(store.clone()));
+    let relay = relay_router(store, api_base_url, rate_limit);
+    Router::new().merge(relay).merge(api)
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired

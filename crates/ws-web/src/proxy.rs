@@ -22,6 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use thiserror::Error;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::PeerIpKeyExtractor;
+use tower_governor::GovernorLayer;
 
 use crate::session::relay::{rotate_once, RotationOutcome};
 use crate::session::store::SessionStore;
@@ -39,8 +42,36 @@ const PROXY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Build the proxy router for the API's base URL over the internal
 /// network, e.g. `http://ws-api:8080` (Task 12's `WARDSTONE_API_URL`
-/// default). A trailing slash is tolerated and dropped.
+/// default). A trailing slash is tolerated and dropped. No auth-surface
+/// limiter is mounted — the [`api_router_with_auth_limit`] variant.
 pub fn api_router(api_base_url: &str) -> Router {
+    api_router_with_auth_limit(api_base_url, None)
+}
+
+/// [`api_router`] with the front-door auth limiter: when `rate_limit` is
+/// `Some`, the proxied credential surfaces — `POST /api/v1/auth/login`
+/// and `POST /api/v1/auth/refresh` — are wrapped in the SAME per-IP GCRA
+/// the `/auth/ui` relay nest carries (the same construction, keyed on the
+/// peer address), REGISTERED ALONGSIDE (never replacing) the `/api/v1`
+/// catch-all: static routes win over the wildcard in axum 0.8's match
+/// order, so only the two auth-shaped routes pay the layer and every
+/// other `/api/v1/*` path — the machine-token flows, `ws_at_`/`ws_ot_`
+/// carriers — forwards exactly as before, unlimited at this edge.
+///
+/// Why the pair: in a UI-fronted deployment ws-api's own auth limiter is
+/// commonly disabled (`WARDSTONE_AUTH_RATE_LIMIT_DISABLED`, the bundled
+/// compose setting, because every proxied login arrives from ONE loopback
+/// IP) — and the proxy would otherwise forward unlimited cookieless
+/// `POST /api/v1/auth/login` traffic from the public TLS port. The login
+/// and refresh handlers are the brute-force targets of record (password
+/// spraying, TOTP guessing: the code rides the login body); every OTHER
+/// auth surface (`/me`, logout, the OIDC relay routes) either accepts a
+/// bearer it cannot guess or is already covered by the `/auth/ui` nest's
+/// own limiter, which the same `rate_limit` configures.
+pub fn api_router_with_auth_limit(
+    api_base_url: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
     // Both timeouts are deliberate: without them a black-holing upstream
     // holds the browser request open with no bound, and this front door
     // becomes a wedge vector. The client fails fast on connect and gives
@@ -53,10 +84,47 @@ pub fn api_router(api_base_url: &str) -> Router {
         client: proxy_client().ok(),
         base: api_base_url.trim_end_matches('/').to_owned(),
     });
-    Router::new()
+    let proxy = Router::new()
         .route("/api/v1", any(proxy_request))
         .route("/api/v1/{*path}", any(proxy_request))
-        .with_state(backend)
+        .with_state(backend.clone());
+    let Some(limit) = rate_limit else {
+        return proxy;
+    };
+    // `finish()` fails only on a zero burst or period (both
+    // caller-configured; the binary refuses a zero at boot, so this skip
+    // branch is unreachable from `run_ui`) — the same logs-and-skips
+    // contract the relay nest's construction documents.
+    match GovernorConfigBuilder::<PeerIpKeyExtractor, _>::default()
+        .per_millisecond(limit.per_millis)
+        .burst_size(limit.burst)
+        .finish()
+    {
+        Some(config) => {
+            // The layer rides the TWO auth routes' own sub-router (applied
+            // to it BEFORE the merge), so the `/api/v1` catch-all and the
+            // exact `/api/v1` route never pass through the governor. The
+            // peer IP is `ConnectInfo` — `serve_tls`'s make service
+            // attaches the real client address to every request and
+            // ws-web IS the edge, exactly as on the relay nest.
+            let limited_auth = Router::new()
+                .route("/api/v1/auth/login", any(proxy_request))
+                .route("/api/v1/auth/refresh", any(proxy_request))
+                .with_state(backend)
+                .layer(GovernorLayer::new(std::sync::Arc::new(config)));
+            proxy.merge(limited_auth)
+        }
+        None => {
+            tracing::error!(
+                per_millis = limit.per_millis,
+                burst = limit.burst,
+                "invalid proxied-auth rate-limit configuration: per_millis and burst must \
+                 be positive; the proxied /api/v1/auth login & refresh routes run WITHOUT \
+                 rate limiting"
+            );
+            proxy
+        }
+    }
 }
 
 /// The proxy's reqwest client: the bounded construction (connect and

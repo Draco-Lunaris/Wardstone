@@ -1,7 +1,7 @@
-//! The Task 13 GCRA limiter on the `/auth/ui` nest, NON-DB.
+//! The Task 13 GCRA limiter on the `/auth/ui` nest — and, in `ui` mode,
+//! the front-door limiter on the proxied credential pair. NON-DB.
 //!
-//! The suite pins three properties of [`ws_web::session::relay_router`]'s
-//! GovernorLayer:
+//! The suite pins five properties of the web front door's rate limiting:
 //!
 //! 1. two rapid logins from the SAME peer IP — the second is 429 (the
 //!    exact shape ws-api's default `GovernorLayer` produces: a plain 429
@@ -10,7 +10,18 @@
 //!    limited; a different loopback alias keeps its own bucket) and the
 //!    layer covers the WHOLE nest (login, oidc start, logout), not just
 //!    login;
-//! 3. `None` mounts nothing.
+//! 3. `None` mounts nothing;
+//! 4. through the COMPOSED stack ([`ws_web::session_router_with_store`]
+//!    — the exact relay+proxy merge `web_router_with_store` serves, no
+//!    database), the proxied credential surfaces `POST /api/v1/auth/login`
+//!    and `POST /api/v1/auth/refresh` carry the SAME per-IP GCRA: in the
+//!    bundled deployment ws-api's limiter is off, so this edge is the
+//!    ONLY limiter between the public TLS port and the password/TOTP
+//!    check;
+//! 5. the proxied limiter's scope stays credential-shaped: with an IP's
+//!    bucket exhausted, machine-token traffic on non-auth routes and
+//!    `GET /api/v1/auth/me` FORWARD unlimited (502 at the dead upstream,
+//!    never 429).
 //!
 //! No database, no upstream, no real sockets: the router is driven
 //! in-process through `tower::ServiceExt::oneshot`, with the peer address
@@ -29,6 +40,7 @@ use axum::http::{header, Request, Response, StatusCode};
 use tower::ServiceExt;
 use ws_api::AuthRateLimit;
 use ws_web::session::{relay_router, SessionStore};
+use ws_web::session_router_with_store;
 
 /// Burst of 1 with a refill period far longer than any test run: the
 /// FIRST request from an IP spends the whole bucket and every later one
@@ -54,6 +66,18 @@ const PEER_B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// the test's `rate_limit` choice.
 fn relay_router_for(rate_limit: Option<AuthRateLimit>) -> axum::Router {
     relay_router(
+        std::sync::Arc::new(SessionStore::new(std::time::Duration::from_secs(60))),
+        DEAD_API,
+        rate_limit,
+    )
+}
+
+/// The COMPOSED front-door stack the tests drive for the proxied
+/// properties: the exact relay+proxy merge [`ws_web::web_router_with_store`]
+/// serves (the setup/SPA mounts need a tenant check, hence this core), one
+/// store, the dead upstream, and the test's `rate_limit` choice.
+fn composed_router_for(rate_limit: Option<AuthRateLimit>) -> axum::Router {
+    session_router_with_store(
         std::sync::Arc::new(SessionStore::new(std::time::Duration::from_secs(60))),
         DEAD_API,
         rate_limit,
@@ -94,6 +118,29 @@ fn oidc_start_from(ip: Ipv4Addr, port: u16) -> Request<Body> {
 
 fn logout_from(ip: Ipv4Addr, port: u16) -> Request<Body> {
     request_from(ip, port, "POST", "/auth/ui/logout", b"")
+}
+
+/// A cookieless `POST /api/v1/auth/login` at the proxied surface — the
+/// shape a password sprayer sends through the public TLS port. `request_from`
+/// carries a JSON content-type, which the bodyless /me GET below tolerates.
+fn api_login_from(ip: Ipv4Addr, port: u16) -> Request<Body> {
+    request_from(
+        ip,
+        port,
+        "POST",
+        "/api/v1/auth/login",
+        br#"{"username":"u","password":"p"}"#,
+    )
+}
+
+fn api_refresh_from(ip: Ipv4Addr, port: u16) -> Request<Body> {
+    request_from(
+        ip,
+        port,
+        "POST",
+        "/api/v1/auth/refresh",
+        br#"{"refresh_token":"r"}"#,
+    )
 }
 
 /// Drive one request through the router. (Test-only unwrappers.)
@@ -177,4 +224,88 @@ async fn rate_limit_none_mounts_no_layer() {
             "an unlimited nest never answers 429"
         );
     }
+}
+
+/// Property 4: through the COMPOSED stack (relay nest + proxy, the exact
+/// merge `web_router_with_store` serves), the proxied credential surfaces
+/// carry the same per-IP GCRA the relay nest carries. A cookieless
+/// `POST /api/v1/auth/login` — the shape a password sprayer sends at the
+/// public TLS port — passes once (dying at the dead upstream: 502, never
+/// 429) and the second call from the SAME IP is 429 with `Retry-After`;
+/// `/auth/refresh` shares the bucket. In the bundled deployment ws-api's
+/// own limiter is off, so this edge is the ONLY limiter between the
+/// public port and the password/TOTP check.
+#[tokio::test]
+async fn second_proxied_login_from_the_same_ip_is_429_through_the_composed_stack() {
+    let router = composed_router_for(ONE_SHOT);
+
+    let first = send(&router, api_login_from(PEER_A, 44444)).await;
+    assert_eq!(
+        first.status(),
+        StatusCode::BAD_GATEWAY,
+        "the first proxied login passes the limiter and dies at the proxy's dead upstream"
+    );
+
+    let second = send(&router, api_login_from(PEER_A, 55555)).await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a rapid second proxied login from the same peer IP is limited at the front door"
+    );
+    assert!(
+        second.headers().get(header::RETRY_AFTER).is_some(),
+        "the default tower_governor 429 carries Retry-After"
+    );
+
+    let refresh = send(&router, api_refresh_from(PEER_A, 56565)).await;
+    assert_eq!(
+        refresh.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the proxied refresh surface shares the IP's bucket"
+    );
+}
+
+/// Property 5: the proxied limiter's scope stays credential-shaped. With
+/// an IP's bucket spent by a proxied login, a cookieless machine-token
+/// request on a non-auth route (the `ws_at_` carrier shape) and a
+/// `GET /api/v1/auth/me` both FORWARD unlimited — 502 at the dead
+/// upstream, never 429. The machine flows' budget is ws-api's own
+/// limiter, not this edge.
+#[tokio::test]
+async fn non_auth_proxied_routes_are_not_limited() {
+    let router = composed_router_for(ONE_SHOT);
+
+    assert_eq!(
+        send(&router, api_login_from(PEER_A, 44444)).await.status(),
+        StatusCode::BAD_GATEWAY,
+        "spend the IP's bucket on the limited surface"
+    );
+
+    let machine = send(
+        &router,
+        request_from(
+            PEER_A,
+            45444,
+            "POST",
+            "/api/v1/certificates",
+            br#"{"profile_id":"x"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        machine.status(),
+        StatusCode::BAD_GATEWAY,
+        "a non-auth machine-token route forwards unlimited (never 429)"
+    );
+
+    let me = send(
+        &router,
+        request_from(PEER_A, 46444, "GET", "/api/v1/auth/me", b""),
+    )
+    .await;
+    assert_eq!(
+        me.status(),
+        StatusCode::BAD_GATEWAY,
+        "/me is not on the limited credential pair"
+    );
 }

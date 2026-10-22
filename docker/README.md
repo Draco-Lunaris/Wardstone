@@ -114,16 +114,32 @@ the login page reads `GET /auth/ui/config`, which relays ws-api's PUBLIC
 provider) — that is what renders the "Sign in with SSO" button before any
 session exists; the flag is readable without credentials by design.
 
-**Rate-limiter placement.** `ws-web` limits its `/auth/ui/*` relay routes per
-client IP (GCRA, the house defaults — same burst/refill vocabulary as
-ws-api's). ws-api's OWN auth-route limiter keys on its direct TCP peer; in a
-UI-fronted deployment every operator login reaches ws-api through ws-web's
-proxy from ONE loopback IP, so that limiter would throttle ALL operators
-collectively. The bundled compose therefore sets
+**Rate-limiter placement.** Per-client-IP GCRA covers the credential
+surfaces the public edge serves, with the house defaults (one credit per
+500 ms, burst 20 per IP — the same burst/refill vocabulary in every
+variant):
+
+- **Bundled UI-fronted deployment** (`wardstone ui` publishes the only
+  port): ws-web limits BOTH its `/auth/ui/*` relay routes AND the proxied
+  credential pair `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh`
+  — so password spraying and TOTP guessing stay per-client limited even
+  though ws-api's own limiter is off (below). Other `/api/v1/*` paths —
+  the machine-token (`ws_at_`/`ws_ot_`) flows — are NOT limited at this
+  edge.
+- **Direct API deployment** (clients, or a transparent-TCP proxy, hit
+  `ws-api` itself): ws-api's own auth-route GCRA (login, refresh, OIDC
+  start/callback) applies.
+
+ws-api's limiter keys on its direct TCP peer; in a UI-fronted deployment
+every proxied login arrives from ONE loopback IP, so that limiter would
+throttle ALL operators collectively. The bundled compose therefore sets
 `WARDSTONE_AUTH_RATE_LIMIT_DISABLED=true` on the `api` service — an
-`api`-mode switch only (the `ui` mode never reads it). Only where clients hit
-ws-api directly (an External variant fronting it with a transparent-TCP
-proxy) should the switch stay off.
+`api`-mode switch only (the `ui` mode never reads it, and ws-web's
+front-door limiter stays on regardless of it). Where BOTH limiters run
+(a `ui` deployment that leaves the switch off), the effective per-client
+limit is the tighter of the two buckets — defense in depth, never a gap.
+Only where clients hit ws-api directly (an External variant fronting it
+with a transparent-TCP proxy) is the switch meaningful at all.
 
 **Egress: the compose network must NOT be `internal: true`.** ws-api performs
 OIDC egress — the discovery fetch and the token exchange are made by the
@@ -204,13 +220,20 @@ Both files are re-created on the next boot; **every outstanding access and
 refresh token is now invalid** and every user must log in again. Verify the
 new fingerprint before proceeding if you have out-of-band key pinning.
 
-**Rate limiting is always-on, keyed per client IP, and tunable — but never
-disablable.** The `api` process limits the public auth routes (login,
-refresh, OIDC start/callback) with GCRA: one credit per 500 ms, burst 20 per
-IP — the house defaults, applied without any configuration. The environment
-overrides `WARDSTONE_RATE_LIMIT_PER_MILLIS` and `WARDSTONE_RATE_LIMIT_BURST`
-may tune them; the shipped bundle intentionally does not set either. A zero
-or unparsable value is a **boot failure**, not a silent un-limited listener.
+**Rate limiting is always-on across the credential surfaces, keyed per
+client IP, tunable — but the coverage is never optional.** The `api`
+process limits its public auth routes (login, refresh, OIDC
+start/callback) with GCRA: one credit per 500 ms, burst 20 per IP — the
+house defaults, applied without any configuration. In the bundled
+UI-fronted deployment the compose switches THAT limiter off
+(`WARDSTONE_AUTH_RATE_LIMIT_DISABLED=true` on the `api` service) because
+every proxied login arrives from one loopback IP — and the front door
+(`ws-web`) then carries the per-client GCRA instead, on `/auth/ui/*` AND
+the proxied `POST /api/v1/auth/login` / `/auth/refresh` pair. The
+environment overrides `WARDSTONE_RATE_LIMIT_PER_MILLIS` and
+`WARDSTONE_RATE_LIMIT_BURST` tune both limiters; the shipped bundle
+intentionally sets neither. A zero or unparsable value is a **boot
+failure**, not a silent un-limited listener.
 
 **Admin CIDRs (v1 status).** The setup form's admin CIDR list takes its
 effect through the two built-in certificate profiles created during setup:
