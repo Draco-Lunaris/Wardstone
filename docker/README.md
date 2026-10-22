@@ -93,8 +93,15 @@ for it, deliberately.
 Dockerfile itself is out of this bundle's scope. The bundle's contract with
 that image is:
 
-1. The image's entrypoint is the `wardstone` binary (compose only overrides
-   the mode argument via `command: wardstone ui` / `wardstone api`).
+1. The image declares **no ENTRYPOINT**; the `wardstone` binary is installed
+   on the container's PATH, and each service overrides the WHOLE command —
+   both words — via `command: ["wardstone", "ui"]` /
+   `command: ["wardstone", "api"]`. The missing-entrypoint half of the
+   contract is load-bearing, not style: an image with
+   `ENTRYPOINT ["/usr/local/bin/wardstone"]` would let compose APPEND the
+   command list, making argv `wardstone wardstone ui`, and the binary's mode
+   dispatch (exact match on `argv[1]`) would fail the boot into a usage
+   error — i.e. a restart-policy crash loop.
 2. The image runs as a **non-root** user (`wardstone`, a fixed uid), and
    that user **owns `/var/lib/wardstone/keys`** in the image, so an empty
    named volume first mounted there inherits the correct ownership. The

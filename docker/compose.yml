@@ -32,8 +32,10 @@
 #
 # The image: compose does not build anything in this bundle — the image is
 # supplied by the release flow (see "The image and the keys volume" in
-# docker/README.md for its contract: the wardstone binary entrypoint, a
-# non-root run user, and a `wardstone`-owned `/var/lib/wardstone/keys`).
+# docker/README.md for its contract: the wardstone binary on PATH with NO
+# entrypoint (the commands below carry BOTH words, so an ENTRYPOINT would
+# double the binary into argv and crash-loop), a non-root run user, and a
+# `wardstone`-owned `/var/lib/wardstone/keys`).
 # `WARDSTONE_IMAGE` overrides the tag (the e2e harness uses this to point
 # at a locally built image):
 #
