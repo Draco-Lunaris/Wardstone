@@ -658,6 +658,100 @@ async fn list_expiring_picks_up_upcoming() {
     );
 }
 
+/// The slim column projection the dashboard sieve reads: exactly
+/// (id, subject, serial_hex, not_after, status) — no PEM, no SAN arrays —
+/// with the typed status decode, the `not_after DESC` order, the optional
+/// status filter, and the shared paging. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn list_slim_projects_only_the_slim_columns() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_CERTS).await;
+
+    sweep_cert_rows(&pool).await;
+
+    let tenant = TenantRepo::new()
+        .insert(&pool, CERTS_TENANT)
+        .await
+        .expect("insert test tenant for certificate rows");
+    let ca = cert_ca_model(tenant.id);
+    CaRepo::new()
+        .insert(&pool, &ca)
+        .await
+        .expect("insert test CA row");
+
+    let now = Utc::now().trunc_subsecs(0);
+    let mut soonest = cert_model(tenant.id, ca.id, 0x44, now + chrono::Duration::days(5));
+    soonest.subject = "CN=soonest.example".to_string();
+    let mut middle = cert_model(tenant.id, ca.id, 0x55, now + chrono::Duration::days(50));
+    middle.subject = "CN=middle.example".to_string();
+    let mut revoked = cert_model(tenant.id, ca.id, 0x66, now + chrono::Duration::days(90));
+    revoked.subject = "CN=revoked.example".to_string();
+    revoked.status = CertStatus::Revoked;
+
+    let certs = CertificateRepo::new();
+    certs
+        .insert(&pool, &soonest)
+        .await
+        .expect("insert the soonest cert");
+    certs
+        .insert(&pool, &middle)
+        .await
+        .expect("insert the middle cert");
+    certs
+        .insert(&pool, &revoked)
+        .await
+        .expect("insert the revoked cert");
+
+    let all = certs.list_slim(&pool, tenant.id, None, 0, 10).await;
+    let active = certs
+        .list_slim(&pool, tenant.id, Some(CertStatus::Active), 0, 10)
+        .await;
+    let page = certs.list_slim(&pool, tenant.id, None, 0, 2).await;
+    let other_tenant = certs
+        .list_slim(&pool, uuid::Uuid::new_v4(), None, 0, 10)
+        .await;
+
+    // Cleanup BEFORE asserting.
+    delete_cert_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY_CERTS).await;
+
+    let all = all.expect("list_slim");
+    assert_eq!(all.len(), 3, "every row of the tenant");
+    // not_after DESC is `list_by_tenant`'s order: furthest expiry FIRST,
+    // so the 90-day revoked row leads and the 5-day one trails.
+    assert_eq!(all[0].id, revoked.id);
+    assert_eq!(
+        all[0].status,
+        CertStatus::Revoked,
+        "the typed status decode"
+    );
+    assert_eq!(
+        all[2].id, soonest.id,
+        "not_after DESC puts the soonest expiry last"
+    );
+    assert_eq!(all[2].subject, "CN=soonest.example");
+    assert_eq!(all[2].status, CertStatus::Active);
+
+    let active = active.expect("list_slim with the status filter");
+    assert_eq!(active.len(), 2, "the revoked row is excluded");
+    for row in &active {
+        assert_eq!(row.status, CertStatus::Active);
+    }
+
+    let page = page.expect("list_slim with paging");
+    assert_eq!(page.len(), 2, "the limit applies");
+
+    let other_tenant = other_tenant.expect("list_slim under another tenant");
+    assert!(
+        other_tenant.is_empty(),
+        "another tenant's rows are invisible"
+    );
+}
+
 /// One audit entry fixture: `cert_issued` by default, with the caller's
 /// action labels, actor, target, and details map.
 fn audit_entry(

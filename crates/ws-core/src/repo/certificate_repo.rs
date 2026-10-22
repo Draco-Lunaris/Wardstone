@@ -49,6 +49,31 @@ struct CertificateRow {
     created_at: DateTime<Utc>,
 }
 
+/// Inline row shape for the slim list (`sqlx::FromRow`): the five columns
+/// the dashboard sieve reads, minus the PEM/SAN bulk that makes the full
+/// row heavy. `status` is the raw text column, decoded via
+/// `CertStatus::from_str` into [`SlimCertificate`].
+#[derive(sqlx::FromRow)]
+pub struct SlimCertificateRow {
+    id: Uuid,
+    subject: String,
+    serial_hex: String,
+    not_after: DateTime<Utc>,
+    status: String,
+}
+
+/// The slim read model `CertificateRepo::list_slim` serves: the projection
+/// the dashboard's expiring-soon sieve consumes (and the only thing it
+/// needs), with no certificate PEM, SAN arrays, or revocation detail.
+#[derive(Debug)]
+pub struct SlimCertificate {
+    pub id: Uuid,
+    pub subject: String,
+    pub serial_hex: String,
+    pub not_after: DateTime<Utc>,
+    pub status: CertStatus,
+}
+
 impl CertificateRepo {
     /// Build the (stateless) repository.
     ///
@@ -271,6 +296,61 @@ impl CertificateRepo {
         rows.into_iter()
             .map(CertificateRow::try_into_model)
             .collect::<Result<Vec<_>, CoreError>>()
+    }
+
+    /// The dashboard sieve's slim projection: a tenant's certificates as
+    /// [`SlimCertificate`] rows — `(id, subject, serial_hex, not_after,
+    /// status)`, nothing else — one page at a time, latest expiry first
+    /// (`not_after DESC`, the same order [`CertificateRepo::list_by_tenant`]
+    /// serves), LIMIT/OFFSET paging through the shared [`crate::repo::paging`]
+    /// helper, and an optional equality filter on `status`. The value of
+    /// the route is the COLUMNS: the sieve reads five small fields about
+    /// up to 500 rows, so the query never drags `cert_pem` and the SAN
+    /// arrays out of the database.
+    pub async fn list_slim(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        status: Option<CertStatus>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<SlimCertificate>, CoreError> {
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
+        let mut sql = String::from(
+            "SELECT id, subject, serial_hex, not_after, status \
+             FROM certificates WHERE tenant_id = $1",
+        );
+        let mut next = 2usize; // the next placeholder's 1-based index
+        if status.is_some() {
+            sql.push_str(&format!(" AND status = ${next}"));
+            next += 1;
+        }
+        sql.push_str(&format!(
+            " ORDER BY not_after DESC LIMIT ${next} OFFSET ${}",
+            next + 1
+        ));
+
+        let mut query = sqlx::query_as::<_, SlimCertificateRow>(&sql).bind(tenant_id);
+        if let Some(status) = &status {
+            query = query.bind(status.as_str());
+        }
+        let rows = query.bind(limit).bind(offset).fetch_all(executor).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(SlimCertificate {
+                    id: row.id,
+                    subject: row.subject,
+                    serial_hex: row.serial_hex,
+                    not_after: row.not_after,
+                    // An unknown stored spelling is data-level damage —
+                    // the same typed refusal the full row model hands
+                    // back, never a per-request string passthrough.
+                    status: row.status.parse::<CertStatus>().map_err(|err| {
+                        CoreError::Config(format!("invalid status in row: {err}"))
+                    })?,
+                })
+            })
+            .collect()
     }
 
     /// The estate's headline counts in ONE round trip: the `FILTER`ed

@@ -2900,6 +2900,113 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
     );
 }
 
+/// The slim list, the dashboard sieve's feed: `GET /certificates/slim`
+/// answers `{id, subject, serial_hex, not_after, status}` and NOTHING
+/// else (no PEM, no SAN arrays, no audit fields), honors the `status`
+/// filter, and gates on `read_certificates` like the full list does.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn slim_listing_serves_the_sieve_projection() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    let (a_status, a_body) = issue_csr(
+        &fx,
+        profile_id,
+        "slim-a.wardstone.test",
+        &["slim-a.wardstone.test"],
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_id = a_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let a_serial_hex = a_body["serial_hex"].as_str().unwrap().to_string();
+    let (b_status, b_body) = issue_csr(
+        &fx,
+        profile_id,
+        "slim-b.wardstone.test",
+        &["slim-b.wardstone.test"],
+    )
+    .await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_id = b_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let revoke = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{b_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded"}),
+    )
+    .await;
+    assert_eq!(revoke.status(), StatusCode::OK, "revoke B");
+
+    let slim = get_json(&fx, "/api/v1/certificates/slim", &token).await;
+    let slim_active = get_json(&fx, "/api/v1/certificates/slim?status=active", &token).await;
+    let gate_status = get_bearer(&fx, "/api/v1/certificates/slim", &api_token(&fx, &[]).await)
+        .await
+        .status();
+
+    fx.cleanup().await;
+
+    let rows = slim.as_array().expect("the slim body is a JSON array");
+    let a_row = rows
+        .iter()
+        .find(|row| row["id"].as_str() == Some(a_id.to_string().as_str()))
+        .expect("A appears in the slim list");
+    let mut keys: Vec<&str> = a_row
+        .as_object()
+        .expect("a slim row is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["id", "not_after", "serial_hex", "status", "subject"],
+        "the slim projection carries EXACTLY five fields"
+    );
+    assert_eq!(a_row["subject"], "CN=slim-a.wardstone.test");
+    assert_eq!(a_row["serial_hex"], a_serial_hex);
+    assert_eq!(a_row["status"], "active");
+    assert!(
+        a_row["not_after"].is_string(),
+        "not_after arrives as an RFC 3339 timestamp"
+    );
+
+    let ids = |list: &Value| -> Vec<Uuid> {
+        list.as_array()
+            .expect("the slim body is a JSON array")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect()
+    };
+    assert!(
+        ids(&slim).contains(&a_id) && ids(&slim).contains(&b_id),
+        "the unfiltered slim list lists both"
+    );
+    let active_ids = ids(&slim_active);
+    assert!(active_ids.contains(&a_id), "the active filter keeps A");
+    assert!(
+        !active_ids.contains(&b_id),
+        "the active filter drops the revoked B"
+    );
+    let b_row = rows
+        .iter()
+        .find(|row| row["id"].as_str() == Some(b_id.to_string().as_str()))
+        .expect("B appears in the slim list");
+    assert_eq!(b_row["status"], "revoked", "the revoked status decodes");
+
+    assert_eq!(gate_status, StatusCode::FORBIDDEN, "the capability gate");
+}
+
 /// The estate statistics endpoint counts, in one response: active,
 /// revoked, and active-and-expiring-within-the-30-day horizon. Four
 /// certificates are issued and their `not_after` pinned by direct row
