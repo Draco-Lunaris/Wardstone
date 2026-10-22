@@ -5,3 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Argon2id password hashing (workspace pin; default features enable the
+# auto-salted `PasswordHasher::hash_password`).
+argon2 = { workspace = true }
+# iat/exp unix timestamps on the JWT claims (house pattern).
+chrono = { workspace = true }
+# Ed25519 keypair generation for the JWT signing/verification key pair
+# (keys are kept in PEM form, matching the house layout).
+ed25519-dalek = { workspace = true }
+# JWT issuing/validation with the pure-Rust Ed25519 backend.
+jsonwebtoken = { workspace = true }
+# PKCS#8/SPKI encoders plus the `pem` feature (to_pkcs8_pem /
+# to_public_key_pem / LineEnding) for writing the key pair.
+pkcs8 = { workspace = true }
+# OS entropy for the fresh Ed25519 seed (house pattern: rand 0.10 SysRng).
+rand = { workspace = true }
+# Claims types are the JWT payload (jsonwebtoken serializes via serde).
+serde = { workspace = true }
+# Zero-wipe the fresh Ed25519 seed after the key is built.
+zeroize = { workspace = true }
+# Typed error enum shared by every later auth task.
+thiserror = { workspace = true }
+# Claims carry UUIDs: user_id and the refresh-token session id (sid).
+uuid = { workspace = true, features = ["serde"] }

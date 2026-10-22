@@ -57,6 +57,27 @@ tracing = { version = "0.1.44" }
 thiserror = { version = "2.0.21" }
 anyhow = { version = "1.0.104" }
 
+# JWT: Ed25519 (EdDSA) access tokens. House pin (linux-patch-manager). The
+# `rust_crypto` feature selects the pure-Rust ed25519-dalek backend over
+# aws-lc-rs, which needs a C toolchain absent from the container image; the
+# default `use_pem` feature provides EncodingKey/DecodingKey::from_ed_pem.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# Ed25519 keypair generation for the JWT signing/verification key pair (the
+# `pkcs8` feature provides the PKCS#8/SPKI encoders; keys stay in PEM form).
+ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
+
+# PKCS#8/SPKI DER encoding for the JWT key pair. The `pem` feature provides
+# to_pkcs8_pem / to_public_key_pem and LineEnding (der/pem -> pem-rfc7468).
+pkcs8 = { version = "0.10.2", features = ["pem"] }
+
+# PEM codec (house pin "3"; jsonwebtoken 10's use_pem parser uses the same
+# major). Carried as the plan's PEM-handling pin for ws-auth.
+pem = "3"
+
+# Hex encoding for auth token material (house pin; used from Task 8 on).
+hex = "0.4"
+
 # Timestamp type of rcgen's CertificateParams (not_before/not_after):
 # issue.rs converts caller chrono instants to time::OffsetDateTime at the
 # rcgen boundary. Already resolved in the lock via rcgen.
