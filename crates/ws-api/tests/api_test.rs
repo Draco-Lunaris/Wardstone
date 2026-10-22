@@ -1279,6 +1279,172 @@ async fn revision_move_makes_issuance_retry_not_record_stale() {
     );
 }
 
+/// A genuine database failure through the issuance CAS (`ProfileRepo::update`)
+/// surfaces as the MAPPED 500 — never as the retries-exhausted Conflict —
+/// and the failed attempt rolls back completely.
+///
+/// Failure-injection mechanism (the Task 3 FK-bend test's drop-and-heal
+/// idiom, sweep first): a `CHECK (false) NOT VALID` constraint on
+/// `profiles`. Pure DDL, and NOT VALID means existing rows are never
+/// re-validated — the constraint is evaluated ONLY on writes, so every
+/// SELECT the issuance flow runs before the CAS still succeeds and EXACTLY
+/// the `UPDATE profiles` statement fails with a check violation
+/// (`sqlx::Error` → `CoreError::Database` → the mapping table's 500, which
+/// is a different code AND status from `ApiError::Conflict`).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn cas_database_failure_maps_to_500_not_retry_conflict() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let actor = admin_actor(&fx);
+
+    // Sweep-first covers the schema too: heal a constraint a previously
+    // crashed run might have left behind.
+    sqlx::query("ALTER TABLE profiles DROP CONSTRAINT IF EXISTS ws_test_invalid_check")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep a stale injected check constraint");
+    sqlx::query(
+        "ALTER TABLE profiles ADD CONSTRAINT ws_test_invalid_check \
+         CHECK (false) NOT VALID",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("inject the write-failing check constraint");
+
+    // Baselines BEFORE the failed attempt, compared after: the rollback
+    // must leave no certificate, no `cert_issued` audit row, and no burned
+    // serial row behind.
+    let (certs_before, audits_before, serials_before): (i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM certificates WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND action = 'cert_issued'",
+        )
+        .bind(fx.tenant_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM used_serials WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+    );
+
+    // The core loop and the HTTP leg BOTH run while the constraint is in
+    // place, WITHOUT asserting: NOTHING between the injection and the heal
+    // may panic — a panic there would leave the schema broken for every
+    // later suite (which is why every assertion lives AFTER the heal). The
+    // core leg captures the `Result` un-demolished; the HTTP leg captures
+    // status and body with panic-proof reads.
+    let body = ws_api::routes::certificates::IssueCertificateBody {
+        profile_id,
+        subject_cn: "casfail.wardstone.test".to_string(),
+        sans: vec!["casfail.wardstone.test".to_string()],
+        csr_pem: Some(mint_csr(
+            "casfail.wardstone.test",
+            &["casfail.wardstone.test"],
+        )),
+    };
+    let core = ws_api::routes::certificates::issue_certificate_core(
+        &fx.state,
+        &actor,
+        &body,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        None,
+    )
+    .await;
+
+    let token = admin_token(&fx);
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "casfail.wardstone.test",
+            "sans": ["casfail.wardstone.test"],
+            "csr_pem": mint_csr("casfail.wardstone.test", &["casfail.wardstone.test"])
+        }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let mapped: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+
+    // Heal the schema BEFORE any assertion (a failed assert must never
+    // leave the constraint behind).
+    sqlx::query("ALTER TABLE profiles DROP CONSTRAINT ws_test_invalid_check")
+        .execute(&fx.pool)
+        .await
+        .expect("heal the injected check constraint");
+
+    // The core loop: a `CoreError::Database` from the CAS propagates as
+    // the mapped `ApiError::Internal` from the FIRST attempt — the bounded
+    // retry counts only `Ok(None)` (the revision moved), never `Err`.
+    let err = core.expect_err("the injected DB failure makes issuance fail");
+    assert!(
+        matches!(err, ws_api::ApiError::Internal(_)),
+        "a genuine CAS DB failure maps to Internal (500), got: {err:?}"
+    );
+    assert!(
+        !matches!(err, ws_api::ApiError::Conflict(_)),
+        "a genuine DB failure must NOT arrive as the retries-exhausted Conflict"
+    );
+
+    // The HTTP surface renders the mapped error: 500 with body code
+    // `internal` under the `error` object, never the conflict-shape 409.
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the route renders the mapped database error as a 500"
+    );
+    assert_eq!(
+        mapped["error"]["code"], "internal",
+        "the 500 body carries the mapped `internal` code"
+    );
+    assert_ne!(
+        mapped["error"]["code"], "conflict",
+        "a genuine DB failure must not render the conflict code"
+    );
+
+    let (certs_after, audits_after, serials_after): (i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM certificates WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND action = 'cert_issued'",
+        )
+        .bind(fx.tenant_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM used_serials WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        (certs_before, audits_before, serials_before),
+        (certs_after, audits_after, serials_after),
+        "the failed issuance attempt rolls back completely (no certificate row, \
+         no cert_issued audit row, no burned serial)"
+    );
+
+    fx.cleanup().await;
+}
+
 /// Every route in the capability table refuses a token lacking its
 /// capability (403, not 401), and answers a token holding exactly that
 /// capability with something other than 401/403 (validation failures
