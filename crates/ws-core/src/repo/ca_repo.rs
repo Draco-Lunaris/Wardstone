@@ -1,7 +1,7 @@
 //! Repository over the `cas` table.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::error::CoreError;
@@ -9,9 +9,14 @@ use crate::models::ca::{CaModel, KeyType};
 use crate::repo::tenant_repo::map_unique;
 
 /// Data access for [`CaModel`] rows.
-pub struct CaRepo {
-    pool: PgPool,
-}
+///
+/// Stateless by design: the repository holds no pool, and every method
+/// takes `executor: impl PgExecutor<'_>` so a mutation and its audit row
+/// can share one transaction (callers pass `&pool`, or `&mut *tx` inside a
+/// transaction — `&mut Transaction` does not implement `PgExecutor` in
+/// sqlx 0.8.6).
+#[derive(Default)]
+pub struct CaRepo;
 
 /// Inline row shape for `sqlx::query_as` (house style: hand-mapped to the
 /// model). `key_type` is the raw text column, decoded via `KeyType::from_str`.
@@ -32,16 +37,28 @@ struct CaRow {
 }
 
 impl CaRepo {
-    /// Build a repository bound to the shared pool.
-    pub fn new(pool: &PgPool) -> Self {
-        CaRepo { pool: pool.clone() }
+    /// Build the (stateless) repository.
+    ///
+    /// The body is the plan's house shape verbatim
+    /// (`Self::default()`), satisfied by the derived `Default`
+    /// (`clippy::new_without_default` is an error here under the house
+    /// rule); the allow silences the newer, contradicting
+    /// `clippy::default_constructed_unit_structs` style lint, which the
+    /// house shape deliberately does not adopt.
+    #[allow(clippy::default_constructed_unit_structs)]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Insert a CA row exactly as given (`id`, `created_at`, every field: the
     /// model is authoritative — `created_at` is written explicitly rather
     /// than left to the `now()` default, so `get` returns the same row).
     /// `key_type` is bound via its text representation.
-    pub async fn insert(&self, ca: &CaModel) -> Result<(), CoreError> {
+    pub async fn insert(
+        &self,
+        executor: impl PgExecutor<'_>,
+        ca: &CaModel,
+    ) -> Result<(), CoreError> {
         sqlx::query(
             "INSERT INTO cas (id, tenant_id, name, subject, is_root, parent_id, key_type, \
              not_before, not_after, cert_pem, key_file, created_at) \
@@ -59,21 +76,25 @@ impl CaRepo {
         .bind(&ca.cert_pem)
         .bind(&ca.key_file)
         .bind(ca.created_at)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(map_unique)?;
         Ok(())
     }
 
     /// Fetch a CA by id; `None` when absent.
-    pub async fn get(&self, id: Uuid) -> Result<Option<CaModel>, CoreError> {
+    pub async fn get(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+    ) -> Result<Option<CaModel>, CoreError> {
         let row: Option<CaRow> = sqlx::query_as(
             "SELECT id, tenant_id, name, subject, is_root, parent_id, key_type, \
              not_before, not_after, cert_pem, key_file, created_at \
              FROM cas WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -83,14 +104,18 @@ impl CaRepo {
     }
 
     /// All CAs owned by a tenant, ordered by name for stable output.
-    pub async fn list_by_tenant(&self, tenant_id: Uuid) -> Result<Vec<CaModel>, CoreError> {
+    pub async fn list_by_tenant(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+    ) -> Result<Vec<CaModel>, CoreError> {
         let rows: Vec<CaRow> = sqlx::query_as(
             "SELECT id, tenant_id, name, subject, is_root, parent_id, key_type, \
              not_before, not_after, cert_pem, key_file, created_at \
              FROM cas WHERE tenant_id = $1 ORDER BY name",
         )
         .bind(tenant_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
         rows.into_iter()
@@ -99,14 +124,18 @@ impl CaRepo {
     }
 
     /// CAs whose `parent_id` is the given CA, ordered by name.
-    pub async fn children_of(&self, parent_id: Uuid) -> Result<Vec<CaModel>, CoreError> {
+    pub async fn children_of(
+        &self,
+        executor: impl PgExecutor<'_>,
+        parent_id: Uuid,
+    ) -> Result<Vec<CaModel>, CoreError> {
         let rows: Vec<CaRow> = sqlx::query_as(
             "SELECT id, tenant_id, name, subject, is_root, parent_id, key_type, \
              not_before, not_after, cert_pem, key_file, created_at \
              FROM cas WHERE parent_id = $1 ORDER BY name",
         )
         .bind(parent_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
         rows.into_iter()

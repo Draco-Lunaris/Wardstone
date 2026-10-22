@@ -217,13 +217,13 @@ async fn insert_revoked_cert(
         source: "manual".to_string(),
         created_at: now,
     };
-    let certs = CertificateRepo::new(pool);
+    let certs = CertificateRepo::new();
     certs
-        .insert(&model)
+        .insert(pool, &model)
         .await
         .expect("insert the certificate row");
     certs
-        .revoke(id, "key_compromise")
+        .revoke(pool, id, "key_compromise")
         .await
         .expect("revoke the certificate row");
     id
@@ -251,8 +251,8 @@ async fn test_scheduler_regenerates_on_revocation() {
     let mut keystore = temp_keystore("regenerates-on-revocation");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = CaModel {
@@ -269,8 +269,8 @@ async fn test_scheduler_regenerates_on_revocation() {
         key_file: "keystore://ca".to_string(),
         created_at: chrono::Utc::now(),
     };
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert the test CA row");
 
@@ -292,8 +292,12 @@ async fn test_scheduler_regenerates_on_revocation() {
             .bind(ca.id)
             .fetch_one(&pool)
             .await;
-    let latest = OcspRepo::new(&pool)
-        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+    let latest = OcspRepo::new()
+        .get_latest(
+            &pool,
+            ca.id,
+            i64::try_from(LEAF_SERIAL).expect("serial fits i64"),
+        )
         .await
         .expect("get the latest OCSP response");
     let ocsp_tenant: Result<Option<uuid::Uuid>, sqlx::Error> =
@@ -309,8 +313,8 @@ async fn test_scheduler_regenerates_on_revocation() {
             .fetch_all(&pool)
             .await
             .expect("list the CA's audit actions");
-    let cert_after = CertificateRepo::new(&pool)
-        .get(cert_id)
+    let cert_after = CertificateRepo::new()
+        .get(&pool, cert_id)
         .await
         .expect("get the certificate row");
 
@@ -382,11 +386,11 @@ async fn test_regen_isolates_a_failing_ca() {
     let mut keystore = temp_keystore("isolates-a-failing-ca");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
-    let cas = CaRepo::new(&pool);
+    let cas = CaRepo::new();
     let ca = CaModel {
         id: root.key_pair_id,
         tenant_id: tenant.id,
@@ -401,7 +405,9 @@ async fn test_regen_isolates_a_failing_ca() {
         key_file: "keystore://ca".to_string(),
         created_at: chrono::Utc::now(),
     };
-    cas.insert(&ca).await.expect("insert the test CA row");
+    cas.insert(&pool, &ca)
+        .await
+        .expect("insert the test CA row");
     // A second CA row whose key was never stored: the job must fail on
     // it without touching the first CA's results. It has a revocation of
     // its own, so the job really tries to sign for it.
@@ -411,7 +417,9 @@ async fn test_regen_isolates_a_failing_ca() {
         cert_pem: root.cert_pem.clone(),
         ..ca.clone()
     };
-    cas.insert(&broken).await.expect("insert the second CA row");
+    cas.insert(&pool, &broken)
+        .await
+        .expect("insert the second CA row");
 
     let cert_id = insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL).await;
     let broken_cert_id = insert_revoked_cert(&pool, tenant.id, broken.id, BROKEN_SERIAL).await;
@@ -428,8 +436,12 @@ async fn test_regen_isolates_a_failing_ca() {
         .fetch_one(&pool)
         .await
         .expect("count the broken CA's CRL rows");
-    let latest = OcspRepo::new(&pool)
-        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+    let latest = OcspRepo::new()
+        .get_latest(
+            &pool,
+            ca.id,
+            i64::try_from(LEAF_SERIAL).expect("serial fits i64"),
+        )
         .await
         .expect("get the latest OCSP response");
 
@@ -482,8 +494,8 @@ async fn insert_ca(
         key_file: "keystore://ca".to_string(),
         created_at: chrono::Utc::now(),
     };
-    CaRepo::new(pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(pool, &ca)
         .await
         .expect("insert the test CA row");
     ca
@@ -519,8 +531,8 @@ async fn insert_active_cert(
         source: "manual".to_string(),
         created_at: now,
     };
-    CertificateRepo::new(pool)
-        .insert(&model)
+    CertificateRepo::new()
+        .insert(pool, &model)
         .await
         .expect("insert the active certificate row");
     id
@@ -629,8 +641,8 @@ async fn test_regen_counts_only_cas_with_work() {
     )
     .expect("create the second root");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let revoking = insert_ca(&pool, tenant.id, &revoking_root, WORKER_CA_NAME).await;
@@ -695,8 +707,8 @@ async fn test_regen_republishes_expired_crl() {
 
     let mut keystore = temp_keystore("republishes-expired-crl");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -745,8 +757,8 @@ async fn test_regen_republishes_lost_revocation() {
 
     let mut keystore = temp_keystore("republishes-lost-revocation");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -772,8 +784,9 @@ async fn test_regen_republishes_lost_revocation() {
     .await
     .expect("read the newest published CRL");
     let listed = crl_serials(&newest_crl);
-    let lost_response = OcspRepo::new(&pool)
+    let lost_response = OcspRepo::new()
         .get_latest(
+            &pool,
             ca.id,
             i64::try_from(BROKEN_SERIAL).expect("serial fits i64"),
         )
@@ -821,8 +834,8 @@ async fn test_regen_republishes_missing_ocsp_response() {
 
     let mut keystore = temp_keystore("republishes-missing-ocsp");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -843,8 +856,12 @@ async fn test_regen_republishes_missing_ocsp_response() {
 
     let second = regen_crl_and_ocsp(&pool, &keystore).await;
     let crls_after = crl_count(&pool, ca.id).await;
-    let latest = OcspRepo::new(&pool)
-        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+    let latest = OcspRepo::new()
+        .get_latest(
+            &pool,
+            ca.id,
+            i64::try_from(LEAF_SERIAL).expect("serial fits i64"),
+        )
         .await
         .expect("get the latest OCSP response");
 
@@ -884,8 +901,8 @@ async fn test_regen_rejects_revocation_without_date() {
 
     let mut keystore = temp_keystore("rejects-revocation-without-date");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -923,8 +940,8 @@ async fn test_regen_refreshes_expired_ocsp_response() {
 
     let mut keystore = temp_keystore("refreshes-expired-ocsp");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let ca = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -962,8 +979,12 @@ async fn test_regen_refreshes_expired_ocsp_response() {
             .fetch_one(&pool)
             .await
             .expect("count the OCSP responses again");
-    let latest = OcspRepo::new(&pool)
-        .get_latest(ca.id, i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
+    let latest = OcspRepo::new()
+        .get_latest(
+            &pool,
+            ca.id,
+            i64::try_from(LEAF_SERIAL).expect("serial fits i64"),
+        )
         .await
         .expect("get the latest OCSP response");
 
@@ -1015,8 +1036,8 @@ async fn insert_unprovisioned_ca(
         key_file: "keystore://ca".to_string(),
         created_at: chrono::Utc::now(),
     };
-    CaRepo::new(pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(pool, &ca)
         .await
         .expect("insert the unprovisioned CA row");
     ca
@@ -1041,8 +1062,8 @@ async fn test_regen_skips_unprovisioned_ca_without_documents() {
     let mut keystore = temp_keystore("skips-unprovisioned-ca");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let healthy = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -1093,8 +1114,8 @@ async fn test_regen_fails_for_unprovisioned_ca_with_revocation() {
     let mut keystore = temp_keystore("fails-for-unprovisioned-ca");
     let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     let healthy = insert_ca(&pool, tenant.id, &root, WORKER_CA_NAME).await;
@@ -1159,8 +1180,8 @@ async fn test_regen_fails_for_ca_with_corrupt_key() {
     let envelope = dir.join("ca").join(format!("{}.key", root.key_pair_id));
     fs::write(&envelope, b"not a valid envelope").expect("damage the key envelope");
 
-    let tenant = ws_core::repo::tenant_repo::TenantRepo::new(&pool)
-        .insert(WORKER_TENANT)
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
         .await
         .expect("insert the test tenant");
     // The CA owes nothing: no revocations and no published CRL.

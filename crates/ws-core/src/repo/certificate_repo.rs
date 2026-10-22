@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::error::CoreError;
@@ -11,9 +11,14 @@ use crate::models::certificate::{CertStatus, CertificateModel};
 use crate::repo::tenant_repo::map_unique;
 
 /// Data access for [`CertificateModel`] rows.
-pub struct CertificateRepo {
-    pool: PgPool,
-}
+///
+/// Stateless by design: the repository holds no pool, and every method
+/// takes `executor: impl PgExecutor<'_>` so a mutation and its audit row
+/// can share one transaction (callers pass `&pool`, or `&mut *tx` inside a
+/// transaction — `&mut Transaction` does not implement `PgExecutor` in
+/// sqlx 0.8.6).
+#[derive(Default)]
+pub struct CertificateRepo;
 
 /// Inline row shape for `sqlx::query_as` (house style: hand-mapped to the
 /// model). `serial` is the raw `bigint` column; `status` is the raw text
@@ -42,9 +47,17 @@ struct CertificateRow {
 }
 
 impl CertificateRepo {
-    /// Build a repository bound to the shared pool.
-    pub fn new(pool: &PgPool) -> Self {
-        CertificateRepo { pool: pool.clone() }
+    /// Build the (stateless) repository.
+    ///
+    /// The body is the plan's house shape verbatim
+    /// (`Self::default()`), satisfied by the derived `Default`
+    /// (`clippy::new_without_default` is an error here under the house
+    /// rule); the allow silences the newer, contradicting
+    /// `clippy::default_constructed_unit_structs` style lint, which the
+    /// house shape deliberately does not adopt.
+    #[allow(clippy::default_constructed_unit_structs)]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Insert a certificate row exactly as given (every field, `created_at`
@@ -54,7 +67,11 @@ impl CertificateRepo {
     /// policy authority, `profile_name` the display label). A
     /// unique-violation on `(ca_id, serial)`
     /// becomes [`CoreError::Duplicate`].
-    pub async fn insert(&self, cert: &CertificateModel) -> Result<(), CoreError> {
+    pub async fn insert(
+        &self,
+        executor: impl PgExecutor<'_>,
+        cert: &CertificateModel,
+    ) -> Result<(), CoreError> {
         let serial = serial_to_i64(cert.serial)?;
         sqlx::query(
             "INSERT INTO certificates (id, tenant_id, ca_id, profile_name, \
@@ -83,21 +100,25 @@ impl CertificateRepo {
         .bind(cert.revocation_reason.as_deref())
         .bind(&cert.source)
         .bind(cert.created_at)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(map_unique)?;
         Ok(())
     }
 
     /// Fetch a certificate by id; `None` when absent.
-    pub async fn get(&self, id: Uuid) -> Result<Option<CertificateModel>, CoreError> {
+    pub async fn get(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+    ) -> Result<Option<CertificateModel>, CoreError> {
         let row: Option<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
              revoked_at, revocation_reason, source, created_at FROM certificates WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -108,14 +129,16 @@ impl CertificateRepo {
 
     /// A tenant's certificates, one page at a time, latest expiry first
     /// (`not_after` DESC), LIMIT/OFFSET paging (`offset = page *
-    /// page_size`).
+    /// page_size`) through the shared [`crate::repo::paging`] helper
+    /// (clamped page size).
     pub async fn list_by_tenant(
         &self,
+        executor: impl PgExecutor<'_>,
         tenant_id: Uuid,
         page: u32,
         page_size: u32,
     ) -> Result<Vec<CertificateModel>, CoreError> {
-        let (limit, offset) = paging(page, page_size)?;
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
         let rows: Vec<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
@@ -126,7 +149,7 @@ impl CertificateRepo {
         .bind(tenant_id)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
         rows.into_iter()
@@ -141,12 +164,13 @@ impl CertificateRepo {
     /// already passed is exactly what a renewal monitor must surface.
     pub async fn list_expiring_before(
         &self,
+        executor: impl PgExecutor<'_>,
         tenant_id: Uuid,
         threshold: DateTime<Utc>,
         page: u32,
         page_size: u32,
     ) -> Result<Vec<CertificateModel>, CoreError> {
-        let (limit, offset) = paging(page, page_size)?;
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
         let rows: Vec<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
@@ -158,7 +182,7 @@ impl CertificateRepo {
         .bind(threshold)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
         rows.into_iter()
@@ -171,14 +195,19 @@ impl CertificateRepo {
     /// guard makes a double revoke structurally idempotent — a second call
     /// updates zero rows and still returns `Ok(())`, leaving `revoked_at`
     /// exactly where the first call set it.
-    pub async fn revoke(&self, id: Uuid, reason: &str) -> Result<(), CoreError> {
+    pub async fn revoke(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), CoreError> {
         sqlx::query(
             "UPDATE certificates SET status = 'revoked', revoked_at = now(), \
              revocation_reason = $2 WHERE id = $1 AND status = 'active'",
         )
         .bind(id)
         .bind(reason)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -188,6 +217,7 @@ impl CertificateRepo {
     /// the feed CRL building consumes.
     pub async fn list_revoked_since(
         &self,
+        executor: impl PgExecutor<'_>,
         ca_id: Uuid,
         since: DateTime<Utc>,
     ) -> Result<Vec<CertificateModel>, CoreError> {
@@ -200,7 +230,7 @@ impl CertificateRepo {
         )
         .bind(ca_id)
         .bind(since)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
         rows.into_iter()
@@ -258,15 +288,4 @@ fn serial_to_i64(serial: u128) -> Result<i64, CoreError> {
             "certificate serial {serial} exceeds the bigint column range"
         ))
     })
-}
-
-/// LIMIT/OFFSET values for a page: `page_size` and `page * page_size`.
-/// The u32-by-u32 product cannot overflow u64, so the multiply is plain;
-/// the i64 conversion is still typed — an offset beyond i64 is a caller
-/// bug surfaced as [`CoreError::Config`], never a silent wrap.
-fn paging(page: u32, page_size: u32) -> Result<(i64, i64), CoreError> {
-    let offset = u64::from(page) * u64::from(page_size);
-    let offset = i64::try_from(offset)
-        .map_err(|_| CoreError::Config(format!("page offset {offset} overflows")))?;
-    Ok((i64::from(page_size), offset))
 }

@@ -303,3 +303,99 @@ async fn test_serial_allocation_records_the_tenant() {
         "the used_serials row carries the tenant it was allocated for"
     );
 }
+
+/// The executor widening: `allocate_serial` runs against the pool OR
+/// against a transaction (`&mut *tx`), sharing the CALLER's transaction —
+/// the issuance shape, where the serial INSERT and the certificate INSERT
+/// commit atomically. A committed transaction leaves the drawn serial in
+/// `used_serials` (visible inside the transaction already); a rolled-back
+/// one RELEASES it: no row remains. The serial is not burned — it was
+/// never attached to an issued certificate — and `(ca_id, serial)`
+/// uniqueness still separates live certificates. Cleans up before
+/// asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn test_serial_allocation_inside_a_transaction() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_serial_rows(&pool).await;
+
+    let (ca_id, tenant_id) = insert_serial_fixture(&pool).await;
+
+    // Committed transaction: the serial is visible inside the
+    // transaction before the commit, and persists after it.
+    let mut tx = pool.begin().await.expect("begin the first transaction");
+    let committed = allocate_serial(ca_id, tenant_id, &mut *tx).await;
+    let seen_in_tx: Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT serial FROM used_serials WHERE ca_id = $1")
+            .bind(ca_id)
+            .fetch_one(&mut *tx)
+            .await;
+    let commit = tx.commit().await;
+    let stored_after_commit: Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT serial FROM used_serials WHERE ca_id = $1")
+            .bind(ca_id)
+            .fetch_one(&pool)
+            .await;
+
+    // Rolled-back transaction: the drawn serial disappears with it, and
+    // the committed allocation's row is untouched — so `used_serials`
+    // holds exactly the same set after the rollback as before it, and the
+    // rolled-back draw's value is not among them (the serial is
+    // released, not burned).
+    let stored_before_rollback: Result<Vec<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT serial FROM used_serials WHERE ca_id = $1")
+            .bind(ca_id)
+            .fetch_all(&pool)
+            .await;
+    let mut tx = pool.begin().await.expect("begin the second transaction");
+    let rolled_back = allocate_serial(ca_id, tenant_id, &mut *tx).await;
+    let rollback = tx.rollback().await;
+    let stored_after_rollback: Result<Vec<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT serial FROM used_serials WHERE ca_id = $1")
+            .bind(ca_id)
+            .fetch_all(&pool)
+            .await;
+
+    // Cleanup BEFORE asserting.
+    delete_serial_rows(&pool, ca_id, tenant_id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let committed = committed.expect("allocate inside the first transaction");
+    commit.expect("commit the first transaction");
+    let seen_in_tx = seen_in_tx
+        .expect("read used_serials inside the transaction")
+        .expect("the drawn serial is visible inside its own transaction");
+    assert_eq!(
+        i64::try_from(committed).expect("serial fits i64"),
+        seen_in_tx,
+        "inside the transaction, used_serials already holds the drawn serial"
+    );
+    let stored_after_commit = stored_after_commit
+        .expect("read used_serials after the commit")
+        .expect("the committed allocation persisted");
+    assert_eq!(
+        stored_after_commit, seen_in_tx,
+        "the commit persisted exactly the drawn serial"
+    );
+
+    let rolled_serial: i64 = match rolled_back {
+        Ok(serial) => i64::try_from(serial).expect("the rolled-back draw fit i64"),
+        Err(err) => panic!("allocate inside the rolled-back transaction: {err}"),
+    };
+    rollback.expect("roll back the second transaction");
+    let stored_before_rollback = stored_before_rollback.expect("read used_serials before");
+    let stored_after_rollback = stored_after_rollback.expect("read used_serials after");
+    assert_eq!(
+        stored_after_rollback, stored_before_rollback,
+        "the rolled-back allocation left used_serials exactly as it was"
+    );
+    assert!(
+        !stored_after_rollback.contains(&rolled_serial),
+        "the rolled-back serial was released: no burned row remains"
+    );
+}

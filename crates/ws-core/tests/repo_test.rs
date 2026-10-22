@@ -203,10 +203,10 @@ async fn tenant_insert_get_roundtrip() {
         .await
         .expect("sweep stale 'default' tenant");
 
-    let repo = TenantRepo::new(&pool);
-    let inserted = repo.insert(DEFAULT_TENANT).await;
-    let fetched = repo.get_by_name(DEFAULT_TENANT).await;
-    let duplicate = repo.insert(DEFAULT_TENANT).await;
+    let repo = TenantRepo::new();
+    let inserted = repo.insert(&pool, DEFAULT_TENANT).await;
+    let fetched = repo.get_by_name(&pool, DEFAULT_TENANT).await;
+    let duplicate = repo.insert(&pool, DEFAULT_TENANT).await;
 
     // Cleanup BEFORE asserting: the tenant row is gone here no matter how the
     // assertions below turn out.
@@ -254,9 +254,9 @@ async fn ca_insert_get_list_roundtrip() {
         .await
         .expect("sweep stale tenant");
 
-    let tenants = TenantRepo::new(&pool);
+    let tenants = TenantRepo::new();
     let tenant = tenants
-        .insert(CAS_TENANT)
+        .insert(&pool, CAS_TENANT)
         .await
         .expect("insert test tenant for CA rows");
 
@@ -275,11 +275,11 @@ async fn ca_insert_get_list_roundtrip() {
         created_at: ts("2026-06-15T12:30:00Z"),
     };
 
-    let cas = CaRepo::new(&pool);
-    let insert_ca = cas.insert(&model).await;
-    let get_ca = cas.get(model.id).await;
-    let list = cas.list_by_tenant(tenant.id).await;
-    let children = cas.children_of(model.id).await;
+    let cas = CaRepo::new();
+    let insert_ca = cas.insert(&pool, &model).await;
+    let get_ca = cas.get(&pool, model.id).await;
+    let list = cas.list_by_tenant(&pool, tenant.id).await;
+    let children = cas.children_of(&pool, model.id).await;
 
     // Cleanup BEFORE asserting: this tenant's CA rows (the suite inserted
     // exactly one), then the tenant. Runs whether or not the CA insert
@@ -410,13 +410,13 @@ async fn certificate_insert_get_roundtrip() {
 
     sweep_cert_rows(&pool).await;
 
-    let tenant = TenantRepo::new(&pool)
-        .insert(CERTS_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, CERTS_TENANT)
         .await
         .expect("insert test tenant for certificate rows");
     let ca = cert_ca_model(tenant.id);
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert test CA row");
 
@@ -426,10 +426,10 @@ async fn certificate_insert_get_roundtrip() {
         0x1234_5678_9abc_def0,
         ts("2026-12-01T00:00:00Z"),
     );
-    let certs = CertificateRepo::new(&pool);
-    let inserted = certs.insert(&model).await;
-    let fetched = certs.get(model.id).await;
-    let listed = certs.list_by_tenant(tenant.id, 0, 10).await;
+    let certs = CertificateRepo::new();
+    let inserted = certs.insert(&pool, &model).await;
+    let fetched = certs.get(&pool, model.id).await;
+    let listed = certs.list_by_tenant(&pool, tenant.id, 0, 10).await;
 
     // Cleanup BEFORE asserting, no matter how the operations below turn out.
     delete_cert_rows(&pool, tenant.id).await;
@@ -463,24 +463,27 @@ async fn test_revoke_twice_is_idempotent() {
 
     sweep_cert_rows(&pool).await;
 
-    let tenant = TenantRepo::new(&pool)
-        .insert(CERTS_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, CERTS_TENANT)
         .await
         .expect("insert test tenant for certificate rows");
     let ca = cert_ca_model(tenant.id);
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert test CA row");
 
     let model = cert_model(tenant.id, ca.id, 0x0bad_c0de, ts("2026-12-01T00:00:00Z"));
-    let certs = CertificateRepo::new(&pool);
-    certs.insert(&model).await.expect("insert certificate row");
+    let certs = CertificateRepo::new();
+    certs
+        .insert(&pool, &model)
+        .await
+        .expect("insert certificate row");
 
-    let first_revoke = certs.revoke(model.id, "key_compromise").await;
-    let after_first = certs.get(model.id).await;
-    let second_revoke = certs.revoke(model.id, "key_compromise").await;
-    let after_second = certs.get(model.id).await;
+    let first_revoke = certs.revoke(&pool, model.id, "key_compromise").await;
+    let after_first = certs.get(&pool, model.id).await;
+    let second_revoke = certs.revoke(&pool, model.id, "key_compromise").await;
+    let after_second = certs.get(&pool, model.id).await;
 
     // The `since` boundary queries run before cleanup; their inputs are
     // read out of the captured first-revoke row without asserting (a None
@@ -492,16 +495,16 @@ async fn test_revoke_twice_is_idempotent() {
         .and_then(|row| row.as_ref())
         .and_then(|cert| cert.revoked_at);
     let since_epoch = certs
-        .list_revoked_since(ca.id, ts("2020-01-01T00:00:00Z"))
+        .list_revoked_since(&pool, ca.id, ts("2020-01-01T00:00:00Z"))
         .await;
     let since_boundary = match revoked_at {
-        Some(at) => certs.list_revoked_since(ca.id, at).await,
+        Some(at) => certs.list_revoked_since(&pool, ca.id, at).await,
         None => Ok(Vec::new()),
     };
     let since_after = match revoked_at {
         Some(at) => {
             certs
-                .list_revoked_since(ca.id, at + chrono::Duration::seconds(1))
+                .list_revoked_since(&pool, ca.id, at + chrono::Duration::seconds(1))
                 .await
         }
         None => Ok(Vec::new()),
@@ -571,13 +574,13 @@ async fn list_expiring_picks_up_upcoming() {
 
     sweep_cert_rows(&pool).await;
 
-    let tenant = TenantRepo::new(&pool)
-        .insert(CERTS_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, CERTS_TENANT)
         .await
         .expect("insert test tenant for certificate rows");
     let ca = cert_ca_model(tenant.id);
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert test CA row");
 
@@ -587,13 +590,22 @@ async fn list_expiring_picks_up_upcoming() {
     let five_day = cert_model(tenant.id, ca.id, 0x22, now + chrono::Duration::days(5));
     let ninety_day = cert_model(tenant.id, ca.id, 0x33, now + chrono::Duration::days(90));
 
-    let certs = CertificateRepo::new(&pool);
-    certs.insert(&expired).await.expect("insert expired cert");
-    certs.insert(&five_day).await.expect("insert 5-day cert");
-    certs.insert(&ninety_day).await.expect("insert 90-day cert");
+    let certs = CertificateRepo::new();
+    certs
+        .insert(&pool, &expired)
+        .await
+        .expect("insert expired cert");
+    certs
+        .insert(&pool, &five_day)
+        .await
+        .expect("insert 5-day cert");
+    certs
+        .insert(&pool, &ninety_day)
+        .await
+        .expect("insert 90-day cert");
 
     let expiring = certs
-        .list_expiring_before(tenant.id, now + chrono::Duration::days(7), 0, 10)
+        .list_expiring_before(&pool, tenant.id, now + chrono::Duration::days(7), 0, 10)
         .await;
 
     // Cleanup BEFORE asserting.
@@ -685,8 +697,8 @@ async fn test_audit_roundtrip() {
 
     sweep_audit_rows(&pool).await;
 
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUDIT_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUDIT_TENANT)
         .await
         .expect("insert test tenant for audit rows");
 
@@ -718,15 +730,15 @@ async fn test_audit_roundtrip() {
         serde_json::json!({}),
     );
 
-    let audit = AuditRepo::new(&pool);
-    let first_insert = audit.record(&first).await;
-    let second_insert = audit.record(&second).await;
-    let listed = audit.list_by_tenant(tenant.id, 0, 10).await;
-    let append = audit.record(&third).await;
-    let listed_after = audit.list_by_tenant(tenant.id, 0, 10).await;
+    let audit = AuditRepo::new();
+    let first_insert = audit.record(&pool, &first).await;
+    let second_insert = audit.record(&pool, &second).await;
+    let listed = audit.list_by_tenant(&pool, tenant.id, 0, 10).await;
+    let append = audit.record(&pool, &third).await;
+    let listed_after = audit.list_by_tenant(&pool, tenant.id, 0, 10).await;
     // Appending the exact same entry again (same primary key) must be
     // rejected, not silently overwritten: append-only has no upsert path.
-    let duplicate_append = audit.record(&first).await;
+    let duplicate_append = audit.record(&pool, &first).await;
     let count_after_duplicate: i64 =
         sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE tenant_id = $1")
             .bind(tenant.id)
@@ -860,8 +872,8 @@ async fn test_ocsp_response_roundtrip() {
             .expect("sweep stale OCSP-suite rows");
     }
 
-    let tenant = TenantRepo::new(&pool)
-        .insert(OCSP_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, OCSP_TENANT)
         .await
         .expect("insert the test tenant for OCSP rows");
     let ca = CaModel {
@@ -878,8 +890,8 @@ async fn test_ocsp_response_roundtrip() {
         key_file: "/var/lib/wardstone/keys/rt-ocsp-ca.pem".to_string(),
         created_at: ts("2026-06-15T12:30:00Z"),
     };
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert the test CA row");
 
@@ -904,12 +916,12 @@ async fn test_ocsp_response_roundtrip() {
         resp_der: vec![0x30, 0x03, 0x02, 0x01, 0x00],
     };
 
-    let ocsp = OcspRepo::new(&pool);
-    let first_insert = ocsp.insert(&older).await;
-    let second_insert = ocsp.insert(&newer).await;
-    let latest = ocsp.get_latest(ca.id, newer.serial).await;
-    let missing = ocsp.get_latest(ca.id, 0x9999).await;
-    let duplicate = ocsp.insert(&newer).await;
+    let ocsp = OcspRepo::new();
+    let first_insert = ocsp.insert(&pool, &older).await;
+    let second_insert = ocsp.insert(&pool, &newer).await;
+    let latest = ocsp.get_latest(&pool, ca.id, newer.serial).await;
+    let missing = ocsp.get_latest(&pool, ca.id, 0x9999).await;
+    let duplicate = ocsp.insert(&pool, &newer).await;
     // The column itself, read back from the table: the model roundtrip
     // above proves the model carries the tenant, this proves the ROW
     // does (a `tenant_id` that the INSERT silently dropped would still
@@ -1022,13 +1034,13 @@ async fn tenant_fk_rejects_mismatched_tenant_child_row() {
     }
 
     // Two tenants, and a CA that belongs to tenant A.
-    let tenants = TenantRepo::new(&pool);
+    let tenants = TenantRepo::new();
     let tenant_a = tenants
-        .insert(TENANT_FK_TENANT_A)
+        .insert(&pool, TENANT_FK_TENANT_A)
         .await
         .expect("insert tenant A for the tenant-consistency rows");
     let tenant_b = tenants
-        .insert(TENANT_FK_TENANT_B)
+        .insert(&pool, TENANT_FK_TENANT_B)
         .await
         .expect("insert tenant B for the tenant-consistency rows");
 
@@ -1046,8 +1058,8 @@ async fn tenant_fk_rejects_mismatched_tenant_child_row() {
         key_file: "/var/lib/wardstone/keys/rt-tenantfk-ca.pem".to_string(),
         created_at: ts("2026-06-15T12:30:00Z"),
     };
-    CaRepo::new(&pool)
-        .insert(&ca)
+    CaRepo::new()
+        .insert(&pool, &ca)
         .await
         .expect("insert the CA row that belongs to tenant A");
 
@@ -1420,13 +1432,13 @@ async fn user_insert_roundtrip_and_per_tenant_uniqueness() {
     sweep_auth_rows(&pool, AUTH_TENANT).await;
     sweep_auth_rows(&pool, AUTH_TENANT_B).await;
 
-    let tenants = TenantRepo::new(&pool);
+    let tenants = TenantRepo::new();
     let tenant_a = tenants
-        .insert(AUTH_TENANT)
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant A for user rows");
     let tenant_b = tenants
-        .insert(AUTH_TENANT_B)
+        .insert(&pool, AUTH_TENANT_B)
         .await
         .expect("insert test tenant B for user rows");
 
@@ -1516,8 +1528,8 @@ async fn failed_login_increments_and_locks() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant for user rows");
     let user = user_model(tenant.id, "lockout");
@@ -1590,8 +1602,8 @@ async fn profile_revision_optimistic_concurrency() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant for profile rows");
 
@@ -1691,8 +1703,8 @@ async fn service_identity_capabilities_and_one_shot_consume() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant for credential rows");
 
@@ -1861,8 +1873,8 @@ async fn refresh_token_roundtrip_and_rotate() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant for refresh-token rows");
     let user = user_model(tenant.id, "refresh-user");
@@ -1941,8 +1953,8 @@ async fn oidc_config_roundtrip() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
         .await
         .expect("insert test tenant for OIDC rows");
 
@@ -2008,8 +2020,8 @@ async fn audit_auth_method_roundtrip_and_crl_built_system() {
     let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
 
     sweep_auth_rows(&pool, AUTH_AUDIT_TENANT).await;
-    let tenant = TenantRepo::new(&pool)
-        .insert(AUTH_AUDIT_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_AUDIT_TENANT)
         .await
         .expect("insert test tenant for audit rows");
 
@@ -2046,10 +2058,10 @@ async fn audit_auth_method_roundtrip_and_crl_built_system() {
         created_at: ts("2026-06-15T12:30:00Z"),
     };
 
-    let audit = AuditRepo::new(&pool);
-    let session_record = audit.record(&session_entry).await;
-    let crl_record = audit.record(&crl_entry).await;
-    let listed = audit.list_by_tenant(tenant.id, 0, 10).await;
+    let audit = AuditRepo::new();
+    let session_record = audit.record(&pool, &session_entry).await;
+    let crl_record = audit.record(&pool, &crl_entry).await;
+    let listed = audit.list_by_tenant(&pool, tenant.id, 0, 10).await;
     // The stored columns read back raw: the row-level truth the model
     // roundtrip only implies.
     let stored_method: Option<String> =
@@ -2103,5 +2115,215 @@ async fn audit_auth_method_roundtrip_and_crl_built_system() {
     assert_eq!(
         stored_session, None,
         "the system actor has no session (the column stays NULL)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Plan 2, task 6: the Plan 1 repositories go stateless and
+// executor-agnostic.
+//
+// Postgres advisory-lock key for this suite's executor-shape tests: the
+// "WARDST" family with suite marker 0x000d (`0x0057_4144_5354_000d`),
+// one past schema_test's 0x000b and the auth suite's 0x000c — a disjoint
+// row set (the tenant name below), so a process holding another suite's
+// key never waits on these rows.
+// ---------------------------------------------------------------------
+
+/// Postgres advisory-lock key for this suite's executor-shape tests:
+/// suite marker 0x000d of the "WARDST" family.
+const ADVISORY_KEY_TX: i64 = 0x0057_4144_5354_000d;
+
+/// Tenant name this suite owns for the executor-shape tests; deleted
+/// before asserts (audit rows and certificates first, then the CA, then
+/// the tenant).
+const TX_TENANT: &str = "rt2-tx-tenant";
+
+/// The Task 6 widening, end to end: the Plan 1 repositories are
+/// stateless (`AuditRepo::new()` takes no pool) and every method takes
+/// `executor: impl PgExecutor<'_>`, so the same method runs against a
+/// transaction (`&mut *tx`) or against the shared pool (`&pool`) — and
+/// `AuditRepo::record` works INSIDE the transaction, which is what makes
+/// an issuance and its audit row atomic (the shape Task 10's audit
+/// write-side depends on). A record written in a committed transaction
+/// is listed alongside one written straight against the pool, both Plan
+/// 1 repos with a `list_by_tenant` still return the right page, and a
+/// rolled-back `record` disappears with its transaction. Cleans up
+/// before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn plan1_repos_execute_against_a_transaction_and_the_pool() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_TX).await;
+
+    // Sweep debris from any previously crashed run of this suite.
+    for sql in [
+        "DELETE FROM audit_log WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(TX_TENANT)
+            .execute(&pool)
+            .await
+            .expect("sweep stale executor-shape rows");
+    }
+
+    // The tenant, its CA, its certificate, and one audit entry — all in
+    // ONE transaction through `&mut *tx`, the shape an issuance shares.
+    let mut tx = pool.begin().await.expect("begin the transaction");
+    let tenant = TenantRepo::new()
+        .insert(&mut *tx, TX_TENANT)
+        .await
+        .expect("insert the test tenant in the transaction");
+    let ca = cert_ca_model(tenant.id);
+    CaRepo::new()
+        .insert(&mut *tx, &ca)
+        .await
+        .expect("insert the CA row in the transaction");
+    let cert = cert_model(tenant.id, ca.id, 0x77aa, ts("2026-12-01T00:00:00Z"));
+    let certs = CertificateRepo::new();
+    certs
+        .insert(&mut *tx, &cert)
+        .await
+        .expect("insert the certificate row in the transaction");
+    let in_tx_entry = audit_entry(
+        tenant.id,
+        ActorType::System,
+        "worker",
+        "cert_issued",
+        "certificate",
+        &cert.id.to_string(),
+        serde_json::json!({ "via": "transaction" }),
+    );
+    let audit = AuditRepo::new();
+    audit
+        .record(&mut *tx, &in_tx_entry)
+        .await
+        .expect("record the audit entry in the transaction");
+
+    // Reading inside the transaction: the listing (taken through the
+    // SAME `&mut *tx` executor) sees the transaction's own uncommitted
+    // record.
+    let in_tx_listing = audit.list_by_tenant(&mut *tx, tenant.id, 0, 10).await;
+
+    tx.commit().await.expect("commit the transaction");
+
+    // A second audit entry straight against the pool — the same method,
+    // a different executor (the tenant row is committed by now, so the
+    // audit row's foreign key can hold).
+    let via_pool_entry = audit_entry(
+        tenant.id,
+        ActorType::User,
+        "op-user-9",
+        "cert_issued",
+        "certificate",
+        &cert.id.to_string(),
+        serde_json::json!({ "via": "pool" }),
+    );
+    let pool_record = audit.record(&pool, &via_pool_entry).await;
+
+    // A third record inside a NEW transaction that is then rolled back:
+    // the record must vanish with the transaction — no orphaned audit
+    // row, nothing burned.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin the rolled-back transaction");
+    let rolled_entry = audit_entry(
+        tenant.id,
+        ActorType::ApiToken,
+        "api-token-7",
+        "cert_issued",
+        "certificate",
+        &cert.id.to_string(),
+        serde_json::json!({ "via": "rolled-back" }),
+    );
+    let rolled_record = audit.record(&mut *tx, &rolled_entry).await;
+    tx.rollback().await.expect("roll the transaction back");
+
+    // The page reads through the pool, after everything settled.
+    let listing = audit.list_by_tenant(&pool, tenant.id, 0, 10).await;
+    let cert_listing = certs.list_by_tenant(&pool, tenant.id, 0, 10).await;
+    let audit_count_after_rollback: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE tenant_id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(-1);
+
+    // Cleanup BEFORE asserting.
+    sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the inserted audit rows");
+    sqlx::query("DELETE FROM certificates WHERE tenant_id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the certificate row");
+    sqlx::query("DELETE FROM cas WHERE tenant_id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the CA row");
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .execute(&pool)
+        .await
+        .expect("delete the test tenant");
+    release_advisory(&mut advisory, ADVISORY_KEY_TX).await;
+
+    pool_record.expect("record the audit entry via the pool");
+    rolled_record.expect("record the audit entry in the rolled-back transaction");
+
+    // Inside the transaction: exactly the transaction's own record — the
+    // pool-side entry did not exist yet, and nothing else does.
+    let in_tx_listing = in_tx_listing.expect("list_by_tenant inside the transaction");
+    assert_eq!(
+        in_tx_listing.len(),
+        1,
+        "the transaction sees its own uncommitted record"
+    );
+    assert_eq!(
+        in_tx_listing[0].id, in_tx_entry.id,
+        "the in-transaction listing is the entry recorded in the transaction"
+    );
+
+    // After the commit (through the pool): the same two, and the
+    // rolled-back record never existed.
+    let listing = listing.expect("list_by_tenant after the commit");
+    assert_eq!(listing.len(), 2, "the committed listing holds two entries");
+    let ids: std::collections::HashSet<_> = listing.iter().map(|row| row.id).collect();
+    assert_eq!(
+        ids,
+        [in_tx_entry.id, via_pool_entry.id]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        "the committed entries are exactly the ones recorded"
+    );
+    assert_eq!(
+        audit_count_after_rollback, 2,
+        "the rolled-back record left no audit row behind"
+    );
+
+    // The certificate listing still forms the right page after the
+    // widening (LIMIT/OFFSET through the shared paging helper).
+    let cert_listing = cert_listing.expect("certificate list_by_tenant after the widening");
+    assert_eq!(
+        cert_listing.len(),
+        1,
+        "the page holds the single certificate"
+    );
+    assert_eq!(cert_listing[0], cert);
+
+    // The audit listing likewise: the two entries, newest first.
+    assert!(
+        listing[0].created_at >= listing[1].created_at,
+        "created_at desc order"
     );
 }
