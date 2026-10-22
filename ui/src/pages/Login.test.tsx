@@ -153,6 +153,71 @@ describe("Login", () => {
     expect(loginCalls).toBe(2);
   });
 
+  it("keeps the TOTP field visible when a wrong code is refused mid-challenge", async () => {
+    // SessionStore.login's MFA-step rule on the page: mfa_required shows
+    // the field; a wrong code arrives as the 401 `unauthorized`
+    // "invalid multi-factor code" — the error must surface AND the field
+    // must STAY (a wrong-code retry is not a credential rejection; the
+    // operator must not be forced back to re-submit username+password).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (method === "GET" && url === "/api/v1/auth/me") {
+          return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
+        }
+        if (method === "GET" && url === "/auth/ui/config") {
+          return jsonResponse(200, { oidc_configured: false, provider: null });
+        }
+        if (method === "POST" && url === "/auth/ui/login") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          if (body.totp_code === undefined) {
+            return jsonResponse(401, {
+              error: { code: "mfa_required", message: "a TOTP code is required" },
+            });
+          }
+          if (body.totp_code === "000000") {
+            return jsonResponse(401, {
+              error: { code: "unauthorized", message: "invalid multi-factor code" },
+            });
+          }
+          return jsonResponse(200, {
+            actor_type: "user",
+            actor_id: "x",
+            tenant_id: "y",
+            capabilities: [],
+            username: "admin",
+            display_name: "Ada",
+            role: "admin",
+            mfa_enabled: true,
+          });
+        }
+        throw new Error(`no mock route for ${method} ${url}`);
+      }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/login"]}>
+        <SessionProvider>
+          <Login />
+        </SessionProvider>
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText(/username/i);
+    await submitCredentials();
+    const totp = await screen.findByLabelText(/one-time code/i);
+
+    // Submit a WRONG code: the error surfaces and the TOTP field stays.
+    fireEvent.change(totp, { target: { value: "000000" } });
+    fireEvent.click(screen.getByRole("button", { name: /^sign in$/i }));
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "invalid multi-factor code",
+    );
+    expect(screen.getByLabelText(/one-time code/i)).toBeDefined();
+  });
+
   it("surfaces a wrong-credentials message verbatim", async () => {
     renderLogin(
       jsonResponse(200, { oidc_configured: false, provider: null }),

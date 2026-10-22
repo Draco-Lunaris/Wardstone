@@ -59,7 +59,9 @@ export interface AuthState {
   status: AuthStatus;
   me: MeResponse | null;
   /** True after a login answered `mfa_required` — the Login page shows
-   * the TOTP field. Cleared on any success (password-only logins too). */
+   * the TOTP field. Cleared on success (password-only logins too) and on
+   * any login failure that is NOT a wrong-code refusal while the step is
+   * showing (login()'s MFA-step rule below). */
   mfaRequired: boolean;
   /** The current login submit: `submitting` while POST /auth/ui/login is
    * in flight (double submits are ignored), `idle` otherwise. */
@@ -79,6 +81,14 @@ const INITIAL_STATE: AuthState = {
   loginError: null,
   authConfig: null,
 };
+
+/** Does this ws-api message name the SECOND-FACTOR check (the wrong-code
+ * 401's wire text: "invalid multi-factor code")? The two `unauthorized`
+ * login messages are ws-api's contract (routes/auth.rs), so the marker is
+ * the phrase, not the status/code both flavors share. */
+function isMultiFactorMessage(message: string): boolean {
+  return /multi-factor|one-time|mfa|totp/i.test(message);
+}
 
 /** The session store. One instance per provider; every mutation swaps in
  * a fresh immutable snapshot and notifies subscribers. */
@@ -165,7 +175,32 @@ export class SessionStore {
               error instanceof Error ? error.message : "the login could not be sent",
               0,
             );
-      this.set({ loginState: "idle", loginError: apiError, mfaRequired: false });
+      // THE MFA-STEP RULE: a wrong TOTP code is NOT a credential rejection.
+      // ws-api's wire shapes both refusals as a 401 `unauthorized` —
+      // the password check answers "invalid credentials" (routes/auth.rs's
+      // username/password verification), the TOTP check answers
+      // "invalid multi-factor code" — so the status AND the envelope code
+      // are shared and only the MESSAGE tells them apart. Once the
+      // challenge is showing, the credentials were ALREADY accepted once
+      // (`mfa_required` is issued only after the password verified), so a
+      // further `unauthorized` whose message names the multi-factor check
+      // is a wrong-code RETRY: the TOTP field STAYS ARMED and the error
+      // surfaces above it. Any other failure shape resets the step:
+      // "invalid credentials" (the operator re-edited the password, or the
+      // account's credential state changed) must still escape the step; a
+      // 429 limiter answer, a 403 lockout, a 5xx, or a transport failure
+      // is not an MFA verdict at all — without a live challenge the next
+      // `mfa_required` flips the field back on, and with one shown the
+      // operator resubmits username + password to re-enter it.
+      const keepMfaStep =
+        this.snapshot.mfaRequired &&
+        apiError.code === "unauthorized" &&
+        isMultiFactorMessage(apiError.message);
+      this.set({
+        loginState: "idle",
+        loginError: apiError,
+        mfaRequired: keepMfaStep,
+      });
     }
   }
 

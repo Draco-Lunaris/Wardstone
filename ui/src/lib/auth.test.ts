@@ -163,6 +163,93 @@ describe("login", () => {
     expect(store.state.mfaRequired).toBe(false);
   });
 
+  it("keeps the TOTP step armed when a wrong code is refused mid-challenge", async () => {
+    // SessionStore.login's MFA-step rule: once the challenge is showing
+    // (mfa_required answered the first attempt), a wrong code comes back
+    // as a 401 `unauthorized` whose message is the shared-code
+    // second-factor flavor ("invalid multi-factor code", NOT the password
+    // check's "invalid credentials") — the field must NOT disappear, and
+    // the error surfaces verbatim above it. The correct code then
+    // completes the login WITHOUT re-entering username + password.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/v1/auth/me" && method === "GET") return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
+      if (url === "/auth/ui/login" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.totp_code === undefined) return jsonResponse(401, MFA_ENVELOPE);
+        if (body.totp_code === "000000") {
+          return jsonResponse(401, {
+            error: { code: "unauthorized", message: "invalid multi-factor code" },
+          });
+        }
+        if (body.totp_code === "654321") return jsonResponse(200, ME);
+        return jsonResponse(500, "unexpected login fixture");
+      }
+      throw new Error(`no mock route for ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const store = new SessionStore();
+    await store.bootOnce();
+
+    await store.login("admin", "staple");
+    expect(store.state.mfaRequired).toBe(true);
+
+    await store.login("admin", "staple", "000000");
+
+    expect(store.state.status).toBe("unauthenticated");
+    expect(store.state.mfaRequired).toBe(true);
+    expect(store.state.loginError).toBeInstanceOf(ApiError);
+    expect(store.state.loginError!.code).toBe("unauthorized");
+    expect(store.state.loginError!.message).toBe("invalid multi-factor code");
+    expect(store.state.loginState).toBe("idle");
+
+    // Still armed: the correct code completes without re-submitting the
+    // credentials.
+    await store.login("admin", "staple", "654321");
+    expect(store.state.status).toBe("authenticated");
+    expect(store.state.mfaRequired).toBe(false);
+    expect(store.state.loginError).toBeNull();
+  });
+
+  it("resets the TOTP step when the challenge is showing but the password is re-rejected", async () => {
+    // The other half of the MFA-step rule: the operator re-edited the
+    // password and resubmitted, and ws-api's "invalid credentials"
+    // envelope is a genuine credential rejection — the step escapes so a
+    // fresh attempt starts from the password form.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/v1/auth/me" && method === "GET") return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
+      if (url === "/auth/ui/login" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.totp_code === undefined) return jsonResponse(401, MFA_ENVELOPE);
+        if (body.totp_code === "123456" && body.password === "typo") {
+          return jsonResponse(401, {
+            error: { code: "unauthorized", message: "invalid credentials" },
+          });
+        }
+        return jsonResponse(500, "unexpected login fixture");
+      }
+      throw new Error(`no mock route for ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const store = new SessionStore();
+    await store.bootOnce();
+
+    await store.login("admin", "staple");
+    expect(store.state.mfaRequired).toBe(true);
+
+    await store.login("admin", "typo", "123456");
+
+    expect(store.state.status).toBe("unauthenticated");
+    expect(store.state.mfaRequired).toBe(false);
+    expect(store.state.loginError).toBeInstanceOf(ApiError);
+    expect(store.state.loginError!.message).toBe("invalid credentials");
+  });
+
   it("surfaces a wrong-credentials 401 verbatim", async () => {
     vi.stubGlobal(
       "fetch",
