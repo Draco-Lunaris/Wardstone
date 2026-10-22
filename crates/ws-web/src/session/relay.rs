@@ -224,6 +224,24 @@ async fn ui_logout(
     };
     let client = client_or_502(&relay)?;
 
+    // LOCK DISCIPLINE: the session's rotation_lock is held from here across
+    // the re-read, the revocation relay, any rotate-and-retry, and the
+    // store removal — logout and rotation serialize on the SAME per-session
+    // lock, so a concurrent rotation can never rotate away the refresh
+    // plaintext this revoke targets (an unlocked revoke could kill a
+    // just-rotated-away generation and strand one LIVE refresh row whose
+    // plaintext only ws-web's memory held). Mutex ordering is
+    // rotation_lock -> store Mutex — the order every rotation path uses;
+    // never the reverse.
+    let _rotation_guard = entry.rotation_lock.lock().await;
+    // The CURRENT generation, re-read under the lock: any interleaved
+    // rotation already finished (it held this same lock), so the store's
+    // newest pair is what the revoke must target — never this request's
+    // possibly-stale snapshot (which `entry` still is).
+    let Some(current) = relay.store.get(session_id).await else {
+        return Ok(no_content());
+    };
+
     // ws-api's logout demands BOTH halves: the session's bearer access
     // (its handler resolves the actor and binds the body's token to the
     // access token's sid) AND the refresh token in the body.
@@ -234,31 +252,26 @@ async fn ui_logout(
             .json(&json!({ "refresh_token": refresh }))
             .send()
     };
-    let relayed = revoke(&entry.access_token, &entry.refresh_token).await;
+    let relayed = revoke(&current.access_token, &current.refresh_token).await;
     let relayed = match relayed {
         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-            // The stored access token died mid-session (expired, or the
-            // sid revoked elsewhere): rotate ONCE under the per-session
-            // lock and retry with the fresh pair — a logout must still
-            // revoke, not leave a live refresh token orphaned.
-            match rotate_once(
-                &relay.store,
-                session_id,
-                &entry,
-                &entry.access_token,
-                &client,
-                &relay.base,
-            )
-            .await
-            {
-                RotationOutcome::Fresh { access, refresh } => Some(
-                    revoke(&access, &refresh)
+            // The CURRENT access died mid-session (expired, or the sid
+            // revoked elsewhere): refresh ONCE and retry with the fresh
+            // pair — a logout must still revoke, not orphan the live row.
+            // The rotation_lock is ALREADY held here, so the shared
+            // `rotate_once` must NOT be called (it takes the same lock —
+            // that would deadlock); `refresh_locked` performs the
+            // identical ws-api exchange under the lock precondition.
+            match refresh_locked(&relay.store, session_id, &current, &client, &relay.base).await {
+                Some(tokens) => Some(
+                    revoke(&tokens.access_token, &tokens.refresh_token)
                         .await
                         .map_err(|err| ProxyError(err.to_string()))?,
                 ),
-                // The rotation itself failed (refresh revoked/expired):
-                // there is nothing left to revoke server-side.
-                RotationOutcome::Died => None,
+                // The refresh was refused (revoked/expired): there is no
+                // live pair left to revoke server-side (the session was
+                // removed by refresh_locked); the local logout proceeds.
+                None => None,
             }
         }
         // Any other relayed answer (204 revoked, 400 already-unknown,
@@ -278,15 +291,18 @@ async fn ui_logout(
 // The shared rotation critical section
 // ---------------------------------------------------------------------------
 
-/// The outcome of one locked rotation attempt: the fresh pair to proceed
-/// with, or `Died` (the session was removed — refresh refused or the
-/// store entry vanished under the lock).
+/// The outcome of one locked rotation attempt: the fresh ACCESS token to
+/// proceed with (`refresh` is store-internal after the rotation — no
+/// caller consumes it, the pair lives in the new generation), or `Died`
+/// (the session was removed — refresh refused or the store entry vanished
+/// under the lock).
 pub(crate) enum RotationOutcome {
-    Fresh { access: String, refresh: String },
+    Fresh { access: String },
     Died,
 }
 
 /// The rotation critical section, shared by the proxy's injection path and
+/// (through [`refresh_locked`], under logout's OWN rotation-lock hold)
 /// logout's rotate-and-retry. Under the entry's per-session lock:
 ///
 /// 1. re-read the CURRENT generation — if its access token differs from
@@ -315,11 +331,34 @@ pub(crate) async fn rotate_once(
     if current.access_token != observed_access {
         return RotationOutcome::Fresh {
             access: current.access_token.clone(),
-            refresh: current.refresh_token.clone(),
         };
     }
 
-    // The lock holder relays the one refresh.
+    // The lock holder relays the one refresh (refresh_locked takes the
+    // lock as a PRECONDITION — we hold it; it can never re-take it).
+    match refresh_locked(store, session_id, &current, client, base).await {
+        Some(tokens) => RotationOutcome::Fresh {
+            access: tokens.access_token,
+        },
+        None => RotationOutcome::Died,
+    }
+}
+
+/// The ws-api refresh exchange, run with the CALLER holding the session's
+/// rotation_lock (both `rotate_once`'s critical section and logout's locked
+/// revoke land here). Relays `POST /api/v1/auth/refresh` with the stored
+/// refresh plaintext; on success swaps the new pair in as the next
+/// generation and returns it; on ANY failure (ws-api refusal, transport
+/// error, bad shape) the session is REMOVED and `None` returned — fail
+/// closed, the browser is logged out rather than left holding a zombie
+/// session.
+async fn refresh_locked(
+    store: &Arc<SessionStore>,
+    session_id: Uuid,
+    current: &Arc<SessionEntry>,
+    client: &reqwest::Client,
+    base: &str,
+) -> Option<SessionTokensWire> {
     let response = client
         .post(format!("{base}/api/v1/auth/refresh"))
         .json(&json!({ "refresh_token": current.refresh_token }))
@@ -333,7 +372,7 @@ pub(crate) async fn rotate_once(
             // alternative — keeping an unrotatable session — is worse).
             tracing::warn!(error = %err, "the session refresh relay failed; killing the browser session");
             store.remove(session_id).await;
-            return RotationOutcome::Died;
+            return None;
         }
     };
     if !response.status().is_success() {
@@ -342,22 +381,24 @@ pub(crate) async fn rotate_once(
             "ws-api refused the session refresh; killing the browser session"
         );
         store.remove(session_id).await;
-        return RotationOutcome::Died;
+        return None;
     }
     let tokens: Result<SessionTokensWire, _> = response.json().await;
     match tokens {
         Ok(tokens) => {
-            let access = tokens.access_token.clone();
-            let refresh = tokens.refresh_token.clone();
             store
-                .update_tokens(session_id, access.clone(), refresh.clone())
+                .update_tokens(
+                    session_id,
+                    tokens.access_token.clone(),
+                    tokens.refresh_token.clone(),
+                )
                 .await;
-            RotationOutcome::Fresh { access, refresh }
+            Some(tokens)
         }
         Err(err) => {
             tracing::warn!(error = %err, "the refresh response was not the token shape; killing the browser session");
             store.remove(session_id).await;
-            RotationOutcome::Died
+            None
         }
     }
 }

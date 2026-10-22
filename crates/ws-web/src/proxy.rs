@@ -174,7 +174,7 @@ async fn proxy_request(
             .await
             {
                 RotationOutcome::Died => Ok(session_expired_response()),
-                RotationOutcome::Fresh { access, .. } => {
+                RotationOutcome::Fresh { access } => {
                     forward_one(
                         client,
                         &backend.base,
@@ -213,7 +213,7 @@ async fn proxy_request(
     let observed: &str = injected.as_deref().unwrap_or(entry.access_token.as_str());
     match rotate_once(&store, id, &entry, observed, client, &backend.base).await {
         RotationOutcome::Died => Ok(session_expired_response()),
-        RotationOutcome::Fresh { access, .. } => {
+        RotationOutcome::Fresh { access } => {
             forward_one(
                 client,
                 &backend.base,

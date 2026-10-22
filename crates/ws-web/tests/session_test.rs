@@ -1021,3 +1021,105 @@ async fn rotation_failure_kills_session_cleanly() {
 
     env.cleanup().await;
 }
+
+/// THE logout-vs-rotation race (the round-1 Important fix's cover): a
+/// logout and a rotation racing on the SAME session must never strand a
+/// LIVE refresh row in ws-api. With the ZERO ttl every proxied request
+/// takes the rotation path; the per-session rotation_lock serializes
+/// logout's revoke against it, and the locked logout re-reads the CURRENT
+/// generation under the lock — so whichever order lands (logout first or
+/// rotation first), every ws-api-minted refresh row ends up revoked (by
+/// the logout) or rotated away (dead by ws-api's own rotate CTE, which
+/// stamps `revoked_at` on the old row). The invariant is asserted
+/// DIRECTLY on the test pool over the refresh_tokens table.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn logout_after_concurrent_rotation_leaves_no_live_refresh() {
+    let _db = lock_db().await;
+    let mut env = env(Duration::ZERO).await;
+    let login = login_admin(&env).await;
+
+    let first = tokio::spawn({
+        let web = env.web.clone();
+        let cookie = cookie_raw(&login.session_id);
+        async move {
+            drive(
+                &web,
+                Method::GET,
+                "/api/v1/auth/me",
+                Some(&cookie),
+                None,
+                false,
+                None,
+            )
+            .await
+        }
+    });
+    let second = tokio::spawn({
+        let web = env.web.clone();
+        let cookie = cookie_raw(&login.session_id);
+        async move {
+            drive(
+                &web,
+                Method::POST,
+                "/auth/ui/logout",
+                Some(&cookie),
+                None,
+                true,
+                None,
+            )
+            .await
+        }
+    });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("the proxied task");
+    let second = second.expect("the logout task");
+
+    // Both sides complete without wedging. The proxied request is either
+    // 200 (it rotated before the logout killed the entry) or 401 (the
+    // logout won: the out-going forward had no store entry, hence no
+    // injected Authorization) — the invariant below holds for BOTH.
+    assert!(
+        first.status() == StatusCode::OK || first.status() == StatusCode::UNAUTHORIZED,
+        "the concurrent proxied request completes one way or the other: {}",
+        first.status()
+    );
+    assert_eq!(
+        second.status(),
+        StatusCode::NO_CONTENT,
+        "the racing logout is a quiet 204"
+    );
+
+    // THE INVARIANT, direct on the pool: the fixture user has NO live
+    // (never-revoked) refresh row. Rotation-dead rows carry `revoked_at`
+    // from ws-api's rotate CTE; logout-revoked rows carry it from the
+    // handler's revoke. Neither interleaving may mint a row that only
+    // ws-web's memory ever held.
+    let live = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(env.admin_id)
+    .fetch_one(&env.pool)
+    .await
+    .expect("count the live refresh rows");
+    assert_eq!(
+        live, 0,
+        "no live refresh row may survive the logout/rotation race"
+    );
+
+    // The store entry is gone and the session stays dead at the relay.
+    assert!(env.store.get(login.session_id).await.is_none());
+    let response = drive(
+        &env.web,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&cookie_raw(&login.session_id)),
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    env.cleanup().await;
+}
