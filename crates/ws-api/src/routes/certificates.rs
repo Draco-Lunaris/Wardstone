@@ -53,7 +53,7 @@ use ws_ca::serial::allocate_serial;
 use ws_core::error::CoreError;
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
-use ws_core::models::profile::ProfileRevisionModel;
+use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::models::rbac::{Actor, Capability, KeyUsagePurpose};
 use ws_core::profile_match::san_is_permitted;
 use ws_core::repo::audit_repo::AuditRepo;
@@ -169,17 +169,7 @@ pub async fn issue_certificate_core(
     actor.require(required).map_err(ApiError::from)?;
 
     for _ in 0..MAX_ISSUE_ATTEMPTS {
-        match issue_attempt(
-            state,
-            actor,
-            body,
-            cert_id,
-            audit_id,
-            generating,
-            expected_revision,
-        )
-        .await?
-        {
+        match issue_attempt(state, actor, body, cert_id, audit_id, expected_revision).await? {
             Some(response) => return Ok(response),
             // The revision moved: retry against the FRESH current revision
             // (the stale pin is dropped — re-pinning it would read the
@@ -192,19 +182,19 @@ pub async fn issue_certificate_core(
     ))
 }
 
-/// One issuance transaction against the (possibly pinned) revision:
-/// profile + revision read, name validation, CA + lifetime pre-check,
-/// then the transaction — CAS re-affirmation, serial allocation,
-/// signing, certificate insert, audit record. Returns `Ok(None)` when the
-/// conditional write reports a moved revision (the caller retries).
-#[allow(clippy::too_many_lines)]
+/// One issuance attempt against the (possibly pinned) revision: the
+/// direct path's pre-transaction steps — profile + revision read (via
+/// the pool: the CAPABILITY-checked actor gates the tenant filter), name
+/// validation, CA choice — then the transaction opened over the pool and
+/// the shared [`issue_in_tx`] core, and the commit. Returns `Ok(None)`
+/// when the revision moved under us (the caller retries against the
+/// fresh current revision).
 async fn issue_attempt(
     state: &AppState,
     actor: &Actor,
     body: &IssueCertificateBody,
     cert_id: Uuid,
     audit_id: Uuid,
-    generating: bool,
     expected_revision: Option<Uuid>,
 ) -> Result<Option<IssuedCertificateResponse>, ApiError> {
     // The profile must exist in this tenant (another tenant's profile is
@@ -241,6 +231,86 @@ async fn issue_attempt(
     // from yet.
     let ca = choose_ca(&state.pool, actor.tenant_id).await?;
 
+    // The transaction: the shared issuance core below, committed once
+    // (the write-side contract).
+    let mut tx = state.pool.begin().await?;
+    let Some(response) = issue_in_tx(
+        &mut tx,
+        &state.config.keys_dir,
+        &profile,
+        &ca,
+        &revision,
+        body,
+        actor,
+        cert_id,
+        audit_id,
+    )
+    .await?
+    else {
+        // The revision moved: the transaction rolls back (dropped below),
+        // releasing nothing — the serial was never allocated.
+        return Ok(None);
+    };
+    tx.commit().await?;
+
+    Ok(Some(response))
+}
+
+/// The issuance core shared by BOTH paths — the direct `POST
+/// /certificates` flow and the one-shot pull — called on the caller's
+/// already-open transaction. The caller has finished its own pre-steps
+/// (the direct path's capability check, profile/revision read and CA
+/// choice; the pull path's `claim_one_shot` ON THE SAME TRANSACTION plus
+/// its in-transaction profile re-read, so the CLAIMED actor's tenant
+/// gates the read) and hands over the transaction the issuance must be
+/// written on.
+///
+/// One shared piece because these steps stand or fall together on ONE
+/// transaction:
+///
+/// 1. the CA remaining-life pre-check — the API's refusal is the one the
+///    operator sees, and it names the profile's lifetime and the CA's
+///    expiry (the engine refuses too, Task 7);
+/// 2. the optimistic-concurrency re-affirmation (Task 5's conditional
+///    write): repoint the profile to ITS OWN current revision — a no-op
+///    write unless the pointer moved — so a concurrent profile edit
+///    between the caller's read and this commit collapses to zero rows;
+/// 3. Task 8's transactional serial allocation, so a rollback RELEASES
+///    the serial instead of burning it;
+/// 4. the CPU-bound signing leg inside `spawn_blocking` (the keystore is
+///    opened inside the task; the transaction stays open meanwhile — a
+///    slow signing merely extends it);
+/// 5. the certificate insert and the audit record, committed together
+///    (the write-side contract): `cert_issued` details carry the profile,
+///    revision, serial and sans, with `minted_by` (the minting user's id)
+///    present only when the actor carries it (the one-shot actor); the
+///    key-generation path records `key_generated` instead, never the key.
+///
+/// The executor is `&mut sqlx::PgConnection`, not a generic
+/// `impl PgExecutor<'_>`: the core runs SEVERAL statements on it, and an
+/// `impl PgExecutor` parameter is consumed by the first query. `&mut
+/// PgConnection` is also the one executor both callers can rebind a
+/// transaction to (each passes `&mut *tx`, following the house repos' own
+/// convention — `&mut Transaction` does not implement `PgExecutor` in
+/// sqlx 0.8.6).
+///
+/// Returns `Ok(None)` when the conditional write reports a moved
+/// revision: the caller's transaction drops (rollback — on the pull path
+/// that also un-claims the one-shot, whose claim lives in THAT
+/// transaction) and the caller's bounded retry loop re-reads the fresh
+/// current revision.
+#[allow(clippy::too_many_arguments)]
+async fn issue_in_tx(
+    exec: &mut sqlx::PgConnection,
+    keys_dir: &std::path::Path,
+    profile: &ProfileModel,
+    ca: &CaModel,
+    revision: &ProfileRevisionModel,
+    body: &IssueCertificateBody,
+    actor: &Actor,
+    cert_id: Uuid,
+    audit_id: Uuid,
+) -> Result<Option<IssuedCertificateResponse>, ApiError> {
     // The issuance path pre-checks the CA's remaining life and refuses —
     // it never silently issues a shortened certificate. The engine
     // refuses too (Task 7), but the API's refusal is the one the operator
@@ -264,9 +334,7 @@ async fn issue_attempt(
         });
     }
 
-    // The transaction: CAS, serial, signing, insert, audit — committed
-    // once (the write-side contract).
-    let mut tx = state.pool.begin().await?;
+    let generating = body.csr_pem.is_none();
 
     // The conditional write (Task 5's `ProfileRepo::update`) is the
     // optimistic-concurrency point: repoint the profile to ITS OWN
@@ -275,19 +343,18 @@ async fn issue_attempt(
     // to zero rows, and the issuance retries against the new revision
     // instead of recording a stale one. (The serial is not allocated
     // until after the CAS, so `None` releases nothing.)
-    let expected = expected_revision.unwrap_or(revision.id);
     if ProfileRepo::new()
-        .update(&mut *tx, profile.id, Some(expected), revision.id)
+        .update(&mut *exec, profile.id, Some(revision.id), revision.id)
         .await
         .is_err()
     {
-        return Ok(None); // tx drops → rollback
+        return Ok(None); // the caller's tx drops → rollback
     }
 
     // Task 8's transactional serial allocation: the serial the certificate
     // will carry, allocated inside the issuance transaction, so a
     // rollback RELEASES the serial instead of burning it.
-    let serial = allocate_serial(ca.id, ca.tenant_id, &mut *tx)
+    let serial = allocate_serial(ca.id, ca.tenant_id, &mut *exec)
         .await
         .map_err(ApiError::from)?;
 
@@ -297,9 +364,9 @@ async fn issue_attempt(
     // keystore is opened inside the task; the transaction stays open
     // meanwhile (a slow signing merely extends the transaction).
     let signed = spawn_signing(
-        &state.config.keys_dir,
-        &ca,
-        &revision,
+        keys_dir,
+        ca,
+        revision,
         body.subject_cn.trim(),
         &body.sans,
         body.csr_pem.clone(),
@@ -309,15 +376,15 @@ async fn issue_attempt(
 
     let cert = certificate_model(
         cert_id,
-        &ca,
+        ca,
         &profile.name,
-        &revision,
+        revision,
         body,
         &signed.issued,
         serial,
     );
 
-    CertificateRepo::new().insert(&mut *tx, &cert).await?;
+    CertificateRepo::new().insert(&mut *exec, &cert).await?;
 
     // The audit entry commits WITH the certificate (the write-side
     // contract). The action vocabulary: `cert_issued` on the CSR path,
@@ -350,7 +417,7 @@ async fn issue_attempt(
     };
     AuditRepo::new()
         .record(
-            &mut *tx,
+            &mut *exec,
             &audit_entry_with_id(
                 audit_id,
                 actor,
@@ -362,15 +429,13 @@ async fn issue_attempt(
         )
         .await?;
 
-    tx.commit().await?;
-
     Ok(Some(IssuedCertificateResponse {
         certificate_id: cert_id,
         cert_pem: signed.issued.cert_pem,
         serial: serial.to_string(),
         serial_hex: format!("{serial:x}"),
         profile_revision_id: revision.id,
-        profile_name: profile.name,
+        profile_name: profile.name.clone(),
         not_before: signed.issued.not_before,
         not_after: signed.issued.not_after,
         private_key_pem: signed.private_key_pem,
@@ -683,9 +748,10 @@ pub struct PullCertificateBody {
 }
 
 /// The pull flow: one transaction per attempt — claim → profile/revision
-/// → validation → CAS → serial → signing → insert → audit — with the
-/// same bounded retry on a moved revision (any rollback un-claims the
-/// token: the claim lives in THAT transaction).
+/// read (inside the transaction, against the CLAIMED actor) → validation
+/// → CA choice → the shared [`issue_in_tx`] core — with the same bounded
+/// retry on a moved revision (any rollback un-claims the token: the claim
+/// lives in THAT transaction).
 pub async fn pull_certificate(
     state: &AppState,
     token: &str,
@@ -714,6 +780,11 @@ pub async fn pull_certificate(
                 ApiError::Unauthorized("one-shot token is unknown, used, or expired".to_string())
             })?;
 
+        // The profile/revision re-read INSIDE the claim transaction: the
+        // CLAIMED actor gates the tenant filter, and validation runs
+        // against it too — the one-shot actor carries exactly the fixed
+        // `Issue` grant (no `ReadProfiles`), so its naming errors are
+        // generic: it must not learn the profile's contents.
         let profile = ProfileRepo::new()
             .get_profile(&mut *tx, body.profile_id)
             .await?
@@ -729,109 +800,32 @@ pub async fn pull_certificate(
                 ))
             })?;
 
-        // Validation runs against the CLAIMED actor: the one-shot actor
-        // carries exactly the fixed `Issue` grant (no `ReadProfiles`), so
-        // its naming errors are generic — it must not learn the profile's
-        // contents.
         validate_names(&revision, &actor, &issued)?;
 
         let ca = choose_ca(&state.pool, actor.tenant_id).await?;
-        let lifetime = Duration::days(i64::from(revision.lifetime_days));
-        if lifetime.num_seconds() <= 0 {
-            return Err(ApiError::Internal(format!(
-                "profile {:?} pins a non-positive lifetime",
-                profile.name
-            )));
-        }
-        if Utc::now() + lifetime > ca.not_after {
-            return Err(ApiError::BadRequest {
-                code: "ca_lifetime_exceeded",
-                message: format!(
-                    "the profile's {}-day lifetime would run past the issuing CA certificate's \
-                     expiry ({}); shorten the profile's lifetime or renew the CA",
-                    revision.lifetime_days,
-                    ca.not_after.to_rfc3339()
-                ),
-            });
-        }
 
-        // The optimistic-concurrency point (Task 5's conditional write): a
-        // profile edited between this transaction's read and its commit
-        // collapses to zero rows — and the token, claimed in the rolled-
-        // back transaction, stays claimable.
-        if ProfileRepo::new()
-            .update(&mut *tx, profile.id, Some(revision.id), revision.id)
-            .await
-            .is_err()
-        {
-            continue; // tx drops → rollback → un-claim
-        }
-
-        let serial = allocate_serial(ca.id, ca.tenant_id, &mut *tx)
-            .await
-            .map_err(ApiError::from)?;
-        let signed = spawn_signing(
+        // The shared issuance core on the claim-and-certificate
+        // transaction: the CAS collapsing to zero rows — or any later
+        // failure — rolls the transaction back, and the token claimed IN
+        // it stays claimable.
+        let Some(response) = issue_in_tx(
+            &mut tx,
             &state.config.keys_dir,
+            &profile,
             &ca,
-            &revision,
-            body.subject_cn.trim(),
-            &body.sans,
-            Some(body.csr_pem.clone()),
-            serial,
-        )
-        .await?;
-
-        let cert = certificate_model(
-            cert_id,
-            &ca,
-            &profile.name,
             &revision,
             &issued,
-            &signed.issued,
-            serial,
-        );
-        CertificateRepo::new().insert(&mut *tx, &cert).await?;
-
-        // cert_issued details carry `minted_by` — the minting human's
-        // user id, rendered as its hyphenated uuid string, present only
-        // for a one-shot-issued certificate (the one-shot actor carries
-        // it; the CSR path's actors never do).
-        let mut details = serde_json::json!({
-            "profile_id": body.profile_id.to_string(),
-            "profile_revision_id": revision.id.to_string(),
-            "serial": serial.to_string(),
-            "sans": body.sans,
-        });
-        if let Some(minted_by) = &actor.minted_by {
-            details["minted_by"] = serde_json::json!(minted_by);
-        }
-        AuditRepo::new()
-            .record(
-                &mut *tx,
-                &audit_entry_with_id(
-                    audit_id,
-                    &actor,
-                    "cert_issued",
-                    "certificate",
-                    &cert_id.to_string(),
-                    details,
-                ),
-            )
-            .await?;
-
+            &actor,
+            cert_id,
+            audit_id,
+        )
+        .await?
+        else {
+            continue; // tx drops → rollback → un-claim
+        };
         tx.commit().await?;
 
-        return Ok(IssuedCertificateResponse {
-            certificate_id: cert_id,
-            cert_pem: signed.issued.cert_pem,
-            serial: serial.to_string(),
-            serial_hex: format!("{serial:x}"),
-            profile_revision_id: revision.id,
-            profile_name: profile.name,
-            not_before: signed.issued.not_before,
-            not_after: signed.issued.not_after,
-            private_key_pem: None,
-        });
+        return Ok(response);
     }
     Err(ApiError::Conflict(
         "the profile revision kept moving; pull retries were exhausted".to_string(),
