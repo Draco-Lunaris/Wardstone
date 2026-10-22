@@ -86,6 +86,51 @@ To front `ws-api` directly, add a `ports:` block (or attach your proxy's
 network) in **your copy** of the file — the shipped file publishes nothing
 for it, deliberately.
 
+## The UI and SSO login
+
+**Login.** Browse `https://<host>:8443/` and sign in with the admin account.
+The SPA posts `/auth/ui/login` — ws-web's session relay, one of the five
+`/auth/ui` routes — which relays ws-api's login, stores the token pair
+SERVER-side under an opaque `wardstone_session` cookie (HttpOnly; the browser
+never sees a token), and answers with the identity. MFA accounts pass a TOTP
+step: ws-api's error bodies pass through the relay untouched, so the UI's
+TOTP prompt keys on the same machine-readable code. `POST /auth/ui/logout`
+ends the session.
+
+**SSO (OIDC) setup.** In the UI's Admin section, SSO provider tab, configure
+one provider: provider type, discovery URL, client id, client secret (empty
+string = public client), scopes, and the redirect URI. The redirect URI is
+always the PUBLIC callback on ws-web:
+
+    https://<host>/auth/ui/oidc/<provider>/callback
+
+ws-api mints the authorization URL (fetching the IdP's discovery document and
+minting the CSRF state) against that registered redirect, and the
+`/auth/ui/oidc/{provider}/callback` relay completes the exchange into a
+session. Before committing values to the IdP, the discovery-test route
+probes a SAVED configuration or an override payload. After configuration,
+the login page reads `GET /auth/ui/config`, which relays ws-api's PUBLIC
+`GET /api/v1/oidc/config/status` flag (is SSO configured, and for which
+provider) — that is what renders the "Sign in with SSO" button before any
+session exists; the flag is readable without credentials by design.
+
+**Rate-limiter placement.** `ws-web` limits its `/auth/ui/*` relay routes per
+client IP (GCRA, the house defaults — same burst/refill vocabulary as
+ws-api's). ws-api's OWN auth-route limiter keys on its direct TCP peer; in a
+UI-fronted deployment every operator login reaches ws-api through ws-web's
+proxy from ONE loopback IP, so that limiter would throttle ALL operators
+collectively. The bundled compose therefore sets
+`WARDSTONE_AUTH_RATE_LIMIT_DISABLED=true` on the `api` service — an
+`api`-mode switch only (the `ui` mode never reads it). Only where clients hit
+ws-api directly (an External variant fronting it with a transparent-TCP
+proxy) should the switch stay off.
+
+**Egress: the compose network must NOT be `internal: true`.** ws-api performs
+OIDC egress — the discovery fetch and the token exchange are made by the
+`api` process over the IdP's public URL. Marking the compose network
+`internal: true` would cut that off and break both SSO setup and SSO login.
+NEVER apply `internal: true` to this bundle's network.
+
 ## The image and the keys volume
 
 `compose.yml` does not build anything: the image named by
