@@ -36,6 +36,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::PeerIpKeyExtractor;
+use tower_governor::GovernorLayer;
 use uuid::Uuid;
 
 use crate::proxy::{csrf_refusal, proxy_client, ProxyError};
@@ -55,7 +58,19 @@ pub struct RelayState {
 /// The relay's router: the four `/auth/ui` routes, mounted by
 /// [`crate::web_router_with_store`] at the same precedence as `/api/v1`
 /// (before the SPA fallback).
-pub fn relay_router(store: Arc<SessionStore>, api_base_url: &str) -> Router {
+///
+/// `rate_limit` is the Task 13 per-client GCRA on the nest (`None` mounts
+/// none — tests): the layer keys on the PEER IP (`ConnectInfo` — Task 12's
+/// `serve_tls` maker attaches the real client address to every request;
+/// ws-web IS the edge, so no forwarding headers are trusted), with the
+/// same tower_governor idiom and default 429 shape ws-api's auth router
+/// uses (`crates/ws-api/src/routes/auth.rs`) so the UI treats both
+/// limiters identically.
+pub fn relay_router(
+    store: Arc<SessionStore>,
+    api_base_url: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
     let state = RelayState {
         store,
         // The same bounded construction as the proxy's client (connect +
@@ -64,12 +79,43 @@ pub fn relay_router(store: Arc<SessionStore>, api_base_url: &str) -> Router {
         client: proxy_client().ok(),
         base: api_base_url.trim_end_matches('/').to_owned(),
     };
-    Router::new()
+    let router = Router::new()
         .route("/auth/ui/login", post(ui_login))
         .route("/auth/ui/logout", post(ui_logout))
         .route("/auth/ui/oidc/{provider}/start", get(ui_oidc_start))
         .route("/auth/ui/oidc/{provider}/callback", get(ui_oidc_callback))
-        .with_state(state)
+        // The layer rides THIS nest only — never the `/api/v1` proxy (the
+        // machine flows' budget is ws-api's own limiter) nor the SPA
+        // serving — because it is applied to the relay sub-router before
+        // the composition merges it.
+        .with_state(state);
+    match rate_limit {
+        Some(limit) => {
+            // `finish()` fails only on a zero burst or period (both
+            // caller-configured; the binary refuses a zero at boot, so
+            // this skip branch is unreachable from `run_ui`). The router
+            // constructor cannot be fallible — mirroring ws-api, a broken
+            // number is a LOUDLY-LOGGED skip of the layer, never a panic
+            // at boot.
+            match GovernorConfigBuilder::<PeerIpKeyExtractor, _>::default()
+                .per_millisecond(limit.per_millis)
+                .burst_size(limit.burst)
+                .finish()
+            {
+                Some(config) => router.layer(GovernorLayer::new(std::sync::Arc::new(config))),
+                None => {
+                    tracing::error!(
+                        per_millis = limit.per_millis,
+                        burst = limit.burst,
+                        "invalid UI auth rate-limit configuration: per_millis and burst must \
+                         be positive; the /auth/ui routes run WITHOUT rate limiting"
+                    );
+                    router
+                }
+            }
+        }
+        None => router,
+    }
 }
 
 /// The relayed ws-api login body (the same shape ws-api's `LoginBody`

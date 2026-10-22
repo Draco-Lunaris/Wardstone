@@ -310,6 +310,7 @@ async fn env(ttl: Duration) -> TestEnv {
         "ui.relay.test".to_owned(),
         &api_base,
         store.clone(),
+        None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter
     )
     .await
     .expect("build the ws-web composed router");

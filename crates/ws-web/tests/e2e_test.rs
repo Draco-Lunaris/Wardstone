@@ -552,6 +552,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         HOSTNAME.to_string(),
         "http://127.0.0.1:9", // intentionally nothing listens here
         ws_web::DEFAULT_SESSION_TTL,
+        None, // no rate limiter on the front-door suites' routers
     )
     .await
     .expect("the front-door router builds after setup");

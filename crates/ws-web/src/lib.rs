@@ -71,6 +71,13 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
 /// The session store is constructed here with `session_access_ttl` (the
 /// 15-minute [`DEFAULT_SESSION_TTL`] for the binary); tests that need a
 /// handle on the SAME store instance use [`web_router_with_store`].
+///
+/// `rate_limit` is the GCRA configuration the binary parsed for the
+/// `/auth/ui` routes (`Some` — the per-client-IP limiter mounted on the
+/// relay nest; Task 13); the existing binary env contract feeds it, and
+/// tests that run `web_router` pass `None` (no limiter — an in-process
+/// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
+/// the same reason ws-api's tests disable its layer).
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
@@ -78,9 +85,19 @@ pub async fn web_router(
     hostname: String,
     api_base_url: &str,
     session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
     let store = std::sync::Arc::new(SessionStore::new(session_access_ttl));
-    web_router_with_store(pool, keys_dir, fingerprint, hostname, api_base_url, store).await
+    web_router_with_store(
+        pool,
+        keys_dir,
+        fingerprint,
+        hostname,
+        api_base_url,
+        store,
+        rate_limit,
+    )
+    .await
 }
 
 /// [`web_router`] with the caller owning the `Arc<SessionStore>` instance:
@@ -89,6 +106,9 @@ pub async fn web_router(
 /// token reads) — this constructor is the pin that makes "same Arc"
 /// structural instead of a promise, and it is how the session_test suite
 /// inspects store contents alongside a live router.
+///
+/// `rate_limit` threads to [`relay_router`]'s `/auth/ui` GCRA nest layer
+/// (see [`web_router`]).
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
@@ -96,6 +116,7 @@ pub async fn web_router_with_store(
     hostname: String,
     api_base_url: &str,
     store: std::sync::Arc<SessionStore>,
+    rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
     // The ONE store instance rides BOTH routers: as the relay routes'
     // state (mint/rotate/kill) and as an Extension on the proxy router
@@ -103,7 +124,7 @@ pub async fn web_router_with_store(
     // proxy handler keeps `api_router` usable standalone (no store: zero
     // injection, the machine-token surface is untouched).
     let api = api_router(api_base_url).layer(Extension(store.clone()));
-    let relay = relay_router(store, api_base_url);
+    let relay = relay_router(store, api_base_url, rate_limit);
     let mut app = Router::new().merge(relay).merge(api);
     if !tenant_exists(&pool).await? {
         app = app.merge(setup_router(SetupState {

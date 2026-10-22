@@ -61,6 +61,11 @@ rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 # directory that is git-committed (ui/README.md documents the rebuild), so
 # the running binary always serves the SPA that was reviewed and committed.
 include_dir = "0.7"
+# The GCRA rate limiter ws-web mounts on the /auth/ui routes (Task 13):
+# per-client-IP limiting keyed on the peer socket address (ConnectInfo).
+# Same workspace pin ws-api uses; its `governor` module re-exports the
+# builder, so the `governor` crate is not needed directly.
+tower_governor = { workspace = true }
 # The domain layer: models, repositories, the secret-encryption key file.
 ws-core = { path = "../ws-core" }
 # Authentication primitives: the argon2id password hash the setup admin
