@@ -352,12 +352,22 @@ async fn issue_in_tx(
     // to zero rows, and the issuance retries against the new revision
     // instead of recording a stale one. (The serial is not allocated
     // until after the CAS, so `None` releases nothing.)
-    if ProfileRepo::new()
+    if let Err(e) = ProfileRepo::new()
         .update(&mut *exec, profile.id, Some(revision.id), revision.id)
         .await
-        .is_err()
     {
-        return Ok(None); // the caller's tx drops → rollback
+        // Only the revision-moved shape retries: the conditional write's
+        // collapse to zero rows surfaces as `CoreError::Config` — the
+        // exact case `update_profile` maps to its retry-able Conflict.
+        // The caller's tx drops (rollback) and the loop re-reads the
+        // fresh revision.
+        if let ws_core::error::CoreError::Config(_) = e {
+            return Ok(None);
+        }
+        // Any OTHER failure is a genuine database error: surface it
+        // through the CoreError→ApiError mapping instead of masquerading
+        // as a revision move and burning the retry budget on a 409.
+        return Err(ApiError::from(e));
     }
 
     // Task 8's transactional serial allocation: the serial the certificate
