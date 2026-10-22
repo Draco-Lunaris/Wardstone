@@ -351,7 +351,14 @@ export default function AdminProfiles() {
               id="profile-description"
               value={draft.description}
               onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+              disabled={editingId !== null}
             />
+            {editingId !== null && (
+              <p className="muted">
+                The profile description is fixed in v1 — it cannot be edited after creation, so
+                the edit PUT leaves it out rather than pretending to save it.
+              </p>
+            )}
 
             <label htmlFor="profile-key-type">Key type</label>
             <select

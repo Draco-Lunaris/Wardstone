@@ -157,6 +157,12 @@ describe("AdminProfiles", () => {
     const nameInput = await screen.findByLabelText("Name") as HTMLInputElement;
     expect((nameInput).disabled).toBe(true);
     expect(nameInput.value).toBe("web-server");
+    // The description is frozen too: the PUT path never persists it, so
+    // editing it would visibly succeed and silently not stick.
+    const descriptionInput = screen.getByLabelText("Description (optional)") as HTMLInputElement;
+    expect(descriptionInput.disabled).toBe(true);
+    expect(descriptionInput.value).toBe("TLS server certificates (setup-built-in)");
+    expect(screen.getByText(/description is fixed in v1/)).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText("Lifetime (days)"), { target: { value: "180" } });
     fireEvent.click(screen.getByRole("button", { name: "Save new revision" }));
@@ -165,6 +171,7 @@ describe("AdminProfiles", () => {
     const put = bodies.find((body) => body.includes("lifetime_days"));
     const parsed = JSON.parse(put!);
     expect("name" in parsed).toBe(false); // The update keeps the profile's name.
+    expect("description" in parsed).toBe(false); // And never pretends to save its description.
     expect(parsed.lifetime_days).toBe(180);
     expect(parsed.key_usages).toEqual(["digital_signature", "key_encipherment"]);
   });

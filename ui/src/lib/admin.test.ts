@@ -145,10 +145,11 @@ describe("buildProfilePayload", () => {
     expect(body!.san_patterns).toEqual(["*.test", "10.0.0.0/8"]);
   });
 
-  it("omits the name on an EDIT body — updating writes a revision, the name stays", () => {
+  it("omits BOTH name and description on an EDIT body — the PUT only revises policy", () => {
     const { body, error } = buildProfilePayload(PROFILE_BASE, true);
     expect(error).toBeNull();
     expect("name" in body!).toBe(false);
+    expect("description" in body!).toBe(false);
   });
 
   it("refuses a blank name on create with the server's wording", () => {

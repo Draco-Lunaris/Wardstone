@@ -268,13 +268,17 @@ export type ProfilePayloadResult =
 
 /**
  * Build the profile create/edit body, pure. On create the name is
- * required (trimmed — the server's same 400 wording otherwise); on edit
- * the name key is omitted even though the form still shows it locked.
- * A blank description maps to the ABSENT key (the server stores the
- * description verbatim, so the UI's emptiness discipline is the difference
- * between "no description" and a phantom blank). Lists pass through with
- * empty entries dropped — the server owns the deeper validation (unknown
- * usage spellings, unparsable SAN patterns, the fail-closed `*.`).
+ * required (trimmed — the server's same 400 wording otherwise) and the
+ * description is carried when typed; on edit BOTH keys are omitted even
+ * though the form still shows them locked: the update route appends a
+ * policy revision and repoints `current_revision_id` ONLY (no SQL on the
+ * PUT path persists `profiles.description`), so a description sent there
+ * would visibly succeed and silently not persist. A blank description on
+ * create maps to the ABSENT key (the server stores the description
+ * verbatim, so the UI's emptiness discipline is the difference between
+ * "no description" and a phantom blank). Lists pass through with empty
+ * entries dropped — the server owns the deeper validation (unknown usage
+ * spellings, unparsable SAN patterns, the fail-closed `*.`).
  */
 export function buildProfilePayload(fields: ProfileFormFields, editing: boolean): ProfilePayloadResult {
   const lifetime = Number(fields.lifetime_days.trim());
@@ -294,10 +298,10 @@ export function buildProfilePayload(fields: ProfileFormFields, editing: boolean)
       return { body: null, error: "a profile name is required" };
     }
     body.name = name;
-  }
-  const description = fields.description.trim();
-  if (description) {
-    body.description = description;
+    const description = fields.description.trim();
+    if (description) {
+      body.description = description;
+    }
   }
   return { body, error: null };
 }
