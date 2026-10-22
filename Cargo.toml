@@ -74,6 +74,23 @@ pkcs8 = { version = "0.10.2", features = ["pem"] }
 # Hex encoding for auth token material (house pin; Task 8's token digests).
 hex = "0.4"
 
+# TOTP MFA (ws-auth): HMAC-SHA1 RFC 6238 authenticator-compatible codes. The
+# `gen_secret` feature keys the fresh-secret generator; `otpauth` builds
+# per-user otpauth:// URIs. House pin (linux-patch-manager pm-auth).
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+
+# OIDC discovery / code-exchange / JWKS HTTP client (ws-auth). House pin
+# (linux-patch-manager). Default features are OFF so the default-tls feature
+# (native-tls/OpenSSL, absent from this container image) is never pulled; the
+# pure-Rust rustls backend is pinned instead.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# HMAC-SHA1 signing backend for the TOTP code-computation regression test's
+# independent RFC 6238 check (dev-only in ws-auth; never used by production
+# code). 0.13 is the only live 0.x line in this timeline's index; it pairs
+# with digest 0.11, so ws-auth's test pins sha1 0.11 crate-locally.
+hmac = { version = "0.13", default-features = false }
+
 # Timestamp type of rcgen's CertificateParams (not_before/not_after):
 # issue.rs converts caller chrono instants to time::OffsetDateTime at the
 # rcgen boundary. Already resolved in the lock via rcgen.
