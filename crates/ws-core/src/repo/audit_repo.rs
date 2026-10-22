@@ -1,10 +1,11 @@
 //! Repository over the `audit_log` table.
 //!
-//! Append-only is structural: the surface is [`AuditRepo::record`] and
-//! [`AuditRepo::list_by_tenant`] and nothing else — no update, no delete,
-//! and no SQL anywhere in this module that could amend or remove a row.
-//! Test cleanup uses raw `DELETE` statements against the database directly
-//! (test scaffolding, outside this module).
+//! Append-only is structural: the surface is [`AuditRepo::record`] and the
+//! reads [`AuditRepo::list_by_tenant`] and
+//! [`AuditRepo::list_by_tenant_filtered`] — one insert and nothing that
+//! could amend or remove a row — and no SQL anywhere in this module could
+//! amend or remove a row. Test cleanup uses raw `DELETE` statements
+//! against the database directly (test scaffolding, outside this module).
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -12,7 +13,7 @@ use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::error::CoreError;
-use crate::models::audit::{ActorType, AuditEntry, AuthMethod};
+use crate::models::audit::{ActorType, AuditEntry, AuditFilter, AuthMethod};
 use crate::repo::tenant_repo::map_unique;
 
 /// Data access for [`AuditEntry`] rows. Append-only by construction: there
@@ -125,6 +126,70 @@ impl AuditRepo {
         .fetch_all(executor)
         .await?;
 
+        rows.into_iter()
+            .map(AuditRow::try_into_model)
+            .collect::<Result<Vec<_>, CoreError>>()
+    }
+
+    /// A tenant's audit entries through a composed filter, one page at a
+    /// time, newest first (`created_at DESC, id` — same ordering as
+    /// [`AuditRepo::list_by_tenant`]), LIMIT/OFFSET paging through the
+    /// shared [`crate::repo::paging`] helper.
+    ///
+    /// The WHERE clause composes ONLY the filter fields that are `Some`
+    /// (`tenant_id` is always present); every value binds as a parameter —
+    /// nothing is ever stringified into the SQL. `action` matches exactly
+    /// (the action vocabulary is a fixed set; a prefix match would let
+    /// `cert_i` stand in for `cert_issued`).
+    pub async fn list_by_tenant_filtered(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        filter: &AuditFilter,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<AuditEntry>, CoreError> {
+        // Compose the SQL FIRST (nothing may re-borrow the string after the
+        // query takes it), then bind in the same order the placeholders
+        // were written. `format!` + `push_str` is infallible — the house
+        // rule forbids `unwrap`/`expect` outside tests.
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
+        let mut sql = String::from(
+            "SELECT id, tenant_id, actor_type, auth_method, session_id, actor_id, action, \
+             target_type, target_id, details, created_at FROM audit_log WHERE tenant_id = $1",
+        );
+        let mut next = 2usize; // the next placeholder's 1-based index
+
+        if filter.from.is_some() {
+            sql.push_str(&format!(" AND created_at >= ${next}"));
+            next += 1;
+        }
+        if filter.to.is_some() {
+            sql.push_str(&format!(" AND created_at <= ${next}"));
+            next += 1;
+        }
+        if filter.action.is_some() {
+            sql.push_str(&format!(" AND action = ${next}"));
+            next += 1;
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC, id LIMIT ${next} OFFSET ${}",
+            next + 1
+        ));
+
+        let mut query = sqlx::query_as::<_, AuditRow>(&sql).bind(tenant_id);
+        if let Some(from) = filter.from {
+            query = query.bind(from);
+        }
+        if let Some(to) = filter.to {
+            query = query.bind(to);
+        }
+        if let Some(action) = &filter.action {
+            query = query.bind(action);
+        }
+        let query = query.bind(limit).bind(offset);
+
+        let rows = query.fetch_all(executor).await?;
         rows.into_iter()
             .map(AuditRow::try_into_model)
             .collect::<Result<Vec<_>, CoreError>>()

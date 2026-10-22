@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::Router;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -2271,5 +2271,120 @@ async fn statistics_counts_active_revoked_expiring() {
     assert_eq!(
         stats["expiring_soon"], 2,
         "A (+10d) and D (+5d) expire within the 30-day horizon"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The audit list filters (Plan 3 Task 2)
+// ---------------------------------------------------------------------------
+
+/// The audit list filters by `action` (exact), by `from`/`to` on
+/// `created_at`, and composes both ends of the date bracket. The suite's
+/// seeded events run through the normal mutation routes and are backdated
+/// by DIRECT row UPDATE for determinism: the `ca_created` row three hours
+/// ago, the two `cert_issued` rows 61 and 59 minutes ago (never a tie on
+/// `created_at`, whose ties resolve by the random id), while the fixture's
+/// `profile_created` row stays at wall-clock now — the too-new entry the
+/// `to` bound must exclude.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn audit_filter_by_date_and_action() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    // Two issuances: A seeded older, B newer.
+    let (a_status, a_body) = issue_csr(
+        &fx,
+        profile_id,
+        "a-audit.wardstone.test",
+        &["a-audit.wardstone.test"],
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_target = a_body["certificate_id"].as_str().unwrap().to_string();
+    let (b_status, b_body) = issue_csr(
+        &fx,
+        profile_id,
+        "b-audit.wardstone.test",
+        &["b-audit.wardstone.test"],
+    )
+    .await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_target = b_body["certificate_id"].as_str().unwrap().to_string();
+
+    // Backdate: the CA creation three hours ago, A one hour and a minute
+    // ago, B a minute shy of an hour; `profile_created` stays at now.
+    let now = Utc::now();
+    sqlx::query(
+        "UPDATE audit_log SET created_at = $1 WHERE tenant_id = $2 AND action = 'ca_created'",
+    )
+    .bind(now - Duration::hours(3))
+    .bind(fx.tenant_id)
+    .execute(&fx.pool)
+    .await
+    .expect("backdate the ca_created row");
+    for (target, age) in [
+        (&a_target, Duration::minutes(61)),
+        (&b_target, Duration::minutes(59)),
+    ] {
+        sqlx::query(
+            "UPDATE audit_log SET created_at = $1 WHERE tenant_id = $2 \
+             AND action = 'cert_issued' AND target_id = $3",
+        )
+        .bind(now - age)
+        .bind(fx.tenant_id)
+        .bind(target.as_str())
+        .execute(&fx.pool)
+        .await
+        .expect("backdate a cert_issued row");
+    }
+
+    // Every list query runs BEFORE cleanup (the self-cleaning contract).
+    let unfiltered = get_json(&fx, "/api/v1/audit", &token).await;
+    let by_action = get_json(&fx, "/api/v1/audit?action=cert_issued", &token).await;
+    // The Z-suffixed RFC 3339 form: URL-safe (a `+` offset would decode
+    // as a space and the query would fall apart).
+    let from = (now - Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let to = (now - Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let after_from = get_json(&fx, &format!("/api/v1/audit?from={from}"), &token).await;
+    let bracket = get_json(&fx, &format!("/api/v1/audit?from={from}&to={to}"), &token).await;
+    fx.cleanup().await;
+
+    let targets = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .map(|row| row["target_id"].as_str().expect("target_id").to_string())
+            .collect()
+    };
+
+    // Unfiltered: exactly the fixture's four rows, newest first — the
+    // wall-clock profile row, then B, then A, then the backdated CA row.
+    assert_eq!(
+        targets(&unfiltered),
+        vec![
+            profile_id.to_string(),
+            b_target.clone(),
+            a_target.clone(),
+            ca_id.to_string()
+        ],
+        "the full log, newest first"
+    );
+    assert_eq!(
+        targets(&by_action),
+        vec![b_target.clone(), a_target.clone()],
+        "action=cert_issued lists only the two issuances, newest first"
+    );
+    assert_eq!(
+        targets(&after_from),
+        vec![profile_id.to_string(), b_target.clone(), a_target.clone()],
+        "from excludes the three-hour-old CA-creation row"
+    );
+    assert_eq!(
+        targets(&bracket),
+        vec![b_target, a_target],
+        "the from/to bracket excludes both too-old and too-new rows"
     );
 }

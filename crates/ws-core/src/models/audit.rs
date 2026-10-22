@@ -59,6 +59,23 @@ pub struct AuditEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// The audit-list filters `GET /api/v1/audit` composes (Plan 3 Task 2): a
+/// filter axis applies only when its field is `Some`. A plain struct,
+/// deliberately WITHOUT serde: the API's query struct owns the HTTP
+/// deserialization and builds this handler-side, exactly like the
+/// certificates' [`crate::models::certificate::CertificateFilter`].
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// Entries with `created_at` at or after this instant (inclusive).
+    pub from: Option<DateTime<Utc>>,
+    /// Entries with `created_at` at or before this instant (inclusive).
+    pub to: Option<DateTime<Utc>>,
+    /// Entries whose `action` equals this exactly (the action vocabulary:
+    /// `ca_created`, `cert_issued`, `cert_revoked`, `crl_built`,
+    /// `key_generated`, ...).
+    pub action: Option<String>,
+}
+
 /// # Unit tests
 #[cfg(test)]
 mod tests {
