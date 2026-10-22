@@ -306,13 +306,18 @@ async fn test_scheduler_regenerates_on_revocation() {
             .bind(i64::try_from(LEAF_SERIAL).expect("serial fits i64"))
             .fetch_one(&pool)
             .await;
-    let audit_actions: Vec<String> =
-        sqlx::query_scalar("SELECT action FROM audit_log WHERE tenant_id = $1 AND target_id = $2")
-            .bind(tenant.id)
-            .bind(ca.id.to_string())
-            .fetch_all(&pool)
-            .await
-            .expect("list the CA's audit actions");
+    // The audit rows are read with the actor columns, not action only:
+    // the worker's row must name its actor on both (`auth_method` is
+    // NOT NULL since migration 009, and Task 5 set the worker's value).
+    let audit_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT action, auth_method, actor_type FROM audit_log \
+         WHERE tenant_id = $1 AND target_id = $2",
+    )
+    .bind(tenant.id)
+    .bind(ca.id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("list the CA's audit rows");
     let cert_after = CertificateRepo::new()
         .get(&pool, cert_id)
         .await
@@ -358,8 +363,29 @@ async fn test_scheduler_regenerates_on_revocation() {
         "the published response has a validity window"
     );
     assert!(
-        audit_actions.contains(&"crl_built".to_string()),
-        "the rebuilt CRL is audited: {audit_actions:?}"
+        audit_rows
+            .iter()
+            .any(|(action, _, _)| action == "crl_built"),
+        "the rebuilt CRL is audited: {audit_rows:?}"
+    );
+    // The worker acts AS the system and authenticates AS the system, on
+    // both columns: `actor_type` from the shared access vocabulary's
+    // `ActorType::System` spelling and `auth_method` from `AuthMethod`'s.
+    // The insert succeeding at all is the survival of the NOT NULL
+    // constraint on `auth_method` (this whole run would have failed
+    // otherwise); asserting the spellings pins that the worker's edit
+    // keeps naming its actor rather than drifting to some default.
+    let crl_built = audit_rows
+        .iter()
+        .find(|(action, _, _)| action == "crl_built")
+        .expect("the crl_built row exists");
+    assert_eq!(
+        crl_built.1, "system",
+        "the worker's crl_built audit row carries auth_method 'system'"
+    );
+    assert_eq!(
+        crl_built.2, "system",
+        "the worker's crl_built audit row carries actor_type 'system'"
     );
     let cert_after = cert_after.expect("the certificate row is present");
     assert_eq!(cert_after.status, CertStatus::Revoked);
