@@ -408,6 +408,14 @@ code {
   color: var(--danger);
 }
 
+/* The muted badge: a terminal, unremarkable state (e.g. a used one-shot
+   token) — bordered like the rest, colored like the secondary text, no
+   accent or alarm. */
+.status-badge.status-muted {
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+
 .page-controls {
   display: flex;
   align-items: center;

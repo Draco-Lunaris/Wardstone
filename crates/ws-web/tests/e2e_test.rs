@@ -1603,7 +1603,12 @@ async fn ui_oidc_end_to_end() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let me = parse_json(&body_str(response).await);
+    // The second round trip's body joins the sweep too: the token-boundary
+    // claim at the test's end is exhaustive only if EVERY body the flow
+    // produced is in the set — this /me was the one straggler.
+    let me_text = body_str(response).await;
+    bodies.push(me_text.clone());
+    let me = parse_json(&me_text);
     assert_eq!(
         me["username"], name,
         "the same account answers the second round trip"

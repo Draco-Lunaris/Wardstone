@@ -470,7 +470,7 @@ function OneShotList() {
                 <td>{token.expires_at ? formatDate(token.expires_at) : "—"}</td>
                 <td>
                   <span
-                    className={`status-badge ${token.used_at ? "status-active" : token.expires_at && new Date(token.expires_at).getTime() < Date.now() ? "status-revoked" : "status-active"}`}
+                    className={`status-badge ${token.used_at ? "status-muted" : token.expires_at && new Date(token.expires_at).getTime() < Date.now() ? "status-revoked" : "status-active"}`}
                   >
                     {token.used_at ? "used" : token.expires_at && new Date(token.expires_at).getTime() < Date.now() ? "expired" : "ready"}
                   </span>

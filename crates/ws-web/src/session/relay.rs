@@ -21,7 +21,7 @@
 //!   same quiet 204. The CSRF marker rule guards this mutating
 //!   cookie-carrying route exactly like the proxy guards `/api/v1`.
 //! - `GET /auth/ui/config` — the login page's PUBLIC SSO flag: relays
-//!   `GET /api/v1/oidc/config` and answers `{"oidc_configured": bool,
+//!   `GET /api/v1/oidc/config/status` and answers `{"oidc_configured": bool,
 //!   "provider": string|null}` so the browser can render the
 //!   "Sign in with SSO" button before any session exists. See
 //!   [`ui_config`] for the decision this route documents.

@@ -1296,15 +1296,22 @@ async fn revision_move_makes_issuance_retry_not_record_stale() {
 async fn cas_database_failure_maps_to_500_not_retry_conflict() {
     let _db = lock_db().await;
     let mut fx = fixture().await;
-    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
-    let actor = admin_actor(&fx);
-
-    // Sweep-first covers the schema too: heal a constraint a previously
-    // crashed run might have left behind.
+    // Self-heal FIRST — BEFORE any fixture write. A predecessor run of
+    // THIS test that crashed between the inject below and the final heal
+    // leaves `ws_test_invalid_check` on `profiles`; with it in place every
+    // INSERT into `profiles` violates the check, so `setup_profile_and_ca`
+    // would fail before this test got a chance to heal anything. This
+    // placement claims nothing more: dropping the constraint here does not
+    // repair a live schema fault — it only guarantees this test starts
+    // from a constraint-free `profiles` table so IT can re-inject and
+    // clean up after itself (the heal-after-attempt below stays).
     sqlx::query("ALTER TABLE profiles DROP CONSTRAINT IF EXISTS ws_test_invalid_check")
         .execute(&fx.pool)
         .await
         .expect("sweep a stale injected check constraint");
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let actor = admin_actor(&fx);
+
     sqlx::query(
         "ALTER TABLE profiles ADD CONSTRAINT ws_test_invalid_check \
          CHECK (false) NOT VALID",
