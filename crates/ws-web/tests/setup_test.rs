@@ -51,8 +51,17 @@ use ws_web::{run_setup, setup};
 /// plus the suite marker 0x0010.
 const ADVISORY_KEY: i64 = 0x0057_4144_5354_0010;
 
-/// The setup flow's target display hostname (the CA-issued leaf's SAN).
+/// The setup flow's target display hostname (the self-signed setup
+/// certificate's SAN — it predates profiles and is not constrained by
+/// them).
 const HOSTNAME: &str = "wardstone-ui.test";
+
+/// The CA-issued leaf's SAN the tests submit as `server_hostname`. Task 9
+/// (Plan-2 I-3) makes setup refuse a hostname the built-in `web-server`
+/// profile's SAN patterns forbid, so the submitted hostname must live
+/// under the default domain's wildcard (`*.wardstone.test`) — it is NOT
+/// [`HOSTNAME`], which only the boot certificate carries.
+const LEAF_HOSTNAME: &str = "ui.wardstone.test";
 
 /// A display-only fingerprint placeholder (the real one comes from
 /// `setup_certificate`; the page only echoes the state it was given).
@@ -149,7 +158,7 @@ fn test_fields() -> SetupFields {
         admin_password: "correct horse battery staple".to_string(),
         default_domain: "wardstone.test".to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
-        server_hostname: HOSTNAME.to_string(),
+        server_hostname: LEAF_HOSTNAME.to_string(),
     }
 }
 
@@ -422,7 +431,7 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert_eq!(certs.len(), 1, "setup mints exactly the server's own leaf");
     let (_leaf_id, leaf_subject, leaf_status, leaf_source, leaf_profile, leaf_revision) =
         certs[0].clone();
-    assert_eq!(leaf_subject, format!("CN={HOSTNAME}"));
+    assert_eq!(leaf_subject, format!("CN={LEAF_HOSTNAME}"));
     assert_eq!(leaf_status, "active");
     assert_eq!(leaf_source, "manual");
     assert_eq!(
@@ -646,4 +655,194 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         .expect("the setup slot holds the freshly minted key");
 
     fixture.cleanup().await;
+}
+
+/// Task 9 (Plan-2 I-3): a `server_hostname` the built-in `web-server`
+/// profile's SAN patterns forbid is refused BEFORE anything is committed —
+/// a 400 carrying the issuance path's message shape, the setup page still
+/// serving (the route only mounts while the tenant is absent), and not a
+/// single row written. A hostname the profile permits then proceeds
+/// through the full bootstrap.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_refuses_hostname_outside_profile_patterns() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // No wildcard cover: `*.certificates.example.com` does not match a
+    // bare `wardstone.example.com`, and the hostname is not the pattern's
+    // own domain either.
+    let refused_fields = SetupFields {
+        default_domain: "certificates.example.com".to_string(),
+        server_hostname: "wardstone.example.com".to_string(),
+        ..test_fields()
+    };
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &refused_fields).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a hostname the web-server profile forbids is a 400"
+    );
+    let body = body_string(response).await;
+    let error = serde_json::from_str::<Value>(&body)
+        .expect("the error body is JSON")
+        .get("error")
+        .and_then(Value::as_str)
+        .expect("the error body carries an `error` message")
+        .to_string();
+    assert_eq!(
+        error,
+        "server_hostname is not permitted by the web-server profile: name \
+         \"wardstone.example.com\" is not permitted by this profile",
+        "the refusal carries the issuance path's specific message shape"
+    );
+
+    // The refusal commits nothing: no tenant row under the setup tenant's
+    // name, and the front door still mounts the setup page (the route
+    // exists only while the tenant is absent).
+    let tenant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants WHERE name = $1")
+        .bind(setup::DEFAULT_TENANT_NAME)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the setup tenant");
+    assert_eq!(tenant_count, 0, "the refusal writes no rows at all");
+    let still_unconfigured = ws_web::web_router(
+        fixture.pool.clone(),
+        fixture.keys_dir.clone(),
+        PAGE_FINGERPRINT.to_string(),
+        HOSTNAME.to_string(),
+        "http://127.0.0.1:9", // intentionally nothing listens here
+    )
+    .await
+    .expect("the front-door router builds after the refusal");
+    let get = still_unconfigured
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup after the refusal");
+    assert_eq!(
+        get.status(),
+        StatusCode::OK,
+        "the setup page still serves after the refusal"
+    );
+
+    // A matching hostname under the default domain's wildcard proceeds.
+    let ok_fields = SetupFields {
+        default_domain: "certificates.example.com".to_string(),
+        server_hostname: "ca.certificates.example.com".to_string(),
+        ..test_fields()
+    };
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &ok_fields).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a hostname the web-server profile permits completes the setup"
+    );
+
+    // Capture before cleanup (the self-cleaning contract).
+    let pool = fixture.pool.clone();
+    let tenant_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE name = $1")
+            .bind(setup::DEFAULT_TENANT_NAME)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup tenant");
+    let tenant_id = tenant_id.expect("the permitted setup creates the tenant");
+    let admin_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup admin");
+    let leaf_subject: Option<String> =
+        sqlx::query_scalar("SELECT subject FROM certificates WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup leaf");
+
+    fixture.cleanup().await;
+
+    let hash = admin_hash.expect("setup creates the admin");
+    assert!(
+        ws_auth::password::verify_password(&refused_fields.admin_password, &hash)
+            .expect("verify the stored hash"),
+        "the admin's argon2id hash verifies the submitted password"
+    );
+    assert_eq!(
+        leaf_subject,
+        Some(format!("CN={}", ok_fields.server_hostname)),
+        "the matching setup mints the leaf with the permitted hostname"
+    );
+}
+
+/// Task 9: the leaf transaction audits the completion of setup itself —
+/// exactly ONE `setup_completed` row per completed setup, the system
+/// actor, target the tenant, details carrying the submitted domain and
+/// admin CIDRs (house-style direct pool read; the setup test mounts no
+/// API router).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_completed_audit_row_written() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = test_fields();
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+
+    let pool = fixture.pool.clone();
+    let tenant_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE name = $1")
+            .bind(setup::DEFAULT_TENANT_NAME)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup tenant");
+    let rows: Vec<(String, String, String, String, String, String, Value)> = sqlx::query_as(
+        "SELECT actor_type, auth_method, actor_id, action, target_type, target_id, details \
+         FROM audit_log WHERE tenant_id = $1 AND action = 'setup_completed'",
+    )
+    .bind(tenant_id.expect("the completed setup created the tenant"))
+    .fetch_all(&pool)
+    .await
+    .expect("query the setup_completed audit rows");
+
+    fixture.cleanup().await;
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one setup_completed row per completed setup"
+    );
+    let (actor_type, auth_method, actor_id, action, target_type, target_id, details) = &rows[0];
+    assert_eq!(action, "setup_completed", "the completion action");
+    assert_eq!(actor_type, "system", "the setup actor is the system");
+    assert_eq!(auth_method, "system", "authenticated how machines are");
+    assert_eq!(
+        actor_id, "system:setup",
+        "the same setup actor the bootstrap entries carry"
+    );
+    assert_eq!(target_type, "setup", "the completion targets the setup");
+    assert_eq!(
+        target_id,
+        &tenant_id
+            .expect("the completed setup created the tenant")
+            .to_string(),
+        "the completion targets the setup's tenant"
+    );
+    assert_eq!(
+        details,
+        &serde_json::json!({
+            "domain": fields.default_domain,
+            "admin_cidrs": fields.admin_cidrs,
+        }),
+        "the details carry the submitted domain and admin CIDRs"
+    );
 }
