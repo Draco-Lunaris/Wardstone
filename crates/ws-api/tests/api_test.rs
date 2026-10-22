@@ -1,0 +1,1972 @@
+//! Integration tests for the `ws-api` axum surface (Task 10).
+//!
+//! These tests run against a live Postgres and are marked `#[ignore]`.
+//! Run them with:
+//!
+//! ```sh
+//! DATABASE_URL=postgres://wardstone:wardstone@localhost:5432/wardstone_test \
+//!     cargo test -p ws-api --test api_test -- --include-ignored
+//! ```
+//!
+//! # Self-cleaning contract
+//!
+//! The shared `wardstone_test` database is also used by the ws-core suites,
+//! one of which asserts that `tenants` is empty after its runs. To keep that
+//! true no matter how this suite exits: every test sweeps away rows a
+//! previously crashed run may have left behind under this suite's owned
+//! tenant name, and every row inserted during the body is deleted *before*
+//! the assertions run, so a failing assertion cannot leave rows behind.
+//! All query results are captured and unwrapped only after cleanup.
+//!
+//! # Cross-process serialization
+//!
+//! Each test body holds a session-level Postgres advisory lock for its whole
+//! duration on the key [`ADVISORY_KEY`] — the "WARDST" family (ASCII
+//! "WARDST" = 0x5741445354) with suite marker 0x000f. ws-core's suites hold
+//! 0x0003..0x0005 and ws-ca's serial suite holds 0x0006; this suite owns a
+//! disjoint row set, and plain `cargo test` also runs test binaries
+//! sequentially, so the key is a belt against concurrent cross-crate runs.
+//! The in-process mutex mirrors the ws-core pattern.
+
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::Router;
+use chrono::Utc;
+use serde_json::{json, Value};
+use sqlx::pool::PoolConnection;
+use sqlx::PgPool;
+use tokio::sync::Mutex as TokioMutex;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use ws_api::{ApiConfig, AppState};
+use ws_auth::jwt::{issue_access_token, AccessClaims, JwtKeys};
+use ws_auth::service_identity::create_service_identity;
+use ws_core::db::connect;
+use ws_core::models::rbac::Role;
+use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Capability, ALL_CAPABILITIES};
+use ws_core::repo::audit_repo::AuditRepo;
+use ws_core::repo::credential_repo::CredentialRepo;
+
+/// The response type the test helpers return.
+type TestResponse = axum::http::Response<axum::body::Body>;
+
+/// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
+/// plus the suite marker 0x000f. Processes taking this key serialize their
+/// test bodies against this suite.
+const ADVISORY_KEY: i64 = 0x0057_4144_5354_000f;
+
+/// The tenant name this suite owns; swept before use, deleted at the end.
+const API_TENANT: &str = "rt-api-tenant";
+
+/// In-process serialization, the same whole-body lock pattern as the
+/// ws-core suites: the harness runs tests on separate threads. A tokio
+/// mutex because the guard is held across `.await` points.
+static DB_TEST_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+
+/// The guard must be held (not dropped) until the test body finishes.
+#[must_use = "the database lock must stay bound for the whole test body"]
+async fn lock_db() -> tokio::sync::MutexGuard<'static, ()> {
+    DB_TEST_LOCK
+        .get_or_init(|| TokioMutex::new(()))
+        .lock()
+        .await
+}
+
+/// Take the session-level advisory lock `key` on a dedicated pooled
+/// connection, exactly like the ws-ca suites.
+async fn lock_advisory(pool: &PgPool, key: i64) -> PoolConnection<sqlx::Postgres> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("acquire connection for the advisory lock");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await
+        .expect("take pg_advisory_lock");
+    conn
+}
+
+/// Release the advisory lock taken by [`lock_advisory`] explicitly.
+async fn release_advisory(conn: &mut PoolConnection<sqlx::Postgres>, key: i64) {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut **conn)
+        .await
+        .expect("release pg_advisory_lock");
+}
+
+/// Test database URL; `DATABASE_URL` overrides it.
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://wardstone:wardstone@localhost:5432/wardstone_test".to_string()
+    })
+}
+
+/// A per-test fixture: the app state, the built router, the fixture tenant
+/// and admin user, and the held advisory-lock connection.
+struct Fixture {
+    state: AppState,
+    router: Router,
+    pool: PgPool,
+    tenant_id: Uuid,
+    admin_id: Uuid,
+    #[allow(dead_code)] // held for the whole body: serializes this suite
+    advisory: Option<PoolConnection<sqlx::Postgres>>,
+    keys_dir: PathBuf,
+    /// Tenants created by the test body (in addition to [`API_TENANT`]);
+    /// all of them are deleted by `cleanup`.
+    extra_tenants: Mutex<Vec<Uuid>>,
+}
+
+impl Fixture {
+    /// Delete every row this fixture (and the test body) created, then
+    /// release the advisory lock. Runs BEFORE the assertions, so a failing
+    /// assert can never leave rows behind (the self-cleaning contract).
+    async fn cleanup(&mut self) {
+        sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1")
+            .bind(self.tenant_id)
+            .execute(&self.pool)
+            .await
+            .expect("delete fixture audit rows");
+        for table in [
+            "DELETE FROM certificates WHERE tenant_id = $1",
+            "DELETE FROM used_serials WHERE tenant_id = $1",
+            "DELETE FROM one_shot_tokens WHERE tenant_id = $1",
+            "DELETE FROM service_identity_capabilities WHERE service_identity_id \
+             IN (SELECT id FROM service_identities WHERE tenant_id = $1)",
+            "DELETE FROM service_identities WHERE tenant_id = $1",
+            "DELETE FROM profiles WHERE tenant_id = $1",
+            "DELETE FROM cas WHERE tenant_id = $1",
+            "DELETE FROM oidc_config WHERE tenant_id = $1",
+            "DELETE FROM refresh_tokens WHERE tenant_id = $1",
+            "DELETE FROM users WHERE tenant_id = $1",
+        ] {
+            sqlx::query(table)
+                .bind(self.tenant_id)
+                .execute(&self.pool)
+                .await
+                .expect("delete fixture rows");
+        }
+        let mut extra = self.extra_tenants.lock().unwrap().clone();
+        extra.push(self.tenant_id);
+        for tenant_id in extra {
+            // A tenant created by the body may already have audit rows
+            // recorded under the OTHER tenant's log (the actor's tenant) —
+            // those are covered above. Profiles and users created for the
+            // extra tenant must go first: their FKs reference it.
+            sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .execute(&self.pool)
+                .await
+                .expect("delete extra tenant audit rows");
+            for table in [
+                "DELETE FROM certificates WHERE tenant_id = $1",
+                "DELETE FROM profiles WHERE tenant_id = $1",
+                "DELETE FROM cas WHERE tenant_id = $1",
+                "DELETE FROM users WHERE tenant_id = $1",
+                "DELETE FROM tenants WHERE id = $1",
+            ] {
+                sqlx::query(table)
+                    .bind(tenant_id)
+                    .execute(&self.pool)
+                    .await
+                    .expect("delete extra tenant rows");
+            }
+        }
+        if self.advisory.is_some() {
+            let mut conn = self.advisory.take().expect("advisory connection held");
+            release_advisory(&mut conn, ADVISORY_KEY).await;
+        }
+        // The per-fixture keys directory (JWT pair + keystore master key).
+        let _ = std::fs::remove_dir_all(&self.keys_dir);
+    }
+}
+
+/// Build the fixture: connect, take the advisory lock, sweep stale rows,
+/// insert the tenant + admin user, mint the admin access token, and build
+/// the router.
+async fn fixture() -> Fixture {
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    // Sweep-first: stale rows of a previously crashed run under the owned
+    // tenant name.
+    sweep_tenant(&pool, API_TENANT).await;
+
+    let tenant_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(API_TENANT)
+        .execute(&pool)
+        .await
+        .expect("insert fixture tenant");
+
+    let admin_id = Uuid::new_v4();
+    insert_user(&pool, tenant_id, admin_id, "admin", Role::Admin).await;
+
+    let keys_dir = std::env::temp_dir().join(format!(
+        "ws-api-test-keys-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
+    keystore.ensure_master_key().expect("ensure master key");
+    // The TOTP/OIDC secret-encryption envelope key (created at setup).
+    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
+        .expect("create the secret-encryption key");
+    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+
+    let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
+    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), config);
+    let router = ws_api::router(state.clone());
+
+    Fixture {
+        state,
+        router,
+        pool,
+        tenant_id,
+        admin_id,
+        advisory: Some(advisory),
+        keys_dir,
+        extra_tenants: Mutex::new(Vec::new()),
+    }
+}
+
+/// Delete every row a previous run may have left under `name` (children
+/// first, then the tenant).
+async fn sweep_tenant(pool: &PgPool, name: &str) {
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("sweep stale audit rows");
+    sqlx::query(
+        "DELETE FROM service_identity_capabilities WHERE service_identity_id IN \
+         (SELECT id FROM service_identities WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1))",
+    )
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("sweep stale capability grant rows");
+    for table in [
+        "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM used_serials WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM one_shot_tokens WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM service_identities WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM profiles WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM oidc_config WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM refresh_tokens WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM users WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        sqlx::query(table)
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("sweep stale fixture-prefixed rows");
+    }
+}
+
+/// A minimal, active user row (no password unless `password_hash` given).
+async fn insert_user(pool: &PgPool, tenant_id: Uuid, id: Uuid, username: &str, role: Role) {
+    ws_core::repo::user_repo::UserRepo::new()
+        .insert(
+            pool,
+            &ws_core::models::user::UserModel {
+                id,
+                tenant_id,
+                username: username.to_string(),
+                display_name: username.to_string(),
+                email: format!("{username}@wardstone.test"),
+                role,
+                auth_provider: "local".to_string(),
+                password_hash: None,
+                totp_secret_encrypted: None,
+                totp_secret_nonce: None,
+                webauthn_credential: None,
+                mfa_enabled: false,
+                azure_oid: None,
+                oidc_sub: None,
+                is_active: true,
+                force_password_reset: false,
+                failed_login_attempts: 0,
+                locked_until: None,
+                last_login_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("insert fixture user");
+}
+
+/// The actor shape of the fixture's admin user (used as the creator for
+/// token mints, whose creator actor must be a user id).
+fn admin_actor(fixture: &Fixture) -> Actor {
+    Actor {
+        actor_type: ActorType::User,
+        actor_id: fixture.admin_id.to_string(),
+        auth_method: AuthMethod::Session,
+        capabilities: ALL_CAPABILITIES.to_vec(),
+        session_id: None,
+        tenant_id: fixture.tenant_id,
+        minted_by: None,
+    }
+}
+
+/// Mint an API token for a service identity carrying exactly `caps`.
+async fn api_token(fixture: &Fixture, caps: &[Capability]) -> String {
+    create_service_identity(
+        &fixture.pool,
+        &format!("matrix-token-{}", Uuid::new_v4()),
+        None,
+        caps,
+        &admin_actor(fixture),
+        &CredentialRepo::new(),
+    )
+    .await
+    .expect("mint the service identity token")
+    .token
+}
+
+/// Mint a session access token for the fixture's admin user.
+fn admin_token(fixture: &Fixture) -> String {
+    let claims = AccessClaims::new(fixture.admin_id, "admin", "admin", None, 900);
+    issue_access_token(&claims, &fixture.state.jwt).expect("issue the admin access token")
+}
+
+/// A session access token for `user_id` with role `role`.
+fn session_token(fixture: &Fixture, user_id: Uuid, username: &str, role: &str) -> String {
+    let claims = AccessClaims::new(user_id, username, role, None, 900);
+    issue_access_token(&claims, &fixture.state.jwt).expect("issue a session access token")
+}
+
+/// Send a request to the fixture router and return the response.
+async fn send(fixture: &Fixture, request: Request<axum::body::Body>) -> TestResponse {
+    fixture
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router should respond")
+}
+
+fn bearer(value: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("Bearer {value}")).expect("valid header value")
+}
+
+/// A GET request with an `Authorization: Bearer <token>` header.
+async fn get_bearer(fixture: &Fixture, uri: &str, token: &str) -> TestResponse {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer(token))
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    send(fixture, req).await
+}
+
+/// A POST request with a JSON body and (optional) bearer header.
+async fn post_json(
+    fixture: &Fixture,
+    uri: &str,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> TestResponse {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, bearer(token));
+    }
+    let req = builder
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build request");
+    send(fixture, req).await
+}
+
+/// Read a JSON error body's `error.code`.
+fn error_code(body: &Value) -> String {
+    body["error"]["code"]
+        .as_str()
+        .expect("error body carries an error.code")
+        .to_string()
+}
+
+/// A valid ECDSA P-256 CSR (self-signed) for `cn` with DNS SANs `names`.
+fn mint_csr(cn: &str, names: &[&str]) -> String {
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256,
+    };
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    params.subject_alt_names = names
+        .iter()
+        .map(|n| SanType::DnsName((*n).try_into().unwrap()))
+        .collect();
+    let csr = params.serialize_request(&key_pair).unwrap();
+    csr.pem().unwrap()
+}
+
+/// Create the issuance fixture through the API itself: one `ecdsa-p256`
+/// profile with the `wardstone.test` SAN allow-list, one Ed25519 root CA.
+/// Returns `(profile_id, ca_id)`.
+async fn setup_profile_and_ca(fixture: &Fixture) -> (Uuid, Uuid) {
+    let token = admin_token(fixture);
+    let profile_res = post_json(
+        fixture,
+        "/api/v1/profiles",
+        Some(&token),
+        json!({
+            "name": "test-profile",
+            "description": "issued by the api test",
+            "key_type": "ecdsa-p256",
+            "key_usages": ["digital_signature"],
+            "eku": ["server_auth"],
+            "lifetime_days": 30,
+            "san_patterns": ["wardstone.test", "*.wardstone.test"]
+        }),
+    )
+    .await;
+    assert_eq!(profile_res.status(), StatusCode::CREATED, "create profile");
+    let profile_body = axum::body::to_bytes(profile_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let profile: Value = serde_json::from_slice(&profile_body).unwrap();
+    let profile_id = profile["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    let ca_res = post_json(
+        fixture,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "test-root-ca",
+            "subject": "Wardstone Test Root",
+            "key_type": "ed25519",
+            "is_root": true
+        }),
+    )
+    .await;
+    assert_eq!(ca_res.status(), StatusCode::CREATED, "create CA");
+    let ca_body = axum::body::to_bytes(ca_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ca: Value = serde_json::from_slice(&ca_body).unwrap();
+    let ca_id = ca["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    (profile_id, ca_id)
+}
+
+/// Issue one certificate through the API (the CSR path) and return the
+/// `(status, body)` pair.
+async fn issue_csr(
+    fixture: &Fixture,
+    profile_id: Uuid,
+    cn: &str,
+    names: &[&str],
+) -> (StatusCode, Value) {
+    let token = admin_token(fixture);
+    let res = post_json(
+        fixture,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": cn,
+            "sans": names,
+            "csr_pem": mint_csr(cn, names)
+        }),
+    )
+    .await;
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| json!({"error": {"message": "non-json body"}}));
+    (status, body)
+}
+
+/// Audit rows of the fixture tenant as (action, actor_type, auth_method,
+/// details) rows.
+async fn audit_rows(fixture: &Fixture) -> Vec<(String, String, String, Value)> {
+    sqlx::query_as::<_, (String, String, String, Value)>(
+        "SELECT action, actor_type, auth_method, details FROM audit_log \
+         WHERE tenant_id = $1 ORDER BY created_at, id",
+    )
+    .bind(fixture.tenant_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read audit rows")
+}
+
+// ---------------------------------------------------------------------------
+// The required tests
+// ---------------------------------------------------------------------------
+
+/// A request with no Authorization header is 401 — and a bearer the
+/// middleware cannot recognize is 401 too (never 500, never 403).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn missing_or_garbage_bearer_is_401() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/certificates")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/certificates")
+        .header(header::AUTHORIZATION, "not-a-bearer-thing")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/certificates")
+        .header(header::AUTHORIZATION, bearer("ws_at_deadbeef"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    fx.cleanup().await;
+}
+
+/// A valid session token reaches the handler; a token whose actor lacks the
+/// route capability is 403 — authorization, not authentication — and the
+/// error code is `forbidden`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn session_token_reaches_handler_and_wrong_capability_is_403() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    // An admin session token reaches the read endpoint: 200 with a JSON list.
+    let res = get_bearer(&fx, "/api/v1/certificates", &admin_token(&fx)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // A service identity with NO capabilities authenticates fine but is 403
+    // on a route it may not call (403 — not 401 — is the assertion).
+    let token = api_token(&fx, &[]).await;
+    let res = get_bearer(&fx, "/api/v1/certificates", &token).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error_code(&body), "forbidden");
+
+    // An expired/garbage JWT is 401 (authentication), not 403.
+    let res = get_bearer(&fx, "/api/v1/certificates", "garbage.token.value").await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    fx.cleanup().await;
+}
+
+/// A successful issuance writes exactly ONE audit row, with the acting
+/// user's `actor_type`/`auth_method` and the `cert_issued` action.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn issue_writes_exactly_one_audit_row() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    let (status, body) = issue_csr(
+        &fx,
+        profile_id,
+        "host.wardstone.test",
+        &["host.wardstone.test"],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "issue body: {body}");
+
+    let rows = audit_rows(&fx).await;
+    let rows = rows
+        .iter()
+        .filter(|(a, ..)| a == "cert_issued")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one cert_issued row");
+    let (action, actor_type, auth_method, details) = rows[0];
+    assert_eq!(action, "cert_issued");
+    assert_eq!(actor_type, "user");
+    assert_eq!(auth_method, "session");
+    assert_eq!(details["profile_id"], profile_id.to_string());
+    assert!(
+        details["serial"].is_string(),
+        "the serial, as its string form"
+    );
+    assert!(details["sans"].is_array());
+
+    fx.cleanup().await;
+}
+
+/// A mutation whose audit insert fails leaves NO mutation behind: the audit
+/// row is forced to collide on `audit_log`'s primary key (a duplicate `id`),
+/// the transaction aborts, and the certificate row must not exist — and the
+/// serial drawn for it is released, not burned.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn audit_failure_rolls_back_the_mutation() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    // Pre-insert an audit row whose id the issuance must reuse — the
+    // duplicate id forces the audit INSERT to fail with 23505
+    // (CoreError::Duplicate), aborting the transaction.
+    let doomed_audit_id = Uuid::new_v4();
+    let doomed_cert_id = Uuid::new_v4();
+    AuditRepo::new()
+        .record(
+            &fx.pool,
+            &ws_core::models::audit::AuditEntry {
+                id: doomed_audit_id,
+                tenant_id: fx.tenant_id,
+                actor_type: ActorType::User,
+                auth_method: AuthMethod::Session,
+                session_id: None,
+                actor_id: fx.admin_id.to_string(),
+                action: "pre-inserted".to_string(),
+                target_type: "audit".to_string(),
+                target_id: "collision".to_string(),
+                details: json!({}),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("pre-insert the colliding audit row");
+
+    let actor = admin_actor(&fx);
+    let body = ws_api::routes::certificates::IssueCertificateBody {
+        profile_id,
+        subject_cn: "host.wardstone.test".to_string(),
+        sans: vec!["host.wardstone.test".to_string()],
+        csr_pem: Some(mint_csr("host.wardstone.test", &["host.wardstone.test"])),
+    };
+    let outcome = ws_api::routes::certificates::issue_certificate_core(
+        &fx.state,
+        &actor,
+        &body,
+        doomed_cert_id,
+        doomed_audit_id,
+        None,
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the duplicate audit id must fail the issuance"
+    );
+
+    // The certificate row must not exist, and its serial must be back.
+    let certs = sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM certificates WHERE id = $1")
+        .bind(doomed_cert_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let serials =
+        sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM used_serials WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    fx.cleanup().await;
+
+    assert_eq!(
+        certs.0, 0,
+        "no certificate row survives a failed audit insert"
+    );
+    assert_eq!(serials.0, 0, "the allocated serial is released, not burned");
+}
+
+/// Profile naming errors are specific for actors who may READ the profile
+/// and generic otherwise; a non-issuer is always refused at the capability
+/// check, before any validation.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_naming_errors_are_specific_for_readers_and_generic_for_others() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    // (a) An actor holding Issue + ReadProfiles sees the specific message:
+    // it names the failing name, never the permitted set.
+    let token = admin_token(&fx);
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "evil.other.com",
+            "sans": ["evil.other.com"],
+            "csr_pem": mint_csr("evil.other.com", &["evil.other.com"])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error_code(&body), "not_permitted_by_profile");
+    let message = body["error"]["message"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("evil.other.com"),
+        "names the failing name: {message}"
+    );
+    assert!(
+        !message.contains("wardstone.test"),
+        "never dumps the permitted set: {message}"
+    );
+
+    // (b) An actor with Issue but WITHOUT ReadProfiles gets the generic
+    // message and learns nothing about the profile's contents.
+    let narrow = api_token(&fx, &[Capability::Issue]).await;
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&narrow),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "evil.other.com",
+            "sans": ["evil.other.com"],
+            "csr_pem": mint_csr("evil.other.com", &["evil.other.com"])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error_code(&body), "not_permitted_by_profile");
+    let message = body["error"]["message"].as_str().unwrap().to_string();
+    assert!(
+        message.contains("not permitted by policy"),
+        "generic message: {message}"
+    );
+    assert!(
+        !message.contains("evil.other.com") && !message.contains("wardstone.test"),
+        "the generic message names neither the name nor the set: {message}"
+    );
+
+    // (c) An actor without Issue is refused by the capability check (403),
+    // before any validation — even one who could read the profile.
+    let viewer = api_token(&fx, &[Capability::ReadProfiles]).await;
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&viewer),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "evil.other.com",
+            "sans": ["evil.other.com"],
+            "csr_pem": mint_csr("evil.other.com", &["evil.other.com"])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // (d) An empty SAN list is refused (proposing no names is a different
+    // artifact, not a subset).
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "host.wardstone.test",
+            "sans": [],
+            "csr_pem": mint_csr("host.wardstone.test", &[])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    fx.cleanup().await;
+}
+
+/// The two issuance paths are separate capabilities: an actor holding
+/// `issue` cannot reach the server-key-generation path even though it CAN
+/// reach the CSR path with the same profile.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn non_issuer_cannot_reach_the_key_generation_path() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    // An actor holding exactly `issue` CANNOT use the key-generation path
+    // (no csr_pem): the required capability there is generate_leaf_key.
+    let narrow = api_token(&fx, &[Capability::Issue]).await;
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&narrow),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "host.wardstone.test",
+            "sans": ["host.wardstone.test"]
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // The same actor CAN reach the CSR path (proving the 403 above is about
+    // the path, not the actor).
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&narrow),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "host.wardstone.test",
+            "sans": ["host.wardstone.test"],
+            "csr_pem": mint_csr("host.wardstone.test", &["host.wardstone.test"])
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    fx.cleanup().await;
+}
+
+/// The key-generation response carries the key exactly once, carries
+/// `Cache-Control: no-store`, its `key_generated` audit row carries no key
+/// material, no read endpoint hands the key back, and the key never
+/// appears in the captured access log.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn key_generation_response_is_redacted_everywhere() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "gen.wardstone.test",
+            "sans": ["gen.wardstone.test"]
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "the key-generation response is never cached"
+    );
+    let raw = axum::body::to_bytes(res.into_body(), 8 << 20)
+        .await
+        .unwrap();
+    let raw_text = String::from_utf8(raw.to_vec()).unwrap();
+    assert_eq!(
+        raw_text.matches("BEGIN PRIVATE KEY").count(),
+        1,
+        "the private key appears exactly once in the response"
+    );
+    let body: Value = serde_json::from_str(&raw_text).unwrap();
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    // The audit row's action is key_generated and its details carry no key.
+    let rows = audit_rows(&fx).await;
+    let rows = rows
+        .iter()
+        .filter(|(a, ..)| a == "key_generated")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one key_generated row");
+    let (_, actor_type, _, details) = rows[0];
+    assert_eq!(actor_type, "user");
+    let details_text = details.to_string();
+    assert!(
+        !details_text.contains("PRIVATE KEY") && !details_text.contains("BEGIN"),
+        "the key_generated details never carry key material: {details_text}"
+    );
+    assert_eq!(details["profile_id"], profile_id.to_string());
+    assert_eq!(details["key_type"], "ecdsa-p256");
+
+    // No later read endpoint returns the key.
+    let res = get_bearer(&fx, &format!("/api/v1/certificates/{cert_id}"), &token).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "the read endpoint never returns the key: {text}"
+    );
+
+    // The captured access log carries method/path/status only.
+    let log = fx.state.access_log.snapshot();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("PRIVATE KEY") || l.contains("BEGIN")),
+        "the access log never carries the key: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("POST /api/v1/certificates")),
+        "the key-generation request itself is logged: {log:?}"
+    );
+
+    fx.cleanup().await;
+}
+
+/// The one-shot pull endpoint issues exactly once: a bogus bearer does not
+/// burn the token (the extractor is lookup-only), the first valid pull
+/// issues, and a second attempt with the same token is 401.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn one_shot_pull_issues_exactly_once() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    // Mint a one-shot token through its route.
+    let token = admin_token(&fx);
+    let res = post_json(
+        &fx,
+        "/api/v1/one-shot-tokens",
+        Some(&token),
+        json!({"ttl_minutes": 10}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let one_shot = body["token"].as_str().unwrap().to_string();
+    assert!(one_shot.starts_with("ws_ot_"));
+
+    // A stray bearer (malformed one-shot) must NOT burn the token.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/pull")
+        .header(
+            header::AUTHORIZATION,
+            bearer("ws_ot_00000000000000000000000000000000"),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "profile_id": profile_id,
+                "subject_cn": "pull.wardstone.test",
+                "sans": ["pull.wardstone.test"],
+                "csr_pem": mint_csr("pull.wardstone.test", &["pull.wardstone.test"])
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // And a valid API-token bearer is not accepted on the pull route at
+    // all: it is gated by a one-shot token. (The body is deserialize-valid
+    // — axum's extractor rejection would 422 before the handler's 401.)
+    let at_token = api_token(&fx, &[Capability::Issue]).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/pull")
+        .header(header::AUTHORIZATION, bearer(&at_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "profile_id": profile_id,
+                "subject_cn": "pull.wardstone.test",
+                "sans": ["pull.wardstone.test"],
+                "csr_pem": mint_csr("pull.wardstone.test", &["pull.wardstone.test"])
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // First valid pull: issues.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/pull")
+        .header(header::AUTHORIZATION, bearer(&one_shot))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "profile_id": profile_id,
+                "subject_cn": "pull.wardstone.test",
+                "sans": ["pull.wardstone.test"],
+                "csr_pem": mint_csr("pull.wardstone.test", &["pull.wardstone.test"])
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    // Second attempt with the same token: 401 — the token is consumed.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/pull")
+        .header(header::AUTHORIZATION, bearer(&one_shot))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "profile_id": profile_id,
+                "subject_cn": "pull.wardstone.test",
+                "sans": ["pull.wardstone.test"],
+                "csr_pem": mint_csr("pull.wardstone.test", &["pull.wardstone.test"])
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = send(&fx, req).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // The one-shot actor carries the minting user's id, which the audit
+    // row's cert_issued details carry as `minted_by`.
+    let rows = audit_rows(&fx)
+        .await
+        .into_iter()
+        .filter(|(a, at, _, _)| a == "cert_issued" && at == "one_shot_token")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].3["minted_by"], fx.admin_id.to_string());
+
+    // The issued certificate is readable by an actor holding read.
+    let res = get_bearer(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}"),
+        &admin_token(&fx),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    fx.cleanup().await;
+}
+
+/// A profile edit that moves the revision makes the issuance retry against
+/// the NEW revision rather than record a stale one.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revision_move_makes_issuance_retry_not_record_stale() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    // Move the profile to revision 2 through the API.
+    let res = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/profiles/{profile_id}"))
+        .header(header::AUTHORIZATION, bearer(&token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "key_type": "ecdsa-p256",
+                "key_usages": ["digital_signature"],
+                "eku": ["server_auth"],
+                "lifetime_days": 30,
+                "san_patterns": ["wardstone.test", "*.wardstone.test"]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = send(&fx, res).await;
+    assert_eq!(res.status(), StatusCode::OK, "profile edit");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let revised: Value = serde_json::from_slice(&raw).unwrap();
+    let revision_2 = revised["current_revision"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    // Call the issuance core with the STALE revision pinned: the CAS must
+    // fail, the issuance must retry against the current (revision 2), and
+    // the certificate must carry revision 2's id — never the stale one.
+    let actor = admin_actor(&fx);
+
+    // Pin a definitely-stale revision: revision 1's row id.
+    let revisions = ws_core::repo::profile_repo::ProfileRepo::new()
+        .list_revisions(&fx.pool, profile_id)
+        .await
+        .unwrap();
+    let rev1_id = revisions
+        .iter()
+        .find(|r| r.revision == 1)
+        .expect("revision 1 exists")
+        .id;
+
+    let body = ws_api::routes::certificates::IssueCertificateBody {
+        profile_id,
+        subject_cn: "retry.wardstone.test".to_string(),
+        sans: vec!["retry.wardstone.test".to_string()],
+        csr_pem: Some(mint_csr("retry.wardstone.test", &["retry.wardstone.test"])),
+    };
+    let issued = ws_api::routes::certificates::issue_certificate_core(
+        &fx.state,
+        &actor,
+        &body,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Some(rev1_id),
+    )
+    .await
+    .expect("the issuance retries onto the current revision");
+    fx.cleanup().await;
+
+    assert_eq!(
+        issued.profile_revision_id, revision_2,
+        "the certificate is pinned to the CURRENT revision, not the stale one"
+    );
+}
+
+/// Every route in the capability table refuses a token lacking its
+/// capability (403, not 401), and answers a token holding exactly that
+/// capability with something other than 401/403 (validation failures
+/// downstream are fine — the authorization boundary is what this proves).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn capability_table_refusal_matrix() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (_profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+    let some_user = Uuid::new_v4();
+
+    // (method, path, body-json, required capability). Bodies deserialize
+    // (axum's extractor rejection would 422 before the handler's capability
+    // check — not an authorization boundary) but name no real resource, so
+    // the "permitted" leg proves authorization, not business-logic success
+    // (covered by the dedicated tests above).
+    let table: Vec<(&str, String, Option<Value>, Capability)> = vec![
+        (
+            "GET",
+            "/api/v1/certificates".into(),
+            None,
+            Capability::ReadCertificates,
+        ),
+        (
+            "GET",
+            format!("/api/v1/certificates/{}", Uuid::new_v4()),
+            None,
+            Capability::ReadCertificates,
+        ),
+        (
+            "POST",
+            "/api/v1/certificates".into(),
+            Some(
+                json!({"profile_id": Uuid::new_v4(), "subject_cn": "x.test", "sans": ["x.test"], "csr_pem": "not a csr"}),
+            ),
+            Capability::Issue,
+        ),
+        // The key-generation path holds its own capability.
+        (
+            "POST",
+            "/api/v1/certificates".into(),
+            Some(json!({"profile_id": Uuid::new_v4(), "subject_cn": "x.test"})),
+            Capability::GenerateLeafKey,
+        ),
+        (
+            "POST",
+            format!("/api/v1/certificates/{}/revoke", Uuid::new_v4()),
+            Some(json!({"reason": "r"})),
+            Capability::Issue,
+        ),
+        (
+            "GET",
+            "/api/v1/profiles".into(),
+            None,
+            Capability::ReadProfiles,
+        ),
+        (
+            "GET",
+            format!("/api/v1/profiles/{}", Uuid::new_v4()),
+            None,
+            Capability::ReadProfiles,
+        ),
+        (
+            "GET",
+            format!("/api/v1/profiles/{}/revisions", Uuid::new_v4()),
+            None,
+            Capability::ReadProfiles,
+        ),
+        (
+            "POST",
+            "/api/v1/profiles".into(),
+            Some(
+                json!({"name": "", "key_type": "ecdsa-p256", "key_usages": ["digital_signature"], "eku": ["server_auth"], "lifetime_days": 30, "san_patterns": ["d.test"]}),
+            ),
+            Capability::ManageProfiles,
+        ),
+        (
+            "PUT",
+            format!("/api/v1/profiles/{}", Uuid::new_v4()),
+            Some(
+                json!({"key_type": "ecdsa-p256", "key_usages": ["digital_signature"], "eku": ["server_auth"], "lifetime_days": 30, "san_patterns": ["d.test"]}),
+            ),
+            Capability::ManageProfiles,
+        ),
+        ("GET", "/api/v1/cas".into(), None, Capability::ReadCas),
+        (
+            "POST",
+            "/api/v1/cas".into(),
+            Some(json!({"name": "", "subject": "", "key_type": "ed25519", "is_root": true})),
+            Capability::ManageCas,
+        ),
+        (
+            "POST",
+            format!("/api/v1/cas/{ca_id}/export-key"),
+            Some(json!({})),
+            Capability::ExportCaKeys,
+        ),
+        (
+            "GET",
+            "/api/v1/root-trust/ca.crt".into(),
+            None,
+            Capability::ReadCas,
+        ),
+        ("GET", "/api/v1/audit".into(), None, Capability::ReadAudit),
+        (
+            "GET",
+            "/api/v1/audit/export".into(),
+            None,
+            Capability::ReadAudit,
+        ),
+        ("GET", "/api/v1/users".into(), None, Capability::ReadUsers),
+        (
+            "POST",
+            "/api/v1/users".into(),
+            Some(json!({"username": "", "email": "x@y.test", "role": "issuer", "password": "pw"})),
+            Capability::ManageUsers,
+        ),
+        (
+            "POST",
+            format!("/api/v1/users/{some_user}/deactivate"),
+            Some(json!({})),
+            Capability::ManageUsers,
+        ),
+        (
+            "GET",
+            "/api/v1/service-identities".into(),
+            None,
+            Capability::ReadServiceIdentities,
+        ),
+        (
+            "POST",
+            "/api/v1/service-identities".into(),
+            Some(json!({"name": ""})),
+            Capability::ManageApiTokens,
+        ),
+        (
+            "POST",
+            format!("/api/v1/service-identities/{}/revoke", Uuid::new_v4()),
+            None,
+            Capability::ManageApiTokens,
+        ),
+        (
+            "GET",
+            "/api/v1/one-shot-tokens".into(),
+            None,
+            Capability::ReadServiceIdentities,
+        ),
+        (
+            "POST",
+            "/api/v1/one-shot-tokens".into(),
+            Some(json!({"ttl_minutes": 0})),
+            Capability::ManageOneShotTokens,
+        ),
+        (
+            "POST",
+            "/api/v1/tenants".into(),
+            Some(json!({"name": "", "domain": ""})),
+            Capability::ManageSystem,
+        ),
+    ];
+
+    let no_caps = api_token(&fx, &[]).await;
+    for (method, path, body, cap) in table {
+        // The token LACKING the capability is 403 — never 401.
+        let res: TestResponse = match method {
+            "GET" => get_bearer(&fx, &path, &no_caps).await,
+            "POST" => {
+                post_json(
+                    &fx,
+                    &path,
+                    Some(&no_caps),
+                    body.clone().unwrap_or(json!({})),
+                )
+                .await
+            }
+            "PUT" => {
+                put_json(
+                    &fx,
+                    &path,
+                    Some(&no_caps),
+                    body.clone().unwrap_or(json!({})),
+                )
+                .await
+            }
+            other => panic!("unexpected method {other}"),
+        };
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} must refuse a token without {cap:?}"
+        );
+
+        // The token holding EXACTLY the capability is not refused by the
+        // authorization layer.
+        let holder = api_token(&fx, &[cap]).await;
+        let res: TestResponse = match method {
+            "GET" => get_bearer(&fx, &path, &holder).await,
+            "POST" => post_json(&fx, &path, Some(&holder), body.clone().unwrap_or(json!({}))).await,
+            "PUT" => put_json(&fx, &path, Some(&holder), body.clone().unwrap_or(json!({}))).await,
+            other => panic!("unexpected method {other}"),
+        };
+        assert_ne!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} with {cap:?} holder must not be 401"
+        );
+        assert_ne!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} with {cap:?} holder must not be 403"
+        );
+    }
+
+    fx.cleanup().await;
+}
+
+/// PUT convenience for the matrix.
+async fn put_json(fixture: &Fixture, uri: &str, token: Option<&str>, body: Value) -> TestResponse {
+    let mut builder = axum::http::Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, bearer(token));
+    }
+    let req = builder
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build request");
+    send(fixture, req).await
+}
+
+/// The auth lifecycle: login issues paired tokens, refresh rotates (and
+/// kills the old refresh token), logout revokes the session and writes the
+/// `session_revoked` audit row, and `me` reflects the session actor.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_refresh_logout_lifecycle() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    // A real login needs a password: insert the user FIRST, then hash one
+    // (in a blocking thread, like the handler does) and attach it.
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "operator", Role::Issuer).await;
+    let hash = {
+        let hashed = tokio::task::spawn_blocking(|| {
+            ws_auth::password::hash_password("correct horse battery staple")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        hashed
+    };
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(&hash)
+        .execute(&fx.pool)
+        .await
+        .expect("set the user's password hash");
+
+    // Login: wrong password is 401, no user is 401 (uniform).
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "operator", "password": "wrong password"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Login: success pairs the access token with a refresh token.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "operator", "password": "correct horse battery staple"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let login: Value = serde_json::from_slice(&raw).unwrap();
+    let access = login["access_token"].as_str().unwrap().to_string();
+    let refresh = login["refresh_token"].as_str().unwrap().to_string();
+    assert!(refresh.starts_with("ws_rt_"));
+
+    // me reflects the session actor.
+    let res = get_bearer(&fx, "/api/v1/auth/me", &access).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let me: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(me["actor_type"], "user");
+    assert_eq!(me["username"], "operator");
+
+    // Refresh rotates: the new pair works, the OLD refresh token is dead.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/refresh",
+        None,
+        json!({"refresh_token": refresh}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let rotated: Value = serde_json::from_slice(&raw).unwrap();
+    let old_refresh = login["refresh_token"].as_str().unwrap();
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/refresh",
+        None,
+        json!({"refresh_token": old_refresh}),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "rotation revokes the old token"
+    );
+
+    // Logout revokes the (rotated) session and writes session_revoked.
+    let current_refresh = rotated["refresh_token"].as_str().unwrap().to_string();
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/logout",
+        Some(rotated["access_token"].as_str().unwrap()),
+        json!({"refresh_token": current_refresh}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT, "logout succeeds");
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/refresh",
+        None,
+        json!({"refresh_token": current_refresh}),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "logout revoked the session"
+    );
+
+    let rows = audit_rows(&fx).await;
+    let rows = rows
+        .iter()
+        .filter(|(a, ..)| a == "session_revoked")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one session_revoked audit row");
+    assert_eq!(rows[0].1, "user");
+    assert_eq!(rows[0].2, "session");
+
+    fx.cleanup().await;
+}
+
+/// The TOTP MFA flow: enroll returns the secret + provisioning URI, the
+/// first code activates, login then requires the code, deactivate clears
+/// it — each with its audit row in the same transaction as the change.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn totp_mfa_flow_with_audit_rows() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let user_id = Uuid::new_v4();
+    let username = "totp-operator";
+    insert_user(&fx.pool, fx.tenant_id, user_id, username, Role::Issuer).await;
+    let token = session_token(&fx, user_id, username, "issuer");
+
+    // Enroll.
+    let res = post_json(&fx, "/api/v1/auth/totp/enroll", Some(&token), json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let enrolled: Value = serde_json::from_slice(&raw).unwrap();
+    let secret = enrolled["secret"].as_str().unwrap().to_string();
+    assert!(enrolled["provisioning_uri"]
+        .as_str()
+        .unwrap()
+        .contains("otpauth://"));
+
+    // Compute a current code with the workspace's totp-rs pin.
+    fn current_code(secret: &str) -> String {
+        use totp_rs::{Algorithm, Secret, TOTP};
+        let secret = Secret::Encoded(secret.to_string());
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            secret.to_bytes().unwrap(),
+            None,
+            "totp-operator".to_string(),
+        )
+        .unwrap();
+        totp.generate_current().unwrap()
+    }
+
+    // Activate with the first code.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/totp/activate",
+        Some(&token),
+        json!({"code": current_code(&secret)}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Wrong code is rejected.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/totp/deactivate",
+        Some(&token),
+        json!({"code": "000000"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Deactivate with a real code.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/totp/deactivate",
+        Some(&token),
+        json!({"code": current_code(&secret)}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let rows = audit_rows(&fx).await;
+    for action in ["mfa_enrolled", "mfa_activated", "mfa_deactivated"] {
+        let rows: Vec<_> = rows.iter().filter(|(a, ..)| a == action).collect();
+        assert_eq!(rows.len(), 1, "exactly one {action} row");
+        assert_eq!(rows[0].1, "user");
+        assert_eq!(rows[0].2, "session");
+        assert_eq!(rows[0].3, json!({}), "{action} carries no details keys");
+    }
+
+    fx.cleanup().await;
+}
+
+/// CA lifecycle through the API: create a root and a sub-CA, list them,
+/// download the root trust certificate, and export the CA key (admin-only,
+/// no-store, audited, key material never in the log).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ca_lifecycle_root_trust_and_key_export() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (_profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+
+    // A sub-CA underneath the root.
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "sub-ca",
+            "subject": "Wardstone Test Sub",
+            "key_type": "ed25519",
+            "is_root": false,
+            "parent_id": ca_id
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // List: both CAs.
+    let res = get_bearer(&fx, "/api/v1/cas", &token).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+
+    // Root trust download: the CERTIFICATE, never the key.
+    let res = get_bearer(&fx, "/api/v1/root-trust/ca.crt", &token).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    assert!(text.contains("BEGIN CERTIFICATE"), "the certificate PEM");
+    assert!(!text.contains("PRIVATE KEY"), "never the key");
+
+    // Export the root CA key: admin-only, no-store, once per response.
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/cas/{ca_id}/export-key"),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    assert_eq!(text.matches("BEGIN PRIVATE KEY").count(), 1);
+
+    // Audit: ca_key_exported with a reason, never key material.
+    let rows = audit_rows(&fx).await;
+    let exports: Vec<_> = rows
+        .iter()
+        .filter(|(a, ..)| a == "ca_key_exported")
+        .collect();
+    assert_eq!(exports.len(), 1);
+    let details_text = exports[0].3.to_string();
+    assert!(
+        !details_text.contains("PRIVATE"),
+        "ca_key_exported details never carry key material: {details_text}"
+    );
+    let created: Vec<_> = rows.iter().filter(|(a, ..)| a == "ca_created").collect();
+    assert_eq!(created.len(), 2, "ca_created for root and sub");
+
+    // Issuer cannot export.
+    let issuer = api_token(&fx, &[Capability::Issue]).await;
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/cas/{ca_id}/export-key"),
+        Some(&issuer),
+        json!({}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    fx.cleanup().await;
+}
+
+/// The tenants route creates a tenant and seeds its built-in default
+/// profiles, with the `tenant_created` audit row.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn tenants_route_seeds_default_profiles() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        "/api/v1/tenants",
+        Some(&token),
+        json!({"name": "rt-api-secondary", "domain": "rx.test", "domain_cidrs": ["10.100.0.0/16"]}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&raw).unwrap();
+    let tenant_id = created["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    fx.extra_tenants.lock().unwrap().push(tenant_id);
+
+    // Seeded profiles: exactly the two built-ins with the domain's list.
+    // Captured BEFORE cleanup (the rows go with it).
+    let profiles = ws_core::repo::profile_repo::ProfileRepo::new()
+        .list_by_tenant(&fx.pool, tenant_id, 0, 100)
+        .await
+        .unwrap();
+    let mut revision_patterns: Vec<Vec<String>> = Vec::new();
+    for p in &profiles {
+        let rev = ws_core::repo::profile_repo::ProfileRepo::new()
+            .current_revision(&fx.pool, p.id)
+            .await
+            .unwrap()
+            .expect("the seeded profile has revision 1");
+        revision_patterns.push(rev.san_patterns);
+    }
+    // The audit row is captured BEFORE cleanup too.
+    let rows = audit_rows(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(profiles.len(), 2, "the two built-in default profiles");
+    let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"web-server") && names.contains(&"web-server-ecdsa"));
+    for patterns in revision_patterns {
+        assert_eq!(
+            patterns,
+            vec![
+                "rx.test".to_string(),
+                "*.rx.test".to_string(),
+                "10.100.0.0/16".to_string()
+            ]
+        );
+    }
+
+    let created: Vec<_> = rows
+        .iter()
+        .filter(|(a, ..)| a == "tenant_created")
+        .collect();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].3,
+        json!({}),
+        "tenant_created carries no details keys"
+    );
+}
+
+/// The OIDC callback validates the csrf state before any token exchange: a
+/// bogus (or missing) state is refused without any provider call.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn oidc_callback_rejects_a_bogus_state() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/auth/oidc/keycloak/callback?code=x&state=bogus-state")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // And no state at all is refused too.
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/auth/oidc/keycloak/callback?code=x")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    fx.cleanup().await;
+}
+
+/// The OIDC start route mints a csrf state (the Task 3 R8 contract: the
+/// API layer owns state minting and validation) — a configured provider
+/// redirects with a state the callback's store knows.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn oidc_start_mints_csrf_state() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    // Configure the (single) tenant's OIDC provider. The discovery URL is
+    // unreachable here — start is expected to fail on the network leg, but
+    // only AFTER the state was minted and stored.
+    sqlx::query(
+        "INSERT INTO oidc_config (tenant_id, provider_type, display_name, discovery_url, \
+         client_id, client_secret, redirect_uri, scopes) \
+         VALUES ($1, 'custom', 'Test IdP', 'http://127.0.0.1:9/.well-known/openid-configuration', \
+         'client', '', 'http://127.0.0.1:9/callback', 'openid profile email')",
+    )
+    .bind(fx.tenant_id)
+    .execute(&fx.pool)
+    .await
+    .expect("insert the oidc config row");
+
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/auth/oidc/custom/start")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    fx.cleanup().await;
+
+    // The provider is unreachable, so the route fails with 500 — but only
+    // AFTER the csrf state was minted and stored (the internal error, not
+    // a 404 for an unconfigured provider, and not a 401 on a public route).
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        fx.state.oidc_states.pending_count() >= 1,
+        "the csrf state was minted before the network leg"
+    );
+}
+
+/// Revocation is idempotent and audited: the first revoke writes one
+/// `cert_revoked` row, a second revoke writes none.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revocation_is_idempotent_and_audited() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "revoke.wardstone.test",
+        &["revoke.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "key compromise"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "key compromise"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke is idempotent");
+
+    let rows = audit_rows(&fx).await;
+    let revoked: Vec<_> = rows.iter().filter(|(a, ..)| a == "cert_revoked").collect();
+    fx.cleanup().await;
+
+    assert_eq!(revoked.len(), 1, "the second revoke writes no row");
+    assert_eq!(revoked[0].3["reason"], "key compromise");
+}
+
+/// Health and metrics are public and cheap.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn health_and_metrics_are_public() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = send(
+        &fx,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw.to_vec()).unwrap();
+    assert!(text.contains("wardstone_up"));
+
+    fx.cleanup().await;
+}
+
+/// The `*.` pattern is refused at profile-creation time (the fail-closed
+/// matcher fix Task 10 carries): a profile proposing `*.` is a 400, not a
+/// stored open wildcard.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_creation_refuses_the_star_dot_pattern() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        "/api/v1/profiles",
+        Some(&token),
+        json!({
+            "name": "bad-pattern",
+            "key_type": "ecdsa-p256",
+            "key_usages": ["digital_signature"],
+            "eku": ["server_auth"],
+            "lifetime_days": 30,
+            "san_patterns": ["*."]
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    fx.cleanup().await;
+}

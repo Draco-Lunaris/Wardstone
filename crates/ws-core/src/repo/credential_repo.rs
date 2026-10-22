@@ -277,6 +277,31 @@ impl CredentialRepo {
         Ok(())
     }
 
+    /// A tenant's one-shot tokens, one page at a time, newest first (the
+    /// shared [`crate::repo::paging`] helper): the listing the one-shot
+    /// tokens route serves. Consumed and expired tokens stay listed (the
+    /// audit trail of what was minted); the consumer reads `used_at` from
+    /// the row.
+    pub async fn list_one_shot_tokens(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<OneShotTokenModel>, CoreError> {
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
+        let rows: Vec<OneShotTokenRow> = sqlx::query_as(&format!(
+            "{ONE_SHOT_COLUMNS} WHERE tenant_id = $1 ORDER BY created_at DESC, id \
+             LIMIT $2 OFFSET $3"
+        ))
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(OneShotTokenRow::into_model).collect())
+    }
+
     /// Resolve a presented one-shot token's hash to its row, used or not
     /// (the auth layer interprets `used_at`); `None` when unknown.
     pub async fn get_one_shot_by_hash(

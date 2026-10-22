@@ -1,0 +1,213 @@
+//! The application state of the REST surface: the pool, the JWT key pair,
+//! the deployment config, the bounded access log, and the OIDC csrf-state
+//! store.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use sqlx::PgPool;
+use ws_auth::jwt::JwtKeys;
+
+/// The name of the TOTP/OIDC secret-encryption key file inside the keys
+/// directory (`ws_core::crypto::SecretBox`'s envelope key, created at
+/// setup under the keys volume).
+pub const SECRET_KEY_FILE: &str = "secret-encryption.key";
+
+/// The issuer name the TOTP provisioning URIs carry.
+pub const TOTP_ISSUER: &str = "Wardstone";
+
+/// How long a minted OIDC csrf state stays valid in the store.
+const OIDC_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// The deployment configuration the setup flow established. Carried (and
+/// kept immutable) in the application state: the setup hostname/SAN value,
+/// the keys directory, the admin CIDRs collected at setup, and the rate
+/// limits for the public auth routes.
+#[derive(Clone, Debug)]
+pub struct ApiConfig {
+    /// The setup hostname/SAN value (the default domain of the built-in
+    /// profiles and the TOTP issuer context).
+    pub domain: String,
+    /// The keys directory: the JWT key pair, the CA keystore, and the
+    /// secret-encryption key file all live under it.
+    pub keys_dir: PathBuf,
+    /// The admin CIDRs collected at setup (networks from which an
+    /// operator reached the setup form).
+    pub admin_cidrs: Vec<String>,
+    /// The GCRA rate limit of the public auth routes (login, refresh,
+    /// OIDC start/callback): per-token-bucket refill and burst, keyed on
+    /// the peer IP. `None` disables the governor layer — TESTS ONLY —
+    /// because axum's `ConnectInfo` (the peer IP) does not exist for an
+    /// in-process `oneshot` request; the Task 13 binary always configures
+    /// it.
+    pub auth_rate_limit: Option<AuthRateLimit>,
+}
+
+impl ApiConfig {
+    /// Build the config with the setup values and no rate limit (the test
+    /// default); the binary sets `auth_rate_limit` explicitly.
+    pub fn new(domain: String, keys_dir: PathBuf) -> Self {
+        ApiConfig {
+            domain,
+            keys_dir,
+            admin_cidrs: Vec::new(),
+            auth_rate_limit: None,
+        }
+    }
+}
+
+/// The public auth routes' rate limit: one credit refilled every
+/// `per_millis` milliseconds, `burst` credits held at most.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthRateLimit {
+    /// Refill period in milliseconds (house: one credit per 500 ms).
+    pub per_millis: u64,
+    /// Token-bucket burst size (house: 20 per IP on the auth routes).
+    pub burst: u32,
+}
+
+/// The bounded, in-process access log. The middleware appends one line per
+/// request — method, path, status, nothing else — and request/response
+/// BODIES never reach it (the key-generation and CA-key-export responses
+/// therefore cannot leak through logging). The Task 13 binary may mirror
+/// the same lines to its real access log.
+#[derive(Debug)]
+pub struct AccessLog {
+    entries: Mutex<VecDeque<String>>,
+    cap: usize,
+}
+
+impl Default for AccessLog {
+    fn default() -> Self {
+        AccessLog {
+            entries: Mutex::new(VecDeque::new()),
+            cap: 512,
+        }
+    }
+}
+
+impl AccessLog {
+    /// Append one line, dropping the oldest beyond the cap.
+    pub fn push(&self, line: String) {
+        if let Ok(mut entries) = self.entries.lock() {
+            if entries.len() >= self.cap {
+                entries.pop_front();
+            }
+            entries.push_back(line);
+        }
+    }
+
+    /// A snapshot copy of the captured lines, oldest first.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .map(|entries| entries.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A pending OIDC csrf state: the tenant whose OAuth flow minted it, and
+/// when it expires.
+#[derive(Debug)]
+struct OidcPending {
+    tenant_id: uuid::Uuid,
+    expires_at: Instant,
+}
+
+/// The in-memory OIDC csrf-state store (Task 3's R8 contract: `exchange_code`
+/// deliberately does NOT re-validate `state` — ws-auth holds no session
+/// store — so the API layer mints the state on the start route and
+/// validates AND consumes it on the callback, before any code exchange).
+///
+/// The store is process-local on purpose: a csrf state must not survive a
+/// restart or be shared between replicas (the binary is single-instance in
+/// v1), and a lost store just means the operator retries the login.
+#[derive(Debug, Default)]
+pub struct OidcStateStore {
+    states: Mutex<HashMap<String, OidcPending>>,
+}
+
+impl OidcStateStore {
+    /// Mint a random state token, store it for `tenant_id`, and return its
+    /// plaintext. 32 OS-entropy bytes, hex-encoded — the same size and
+    /// encoding as every other bearer token in the workspace.
+    pub fn mint(&self, tenant_id: uuid::Uuid) -> Result<String, ws_auth::error::AuthError> {
+        use rand::{rngs::SysRng, TryRng};
+        let mut raw = [0u8; 32];
+        SysRng.try_fill_bytes(&mut raw).map_err(|e| {
+            ws_auth::error::AuthError::Crypto(format!(
+                "os entropy unavailable for the oidc csrf state: {e}"
+            ))
+        })?;
+        let state = hex::encode(raw);
+        if let Ok(mut states) = self.states.lock() {
+            states.insert(
+                state.clone(),
+                OidcPending {
+                    tenant_id,
+                    expires_at: Instant::now() + OIDC_STATE_TTL,
+                },
+            );
+            // Opportunistic gc: drop expired states while the lock is held.
+            states.retain(|_, pending| pending.expires_at > Instant::now());
+        }
+        Ok(state)
+    }
+
+    /// Validate AND consume the state: `Some((tenant_id))` only when the
+    /// state is known and unexpired, in which case it is removed — a
+    /// replayed state validates once. The house's DashMap-removal check,
+    /// here under one mutex.
+    pub fn consume(&self, state: &str) -> Option<uuid::Uuid> {
+        let mut states = self.states.lock().ok()?;
+        let pending = states.remove(state)?;
+        if pending.expires_at <= Instant::now() {
+            return None;
+        }
+        Some(pending.tenant_id)
+    }
+
+    /// How many states are pending (observability; the Task 13 binary may
+    /// expose it on `/api/v1/metrics`).
+    pub fn pending_count(&self) -> usize {
+        self.states.lock().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
+/// The application state of the REST surface. Clonable (the pool and the
+/// shared handles are cheap `Arc`/connection copies).
+#[derive(Clone)]
+pub struct AppState {
+    /// The database pool (Task 2's migrated schema).
+    pub pool: PgPool,
+    /// The Ed25519 JWT key pair, loaded (or generated) at boot.
+    pub jwt: Arc<JwtKeys>,
+    /// The deployment configuration.
+    pub config: ApiConfig,
+    /// The bounded access log the middleware appends to.
+    pub access_log: Arc<AccessLog>,
+    /// The OIDC csrf-state store (Task 3's R8 contract).
+    pub oidc_states: Arc<OidcStateStore>,
+}
+
+impl AppState {
+    /// Build the state from the pool, the JWT key pair, and the config;
+    /// the mutable-by-product stores start empty.
+    pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
+        AppState {
+            pool,
+            jwt,
+            config,
+            access_log: Arc::new(AccessLog::default()),
+            oidc_states: Arc::new(OidcStateStore::default()),
+        }
+    }
+
+    /// The path of the secret-encryption key file (the TOTP and OIDC
+    /// client-secret envelope key under the keys directory).
+    pub fn secret_key_path(&self) -> PathBuf {
+        self.config.keys_dir.join(SECRET_KEY_FILE)
+    }
+}

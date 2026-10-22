@@ -309,6 +309,30 @@ pub(crate) fn issuer_not_after(
     Ok(issuer_facts(issuer_cert_pem)?.not_after)
 }
 
+/// A certificate's X.509 validity window, `(not_before, not_after)` —
+/// the facts a caller storing a fresh CA (Plan 2's API writes the `cas`
+/// row) reads from the CREATED certificate rather than re-deriving from
+/// the engine's own validity arithmetic.
+///
+/// The engine computes the window itself (midnight-UTC skew margins,
+/// issuer caps); this function merely reports what the certificate
+/// actually carries, so the stored row can never disagree with the
+/// issued structure.
+pub fn certificate_validity(
+    cert_pem: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), CaError> {
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|_| CaError::X509("certificate is not valid PEM".to_owned()))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| CaError::X509("certificate failed to parse".to_owned()))?;
+    let not_before = chrono::DateTime::from_timestamp(cert.validity().not_before.timestamp(), 0)
+        .ok_or_else(|| CaError::X509("certificate notBefore is out of range".to_owned()))?;
+    let not_after = chrono::DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| CaError::X509("certificate notAfter is out of range".to_owned()))?;
+    Ok((not_before, not_after))
+}
+
 /// Common [`CertificateParams`]: subject CN, validity window, fresh
 /// OS-entropy serial, rcgen defaults for everything else (SKI
 /// derivation; no SANs or extended key usages — CAs carry none).

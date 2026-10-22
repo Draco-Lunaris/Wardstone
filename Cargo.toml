@@ -95,3 +95,24 @@ hmac = { version = "0.13", default-features = false }
 # issue.rs converts caller chrono instants to time::OffsetDateTime at the
 # rcgen boundary. Already resolved in the lock via rcgen.
 time = { version = "0.3.55", default-features = false, features = ["std"] }
+
+# HTTP framework of the REST surface (ws-api, Task 10). House pin
+# (linux-patch-manager pm-web).
+axum = { version = "0.8.9" }
+
+# Tower middleware plumbing for the access-log layer (ws-api). The `util`
+# feature is required to build `Service`/`Layer` combinators by hand.
+tower = { version = "0.5.3", features = ["util"] }
+
+# tower-http for security/response headers on the ws-api router.
+tower-http = { version = "0.6.11", features = ["set-header"] }
+
+# GCRA rate limiting (ws-api's public auth routes): the house's rate-limit
+# runtime. Version aligned to tower_governor 0.8.0's requirement (it pulls
+# governor 0.10.x); the two-version lock split of pm-web is not reproduced
+# here.
+governor = { version = "0.10.4" }
+
+# The Governor tower Layer/Service adapter over `governor` (ws-api).
+# House pin (linux-patch-manager pm-web).
+tower_governor = { version = "0.8.0" }

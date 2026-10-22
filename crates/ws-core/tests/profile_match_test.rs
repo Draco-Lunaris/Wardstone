@@ -112,6 +112,27 @@ fn any_matching_pattern_permits() {
     assert!(!perm(&patterns, "11.0.0.1"));
 }
 
+/// A `*.` pattern — the `*.` wildcard prefix with an EMPTY suffix — is a
+/// typed error, not a wildcard over "any DNS name containing a dot": the
+/// profile that stores it is data damage, and the matcher must fail
+/// closed on the issuance hot path (the Task 10 deferred fix, from Task
+/// 5's review R-a). Built-in default profiles never store `*.`.
+#[test]
+fn star_dot_empty_suffix_fails_closed() {
+    let err = san_is_permitted(&["*.".to_string()], "foo.other.com")
+        .expect_err("`*.` (empty suffix) must fail closed, never match");
+    assert!(
+        matches!(err, CoreError::Config(_)),
+        "unexpected error: {err:?}"
+    );
+
+    // The empty-suffix pattern fails closed even against a name the broken
+    // wildcard "should" have covered.
+    let err = san_is_permitted(&["*.".to_string()], "example.com")
+        .expect_err("`*.` must fail closed for every name");
+    assert!(matches!(err, CoreError::Config(_)));
+}
+
 /// An unparsable pattern is a typed error rather than a silent non-match:
 /// a broken stored pattern is data damage and must not read as "no match".
 #[test]

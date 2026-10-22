@@ -79,6 +79,17 @@ fn parse_pattern(pattern: &str) -> Result<Pattern, CoreError> {
     }
     if pattern.contains('*') {
         if let Some(suffix) = pattern.strip_prefix("*.") {
+            // `*.` (an EMPTY suffix) would otherwise mint a wildcard over
+            // "any DNS name containing a dot" — an open-ended grant nobody
+            // profile meant to publish. Fail closed (the Task 10 deferred
+            // fix, from Task 5's review R-a); the built-in default
+            // profiles never store `*.`.
+            if suffix.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "wildcard san pattern in profile is not exactly `*` or `*.<labels>`: {pattern:?} \
+                     (\u{60}*\u{60} with an empty suffix is refused)"
+                )));
+            }
             if !suffix.contains('*') {
                 return Ok(Pattern::Wildcard(suffix.to_lowercase()));
             }

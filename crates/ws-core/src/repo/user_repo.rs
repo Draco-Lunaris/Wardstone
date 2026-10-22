@@ -271,6 +271,66 @@ impl UserRepo {
         Ok(())
     }
 
+    /// Replace the user's TOTP credential wholesale — the encrypted secret,
+    /// its nonce, and the enforcement flag in ONE statement, so a TOTP
+    /// change and its audit row (written by the caller on the same
+    /// executor) commit or roll back together. `None` secret/nonce clears
+    /// the credential (deactivation); the caller chooses the new
+    /// `mfa_enabled` value explicitly, since enroll keeps it false while
+    /// activate sets it true.
+    pub async fn update_totp_credential(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        totp_secret_encrypted: Option<Vec<u8>>,
+        totp_secret_nonce: Option<Vec<u8>>,
+        mfa_enabled: bool,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE users SET totp_secret_encrypted = $2, totp_secret_nonce = $3, \
+             mfa_enabled = $4, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(totp_secret_encrypted)
+        .bind(totp_secret_nonce)
+        .bind(mfa_enabled)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// Link an OIDC subject to the user (`users.oidc_sub`, unique per
+    /// tenant) — the SSO login path's first-login linkage by verified
+    /// email. A conflicting `(tenant_id, oidc_sub)` is
+    /// [`CoreError::Duplicate`].
+    pub async fn link_oidc_sub(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        sub: &str,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE users SET oidc_sub = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(sub)
+            .execute(executor)
+            .await
+            .map_err(map_unique)?;
+        Ok(())
+    }
+
+    /// Stamp `last_login_at` (the successful-login bookkeeping).
+    pub async fn touch_last_login(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// Count one failed login against the lockout policy. Consecutive
     /// calls (one attempt per statement) increment the shared counter; a
     /// login success path calls [`UserRepo::clear_failed_logins`].

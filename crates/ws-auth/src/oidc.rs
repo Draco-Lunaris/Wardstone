@@ -67,6 +67,11 @@ pub struct OidcIdentity {
     /// `pm-web/src/routes/sso.rs` prefers `sub`, falls back to `oid`).
     pub subject: String,
     pub email: Option<String>,
+    /// Whether the provider verified the email claim (Core Profile
+    /// `email_verified`). Task 10's account-linking contract accepts an
+    /// email match ONLY when the provider says it was verified — an
+    /// unverified email is attacker-controllable for most providers.
+    pub email_verified: Option<bool>,
     /// The `name` claim, falling back to `preferred_username`.
     pub display_name: Option<String>,
 }
@@ -78,6 +83,7 @@ struct IdTokenClaims {
     sub: Option<String>,
     oid: Option<String>,
     email: Option<String>,
+    email_verified: Option<bool>,
     name: Option<String>,
     preferred_username: Option<String>,
 }
@@ -266,6 +272,7 @@ pub async fn identity_from_response(
     Ok(OidcIdentity {
         subject,
         email: claims.email,
+        email_verified: claims.email_verified,
         display_name,
     })
 }
