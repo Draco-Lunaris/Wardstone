@@ -113,4 +113,23 @@ impl OidcConfigRepo {
         .map_err(map_unique)?;
         Ok(())
     }
+
+    /// Remove the tenant's OIDC provider configuration. The guarded
+    /// DELETE's affected-rows count is deliberately left unmapped — the
+    /// house pattern for guarded deletes (`CredentialRepo::
+    /// revoke_service_identity`): the route establishes existence first
+    /// (via [`OidcConfigRepo::get`], which also feeds the audit details)
+    /// and turns a missing row into its own 404, so a row that vanishes
+    /// between the two reads is simply a no-op delete.
+    pub async fn delete(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+    ) -> Result<(), CoreError> {
+        sqlx::query("DELETE FROM oidc_config WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
 }

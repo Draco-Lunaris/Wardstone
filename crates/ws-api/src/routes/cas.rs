@@ -12,8 +12,10 @@
 //! `tokio::task::spawn_blocking`; the keystore is opened inside the task.
 
 use axum::extract::{Path, State};
+use axum::http::header;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,7 @@ use ws_core::models::ca::{CaModel, KeyType};
 use ws_core::models::rbac::Capability;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
+use ws_core::repo::crl_repo::CrlRepo;
 
 use crate::auth_middleware::AuthActor;
 use crate::error::ApiError;
@@ -35,10 +38,13 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create_ca).get(list_cas))
         .route("/{id}/export-key", post(export_ca_key))
+        .route("/{id}/chain", get(get_ca_chain))
+        .route("/{id}/crl", get(get_ca_crl))
 }
 
 /// The CA creation body.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateCaBody {
     /// Operator-facing name (unique per tenant).
     pub name: String,
@@ -56,6 +62,7 @@ pub struct CreateCaBody {
 
 /// One CA, as a DTO (the certificate PEM is public; no key path).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CaResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -220,6 +227,7 @@ async fn list_cas(
 
 /// The export body (the reason lands in the audit details).
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct ExportCaKeyBody {
     #[serde(default)]
     pub reason: Option<String>,
@@ -229,6 +237,7 @@ pub struct ExportCaKeyBody {
 /// per request for operator backup — the server keeps its copy, and the
 /// response is never cached.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ExportedCaKey {
     pub key_pem: String,
 }
@@ -278,4 +287,75 @@ async fn export_ca_key(
     tx.commit().await?;
 
     Ok(json_no_store(ExportedCaKey { key_pem }))
+}
+
+/// The latest published CRL for a CA (the `crls` row ws-worker's CRL job
+/// writes). The PEM is the CRL document itself; nothing secret — but it is
+/// only ever served with its exact timestamps, verbatim.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CrlResponse {
+    pub ca_id: Uuid,
+    pub issued_at: DateTime<Utc>,
+    pub next_update: DateTime<Utc>,
+    pub crl_pem: String,
+}
+
+/// `GET /api/v1/cas/{id}/chain` — `read_cas`. The CA's certificate chain
+/// leaf-first: the named CA's certificate, then each parent's, up to the
+/// root's — as one concatenated PEM body (`application/x-pem-file`, the
+/// root-trust route's idiom). Another tenant's CA is indistinguishable
+/// from a missing one (404), and the walk never starts on an id that has
+/// not passed the tenant check.
+async fn get_ca_chain(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    auth.require(Capability::ReadCas).map_err(ApiError::from)?;
+    let ca = CaRepo::new()
+        .get(&state.pool, id)
+        .await?
+        .filter(|ca| ca.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("ca not found".to_string()))?;
+    let chain = {
+        // One pooled connection serves the multi-statement walk (the
+        // repos' executor convention: several statements need a `&mut
+        // PgConnection`); the walk re-checks the verified tenant per hop.
+        let mut conn = state.pool.acquire().await?;
+        CaRepo::new()
+            .chain_to_root(&mut conn, auth.tenant_id, ca.id)
+            .await?
+    };
+    let body: String = chain.iter().map(|ca| ca.cert_pem.as_str()).collect();
+    Ok(([(header::CONTENT_TYPE, "application/x-pem-file")], body).into_response())
+}
+
+/// `GET /api/v1/cas/{id}/crl` — `read_cas`. The CA's newest published CRL
+/// as JSON (`CrlResponse`), or 404 `not_found` when it has none. The
+/// tenant filter sits inside the query (the 006 composite constraint backs
+/// the denormalized `tenant_id`), and the CA itself is also checked
+/// against the actor's tenant first — the route never keys a read on an
+/// id another tenant may own. The error path never carries the PEM.
+async fn get_ca_crl(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<CrlResponse>, ApiError> {
+    auth.require(Capability::ReadCas).map_err(ApiError::from)?;
+    CaRepo::new()
+        .get(&state.pool, id)
+        .await?
+        .filter(|ca| ca.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("ca not found".to_string()))?;
+    let crl = CrlRepo::new()
+        .latest_for_ca(&state.pool, auth.tenant_id, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no published CRL for this ca".to_string()))?;
+    Ok(Json(CrlResponse {
+        ca_id: crl.ca_id,
+        issued_at: crl.issued_at,
+        next_update: crl.next_update,
+        crl_pem: crl.crl_pem,
+    }))
 }

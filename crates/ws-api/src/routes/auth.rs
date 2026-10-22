@@ -102,18 +102,44 @@ pub fn router(state: &AppState) -> Router<AppState> {
 }
 
 /// The v1 tenancy shape: a single-tenant instance by default, tenant-
-/// shaped schema from day one. The public routes (login, OIDC) resolve
-/// THE tenant of the install: the first created. A fresh database with no
-/// tenant is a 404 — setup has not run.
-async fn default_tenant(pool: &sqlx::PgPool) -> Result<Tenant, ApiError> {
-    TenantRepo::new()
-        .list(pool)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            ApiError::NotFound("no tenant exists yet (complete setup first)".to_string())
-        })
+/// shaped schema from day one. The public routes (login, OIDC start)
+/// resolve THE tenant of the install: the FIRST created (the tenant the
+/// setup flow made) — never "first by name", which is an accident of
+/// `list`'s display order, not an install fact. A fresh database with no
+/// tenant is a 404 — setup has not run. ONE helper so every call site
+/// shares the same resolution rule. `pub(crate)` because the OIDC
+/// config's PUBLIC status route (`routes/oidc.rs::config_status`) shares
+/// it — the SSO flag must describe the same tenant the SSO flow runs on.
+pub(crate) async fn primary_tenant(
+    repo: &TenantRepo,
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Tenant, ApiError> {
+    repo.oldest(executor).await?.ok_or_else(|| {
+        ApiError::NotFound("no tenant exists yet (complete setup first)".to_string())
+    })
+}
+
+/// A committed argon2id PHC string, generated ONCE with the house
+/// parameters (`ws_auth::password::hash_password` over a fixed throwaway
+/// input at implementation time — a hash of nothing meaningful, never any
+/// account's password). The unknown-username login branch verifies against
+/// it only to spend the same argon2id time a wrong-password verify spends,
+/// so response timing cannot separate "no such user" from "wrong
+/// password"; the verify's outcome is always discarded.
+const DUMMY_ARGON2_PHC: &str =
+    "$argon2id$v=19$m=65536,t=3,p=1$6A1B1e9sZrNceurghmzWiQ$v17JIRnYACQKRBs1QyWrxycoZI3Zv7A0DAn2uIhgFQo";
+
+/// Run the dummy argon2id verify for the unknown-username branch, off the
+/// async runtime exactly like the real verify (argon2 is slow by intent).
+/// The result is discarded: whatever it says, the answer is the same 401.
+async fn burn_dummy_verify(password: &str) -> Result<(), ApiError> {
+    let password = password.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        ws_auth::password::verify_password(&password, DUMMY_ARGON2_PHC)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("the password task failed: {e}")))?;
+    Ok(())
 }
 
 /// The paired session tokens every auth flow returns.
@@ -126,6 +152,7 @@ struct SessionTokens {
 /// The login body: username + password, plus the TOTP code when the
 /// account has MFA enabled.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LoginBody {
     pub username: String,
     pub password: String,
@@ -138,14 +165,22 @@ async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginBody>,
 ) -> Result<Json<SessionTokens>, ApiError> {
-    let tenant = default_tenant(&state.pool).await?;
+    let tenant = primary_tenant(&TenantRepo::new(), &state.pool).await?;
     let users = UserRepo::new();
-    let user = users
+    let user = match users
         .get_by_username(&state.pool, tenant.id, &body.username)
         .await?
-        // Unknown user and wrong password are the SAME response (never
-        // reveal which half was wrong).
-        .ok_or_else(|| ApiError::Unauthorized("invalid credentials".to_string()))?;
+    {
+        Some(user) => user,
+        None => {
+            // Unknown user and wrong password are the SAME response (never
+            // reveal which half was wrong) — and the same COST: the
+            // unknown-username branch burns one argon2id verify so the
+            // response timing cannot tell the two apart.
+            burn_dummy_verify(&body.password).await?;
+            return Err(ApiError::Unauthorized("invalid credentials".to_string()));
+        }
+    };
 
     // The lockout window: an account under lockout is refused before any
     // verification (the mapping table puts `AccountLocked` at 403).
@@ -206,7 +241,7 @@ async fn verify_totp_of_user(
     code: Option<String>,
 ) -> Result<(), ApiError> {
     let Some(code) = code else {
-        return Err(ApiError::Unauthorized(
+        return Err(ApiError::UnauthorizedMfa(
             "multi-factor authentication required".to_string(),
         ));
     };
@@ -235,6 +270,7 @@ async fn verify_totp_of_user(
 
 /// The refresh body.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RefreshBody {
     pub refresh_token: String,
 }
@@ -314,6 +350,7 @@ async fn mint_session(state: &AppState, user: &UserModel) -> Result<SessionToken
 
 /// The logout body: the refresh token this session owns.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LogoutBody {
     pub refresh_token: String,
 }
@@ -397,6 +434,7 @@ async fn me(auth: AuthActor, State(state): State<AppState>) -> Result<Json<MeRes
 /// The `me` response: the actor's identity and capability set; the user's
 /// own fields only when the actor is a human session.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct MeResponse {
     pub actor_type: String,
     pub actor_id: String,
@@ -410,6 +448,7 @@ pub struct MeResponse {
 
 /// The TOTP mutation bodies (`activate`/`deactivate` verify a code).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TotpCodeBody {
     pub code: String,
 }
@@ -417,6 +456,7 @@ pub struct TotpCodeBody {
 /// The enroll response: the base32 secret (shown once to scan/configure)
 /// and the otpauth:// provisioning URI.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TotpEnrolled {
     pub secret: String,
     pub provisioning_uri: String,
@@ -576,7 +616,7 @@ async fn oidc_start(
     State(state): State<AppState>,
     Path(provider): Path<String>,
 ) -> Result<Redirect, ApiError> {
-    let tenant = default_tenant(&state.pool).await?;
+    let tenant = primary_tenant(&TenantRepo::new(), &state.pool).await?;
     let config = provider_config(&state, tenant.id, &provider).await?;
     let state_token = state.oidc_states.mint(tenant.id).map_err(ApiError::from)?;
 
@@ -606,6 +646,7 @@ async fn oidc_start(
 
 /// The query parameters of the callback.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OidcCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,

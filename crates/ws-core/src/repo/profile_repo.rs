@@ -291,4 +291,35 @@ impl ProfileRepo {
             .await?;
         Ok(())
     }
+
+    /// The delete-refusal check: whether ANY certificate row still
+    /// references a revision of this profile (active or revoked — history
+    /// matters in a CA, so a revoked certificate pins its policy just as
+    /// hard as a live one). `true` means [`ProfileRepo::delete`] would hit
+    /// the `certificates.profile_revision_id` foreign key at COMMIT.
+    ///
+    /// The deletion route calls this inside the SAME transaction as the
+    /// delete and refuses with its 409 BEFORE attempting the delete,
+    /// rather than mapping the commit-time `23503` elsewhere: a count-
+    /// then-delete under one transaction's snapshot gives the
+    /// deterministic refusal message, does not depend on which constraint
+    /// fired, and never conflates a foreign-key violation from some other
+    /// statement with "referenced by certificates". The foreign key stays
+    /// the physical backstop for the commit-time race.
+    pub async fn is_referenced(
+        &self,
+        executor: impl PgExecutor<'_>,
+        profile_id: Uuid,
+    ) -> Result<bool, CoreError> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM certificates c \
+             JOIN profile_revisions r ON c.profile_revision_id = r.id \
+             WHERE r.profile_id = $1 \
+             LIMIT 1",
+        )
+        .bind(profile_id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.is_some())
+    }
 }

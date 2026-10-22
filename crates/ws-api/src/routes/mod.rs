@@ -14,6 +14,7 @@ pub mod cas;
 pub mod certificates;
 pub mod credentials;
 pub mod health;
+pub mod oidc;
 pub mod profiles;
 pub mod root_trust;
 pub mod tenants;
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/one-shot-tokens", credentials::one_shot_tokens_router())
         .nest("/tenants", tenants::router())
         .nest("/root-trust", root_trust::router())
+        .nest("/oidc", oidc::router())
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(health::metrics));
 
@@ -160,16 +162,21 @@ pub fn json_no_store<T: Serialize>(value: T) -> Response {
 /// RFC 7468 form.
 pub(crate) fn pem_from_der(label: &str, der: &[u8]) -> String {
     let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let lines: Vec<String> = body
-        .as_bytes()
-        .chunks(64)
-        .map(String::from_utf8_lossy)
-        .map(String::from)
-        .collect();
-    format!(
-        "-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n",
-        lines = lines.join("\n")
-    )
+    // The base64 alphabet is pure ASCII, so every 64-byte offset of the
+    // encoded `str` is a char boundary: slice the lines straight off it —
+    // no UTF-8 conversion of any kind is needed.
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    let mut rest = body.as_str();
+    while !rest.is_empty() {
+        let (line, tail) = rest.split_at(rest.len().min(64));
+        pem.push_str(line);
+        pem.push('\n');
+        rest = tail;
+    }
+    pem.push_str("-----END ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    pem
 }
 
 /// The shared list query (`?page=&page_size=`), defaulted and clamped by

@@ -86,6 +86,67 @@ To front `ws-api` directly, add a `ports:` block (or attach your proxy's
 network) in **your copy** of the file — the shipped file publishes nothing
 for it, deliberately.
 
+## The UI and SSO login
+
+**Login.** Browse `https://<host>:8443/` and sign in with the admin account.
+The SPA posts `/auth/ui/login` — ws-web's session relay, one of the five
+`/auth/ui` routes — which relays ws-api's login, stores the token pair
+SERVER-side under an opaque `wardstone_session` cookie (HttpOnly; the browser
+never sees a token), and answers with the identity. MFA accounts pass a TOTP
+step: ws-api's error bodies pass through the relay untouched, so the UI's
+TOTP prompt keys on the same machine-readable code. `POST /auth/ui/logout`
+ends the session.
+
+**SSO (OIDC) setup.** In the UI's Admin section, SSO provider tab, configure
+one provider: provider type, discovery URL, client id, client secret (empty
+string = public client), scopes, and the redirect URI. The redirect URI is
+always the PUBLIC callback on ws-web:
+
+    https://<host>/auth/ui/oidc/<provider>/callback
+
+ws-api mints the authorization URL (fetching the IdP's discovery document and
+minting the CSRF state) against that registered redirect, and the
+`/auth/ui/oidc/{provider}/callback` relay completes the exchange into a
+session. Before committing values to the IdP, the discovery-test route
+probes a SAVED configuration or an override payload. After configuration,
+the login page reads `GET /auth/ui/config`, which relays ws-api's PUBLIC
+`GET /api/v1/oidc/config/status` flag (is SSO configured, and for which
+provider) — that is what renders the "Sign in with SSO" button before any
+session exists; the flag is readable without credentials by design.
+
+**Rate-limiter placement.** Per-client-IP GCRA covers the credential
+surfaces the public edge serves, with the house defaults (one credit per
+500 ms, burst 20 per IP — the same burst/refill vocabulary in every
+variant):
+
+- **Bundled UI-fronted deployment** (`wardstone ui` publishes the only
+  port): ws-web limits BOTH its `/auth/ui/*` relay routes AND the proxied
+  credential pair `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh`
+  — so password spraying and TOTP guessing stay per-client limited even
+  though ws-api's own limiter is off (below). Other `/api/v1/*` paths —
+  the machine-token (`ws_at_`/`ws_ot_`) flows — are NOT limited at this
+  edge.
+- **Direct API deployment** (clients, or a transparent-TCP proxy, hit
+  `ws-api` itself): ws-api's own auth-route GCRA (login, refresh, OIDC
+  start/callback) applies.
+
+ws-api's limiter keys on its direct TCP peer; in a UI-fronted deployment
+every proxied login arrives from ONE loopback IP, so that limiter would
+throttle ALL operators collectively. The bundled compose therefore sets
+`WARDSTONE_AUTH_RATE_LIMIT_DISABLED=true` on the `api` service — an
+`api`-mode switch only (the `ui` mode never reads it, and ws-web's
+front-door limiter stays on regardless of it). Where BOTH limiters run
+(a `ui` deployment that leaves the switch off), the effective per-client
+limit is the tighter of the two buckets — defense in depth, never a gap.
+Only where clients hit ws-api directly (an External variant fronting it
+with a transparent-TCP proxy) is the switch meaningful at all.
+
+**Egress: the compose network must NOT be `internal: true`.** ws-api performs
+OIDC egress — the discovery fetch and the token exchange are made by the
+`api` process over the IdP's public URL. Marking the compose network
+`internal: true` would cut that off and break both SSO setup and SSO login.
+NEVER apply `internal: true` to this bundle's network.
+
 ## The image and the keys volume
 
 `compose.yml` does not build anything: the image named by
@@ -159,13 +220,20 @@ Both files are re-created on the next boot; **every outstanding access and
 refresh token is now invalid** and every user must log in again. Verify the
 new fingerprint before proceeding if you have out-of-band key pinning.
 
-**Rate limiting is always-on, keyed per client IP, and tunable — but never
-disablable.** The `api` process limits the public auth routes (login,
-refresh, OIDC start/callback) with GCRA: one credit per 500 ms, burst 20 per
-IP — the house defaults, applied without any configuration. The environment
-overrides `WARDSTONE_RATE_LIMIT_PER_MILLIS` and `WARDSTONE_RATE_LIMIT_BURST`
-may tune them; the shipped bundle intentionally does not set either. A zero
-or unparsable value is a **boot failure**, not a silent un-limited listener.
+**Rate limiting is always-on across the credential surfaces, keyed per
+client IP, tunable — but the coverage is never optional.** The `api`
+process limits its public auth routes (login, refresh, OIDC
+start/callback) with GCRA: one credit per 500 ms, burst 20 per IP — the
+house defaults, applied without any configuration. In the bundled
+UI-fronted deployment the compose switches THAT limiter off
+(`WARDSTONE_AUTH_RATE_LIMIT_DISABLED=true` on the `api` service) because
+every proxied login arrives from one loopback IP — and the front door
+(`ws-web`) then carries the per-client GCRA instead, on `/auth/ui/*` AND
+the proxied `POST /api/v1/auth/login` / `/auth/refresh` pair. The
+environment overrides `WARDSTONE_RATE_LIMIT_PER_MILLIS` and
+`WARDSTONE_RATE_LIMIT_BURST` tune both limiters; the shipped bundle
+intentionally sets neither. A zero or unparsable value is a **boot
+failure**, not a silent un-limited listener.
 
 **Admin CIDRs (v1 status).** The setup form's admin CIDR list takes its
 effect through the two built-in certificate profiles created during setup:

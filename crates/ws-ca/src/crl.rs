@@ -436,11 +436,16 @@ fn authority_key_identifier_extension(ski: &[u8]) -> Result<Vec<u8>, CaError> {
 /// writes and expects, base64 at 64 characters per line.
 fn crl_to_pem(der_bytes: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(der_bytes);
+    // The base64 alphabet is pure ASCII, so every 64-byte offset of the
+    // encoded `str` is a char boundary: slice the lines straight off it —
+    // no UTF-8 conversion of any kind is needed.
     let mut pem = String::from("-----BEGIN X509 CRL-----\n");
-    for line in encoded.as_bytes().chunks(64) {
-        // Pure-ASCII base64; the lossy conversion never has to kick in.
-        pem.push_str(&String::from_utf8_lossy(line));
+    let mut rest = encoded.as_str();
+    while !rest.is_empty() {
+        let (line, tail) = rest.split_at(rest.len().min(64));
+        pem.push_str(line);
         pem.push('\n');
+        rest = tail;
     }
     pem.push_str("-----END X509 CRL-----\n");
     pem

@@ -80,12 +80,34 @@ struct BootConfig {
     /// [`DEFAULT_BIND`].
     bind: SocketAddr,
     /// The public auth routes' rate limit (`api` only — the layer lives
-    /// in ws-api; `ui` mounts none of those routes). Defaults to the
-    /// house constants; `WARDSTONE_RATE_LIMIT_PER_MILLIS` /
-    /// `WARDSTONE_RATE_LIMIT_BURST` may configure them for the compose
-    /// bundle. A zero value is a boot failure, not a silent un-limited
-    /// listener.
-    rate_limit: ws_api::AuthRateLimit,
+    /// in ws-api and is keyed on the peer IP; `ui` mounts none of those
+    /// routes, so a ui boot ignores this field entirely, including the
+    /// disable switch below). `Some` (the limiter mounted) with the
+    /// house defaults unless `WARDSTONE_RATE_LIMIT_PER_MILLIS` /
+    /// `WARDSTONE_RATE_LIMIT_BURST` configure them; a zero value is a
+    /// boot failure, not a silent un-limited listener. `None` when
+    /// `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` is truthy — the UI-fronted
+    /// shape, where every operator login reaches ws-api through ws-web's
+    /// proxy from ONE loopback IP and a per-IP limiter would throttle
+    /// ALL operators collectively (ws-web enforces the per-client limit
+    /// on `/auth/ui/*` instead). When the disable var is truthy the
+    /// rate-limit env vars are NOT read or validated at all: any value
+    /// they carry is inert.
+    auth_rate_limit: Option<ws_api::AuthRateLimit>,
+    /// The `/auth/ui` routes' rate limit (`ui` only): the per-client-IP
+    /// GCRA ws-web mounts on the UI auth routes' nest (Task 13 — the
+    /// Plan-2 I-1 limiter placement). In a UI-fronted deployment ws-api's
+    /// own per-IP limiter sees only ws-web's proxy's ONE loopback IP, so
+    /// ws-web is where the per-client limit lives. Parsed from the SAME
+    /// `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `_BURST` contract (defaults
+    /// {DEFAULT_RATE_PER_MILLIS}/{DEFAULT_RATE_BURST}); keyed on the real
+    /// peer address (`ConnectInfo`, Task 11's serving shape). Unlike the
+    /// api field, the disable switch below does NOT gate it — a
+    /// UI-fronted deployment disables ws-api's limiter BECAUSE ws-web
+    /// limits instead, so a ui boot keeps this one mounted (and its env
+    /// values validated) regardless of the switch. `None` in api mode (no
+    /// web router exists to mount it on).
+    web_rate_limit: Option<ws_api::AuthRateLimit>,
 }
 
 /// Variables whose absence is fatal, with their roles — listed together
@@ -117,14 +139,23 @@ enum BootError {
     Io(#[from] std::io::Error),
 }
 
+/// Which serving mode a [`BootConfig`] is parsed for: the one place the
+/// rate-limit contract differs (the api's disable switch does not reach
+/// the ui's own `/auth/ui` limiter).
+#[derive(Debug, Clone, Copy)]
+enum BootMode {
+    Ui,
+    Api,
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     initialize_logging();
 
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
-        Some("ui") => run_result(async { run_ui(config_from_env()?).await }.await),
-        Some("api") => run_result(async { run_api(config_from_env()?).await }.await),
+        Some("ui") => run_result(async { run_ui(config_from_env(BootMode::Ui)?).await }.await),
+        Some("api") => run_result(async { run_api(config_from_env(BootMode::Api)?).await }.await),
         Some("-h") | Some("--help") => {
             print!("{}", usage_text());
             std::process::ExitCode::SUCCESS
@@ -188,18 +219,32 @@ fn usage_text() -> String {
          \x20 WARDSTONE_SERVER_HOSTNAME  the setup certificate's SAN (optional)\n\
          \x20 WARDSTONE_API_URL          the UI's proxy target (ui; default \
          {DEFAULT_API_URL})\n\
-         \x20 WARDSTONE_BIND             the listen address (default {DEFAULT_BIND})\n"
+         \x20 WARDSTONE_BIND             the listen address (default \
+         {DEFAULT_BIND})\n\
+         \x20 WARDSTONE_RATE_LIMIT_PER_MILLIS / _BURST\n\
+         \x20                            the auth rate limit values (both modes: \
+the api's auth routes, and the ui's /auth/ui login routes; defaults \
+{DEFAULT_RATE_PER_MILLIS}/{DEFAULT_RATE_BURST})\n\
+         \x20 WARDSTONE_AUTH_RATE_LIMIT_DISABLED\n\
+         \x20                            `true` disables the api's auth \
+rate limiter (api; for UI-fronted deployments — the ui's own /auth/ui \
+limiter stays on)\n"
     )
 }
 
-/// Read [`BootConfig`] from the process environment.
-fn config_from_env() -> Result<BootConfig, BootError> {
-    config_from(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+/// Read [`BootConfig`] from the process environment, for `mode`.
+fn config_from_env(mode: BootMode) -> Result<BootConfig, BootError> {
+    config_from(mode, |name| {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    })
 }
 
 /// [`config_from_env`] with the lookup abstracted out — the pure core the
 /// unit tests drive without process-global env manipulation.
-fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<BootConfig, BootError> {
+fn config_from(
+    mode: BootMode,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<BootConfig, BootError> {
     let missing: Vec<String> = REQUIRED_ENV
         .iter()
         .filter(|(name, _)| lookup(name).is_none())
@@ -231,7 +276,18 @@ fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<BootConfig, Bo
         Some(value) => value,
     };
 
-    let rate_limit = rate_limit_from(&lookup, DEFAULT_RATE_PER_MILLIS, DEFAULT_RATE_BURST)?;
+    let auth_rate_limit = auth_rate_limit_from(&lookup)?;
+    // The web limiter: parsed (and validated) ONLY in ui mode, from the
+    // same rate envs, unconditionally — the disable switch above is the
+    // API's machinery and never unlimits the UI's own /auth/ui limiter.
+    let web_rate_limit = match mode {
+        BootMode::Api => None,
+        BootMode::Ui => Some(rate_limit_from(
+            &lookup,
+            DEFAULT_RATE_PER_MILLIS,
+            DEFAULT_RATE_BURST,
+        )?),
+    };
 
     Ok(BootConfig {
         database_url,
@@ -239,8 +295,45 @@ fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<BootConfig, Bo
         server_hostname: lookup("WARDSTONE_SERVER_HOSTNAME"),
         api_url,
         bind,
-        rate_limit,
+        auth_rate_limit,
+        web_rate_limit,
     })
+}
+
+/// The public auth routes' rate limit: `Some` unless truthy
+/// `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` turns the limiter OFF
+/// (`auth_rate_limit: None`). Only `1` and `true` — case-insensitive —
+/// are disable words; any OTHER non-blank value fails the boot loudly
+/// with the variable and its value named (`false`, `0`, `no` are NOT
+/// disable words: a mistyped switch must never silently change the
+/// security posture). When the switch is truthy the rate-limit env vars
+/// are not read at all — a deployment that disabled the limiter cannot
+/// be held back by stale `WARDSTONE_RATE_LIMIT_*` leftovers, however
+/// garbled. Unset or blank keeps the limiter on with the configured (or
+/// default) values, and the zero/unparsable checks in [`rate_limit_from`]
+/// stay in force.
+fn auth_rate_limit_from(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ws_api::AuthRateLimit>, BootError> {
+    match lookup("WARDSTONE_AUTH_RATE_LIMIT_DISABLED") {
+        None => Ok(Some(rate_limit_from(
+            lookup,
+            DEFAULT_RATE_PER_MILLIS,
+            DEFAULT_RATE_BURST,
+        )?)),
+        Some(value) => {
+            let word = value.trim();
+            if word == "1" || word.eq_ignore_ascii_case("true") {
+                Ok(None)
+            } else {
+                Err(BootError::Config(format!(
+                    "WARDSTONE_AUTH_RATE_LIMIT_DISABLED only takes `1` or `true` \
+                     (case-insensitive) to disable the auth rate limiter; got \
+                     {value:?}"
+                )))
+            }
+        }
+    }
 }
 
 /// The public auth routes' rate limit: the house defaults unless
@@ -337,6 +430,8 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
             fingerprint,
             hostname,
             &cfg.api_url,
+            ws_web::DEFAULT_SESSION_TTL,
+            cfg.web_rate_limit,
         )
         .await?;
         return serve_ui(cfg, router, &cert_pem, &key).await;
@@ -415,6 +510,8 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         fingerprint,
         hostname,
         &cfg.api_url,
+        ws_web::DEFAULT_SESSION_TTL,
+        cfg.web_rate_limit,
     )
     .await?;
     serve_ui(cfg, router, &cert_pem, &key_der).await
@@ -494,10 +591,13 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
         // no runtime behavior from this field, so the empty vector is the
         // honest value a directly-served `api` process has at boot.
         admin_cidrs: Vec::new(),
-        // The per-IP GCRA on the public auth routes: configured (the
-        // house defaults) so the `GovernorLayer` is actually mounted —
-        // ws-api's `None` branch is the TESTS-ONLY shape.
-        auth_rate_limit: Some(cfg.rate_limit),
+        // The per-IP GCRA on the public auth routes: `Some` (the governor
+        // mounted) unless `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` was truthy
+        // — the UI-fronted deployment's switch, where logins arrive from
+        // ws-web's proxy's ONE loopback IP and ws-web enforces the
+        // per-client limit on `/auth/ui/*` itself. ws-api's layer skips
+        // when `None`.
+        auth_rate_limit: cfg.auth_rate_limit,
     };
     let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
 
@@ -572,7 +672,7 @@ mod tests {
     /// The full config parses; the two defaults are the brief's pins.
     #[test]
     fn config_minimal_table_gets_every_default() {
-        let cfg = config_from(table(&MINIMAL)).expect("the minimal table parses");
+        let cfg = config_from(BootMode::Api, table(&MINIMAL)).expect("the minimal table parses");
         assert_eq!(
             cfg.database_url,
             "postgres://wardstone:wardstone@db/wardstone"
@@ -581,8 +681,11 @@ mod tests {
         assert!(cfg.server_hostname.is_none(), "no hostname configured");
         assert_eq!(cfg.api_url, "http://ws-api:8080");
         assert_eq!(cfg.bind, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8443)));
-        assert_eq!(cfg.rate_limit.per_millis, 500);
-        assert_eq!(cfg.rate_limit.burst, 20);
+        let rl = cfg
+            .auth_rate_limit
+            .expect("the limiter is configured when the disable var is unset");
+        assert_eq!(rl.per_millis, 500);
+        assert_eq!(rl.burst, 20);
     }
 
     /// Every override is honored; a missing variable is named in the error.
@@ -597,18 +700,21 @@ mod tests {
             ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "100"),
             ("WARDSTONE_RATE_LIMIT_BURST", "5"),
         ];
-        let cfg = config_from(table(&entries)).expect("the full table parses");
+        let cfg = config_from(BootMode::Api, table(&entries)).expect("the full table parses");
         assert_eq!(cfg.server_hostname.as_deref(), Some("ca.example.test"));
         assert_eq!(cfg.api_url, "http://api.internal:9000");
         assert_eq!(cfg.bind, SocketAddr::from((Ipv4Addr::LOCALHOST, 9443)));
-        assert_eq!((cfg.rate_limit.per_millis, cfg.rate_limit.burst), (100, 5));
+        let rl = cfg.auth_rate_limit.expect("the limiter is configured");
+        assert_eq!((rl.per_millis, rl.burst), (100, 5));
 
-        let err = config_from(table(&[MINIMAL[0]])).expect_err("a missing keys dir must fail");
+        let err = config_from(BootMode::Api, table(&[MINIMAL[0]]))
+            .expect_err("a missing keys dir must fail");
         assert!(
             err.to_string().contains("WARDSTONE_KEYS_DIR"),
             "the error names the missing variable: {err}"
         );
-        let err = config_from(table(&[MINIMAL[1]])).expect_err("a missing database url must fail");
+        let err = config_from(BootMode::Api, table(&[MINIMAL[1]]))
+            .expect_err("a missing database url must fail");
         assert!(
             err.to_string().contains("DATABASE_URL"),
             "the error names the missing variable: {err}"
@@ -619,7 +725,8 @@ mod tests {
     #[test]
     fn config_blank_values_are_unset() {
         let entries = [("DATABASE_URL", "   "), ("WARDSTONE_KEYS_DIR", "")];
-        let err = config_from(table(&entries)).expect_err("blank required values must fail");
+        let err = config_from(BootMode::Api, table(&entries))
+            .expect_err("blank required values must fail");
         assert!(
             err.to_string().contains("DATABASE_URL")
                 && err.to_string().contains("WARDSTONE_KEYS_DIR"),
@@ -632,14 +739,15 @@ mod tests {
     #[test]
     fn config_rejects_bad_bind_and_zero_rate_limit() {
         let bind = [MINIMAL[0], MINIMAL[1], ("WARDSTONE_BIND", "not-an-address")];
-        let err = config_from(table(&bind)).expect_err("a bad bind must fail");
+        let err = config_from(BootMode::Api, table(&bind)).expect_err("a bad bind must fail");
         assert!(
             err.to_string().contains("WARDSTONE_BIND"),
             "the error names the variable: {err}"
         );
 
         let zero_burst = [MINIMAL[0], MINIMAL[1], ("WARDSTONE_RATE_LIMIT_BURST", "0")];
-        let err = config_from(table(&zero_burst)).expect_err("a zero burst must fail");
+        let err =
+            config_from(BootMode::Api, table(&zero_burst)).expect_err("a zero burst must fail");
         assert!(
             err.to_string().contains("WARDSTONE_RATE_LIMIT_BURST"),
             "the error names the variable: {err}"
@@ -650,7 +758,8 @@ mod tests {
             MINIMAL[1],
             ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "0"),
         ];
-        let err = config_from(table(&zero_period)).expect_err("a zero period must fail");
+        let err =
+            config_from(BootMode::Api, table(&zero_period)).expect_err("a zero period must fail");
         assert!(
             err.to_string().contains("WARDSTONE_RATE_LIMIT_PER_MILLIS"),
             "the error names the variable: {err}"
@@ -661,11 +770,80 @@ mod tests {
             MINIMAL[1],
             ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
         ];
-        let err = config_from(table(&garbage)).expect_err("a non-numeric rate limit must fail");
+        let err = config_from(BootMode::Api, table(&garbage))
+            .expect_err("a non-numeric rate limit must fail");
         assert!(
             err.to_string().contains("WARDSTONE_RATE_LIMIT_PER_MILLIS"),
             "the error names the variable: {err}"
         );
+    }
+
+    /// The `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` switch: only `1` and
+    /// `true` (case-insensitive) disable the limiter — and make the
+    /// rate-limit env vars entirely inert (zero, garbage: ignored).
+    /// Unset or blank keeps it on; ANY other non-blank value fails the
+    /// boot loudly, naming the variable and the offending value (`false`
+    /// and `0` are deliberately NOT disable words — a mistyped switch
+    /// must never silently change the security posture).
+    #[test]
+    fn auth_rate_limit_disabled_switch_semantics() {
+        let truthy = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+            // Values that would be LOUD boot failures with the limiter on:
+            // with the limiter off they are simply not read.
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
+            ("WARDSTONE_RATE_LIMIT_BURST", "0"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&truthy)).expect("`true` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "the limiter is off");
+
+        let upper = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "TRUE"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&upper)).expect("`TRUE` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "case-insensitive");
+
+        let one = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "1"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&one)).expect("`1` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "the numeric disable word");
+
+        let blank = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", ""),
+        ];
+        let cfg = config_from(BootMode::Api, table(&blank)).expect("blank equals unset");
+        assert!(
+            cfg.auth_rate_limit.is_some(),
+            "blank/unset keeps the limiter on"
+        );
+
+        for word in ["false", "0", "no", "on", "yes"] {
+            let entries = [
+                MINIMAL[0],
+                MINIMAL[1],
+                ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", word),
+            ];
+            let err = config_from(BootMode::Api, table(&entries))
+                .expect_err("a non-disable word fails the boot loudly");
+            let message = err.to_string();
+            assert!(
+                message.contains("WARDSTONE_AUTH_RATE_LIMIT_DISABLED"),
+                "the error names the variable: {message}"
+            );
+            assert!(
+                message.contains(word),
+                "the error names the offending value: {message}"
+            );
+        }
     }
 
     /// A `web-server`-shaped [`CertificateModel`] with the given status
@@ -690,6 +868,7 @@ mod tests {
             status,
             revoked_at: None,
             revocation_reason: None,
+            revocation_detail: None,
             source: "manual".to_owned(),
             created_at: Utc::now() - Duration::minutes(minutes_ago),
         }
@@ -737,6 +916,64 @@ mod tests {
         assert!(usage.contains("ui") && usage.contains("api"));
         assert!(usage.contains("DATABASE_URL"));
         assert!(usage.contains("WARDSTONE_KEYS_DIR"));
+    }
+
+    /// The ui boot parses the WEB limiter from the SAME rate-limit env
+    /// contract the api limiter reads: the house defaults when unset, the
+    /// configured values otherwise.
+    #[test]
+    fn ui_mode_parses_the_web_rate_limit_from_the_same_envs() {
+        let cfg = config_from(BootMode::Ui, table(&MINIMAL)).expect("the minimal table parses");
+        let web = cfg
+            .web_rate_limit
+            .expect("the ui's /auth/ui limiter is configured");
+        assert_eq!((web.per_millis, web.burst), (500, 20), "house defaults");
+
+        let overrides = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "250"),
+            ("WARDSTONE_RATE_LIMIT_BURST", "7"),
+        ];
+        let cfg = config_from(BootMode::Ui, table(&overrides)).expect("the overrides parse");
+        let web = cfg.web_rate_limit.expect("the limiter is configured");
+        assert_eq!((web.per_millis, web.burst), (250, 7));
+    }
+
+    /// The disable switch is the API's machinery: a ui boot keeps its own
+    /// `/auth/ui` limiter mounted with the (default) values even when the
+    /// switch is truthy — and its rate envs are still validated, since
+    /// the web limiter is the one that consumes them in ui mode.
+    #[test]
+    fn ui_mode_keeps_the_web_limiter_when_the_api_switch_is_disabled() {
+        let disabled = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+        ];
+        let cfg = config_from(BootMode::Ui, table(&disabled)).expect("the disabled table parses");
+        assert!(cfg.auth_rate_limit.is_none(), "the api limiter is off");
+        let web = cfg
+            .web_rate_limit
+            .expect("the ui limiter is NOT disabled by the api switch");
+        assert_eq!((web.per_millis, web.burst), (500, 20), "house defaults");
+
+        let zero = [MINIMAL[0], MINIMAL[1], ("WARDSTONE_RATE_LIMIT_BURST", "0")];
+        let err = config_from(BootMode::Ui, table(&zero))
+            .expect_err("a zero burst must fail a ui boot: its limiter consumes it");
+        assert!(
+            err.to_string().contains("WARDSTONE_RATE_LIMIT_BURST"),
+            "the error names the variable: {err}"
+        );
+    }
+
+    /// api mode never builds the web router, so it parses no web limiter
+    /// (and — Task 10, unchanged — a truthy disable switch leaves its
+    /// rate envs unread).
+    #[test]
+    fn api_mode_has_no_web_rate_limit() {
+        let cfg = config_from(BootMode::Api, table(&MINIMAL)).expect("the minimal table parses");
+        assert!(cfg.web_rate_limit.is_none(), "no web router in api mode");
     }
 
     /// The tenant name the boot lookup and the setup flow agree on: the

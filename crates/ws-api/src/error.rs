@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`ApiError::BadRequest`] (and the `not_permitted_by_profile` case) | 400 |
 //! | [`ApiError::Unauthorized`] | 401 |
+//! | [`ApiError::UnauthorizedMfa`] | 401 (code `mfa_required`) |
 //! | [`ApiError::Forbidden`] | 403 |
 //! | [`ApiError::NotFound`] | 404 |
 //! | [`ApiError::Conflict`] | 409 |
@@ -55,6 +56,12 @@ pub enum ApiError {
     /// Authentication failed (401).
     #[error("{0}")]
     Unauthorized(String),
+    /// Authentication NEEDS a multi-factor code (401) — its own variant
+    /// so the body code is `mfa_required`, not `unauthorized`, and the
+    /// SPA can route the user to the MFA prompt instead of the generic
+    /// login-failure path.
+    #[error("{0}")]
+    UnauthorizedMfa(String),
     /// Authorization failed: the actor may not do this at all (403).
     #[error("{0}")]
     Forbidden(String),
@@ -115,6 +122,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest { code, .. } => code,
             ApiError::Unauthorized(_) => "unauthorized",
+            ApiError::UnauthorizedMfa(_) => "mfa_required",
             ApiError::Forbidden(_) => "forbidden",
             ApiError::NotFound(_) => "not_found",
             ApiError::Conflict(_) => "conflict",
@@ -128,6 +136,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::UnauthorizedMfa(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
@@ -141,6 +150,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest { message, .. } => message.clone(),
             ApiError::Unauthorized(m)
+            | ApiError::UnauthorizedMfa(m)
             | ApiError::Forbidden(m)
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
@@ -192,8 +202,10 @@ impl From<CoreError> for ApiError {
 /// taking a `CoreError`. Exhaustive over the frozen twelve variants:
 ///
 /// - `Forbidden` → 403 (authorization, not authentication);
-/// - `BadCredentials` / `TokenInvalid` / `TokenExpired` / `MfaRequired` /
-///   `MfaInvalid` → 401;
+/// - `BadCredentials` / `TokenInvalid` / `TokenExpired` → 401;
+/// - `MfaRequired` → 401 as [`ApiError::UnauthorizedMfa`] (body code
+///   `mfa_required` — a structured signal, not the generic failure);
+/// - `MfaInvalid` → 401;
 /// - `AccountLocked` / `AccountDisabled` → 403;
 /// - `RateLimited` → 429;
 /// - `NotFound` → 404;
@@ -206,7 +218,7 @@ impl From<AuthError> for ApiError {
             AuthError::TokenInvalid => ApiError::Unauthorized("token is invalid".to_string()),
             AuthError::TokenExpired => ApiError::Unauthorized("token has expired".to_string()),
             AuthError::MfaRequired => {
-                ApiError::Unauthorized("multi-factor authentication required".to_string())
+                ApiError::UnauthorizedMfa("multi-factor authentication required".to_string())
             }
             AuthError::MfaInvalid => {
                 ApiError::Unauthorized("invalid multi-factor code".to_string())

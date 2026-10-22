@@ -41,13 +41,22 @@
 #
 #   WARDSTONE_IMAGE=wardstone:local docker compose -f docker/compose.yml up -d
 #
-# Rate limiting (the binary's house contract, not a compose knob): the
-# `api` process applies per-IP GCRA rate limiting on the public auth
-# routes ALWAYS-ON with the house defaults (one credit per 500 ms, burst
-# 20 per IP). `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `WARDSTONE_RATE_LIMIT_BURST`
-# may override them — this bundle deliberately does NOT set either (the
-# defaults are already the house values). If you do set them: positive
-# integers only — zero or unparsable values fail the boot loudly, they do
+# Rate limiting (the binary's house contract, not a compose knob): per-
+# client-IP GCRA covers the credential surfaces the public edge serves.
+# In THIS bundle the `ui` process is the edge: ws-web limits the
+# `/auth/ui/*` relay routes AND the proxied `POST /api/v1/auth/login` /
+# `/api/v1/auth/refresh` pair — so password spraying and TOTP guessing
+# stay per-client limited. The `api` process's own auth-route limiter
+# keys on its direct TCP peer: every proxied login arrives from ONE
+# loopback IP, so it would throttle ALL operators collectively — the
+# compose sets `WARDSTONE_AUTH_RATE_LIMIT_DISABLED: "true"` on the `api`
+# service below, and the front door carries the per-client limit instead
+# (an api-mode switch only; ws-web's limiter ignores it entirely).
+# `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `WARDSTONE_RATE_LIMIT_BURST` tune
+# BOTH limiters (a direct-API deployment's, and ws-web's front-door one
+# in this bundle), overriding the house defaults (one credit per 500 ms,
+# burst 20 per IP) — this bundle deliberately sets neither. Positive
+# integers only: zero or unparsable values fail the boot loudly, they do
 # not disable the limiter.
 
 name: wardstone
@@ -126,6 +135,12 @@ services:
       # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
       # the binary ignores the variable in this mode.
       WARDSTONE_BIND: 0.0.0.0:8080
+      # UI logins reach ws-api from one loopback IP (ws-web's proxy), so
+      # the per-IP limiter would throttle ALL operators collectively; the
+      # front door carries the per-client limit instead — on /auth/ui/*
+      # AND the proxied POST /api/v1/auth/login + /api/v1/auth/refresh
+      # (password spraying and TOTP guessing are limited at ws-web).
+      WARDSTONE_AUTH_RATE_LIMIT_DISABLED: "true"
     # NO `ports:` — intentionally. The REST surface is reachable ONLY over
     # the internal compose network via ws-web's proxy (the Global
     # Constraint). An External deployment that fronts this service with

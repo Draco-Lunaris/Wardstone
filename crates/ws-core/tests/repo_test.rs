@@ -391,6 +391,7 @@ fn cert_model(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_string(),
         created_at: ts("2026-06-15T12:30:00Z"),
     }
@@ -480,9 +481,23 @@ async fn test_revoke_twice_is_idempotent() {
         .await
         .expect("insert certificate row");
 
-    let first_revoke = certs.revoke(&pool, model.id, "key_compromise").await;
+    let first_revoke = certs
+        .revoke(
+            &pool,
+            model.id,
+            "key_compromise",
+            Some("key held by an ex-employee"),
+        )
+        .await;
     let after_first = certs.get(&pool, model.id).await;
-    let second_revoke = certs.revoke(&pool, model.id, "key_compromise").await;
+    let second_revoke = certs
+        .revoke(
+            &pool,
+            model.id,
+            "superseded",
+            Some("a second revoke must not win"),
+        )
+        .await;
     let after_second = certs.get(&pool, model.id).await;
 
     // The `since` boundary queries run before cleanup; their inputs are
@@ -525,6 +540,10 @@ async fn test_revoke_twice_is_idempotent() {
         after_first.revocation_reason.as_deref(),
         Some("key_compromise")
     );
+    assert_eq!(
+        after_first.revocation_detail.as_deref(),
+        Some("key held by an ex-employee")
+    );
     let revoked_at = after_first.revoked_at.expect("revoked_at set by revoke");
 
     let after_second = after_second
@@ -535,6 +554,16 @@ async fn test_revoke_twice_is_idempotent() {
         after_second.revoked_at,
         Some(revoked_at),
         "second revoke must not move revoked_at"
+    );
+    assert_eq!(
+        after_second.revocation_reason.as_deref(),
+        Some("key_compromise"),
+        "the second revoke keeps the FIRST reason"
+    );
+    assert_eq!(
+        after_second.revocation_detail.as_deref(),
+        Some("key held by an ex-employee"),
+        "the second revoke keeps the FIRST detail"
     );
 
     let since_epoch = since_epoch.expect("list_revoked_since epoch");

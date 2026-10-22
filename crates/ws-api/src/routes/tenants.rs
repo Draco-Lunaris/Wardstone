@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
 /// The create body: the tenant name, its default domain (the built-in
 /// profiles' subject ground), and the domain CIDRs the profiles permit.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateTenantBody {
     pub name: String,
     pub domain: String,
@@ -41,6 +42,7 @@ pub struct CreateTenantBody {
 
 /// The create response.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TenantCreated {
     pub id: Uuid,
     pub name: String,

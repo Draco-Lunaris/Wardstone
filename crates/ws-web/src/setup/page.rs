@@ -8,7 +8,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
 
-use super::{run_setup, SetupFields, SetupState};
+use super::{run_setup, validate_hostname_permitted, SetupFields, SetupState};
 
 /// The setup page. The fingerprint is the SHA-256 of the DER of the
 /// certificate the TLS listener is serving for THIS request — the binary
@@ -39,6 +39,14 @@ pub async fn submit_setup(
     Json(fields): Json<SetupFields>,
 ) -> Result<Json<serde_json::Value>, SubmitError> {
     validate(&fields).map_err(SubmitError::BadRequest)?;
+
+    // The Plan-2 I-3 fix's primary seam: refuse a `server_hostname` the
+    // built-in `web-server` profile's SAN patterns forbid BEFORE any
+    // bootstrap work — nothing is committed, the form gets a 400. The
+    // same check is re-applied by `run_setup` inside its leaf transaction
+    // as defense-in-depth for direct library callers (see
+    // `validate_hostname_permitted`'s "two checks").
+    validate_hostname_permitted(&fields).map_err(SubmitError::BadRequest)?;
 
     let keys_dir = state.keys_dir;
     let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir)?;

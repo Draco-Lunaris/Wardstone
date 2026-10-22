@@ -6,10 +6,12 @@
 //!
 //! The setup endpoint is NOT ROUTED once the tenant exists — not merely
 //! refused. [`setup_router`] is mounted by [`crate::web_router`] only
-//! while [`tenant_exists`] is false; with the tenant present there is no
-//! `/setup` route at all and a request to it gets axum's plain 404. The
-//! binary (Task 12) and this crate's own composition perform the same
-//! check at startup.
+//! while [`tenant_exists`] is false; with the tenant present the
+//! composition mounts [`setup_unmounted_router`] instead — GET and POST
+//! `/setup` are explicit, plain 404s, NOT left to the SPA fallback (which
+//! would answer the extension-less path with the UI document, i.e. the
+//! endpoint would not actually be unrouted). The binary (Task 12) and
+//! this crate's own composition perform the same check at startup.
 //!
 //! # The TLS switch
 //!
@@ -45,6 +47,7 @@ use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_core::models::profile::{default_profiles, ProfileModel};
 use ws_core::models::rbac::{ActorType, AuthMethod, KeyUsagePurpose, Role};
 use ws_core::models::user::UserModel;
+use ws_core::profile_match::san_is_permitted;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
@@ -129,6 +132,24 @@ pub fn setup_router(state: SetupState) -> axum::Router {
         .with_state(state)
 }
 
+/// The unmount contract's OTHER branch: what [`crate::web_router`] mounts
+/// when [`tenant_exists`] is true. `GET /setup` and `POST /setup` are
+/// explicit, plain 404s — the exact shape the setup/e2e suites pin ("404,
+/// not 403"), matching axum's own unrouted response (empty body).
+///
+/// The counterpart must be mounted EXPLICITLY, in the same if/else that
+/// decides [`setup_router`] — either the setup routes or their 404s are
+/// mounted, never neither. Left to ws-web's SPA fallback, the unmounted
+/// `/setup` is an extension-less GET and would come back 200 + the index
+/// document: the endpoint would not be unrouted, it would be impersonated
+/// by the UI.
+pub fn setup_unmounted_router() -> axum::Router {
+    async fn setup_gone() -> axum::http::StatusCode {
+        axum::http::StatusCode::NOT_FOUND
+    }
+    axum::Router::new().route(SETUP_ROUTE, axum::routing::get(setup_gone).post(setup_gone))
+}
+
 /// Whether the default tenant exists — the check the caller performs
 /// before mounting [`setup_router`] (the Review Focus item 5: not routed
 /// once the tenant exists).
@@ -162,10 +183,18 @@ pub async fn tenant_exists(pool: &PgPool) -> Result<bool, CaError> {
 ///    audit entries — they stand or fall together.
 /// 5. The server's own leaf, issued by the new root against the
 ///    built-in `web-server` profile with the form's `server_hostname` as
-///    its SAN. Its serial is allocated inside its own issuance
+///    its SAN. The SAN is validated against the profile's `san_patterns`
+///    (`validate_hostname_permitted`) inside the issuance transaction,
+///    right before minting — the same check the setup page pre-flights
+///    for its 400; a direct library caller's refusal surfaces as a
+///    [`CaError::Worker`] and the transaction rolls back without minting.
+///    Its serial is allocated inside its own issuance
 ///    transaction (so a rollback releases it, Task 8's contract), and its
 ///    private-key envelope is stored in the keystore BEFORE that
 ///    transaction commits, for the same reason as the root's key above.
+/// 6. The leaf transaction also audits the completion of setup itself
+///    (`setup_completed`), written right after the certificate insert —
+///    exactly one row per completed setup.
 pub async fn run_setup(
     fields: &SetupFields,
     pool: &PgPool,
@@ -389,6 +418,13 @@ pub async fn run_setup(
     // the certificate row commits (same ordering rationale as the root's
     // key: an orphaned key file is the lesser evil).
     let mut tx = pool.begin().await?;
+    // Defense-in-depth (see `validate_hostname_permitted`'s "two checks"):
+    // the setup page has already pre-checked this and would have answered
+    // 400; a direct library caller gets the refusal here instead — inside
+    // the issuance transaction, before anything is minted, as a `Worker`
+    // error per `run_setup`'s pinned `CaError` vocabulary.
+    validate_hostname_permitted(fields)
+        .map_err(|message| CaError::Worker(format!("setup: {message}")))?;
     let serial = allocate_serial(root_ca.id, tenant.id, &mut *tx).await?;
 
     let ca_cert_pem = root_ca.cert_pem.clone();
@@ -457,11 +493,32 @@ pub async fn run_setup(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_owned(),
         created_at: Utc::now(),
     };
     CertificateRepo::new()
         .insert(&mut *tx, &certificate)
+        .await
+        .map_err(map_core)?;
+    // The completion of setup itself, audited in the leaf transaction
+    // right after the certificate insert: exactly one `setup_completed`
+    // row per completed setup, the same system actor as the bootstrap
+    // entries, target the tenant, details carrying what was configured.
+    audit
+        .record(
+            &mut *tx,
+            &audit_entry(
+                tenant.id,
+                "setup_completed",
+                "setup",
+                &tenant.id.to_string(),
+                serde_json::json!({
+                    "domain": fields.default_domain,
+                    "admin_cidrs": fields.admin_cidrs,
+                }),
+            ),
+        )
         .await
         .map_err(map_core)?;
     audit
@@ -497,6 +554,61 @@ pub async fn run_setup(
         fields.server_hostname
     );
     Ok(())
+}
+
+/// Whether the form's `server_hostname` — the SAN of the leaf the CA will
+/// issue for the UI — is permitted by the built-in `web-server` profile
+/// revision setup is about to create (the Plan-2 I-3 gap: setup must not
+/// mint an issued certificate its own profile would not issue).
+///
+/// The patterns come from [`default_profiles`] — a pure function of the
+/// form's `default_domain` and `admin_cidrs`, no DB round-trip — because
+/// at setup time no profile row exists yet: the `web-server` profile is
+/// created BY this setup, and the built-in revision's patterns are exactly
+/// what the leaf is minted under. [`san_is_permitted`] is the same
+/// predicate the API's issuance path applies, so a hostname refused here
+/// would equally be refused on any later issuance under the profile.
+///
+/// The refusal message carries the issuance path's specific wording shape
+/// (`name "…" is not permitted by this profile`): the setup operator is
+/// the admin who holds `read_profiles`, so the specific form — naming the
+/// failing constraint, never the permitted set — is the right one.
+///
+/// # The two checks
+///
+/// - [`page::submit_setup`] pre-checks with this helper BEFORE
+///   [`run_setup`] is called (nothing is committed yet) and maps a refusal
+///   to [`page::SubmitError::BadRequest`] — a 400 for the form user.
+/// - [`run_setup`] re-applies the same check inside the leaf-mint
+///   transaction, right before minting, so a direct library caller (which
+///   bypasses the page) is caught too; there the refusal is a
+///   [`CaError::Worker`], and the issuance transaction rolls back without
+///   minting.
+///
+/// A malformed pattern (e.g. a blank or ill-formed `admin_cidrs` entry,
+/// which become SAN patterns too, or a malformed hostname literal) also
+/// fails here, with [`san_is_permitted`]'s own message — at setup time
+/// this is form damage, not stored-data corruption, so it takes the same
+/// refusal path.
+pub(crate) fn validate_hostname_permitted(fields: &SetupFields) -> Result<(), String> {
+    // The built-in `web-server` profile is the first of the default
+    // profiles and the one the setup leaf is minted under (see
+    // `run_setup`'s leaf block).
+    let template = &default_profiles(fields.default_domain.as_str(), &fields.admin_cidrs)[0];
+    let refusal = |detail: String| {
+        format!(
+            "server_hostname is not permitted by the {} profile: {detail}",
+            template.name
+        )
+    };
+    match san_is_permitted(&template.san_patterns, fields.server_hostname.as_str()) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(refusal(format!(
+            "name {:?} is not permitted by this profile",
+            fields.server_hostname
+        ))),
+        Err(core) => Err(refusal(core.to_string())),
+    }
 }
 
 /// The setup form's blank-field policy: the four identity fields must be

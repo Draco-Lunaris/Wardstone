@@ -12,52 +12,166 @@
 //!   ws-web; ws-api publishes no ports to the LAN, so every `/api/v1/*`
 //!   request is proxied verbatim to the API base URL over the internal
 //!   network. ws-api's own routes are never mounted here.
+//! - `ui` — the embedded SPA (`ui/dist`, git-committed and included into
+//!   the binary with `include_dir` at compile time): `/`, the hashed
+//!   `/assets/*`, and the SPA fallback, mounted LAST (the composed
+//!   router's fallback) so it never masks the API or setup routes above
+//!   it.
+//! - `session` — the browser-session cookie plumbing: the wire form of the
+//!   `wardstone_session` cookie and the `X-Requested-With: wardstone-ui`
+//!   CSRF marker the proxy's rule requires (Task 12 adds the store).
 //!
-//! The two are composed by [`web_router`]: the setup routes exist only
-//! while the default tenant does not (the setup endpoint is not routed
-//! once it does — the Review Focus item 5 — not merely refused), and the
-//! proxy is always mounted. [`serve_tls`] is the listener the Task 12
+//! The three are composed by [`web_router`]: the API proxy is always
+//! mounted, the setup routes exist only while the default tenant does not
+//! (the setup endpoint is not routed once it does — the Review Focus item
+//! 5 — not merely refused), and the SPA router rides the fallback, so
+//! earlier routes always win. [`serve_tls`] is the listener the Task 12
 //! binary puts that router on: HTTPS from the very first request, on
-//! either the setup certificate or the CA-issued leaf.
+//! either the setup certificate or the CA-issued leaf — with the client's
+//! socket address attached to every request (`ConnectInfo`, Task 12's
+//! per-IP limiter's key input).
 
 pub mod proxy;
+pub mod session;
 pub mod setup;
+pub mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use axum::Extension;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sqlx::PgPool;
 use ws_ca::error::CaError;
 
-pub use proxy::api_router;
-pub use setup::{run_setup, setup_router, tenant_exists, SetupFields, SetupState};
+use session::relay::relay_router;
+use session::store::SessionStore;
+
+pub use proxy::{api_router, api_router_with_auth_limit};
+pub use setup::{
+    run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
+};
+
+/// The default server-side access-token lifetime ws-web bookkeeps (15
+/// minutes, matching ws-api's JWT access-token TTL): past this stamp the
+/// proxy rotates proactively through one locked refresh. The `wardstone`
+/// binary passes this value at [`web_router`]; env override is a Task 13
+/// concern. Tests pass `Duration::ZERO` (always rotate).
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
 
 /// The front-door router a fresh (`ui`-mode) process serves: the setup
 /// surface ONLY while the default tenant does not exist, plus the
-/// `/api/v1` proxy in every phase. The caller checks nothing — this
-/// function performs the `tenant_exists` check itself, so mounting (not
-/// refusal) is the unmount mechanism: with the tenant present there is no
-/// `/setup` route at all and a request to it is a plain 404.
+/// `/api/v1` proxy and the `/auth/ui` session relay in every phase. The
+/// caller checks nothing — this function performs the `tenant_exists`
+/// check itself, so the unmount mechanism is the EXPLICIT replacement
+/// router: with the tenant present the setup routes are swapped for
+/// [`setup_unmounted_router`]'s plain 404s — a request to `/setup` never
+/// reaches the SPA fallback, which would otherwise answer 200 +
+/// `index.html`.
+///
+/// The session store is constructed here with `session_access_ttl` (the
+/// 15-minute [`DEFAULT_SESSION_TTL`] for the binary); tests that need a
+/// handle on the SAME store instance use [`web_router_with_store`].
+///
+/// `rate_limit` is the GCRA configuration the binary parsed for the web
+/// front door's auth surfaces (`Some` — the per-client-IP limiter
+/// mounted on BOTH the `/auth/ui` relay nest AND the proxied
+/// `POST /api/v1/auth/login`/`/refresh` routes; the ui binary always
+/// configures it); the existing binary env contract feeds it, and tests
+/// that run `web_router` pass `None` (no limiter — an in-process
+/// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
+/// the same reason ws-api's tests disable its layer).
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
     api_base_url: &str,
+    session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
-    let mut app = api_router(api_base_url);
-    if !tenant_exists(&pool).await? {
-        app = app.merge(setup_router(SetupState {
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl));
+    web_router_with_store(
+        pool,
+        keys_dir,
+        fingerprint,
+        hostname,
+        api_base_url,
+        store,
+        rate_limit,
+    )
+    .await
+}
+
+/// [`web_router`] with the caller owning the `Arc<SessionStore>` instance:
+/// ws-web's relay routes and the proxy's Authorization injection MUST see
+/// the SAME store (one instance answers login-minting and request-time
+/// token reads) — this constructor is the pin that makes "same Arc"
+/// structural instead of a promise, and it is how the session_test suite
+/// inspects store contents alongside a live router.
+///
+/// `rate_limit` threads to BOTH auth surfaces — [`relay_router`]'s
+/// `/auth/ui` GCRA nest and the proxy's `/api/v1/auth` limiter scope (see
+/// [`web_router`] and [`session_router_with_store`]).
+pub async fn web_router_with_store(
+    pool: PgPool,
+    keys_dir: PathBuf,
+    fingerprint: String,
+    hostname: String,
+    api_base_url: &str,
+    store: std::sync::Arc<SessionStore>,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Result<Router, CaError> {
+    // The setup mounting contract, structurally: BOTH branches live in
+    // this one if/else, so either the setup routes or their explicit 404
+    // replacement ([`setup_unmounted_router`]) is mounted — never
+    // neither. The explicit replacement is load-bearing: the SPA
+    // fallback below catches any extension-less GET, so an unmounted
+    // `/setup` left to it would answer 200 + index.html instead of the
+    // plain 404 the setup/e2e suites pin (404, not 403).
+    let app = if !tenant_exists(&pool).await? {
+        session_router_with_store(store, api_base_url, rate_limit).merge(setup_router(SetupState {
             pool,
             keys_dir,
             fingerprint,
             hostname,
-        }));
-    }
-    Ok(app)
+        }))
+    } else {
+        session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())
+    };
+    // The SPA router rides LAST: `fallback_service` runs only when no
+    // earlier route matched (the precedence the ui-serve suite pins), so
+    // the API proxy, the relay, and the setup surface above are never
+    // masked. A Router is itself a fallback Service — `ui::ui_router()`
+    // carries its own route tree (`/`, `/assets/*`, the SPA catch-all) and
+    // its own routing.
+    Ok(app.fallback_service(ui::ui_router()))
+}
+
+/// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay
+/// nest and the `/api/v1` proxy (its auth routes limiter-scoped per
+/// `rate_limit`) merged — every web-fronted route EXCEPT the setup
+/// surface and the SPA fallback, which need the tenant check. Public so
+/// the rate-limit suite can drive the COMPOSED stack (relay AND proxy in
+/// one router, the precedence the real front door serves — static auth
+/// routes over the catch-all) without a database.
+///
+/// The ONE store instance rides BOTH: as the relay routes' state
+/// (mint/rotate/kill) and as an `Extension` on the proxy router
+/// (read-only injection). The `Option<Extension<_>>` extractor in the
+/// proxy handler keeps `api_router` usable standalone (no store: zero
+/// injection, the machine-token surface is untouched).
+pub fn session_router_with_store(
+    store: std::sync::Arc<SessionStore>,
+    api_base_url: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let api = api_router_with_auth_limit(api_base_url, rate_limit).layer(Extension(store.clone()));
+    let relay = relay_router(store, api_base_url, rate_limit);
+    Router::new().merge(relay).merge(api)
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
@@ -106,7 +220,7 @@ pub async fn serve_tls(
         addr,
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config)),
     )
-    .serve(router.into_make_service())
+    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
     .await
     .map_err(CaError::Io)
 }

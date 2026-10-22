@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::Router;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, SubsecRound, Utc};
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -60,6 +60,11 @@ const ADVISORY_KEY: i64 = 0x0057_4144_5354_000f;
 
 /// The tenant name this suite owns; swept before use, deleted at the end.
 const API_TENANT: &str = "rt-api-tenant";
+
+/// The earlier-sorted, later-created tenant of the primary-tenant test;
+/// swept before use so a crashed run's debris cannot collide with the
+/// insert below.
+const LOGIN_ORDER_TENANT: &str = "aaa-login-order-tenant";
 
 /// In-process serialization, the same whole-body lock pattern as the
 /// ws-core suites: the harness runs tests on separate threads. A tokio
@@ -310,6 +315,40 @@ async fn insert_user(pool: &PgPool, tenant_id: Uuid, id: Uuid, username: &str, r
         .expect("insert fixture user");
 }
 
+/// Attach an argon2id-hashed password to an (already inserted) user row:
+/// the hash is computed in a blocking thread, exactly like the login
+/// handler hashes nothing but the verify does.
+async fn set_password(pool: &PgPool, user_id: Uuid, password: String) {
+    let hash = tokio::task::spawn_blocking(move || ws_auth::password::hash_password(&password))
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("set the user's password hash");
+}
+
+/// Compute a current TOTP code for a base32 secret with the workspace's
+/// totp-rs pin (shared by the MFA-flow and the login tests).
+fn current_totp_code(secret: &str, account: &str) -> String {
+    use totp_rs::{Algorithm, Secret, TOTP};
+    let secret = Secret::Encoded(secret.to_string());
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().unwrap(),
+        None,
+        account.to_string(),
+    )
+    .unwrap();
+    totp.generate_current().unwrap()
+}
+
 /// The actor shape of the fixture's admin user (used as the creator for
 /// token mints, whose creator actor must be a user id).
 fn admin_actor(fixture: &Fixture) -> Actor {
@@ -369,6 +408,18 @@ fn bearer(value: &str) -> HeaderValue {
 async fn get_bearer(fixture: &Fixture, uri: &str, token: &str) -> TestResponse {
     let req = Request::builder()
         .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer(token))
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    send(fixture, req).await
+}
+
+/// A DELETE request with a bearer header (the no-body verbs, shaped like
+/// [`get_bearer`]).
+async fn delete_bearer(fixture: &Fixture, uri: &str, token: &str) -> TestResponse {
+    let req = Request::builder()
+        .method("DELETE")
         .uri(uri)
         .header(header::AUTHORIZATION, bearer(token))
         .body(axum::body::Body::empty())
@@ -1228,6 +1279,179 @@ async fn revision_move_makes_issuance_retry_not_record_stale() {
     );
 }
 
+/// A genuine database failure through the issuance CAS (`ProfileRepo::update`)
+/// surfaces as the MAPPED 500 — never as the retries-exhausted Conflict —
+/// and the failed attempt rolls back completely.
+///
+/// Failure-injection mechanism (the Task 3 FK-bend test's drop-and-heal
+/// idiom, sweep first): a `CHECK (false) NOT VALID` constraint on
+/// `profiles`. Pure DDL, and NOT VALID means existing rows are never
+/// re-validated — the constraint is evaluated ONLY on writes, so every
+/// SELECT the issuance flow runs before the CAS still succeeds and EXACTLY
+/// the `UPDATE profiles` statement fails with a check violation
+/// (`sqlx::Error` → `CoreError::Database` → the mapping table's 500, which
+/// is a different code AND status from `ApiError::Conflict`).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn cas_database_failure_maps_to_500_not_retry_conflict() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    // Self-heal FIRST — BEFORE any fixture write. A predecessor run of
+    // THIS test that crashed between the inject below and the final heal
+    // leaves `ws_test_invalid_check` on `profiles`; with it in place every
+    // INSERT into `profiles` violates the check, so `setup_profile_and_ca`
+    // would fail before this test got a chance to heal anything. This
+    // placement claims nothing more: dropping the constraint here does not
+    // repair a live schema fault — it only guarantees this test starts
+    // from a constraint-free `profiles` table so IT can re-inject and
+    // clean up after itself (the heal-after-attempt below stays).
+    sqlx::query("ALTER TABLE profiles DROP CONSTRAINT IF EXISTS ws_test_invalid_check")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep a stale injected check constraint");
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let actor = admin_actor(&fx);
+
+    sqlx::query(
+        "ALTER TABLE profiles ADD CONSTRAINT ws_test_invalid_check \
+         CHECK (false) NOT VALID",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("inject the write-failing check constraint");
+
+    // Baselines BEFORE the failed attempt, compared after: the rollback
+    // must leave no certificate, no `cert_issued` audit row, and no burned
+    // serial row behind.
+    let (certs_before, audits_before, serials_before): (i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM certificates WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND action = 'cert_issued'",
+        )
+        .bind(fx.tenant_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM used_serials WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+    );
+
+    // The core loop and the HTTP leg BOTH run while the constraint is in
+    // place, WITHOUT asserting: NOTHING between the injection and the heal
+    // may panic — a panic there would leave the schema broken for every
+    // later suite (which is why every assertion lives AFTER the heal). The
+    // core leg captures the `Result` un-demolished; the HTTP leg captures
+    // status and body with panic-proof reads.
+    let body = ws_api::routes::certificates::IssueCertificateBody {
+        profile_id,
+        subject_cn: "casfail.wardstone.test".to_string(),
+        sans: vec!["casfail.wardstone.test".to_string()],
+        csr_pem: Some(mint_csr(
+            "casfail.wardstone.test",
+            &["casfail.wardstone.test"],
+        )),
+    };
+    let core = ws_api::routes::certificates::issue_certificate_core(
+        &fx.state,
+        &actor,
+        &body,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        None,
+    )
+    .await;
+
+    let token = admin_token(&fx);
+    let res = post_json(
+        &fx,
+        "/api/v1/certificates",
+        Some(&token),
+        json!({
+            "profile_id": profile_id,
+            "subject_cn": "casfail.wardstone.test",
+            "sans": ["casfail.wardstone.test"],
+            "csr_pem": mint_csr("casfail.wardstone.test", &["casfail.wardstone.test"])
+        }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let mapped: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+
+    // Heal the schema BEFORE any assertion (a failed assert must never
+    // leave the constraint behind).
+    sqlx::query("ALTER TABLE profiles DROP CONSTRAINT ws_test_invalid_check")
+        .execute(&fx.pool)
+        .await
+        .expect("heal the injected check constraint");
+
+    // The core loop: a `CoreError::Database` from the CAS propagates as
+    // the mapped `ApiError::Internal` from the FIRST attempt — the bounded
+    // retry counts only `Ok(None)` (the revision moved), never `Err`.
+    let err = core.expect_err("the injected DB failure makes issuance fail");
+    assert!(
+        matches!(err, ws_api::ApiError::Internal(_)),
+        "a genuine CAS DB failure maps to Internal (500), got: {err:?}"
+    );
+    assert!(
+        !matches!(err, ws_api::ApiError::Conflict(_)),
+        "a genuine DB failure must NOT arrive as the retries-exhausted Conflict"
+    );
+
+    // The HTTP surface renders the mapped error: 500 with body code
+    // `internal` under the `error` object, never the conflict-shape 409.
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the route renders the mapped database error as a 500"
+    );
+    assert_eq!(
+        mapped["error"]["code"], "internal",
+        "the 500 body carries the mapped `internal` code"
+    );
+    assert_ne!(
+        mapped["error"]["code"], "conflict",
+        "a genuine DB failure must not render the conflict code"
+    );
+
+    let (certs_after, audits_after, serials_after): (i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM certificates WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND action = 'cert_issued'",
+        )
+        .bind(fx.tenant_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM used_serials WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        (certs_before, audits_before, serials_before),
+        (certs_after, audits_after, serials_after),
+        "the failed issuance attempt rolls back completely (no certificate row, \
+         no cert_issued audit row, no burned serial)"
+    );
+
+    fx.cleanup().await;
+}
+
 /// Every route in the capability table refuses a token lacking its
 /// capability (403, not 401), and answers a token holding exactly that
 /// capability with something other than 401/403 (validation failures
@@ -1276,7 +1500,7 @@ async fn capability_table_refusal_matrix() {
         (
             "POST",
             format!("/api/v1/certificates/{}/revoke", Uuid::new_v4()),
-            Some(json!({"reason": "r"})),
+            Some(json!({"reason": "superseded"})),
             Capability::Issue,
         ),
         (
@@ -1615,29 +1839,12 @@ async fn totp_mfa_flow_with_audit_rows() {
         .unwrap()
         .contains("otpauth://"));
 
-    // Compute a current code with the workspace's totp-rs pin.
-    fn current_code(secret: &str) -> String {
-        use totp_rs::{Algorithm, Secret, TOTP};
-        let secret = Secret::Encoded(secret.to_string());
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            secret.to_bytes().unwrap(),
-            None,
-            "totp-operator".to_string(),
-        )
-        .unwrap();
-        totp.generate_current().unwrap()
-    }
-
     // Activate with the first code.
     let res = post_json(
         &fx,
         "/api/v1/auth/totp/activate",
         Some(&token),
-        json!({"code": current_code(&secret)}),
+        json!({"code": current_totp_code(&secret, username)}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1657,7 +1864,7 @@ async fn totp_mfa_flow_with_audit_rows() {
         &fx,
         "/api/v1/auth/totp/deactivate",
         Some(&token),
-        json!({"code": current_code(&secret)}),
+        json!({"code": current_totp_code(&secret, username)}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1670,6 +1877,203 @@ async fn totp_mfa_flow_with_audit_rows() {
         assert_eq!(rows[0].2, "session");
         assert_eq!(rows[0].3, json!({}), "{action} carries no details keys");
     }
+
+    fx.cleanup().await;
+}
+
+/// Login resolves the primary tenant by CREATION order (the setup
+/// tenant), never by name: a second tenant whose name sorts EARLIER but
+/// whose created_at is LATER must not win. The fixture tenant is
+/// backdated with the house direct-UPDATE idiom so it is provably the
+/// oldest row in the shared database, and the young tenant is backdated
+/// to be unambiguously younger while sorting first alphabetically.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_resolves_oldest_primary_tenant() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    sweep_tenant(&fx.pool, LOGIN_ORDER_TENANT).await;
+
+    // 2000-01-01 and 2001-01-01: two fixed instants one year apart so the
+    // creation order is deterministic against the clock and against any
+    // concurrent suite's tenants (all far newer than 2000).
+    let year_2000 = DateTime::from_timestamp(946_684_800, 0).unwrap();
+    let year_2001 = DateTime::from_timestamp(978_307_200, 0).unwrap();
+
+    sqlx::query("UPDATE tenants SET created_at = $1 WHERE id = $2")
+        .bind(year_2000)
+        .bind(fx.tenant_id)
+        .execute(&fx.pool)
+        .await
+        .expect("backdate the fixture tenant to 2000");
+
+    // The password user lives in the fixture (setup) tenant.
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "setup-admin", Role::Admin).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+
+    // The younger tenant, whose name sorts FIRST: the alphabetical-
+    // resolution bug this test pins would pick this row and the login
+    // below would fail (the admin is in the older tenant).
+    let young_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(young_tenant)
+        .bind(LOGIN_ORDER_TENANT)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the younger tenant");
+    fx.extra_tenants.lock().unwrap().push(young_tenant);
+    sqlx::query("UPDATE tenants SET created_at = $1 WHERE id = $2")
+        .bind(year_2001)
+        .bind(young_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("backdate the younger tenant to 2001");
+
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "setup-admin", "password": "correct horse battery staple"}),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "login lands on the setup tenant"
+    );
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let login: Value = serde_json::from_slice(&raw).unwrap();
+    let access = login["access_token"].as_str().unwrap().to_string();
+
+    // The session actor's tenant is the OLDEST tenant.
+    let res = get_bearer(&fx, "/api/v1/auth/me", &access).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let me: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        me["tenant_id"].as_str().unwrap(),
+        fx.tenant_id.to_string(),
+        "the login session belongs to the first-created tenant"
+    );
+
+    fx.cleanup().await;
+}
+
+/// Login without the TOTP code an MFA-enabled account requires: 401 whose
+/// body carries the STRUCTURED code `mfa_required` (not the generic
+/// `unauthorized`), so the SPA can route the user to the MFA prompt.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_mfa_error_carries_code() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let user_id = Uuid::new_v4();
+    let username = "mfa-login-operator";
+    insert_user(&fx.pool, fx.tenant_id, user_id, username, Role::Issuer).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+    let token = session_token(&fx, user_id, username, "issuer");
+
+    // Enroll + activate the account's TOTP (the lifecycle the MFA flow
+    // test pins, compressed to the two calls).
+    let res = post_json(&fx, "/api/v1/auth/totp/enroll", Some(&token), json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let enrolled: Value = serde_json::from_slice(&raw).unwrap();
+    let secret = enrolled["secret"].as_str().unwrap().to_string();
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/totp/activate",
+        Some(&token),
+        json!({"code": current_totp_code(&secret, username)}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Login with the right password but no code: 401, code `mfa_required`.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": username, "password": "correct horse battery staple"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(error_code(&body), "mfa_required");
+
+    fx.cleanup().await;
+}
+
+/// An unknown username and a known username with a wrong password answer
+/// IDENTICALLY — same 401, same body — the uniform-credentials rule. The
+/// unknown-user path burns the same argon2id time as the verify path (the
+/// constant-time treatment); the timing itself is not observable in the
+/// response, so this pins the observable shape the rule requires.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_unknown_user_matches_known_user_error_shape() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "padded-user", Role::Issuer).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+
+    let unknown = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "no-such-user", "password": "some wrong password"}),
+    )
+    .await;
+    let known = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "padded-user", "password": "some wrong password"}),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(known.status(), StatusCode::UNAUTHORIZED);
+    let unknown = axum::body::to_bytes(unknown.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let known = axum::body::to_bytes(known.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let unknown: Value = serde_json::from_slice(&unknown).unwrap();
+    let known: Value = serde_json::from_slice(&known).unwrap();
+    assert_eq!(
+        unknown, known,
+        "unknown-user and wrong-password bodies are identical"
+    );
+    assert_eq!(error_code(&unknown), "unauthorized");
 
     fx.cleanup().await;
 }
@@ -1943,7 +2347,7 @@ async fn revocation_is_idempotent_and_audited() {
         &fx,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&token),
-        json!({"reason": "key compromise"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1952,7 +2356,7 @@ async fn revocation_is_idempotent_and_audited() {
         &fx,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&token),
-        json!({"reason": "key compromise"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK, "revoke is idempotent");
@@ -1962,7 +2366,194 @@ async fn revocation_is_idempotent_and_audited() {
     fx.cleanup().await;
 
     assert_eq!(revoked.len(), 1, "the second revoke writes no row");
-    assert_eq!(revoked[0].3["reason"], "key compromise");
+    assert_eq!(revoked[0].3["reason"], "key_compromise");
+}
+
+/// The stored revocation reason is the exact snake_case name
+/// ws-worker's `reason_from_str` maps into `CrlReason::KeyCompromise`
+/// (the CRL/OCSP contract: worker-side, an unknown stored spelling
+/// silently yields NO reason extension). The raw row is asserted, not
+/// the API DTO, so the test pins the DB contract itself.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn typed_reason_reaches_crl_contract() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "typed.wardstone.test",
+        &["typed.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "key_compromise", "detail": null}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Capture the raw row BEFORE cleanup, then sweep.
+    let stored: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT revocation_reason, revocation_detail FROM certificates WHERE id = $1",
+    )
+    .bind(cert_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("select the revocation pair");
+    fx.cleanup().await;
+
+    let (reason, detail) = stored.expect("the certificate row exists");
+    assert_eq!(
+        reason.as_deref(),
+        Some("key_compromise"),
+        "the stored reason is the exact name worker's reason_from_str parses"
+    );
+    assert_eq!(detail.as_deref(), None, "no detail was supplied");
+}
+
+/// The optional detail round-trips: stored verbatim on the first revoke,
+/// kept on a second (idempotent revoke keeps the FIRST reason/detail
+/// pair), and visible in the certificate GET response.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revocation_detail_roundtrip() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "detail.wardstone.test",
+        &["detail.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+    let first_detail = "under investigation since the 2026-10 incident";
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "certificate_hold", "detail": first_detail}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded", "detail": "a later revoke must not win"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke is idempotent");
+
+    let stored: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT revocation_reason, revocation_detail FROM certificates WHERE id = $1",
+    )
+    .bind(cert_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("select the revocation pair");
+    let get_res = get_bearer(&fx, &format!("/api/v1/certificates/{cert_id}"), &token).await;
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let get_body: Value = serde_json::from_slice(&get_body).unwrap();
+    fx.cleanup().await;
+
+    let (reason, detail) = stored.expect("the certificate row exists");
+    assert_eq!(
+        reason.as_deref(),
+        Some("certificate_hold"),
+        "a second revoke keeps the FIRST reason"
+    );
+    assert_eq!(
+        detail.as_deref(),
+        Some(first_detail),
+        "a second revoke keeps the FIRST detail"
+    );
+    assert_eq!(get_body["revocation_reason"], "certificate_hold");
+    assert_eq!(get_body["revocation_detail"], first_detail);
+}
+
+/// An unknown reason name is a serde rejection mapped to 400
+/// `bad_request`, and a detail longer than 2000 characters is 400
+/// `bad_request` too; the certificate stays active.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revoke_rejects_unknown_reason_and_oversized_detail() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "reject.wardstone.test",
+        &["reject.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "totally_not_a_reason"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(error_code(&body), "bad_request");
+
+    let oversized = "x".repeat(2001);
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded", "detail": oversized}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(error_code(&body), "bad_request");
+
+    let get_res = get_bearer(&fx, &format!("/api/v1/certificates/{cert_id}"), &token).await;
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let get_body: Value = serde_json::from_slice(&get_bytes).unwrap();
+    fx.cleanup().await;
+    assert_eq!(get_body["status"], "active", "the rejects never revoked");
 }
 
 /// Health and metrics are public and cheap.
@@ -2029,4 +2620,1345 @@ async fn profile_creation_refuses_the_star_dot_pattern() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The filtered listing and estate statistics (Plan 3 Task 1)
+// ---------------------------------------------------------------------------
+
+/// Create a profile named `name` permitting the `*.example.test` SAN
+/// wildcard, through the API; returns the profile id.
+async fn create_filter_profile(fixture: &Fixture, token: &str, name: &str) -> Uuid {
+    let res = post_json(
+        fixture,
+        "/api/v1/profiles",
+        Some(token),
+        json!({
+            "name": name,
+            "description": "the filtered-listing fixture profile",
+            "key_type": "ecdsa-p256",
+            "key_usages": ["digital_signature"],
+            "eku": ["server_auth"],
+            "lifetime_days": 30,
+            "san_patterns": ["*.example.test"]
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create profile {name}");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    body["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+}
+
+/// A GET request's parsed JSON body (the response must be 200).
+async fn get_json(fixture: &Fixture, uri: &str, token: &str) -> Value {
+    let res = get_bearer(fixture, uri, token).await;
+    assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+    let raw = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&raw).unwrap()
+}
+
+/// The certificates list composes its filter parameters: `status`, `profile`
+/// (the profile NAME), `q` (subject | serial_hex | certificate SAN), and
+/// `ca` (the issuing CA id). A revoked certificate is matched by its
+/// profile, by a serial-hex search, and excluded by `status=active`; an
+/// unknown CA id matches nothing; an unparseable status is a 400.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn filtered_listing_matches_status_profile_search_and_ca() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    // Two profiles whose NAMES the profile filter keys on, one CA.
+    let web_server = create_filter_profile(&fx, &token, "web-server").await;
+    let web_server_ecdsa = create_filter_profile(&fx, &token, "web-server-ecdsa").await;
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "filter-root-ca",
+            "subject": "Wardstone Filter Root",
+            "key_type": "ed25519",
+            "is_root": true
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the filter CA");
+
+    // A: active, profile web-server, SAN a.example.test.
+    let (a_status, a_body) =
+        issue_csr(&fx, web_server, "a.example.test", &["a.example.test"]).await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_id = a_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let a_serial_hex = a_body["serial_hex"].as_str().unwrap().to_string();
+
+    // B: revoked, profile web-server-ecdsa, SAN b.example.test.
+    let (b_status, b_body) =
+        issue_csr(&fx, web_server_ecdsa, "b.example.test", &["b.example.test"]).await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_id = b_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let b_serial_hex = b_body["serial_hex"].as_str().unwrap().to_string();
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{b_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke B");
+
+    // Every list query runs BEFORE cleanup (the self-cleaning contract).
+    let unfiltered = get_json(&fx, "/api/v1/certificates", &token).await;
+    let by_status = get_json(&fx, "/api/v1/certificates?status=active", &token).await;
+    let by_profile = get_json(&fx, "/api/v1/certificates?profile=web-server-ecdsa", &token).await;
+    let q_san = get_json(&fx, "/api/v1/certificates?q=a.example.test", &token).await;
+    // The serial-hex search needle: a PREFIX of B's hex — extended to the
+    // full hex only if the (random) short prefix also appears in A's.
+    let mut needle: String = b_serial_hex.chars().take(10).collect();
+    if a_serial_hex.contains(&needle) {
+        needle = b_serial_hex.clone();
+    }
+    let q_serial = get_json(&fx, &format!("/api/v1/certificates?q={needle}"), &token).await;
+    let by_other_ca = get_json(
+        &fx,
+        &format!("/api/v1/certificates?ca={}", Uuid::new_v4()),
+        &token,
+    )
+    .await;
+    let bad_status_res = get_bearer(&fx, "/api/v1/certificates?status=bogus", &token).await;
+    let bad_status = bad_status_res.status();
+    let raw = axum::body::to_bytes(bad_status_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let bad_status_body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    fx.cleanup().await;
+
+    let ids = |list: &Value| -> Vec<Uuid> {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect()
+    };
+
+    assert_eq!(ids(&unfiltered), vec![a_id, b_id], "no filter lists both");
+    assert_eq!(
+        ids(&by_status),
+        vec![a_id],
+        "status=active lists only the active certificate"
+    );
+    assert_eq!(
+        ids(&by_profile),
+        vec![b_id],
+        "profile=web-server-ecdsa lists only B"
+    );
+    assert_eq!(ids(&q_san), vec![a_id], "the SAN search matches only A");
+    assert_eq!(
+        ids(&q_serial),
+        vec![b_id],
+        "the serial-hex search matches only B"
+    );
+    assert!(
+        ids(&by_other_ca).is_empty(),
+        "an unknown CA id matches nothing"
+    );
+    assert_eq!(
+        bad_status,
+        StatusCode::BAD_REQUEST,
+        "an unknown status is 400"
+    );
+    assert_eq!(
+        error_code(&bad_status_body),
+        "bad_request",
+        "the invalid-status code"
+    );
+}
+
+/// The estate statistics endpoint counts, in one response: active,
+/// revoked, and active-and-expiring-within-the-30-day horizon. Four
+/// certificates are issued and their `not_after` pinned by direct row
+/// update so the horizon is deterministic: A (+10d) and D (+5d) expire
+/// soon, B (+40d) does not, C is revoked.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn statistics_counts_active_revoked_expiring() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    // Issue four certificates through the API (the CSR path).
+    let mut cert_ids = Vec::new();
+    for cn in [
+        "a.wardstone.test",
+        "b.wardstone.test",
+        "c.wardstone.test",
+        "d.wardstone.test",
+    ] {
+        let (status, body) = issue_csr(&fx, profile_id, cn, &[cn]).await;
+        assert_eq!(status, StatusCode::OK, "issue {cn}: {body}");
+        cert_ids.push(
+            body["certificate_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+    }
+
+    // Pin the expiries: A +10d, B +40d, D +5d (C stays profile-expired and
+    // is revoked below — revoked rows sit outside the horizon either way).
+    let expiry_legs = [
+        (cert_ids[0], Duration::days(10)),
+        (cert_ids[1], Duration::days(40)),
+        (cert_ids[3], Duration::days(5)),
+    ];
+    for (id, leg) in expiry_legs {
+        sqlx::query("UPDATE certificates SET not_after = $2 WHERE id = $1")
+            .bind(id)
+            .bind(Utc::now() + leg)
+            .execute(&fx.pool)
+            .await
+            .expect("pin the certificate expiry");
+    }
+
+    // Revoke C.
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{}/revoke", cert_ids[2]),
+        Some(&token),
+        json!({"reason": "cessation_of_operation"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke C");
+
+    // The statistics GET runs BEFORE cleanup.
+    let res = get_bearer(&fx, "/api/v1/certificates/statistics", &token).await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let stats: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "the statistics route answers");
+    assert_eq!(stats["active"], 3, "A, B, D are active");
+    assert_eq!(stats["revoked"], 1, "C is revoked");
+    assert_eq!(
+        stats["expiring_soon"], 2,
+        "A (+10d) and D (+5d) expire within the 30-day horizon"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The audit list filters (Plan 3 Task 2)
+// ---------------------------------------------------------------------------
+
+/// The audit list filters by `action` (exact), by `from`/`to` on
+/// `created_at`, and composes both ends of the date bracket. The suite's
+/// seeded events run through the normal mutation routes and are backdated
+/// by DIRECT row UPDATE for determinism: the `ca_created` row three hours
+/// ago, the two `cert_issued` rows 61 and 59 minutes ago (never a tie on
+/// `created_at`, whose ties resolve by the random id), while the fixture's
+/// `profile_created` row stays at wall-clock now — the too-new entry the
+/// `to` bound must exclude.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn audit_filter_by_date_and_action() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    // Two issuances: A seeded older, B newer.
+    let (a_status, a_body) = issue_csr(
+        &fx,
+        profile_id,
+        "a-audit.wardstone.test",
+        &["a-audit.wardstone.test"],
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_target = a_body["certificate_id"].as_str().unwrap().to_string();
+    let (b_status, b_body) = issue_csr(
+        &fx,
+        profile_id,
+        "b-audit.wardstone.test",
+        &["b-audit.wardstone.test"],
+    )
+    .await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_target = b_body["certificate_id"].as_str().unwrap().to_string();
+
+    // Backdate: the CA creation three hours ago, A one hour and a minute
+    // ago, B a minute shy of an hour; `profile_created` stays at now.
+    let now = Utc::now();
+    sqlx::query(
+        "UPDATE audit_log SET created_at = $1 WHERE tenant_id = $2 AND action = 'ca_created'",
+    )
+    .bind(now - Duration::hours(3))
+    .bind(fx.tenant_id)
+    .execute(&fx.pool)
+    .await
+    .expect("backdate the ca_created row");
+    for (target, age) in [
+        (&a_target, Duration::minutes(61)),
+        (&b_target, Duration::minutes(59)),
+    ] {
+        sqlx::query(
+            "UPDATE audit_log SET created_at = $1 WHERE tenant_id = $2 \
+             AND action = 'cert_issued' AND target_id = $3",
+        )
+        .bind(now - age)
+        .bind(fx.tenant_id)
+        .bind(target.as_str())
+        .execute(&fx.pool)
+        .await
+        .expect("backdate a cert_issued row");
+    }
+
+    // Every list query runs BEFORE cleanup (the self-cleaning contract).
+    let unfiltered = get_json(&fx, "/api/v1/audit", &token).await;
+    let by_action = get_json(&fx, "/api/v1/audit?action=cert_issued", &token).await;
+    // The Z-suffixed RFC 3339 form: URL-safe (a `+` offset would decode
+    // as a space and the query would fall apart).
+    let from = (now - Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let to = (now - Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let after_from = get_json(&fx, &format!("/api/v1/audit?from={from}"), &token).await;
+    let bracket = get_json(&fx, &format!("/api/v1/audit?from={from}&to={to}"), &token).await;
+    fx.cleanup().await;
+
+    let targets = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .map(|row| row["target_id"].as_str().expect("target_id").to_string())
+            .collect()
+    };
+
+    // Unfiltered: exactly the fixture's four rows, newest first — the
+    // wall-clock profile row, then B, then A, then the backdated CA row.
+    assert_eq!(
+        targets(&unfiltered),
+        vec![
+            profile_id.to_string(),
+            b_target.clone(),
+            a_target.clone(),
+            ca_id.to_string()
+        ],
+        "the full log, newest first"
+    );
+    assert_eq!(
+        targets(&by_action),
+        vec![b_target.clone(), a_target.clone()],
+        "action=cert_issued lists only the two issuances, newest first"
+    );
+    assert_eq!(
+        targets(&after_from),
+        vec![profile_id.to_string(), b_target.clone(), a_target.clone()],
+        "from excludes the three-hour-old CA-creation row"
+    );
+    assert_eq!(
+        targets(&bracket),
+        vec![b_target, a_target],
+        "the from/to bracket excludes both too-old and too-new rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The CRL retrieval and trust-chain routes (Plan 3 Task 3)
+// ---------------------------------------------------------------------------
+
+/// The CRL route serves the NEWEST published CRL for the CA. Two `crls`
+/// rows are seeded by direct INSERT into the ws-worker-owned table (its job
+/// path is untouched — the rows are the seed, not a writer) with distinct
+/// `issued_at` stamps, and the response must carry the newer row's
+/// `issued_at`, `next_update`, and PEM verbatim, nothing more. A CA that
+/// exists but never published a CRL is a 404 `not_found`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn crl_route_serves_newest() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (_profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+
+    // Two CRL rows: OLD two hours ago (already expired), NEW half an hour
+    // ago. `issued_at` is seeded explicitly — the route's ORDER BY keys on
+    // it, so no backdating of anything else is involved. The stamps are
+    // rounded to microsecond precision: a `timestamptz` column truncates
+    // finer digits on write, and the comparison must compare what is
+    // stored, not what was bound.
+    let now = Utc::now().round_subsecs(6);
+    let old_pem = "-----BEGIN X509 CRL-----\nOLDTESTCRL\n-----END X509 CRL-----\n";
+    let new_pem = "-----BEGIN X509 CRL-----\nNEWTESTCRL\n-----END X509 CRL-----\n";
+    let old_issued = now - Duration::hours(2);
+    let old_next = now - Duration::hours(1);
+    let new_issued = now - Duration::minutes(30);
+    let new_next = now + Duration::hours(12);
+    let seeds = [
+        (old_issued, old_next, old_pem),
+        (new_issued, new_next, new_pem),
+    ];
+    for (seeded_issued, seeded_next, crl_pem) in seeds {
+        sqlx::query(
+            "INSERT INTO crls (id, tenant_id, ca_id, issued_at, next_update, crl_pem) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fx.tenant_id)
+        .bind(ca_id)
+        .bind(seeded_issued)
+        .bind(seeded_next)
+        .bind(crl_pem)
+        .execute(&fx.pool)
+        .await
+        .expect("seed a crls row");
+    }
+
+    // The sibling CA that exists but has never published a CRL.
+    let empty_res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "crl-empty-root",
+            "subject": "Wardstone CRL Empty",
+            "key_type": "ed25519",
+            "is_root": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        empty_res.status(),
+        StatusCode::CREATED,
+        "create the CA without CRLs"
+    );
+    let raw = axum::body::to_bytes(empty_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let empty_ca: Value = serde_json::from_slice(&raw).unwrap();
+    let empty_ca_id = empty_ca["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // Both GETs run BEFORE cleanup (the self-cleaning contract).
+    let res = get_bearer(&fx, &format!("/api/v1/cas/{ca_id}/crl"), &token).await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    let no_crl_res = get_bearer(&fx, &format!("/api/v1/cas/{empty_ca_id}/crl"), &token).await;
+    let no_crl_status = no_crl_res.status();
+    let raw = axum::body::to_bytes(no_crl_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let no_crl_body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+
+    // Drop the seeded CRL rows before cleanup: cleanup deletes the `cas`
+    // rows, and the `crls` rows' foreign keys would block those deletes.
+    sqlx::query("DELETE FROM crls WHERE tenant_id = $1")
+        .bind(fx.tenant_id)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the seeded crls rows");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "the CRL route answers");
+    assert_eq!(
+        body["ca_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        ca_id,
+        "the served CRL names the requested CA"
+    );
+    assert_eq!(
+        body["issued_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap(),
+        new_issued,
+        "the NEWEST row's issued_at"
+    );
+    assert_eq!(
+        body["next_update"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap(),
+        new_next,
+        "the newest row's next_update"
+    );
+    assert_eq!(
+        body["crl_pem"].as_str(),
+        Some(new_pem),
+        "the newest row's PEM, verbatim"
+    );
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        4,
+        "exactly ca_id, issued_at, next_update, crl_pem"
+    );
+
+    assert_eq!(
+        no_crl_status,
+        StatusCode::NOT_FOUND,
+        "no published CRL is 404"
+    );
+    assert_eq!(error_code(&no_crl_body), "not_found");
+}
+
+/// The chain routes assemble the trust chain leaf-first with the PEM body
+/// `application/x-pem-file`: `/cas/{id}/chain` concatenates the CA's
+/// certificate up to its root's (a leaf certificate never appears), and
+/// `/certificates/{id}/chain` puts the leaf PEM FIRST, then its issuing
+/// chain. The leaf is issued through the normal issuance helper and its
+/// `ca_id` is then repointed at the intermediate by direct UPDATE — the
+/// issuance helper always issues from the tenant's root, and the same-
+/// tenant repoint keeps the composite tenant/CA foreign key intact.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn chain_routes_walk_to_root() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, root_id) = setup_profile_and_ca(&fx).await;
+
+    // The intermediate under the root, through the API (create_ca).
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "chain-intermediate",
+            "subject": "Wardstone Chain Intermediate",
+            "key_type": "ed25519",
+            "is_root": false,
+            "parent_id": root_id
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the intermediate");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let intermediate: Value = serde_json::from_slice(&raw).unwrap();
+    let intermediate_id = intermediate["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let intermediate_pem = intermediate["cert_pem"].as_str().unwrap().to_string();
+
+    // The root's PEM, from the list (setup_profile_and_ca discards the body).
+    let listed = get_json(&fx, "/api/v1/cas", &token).await;
+    let root_pem = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ca| ca["id"].as_str().unwrap().parse::<Uuid>().unwrap() == root_id)
+        .expect("the fixture root is listed")["cert_pem"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A leaf through the normal issuance helper, then repointed under the
+    // intermediate (same tenant). The name fits the fixture profile's
+    // `wardstone.test` SAN allow-list.
+    let (leaf_status, leaf_body) = issue_csr(
+        &fx,
+        profile_id,
+        "leaf.chain.wardstone.test",
+        &["leaf.chain.wardstone.test"],
+    )
+    .await;
+    assert_eq!(leaf_status, StatusCode::OK, "issue the leaf: {leaf_body}");
+    let leaf_id = leaf_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let leaf_pem = leaf_body["cert_pem"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE certificates SET ca_id = $2 WHERE id = $1")
+        .bind(leaf_id)
+        .bind(intermediate_id)
+        .execute(&fx.pool)
+        .await
+        .expect("repoint the leaf at the intermediate");
+
+    // Both chain GETs run BEFORE cleanup (the self-cleaning contract).
+    let cert_res = get_bearer(
+        &fx,
+        &format!("/api/v1/certificates/{leaf_id}/chain"),
+        &token,
+    )
+    .await;
+    let cert_status = cert_res.status();
+    let cert_type = cert_res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let cert_raw = axum::body::to_bytes(cert_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let cert_chain = String::from_utf8(cert_raw.to_vec()).unwrap();
+    let ca_res = get_bearer(&fx, &format!("/api/v1/cas/{intermediate_id}/chain"), &token).await;
+    let ca_status = ca_res.status();
+    let ca_raw = axum::body::to_bytes(ca_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ca_chain = String::from_utf8(ca_raw.to_vec()).unwrap();
+
+    fx.cleanup().await;
+
+    assert_eq!(
+        cert_status,
+        StatusCode::OK,
+        "the certificate chain route answers"
+    );
+    assert_eq!(
+        cert_type, "application/x-pem-file",
+        "the chain body's content type"
+    );
+    let leaf_at = cert_chain
+        .find(&leaf_pem)
+        .expect("the leaf's PEM in the body");
+    let intermediate_at = cert_chain
+        .find(&intermediate_pem)
+        .expect("the intermediate's PEM in the body");
+    let root_at = cert_chain
+        .find(&root_pem)
+        .expect("the root's PEM in the body");
+    assert!(
+        leaf_at < intermediate_at && intermediate_at < root_at,
+        "the certificate chain is leaf-first: leaf, intermediate, root"
+    );
+
+    assert_eq!(ca_status, StatusCode::OK, "the CA chain route answers");
+    let int_at = ca_chain
+        .find(&intermediate_pem)
+        .expect("the intermediate's PEM in the body");
+    let root_at2 = ca_chain
+        .find(&root_pem)
+        .expect("the root's PEM in the body");
+    assert!(
+        int_at < root_at2,
+        "the CA chain walks intermediate then root"
+    );
+    assert!(
+        ca_chain.find(&leaf_pem).is_none(),
+        "the CA chain never contains a leaf certificate"
+    );
+}
+
+/// The chain walk refuses a CROSS-TENANT parent. The schema normally
+/// refuses it too — migration 008's `cas_parent_tenant_fk` composite
+/// foreign key keeps a CA's parent in-tenant — so this regression
+/// temporarily DROPS that constraint to bend the schema by direct UPDATE
+/// (re-adding it VALIDATED after cleanup, and the sweep-first section also
+/// heals a constraint a crashed run may have left dropped). The bend: a
+/// second tenant seeded raw, the actor tenant's sub-CA's `parent_id`
+/// repointed at the foreign CA, and both chain routes must answer 500
+/// (`internal` — the `CoreError::Config` mapping) WITHOUT the foreign
+/// CA's PEM. Cross-tenant parents are prevented at `create_ca` (the API
+/// filters the named parent to the actor's tenant — the foreign rows here
+/// are seeded raw precisely because the API refuses); the walk's per-hop
+/// tenant check is the third belt, behind the schema and the API.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn chain_walk_refuses_cross_tenant_parent() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, root_id) = setup_profile_and_ca(&fx).await;
+
+    // The sub-CA under the fixture root, through the API: the parent check
+    // at create_ca accepts this one (same tenant).
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "chain-cross-tenant",
+            "subject": "Wardstone Cross-Tenant Chain",
+            "key_type": "ed25519",
+            "is_root": false,
+            "parent_id": root_id
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the sub-CA");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let sub: Value = serde_json::from_slice(&raw).unwrap();
+    let sub_id = sub["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // Sweep-first, then the second tenant and its CA, seeded raw: the API
+    // would refuse a cross-tenant parent — that refusal is exactly what
+    // this belt is for.
+    sqlx::query("DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-chain cas rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-chain tenant");
+    // Heal the schema a previously crashed run may have damaged (this test
+    // drops cas_parent_tenant_fk to bend the edge): re-add it if absent.
+    // The sweep-first contract covers the schema, not just the rows.
+    sqlx::query(
+        "DO $$ BEGIN \
+         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cas_parent_tenant_fk') THEN \
+         ALTER TABLE cas ADD CONSTRAINT cas_parent_tenant_fk \
+         FOREIGN KEY (parent_id, tenant_id) REFERENCES cas (id, tenant_id) \
+         DEFERRABLE INITIALLY DEFERRED; \
+         END IF; END $$;",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("heal cas_parent_tenant_fk if a crashed run dropped it");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign tenant");
+    let foreign_ca = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO cas (id, tenant_id, name, subject, is_root, parent_id, key_type, \
+         not_before, not_after, cert_pem, key_file, created_at) \
+         VALUES ($1, $2, $3, $4, true, NULL, 'ed25519', now(), now(), $5, 'ca/foreign.key', now())",
+    )
+    .bind(foreign_ca)
+    .bind(foreign_tenant)
+    .bind("foreign-root-ca")
+    .bind("Wardstone Foreign Root")
+    .bind("-----BEGIN CERTIFICATE-----\nFOREIGNCHAINPEM\n-----END CERTIFICATE-----\n")
+    .execute(&fx.pool)
+    .await
+    .expect("insert the foreign ca");
+
+    // Bend the schema: the sub's parent becomes the foreign CA. The 008
+    // foreign key would refuse this write — the schema itself keeps a CA's
+    // parent in-tenant — so the constraint is dropped for the bend
+    // (re-added validated after cleanup).
+    sqlx::query("ALTER TABLE cas DROP CONSTRAINT cas_parent_tenant_fk")
+        .execute(&fx.pool)
+        .await
+        .expect("drop cas_parent_tenant_fk for the bend");
+    sqlx::query("UPDATE cas SET parent_id = $2 WHERE id = $1")
+        .bind(sub_id)
+        .bind(foreign_ca)
+        .execute(&fx.pool)
+        .await
+        .expect("seed the cross-tenant parent");
+
+    // A leaf issued through the normal helper, repointed at the sub (same
+    // tenant), so the certificate chain route walks the bent edge too.
+    let (leaf_status, leaf_body) = issue_csr(
+        &fx,
+        profile_id,
+        "x.chain.wardstone.test",
+        &["x.chain.wardstone.test"],
+    )
+    .await;
+    assert_eq!(leaf_status, StatusCode::OK, "issue the leaf: {leaf_body}");
+    let leaf_id = leaf_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    sqlx::query("UPDATE certificates SET ca_id = $2 WHERE id = $1")
+        .bind(leaf_id)
+        .bind(sub_id)
+        .execute(&fx.pool)
+        .await
+        .expect("repoint the leaf at the sub");
+
+    // Both GETs run BEFORE cleanup (the self-cleaning contract).
+    let ca_res = get_bearer(&fx, &format!("/api/v1/cas/{sub_id}/chain"), &token).await;
+    let ca_status = ca_res.status();
+    let raw = axum::body::to_bytes(ca_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ca_text = String::from_utf8(raw.to_vec()).unwrap();
+    let ca_body: Value = serde_json::from_str(&ca_text).unwrap_or(json!({}));
+    let cert_res = get_bearer(
+        &fx,
+        &format!("/api/v1/certificates/{leaf_id}/chain"),
+        &token,
+    )
+    .await;
+    let cert_status = cert_res.status();
+    let raw = axum::body::to_bytes(cert_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let cert_text = String::from_utf8(raw.to_vec()).unwrap();
+    let cert_body: Value = serde_json::from_str(&cert_text).unwrap_or(json!({}));
+
+    // Cleanup covers the fixture tenant; the schema FK is restored BEFORE
+    // the foreign rows go (nothing references the foreign CA by then: the
+    // bent sub row was deleted with the fixture rows, so the re-added
+    // constraint validates cleanly), then the foreign rows.
+    fx.cleanup().await;
+    sqlx::query(
+        "ALTER TABLE cas ADD CONSTRAINT cas_parent_tenant_fk \
+         FOREIGN KEY (parent_id, tenant_id) REFERENCES cas (id, tenant_id) \
+         DEFERRABLE INITIALLY DEFERRED",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("re-add cas_parent_tenant_fk");
+    sqlx::query("DELETE FROM cas WHERE tenant_id = $1")
+        .bind(foreign_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the foreign cas rows");
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(foreign_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the foreign tenant");
+
+    assert_eq!(
+        ca_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the CA chain walk refuses a cross-tenant parent"
+    );
+    assert_eq!(
+        error_code(&ca_body),
+        "internal",
+        "the CoreError::Config mapping"
+    );
+    assert!(
+        !ca_text.contains("FOREIGNCHAINPEM"),
+        "the foreign CA's PEM never enters the response: {ca_text}"
+    );
+    assert_eq!(
+        cert_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the certificate chain walk refuses a cross-tenant parent"
+    );
+    assert_eq!(error_code(&cert_body), "internal");
+    assert!(
+        !cert_text.contains("FOREIGNCHAINPEM"),
+        "the foreign CA's PEM never enters the response: {cert_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Profile deletion with reference refusal (Plan 3 Task 6)
+// ---------------------------------------------------------------------------
+
+/// `DELETE /api/v1/profiles/{id}`: an UNREFERENCED profile deletes (204,
+/// gone on re-read, one `profile_deleted` audit row carrying the profile's
+/// name), a profile any certificate references is refused with 409 and the
+/// fixed message (the setup built-ins — e.g. a default web-server profile
+/// that an issued leaf pins — are exactly this case), and an unknown or
+/// another tenant's profile id is a 404, indistinguishably. All captured
+/// response data is asserted after cleanup.
+/// A PATCH request with a JSON body and (optional) bearer header, shaped
+/// like [`put_json`].
+async fn patch_json(
+    fixture: &Fixture,
+    uri: &str,
+    token: Option<&str>,
+    body: Value,
+) -> TestResponse {
+    let mut builder = Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, bearer(token));
+    }
+    let req = builder
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build request");
+    send(fixture, req).await
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_delete_refuses_when_referenced() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    // The unreferenced path: a fresh profile nothing has issued from.
+    let profile_id = create_filter_profile(&fx, &token, "delete-me").await;
+    let delete_uri = format!("/api/v1/profiles/{profile_id}");
+    let delete_status = delete_bearer(&fx, &delete_uri, &token).await.status();
+    // The re-read and the audited row are captured BEFORE cleanup.
+    let get_res = get_bearer(&fx, &delete_uri, &token).await;
+    let get_status = get_res.status();
+    let audit_res = get_bearer(&fx, "/api/v1/audit?action=profile_deleted", &token).await;
+    let audit_status = audit_res.status();
+    let audit_raw = axum::body::to_bytes(audit_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let audit: Value = serde_json::from_slice(&audit_raw).unwrap();
+
+    // The referenced path: a leaf issued from the fixture profile pins its
+    // revision (active history counts — a revoked one would too), so the
+    // deletion is refused. A setup-built-in profile in the same position
+    // (e.g. the default web-server profile behind the fixture leaf)
+    // refuses the same way.
+    let (referenced_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (issue_status, issue_body) = issue_csr(
+        &fx,
+        referenced_id,
+        "leaf.delete.wardstone.test",
+        &["leaf.delete.wardstone.test"],
+    )
+    .await;
+    assert_eq!(issue_status, StatusCode::OK, "issue the leaf: {issue_body}");
+    let ref_res = delete_bearer(&fx, &format!("/api/v1/profiles/{referenced_id}"), &token).await;
+    let ref_status = ref_res.status();
+    let ref_raw = axum::body::to_bytes(ref_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ref_body: Value = serde_json::from_slice(&ref_raw).unwrap();
+
+    // Unknown id and another tenant's id are both 404.
+    let unknown_status =
+        delete_bearer(&fx, &format!("/api/v1/profiles/{}", Uuid::new_v4()), &token)
+            .await
+            .status();
+    let foreign_name = "rt-api-foreign-profile";
+    sqlx::query("DELETE FROM profiles WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-profile rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-profile tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-profile tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_profile = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO profiles (id, tenant_id, name, description, current_revision_id, created_at) \
+         VALUES ($1, $2, 'foreign-profile', NULL, NULL, now())",
+    )
+    .bind(foreign_profile)
+    .bind(foreign_tenant)
+    .execute(&fx.pool)
+    .await
+    .expect("insert the foreign-profile row");
+    let foreign_status = delete_bearer(&fx, &format!("/api/v1/profiles/{foreign_profile}"), &token)
+        .await
+        .status();
+
+    fx.cleanup().await;
+
+    // Unreferenced: 204, and the profile is gone on re-read.
+    assert_eq!(
+        delete_status,
+        StatusCode::NO_CONTENT,
+        "an unreferenced profile deletes"
+    );
+    assert_eq!(get_status, StatusCode::NOT_FOUND, "gone after the delete");
+
+    // Exactly one `profile_deleted` row, with the profile's name.
+    assert_eq!(
+        audit_status,
+        StatusCode::OK,
+        "the audit list serves the action filter"
+    );
+    let deleted = audit.as_array().expect("the audit list is an array");
+    assert_eq!(
+        deleted.len(),
+        1,
+        "exactly one profile_deleted row: {deleted:?}"
+    );
+    assert_eq!(deleted[0]["target_type"], "profile");
+    assert_eq!(deleted[0]["target_id"], profile_id.to_string());
+    assert_eq!(deleted[0]["details"], json!({ "name": "delete-me" }));
+
+    // Referenced: 409 with the fixed message, code `conflict`.
+    assert_eq!(ref_status, StatusCode::CONFLICT, "the referenced refusal");
+    assert_eq!(error_code(&ref_body), "conflict");
+    assert_eq!(
+        ref_body["error"]["message"].as_str().unwrap(),
+        "profile is referenced by certificates and cannot be deleted"
+    );
+
+    // Unknown and foreign ids are 404, indistinguishably.
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
+}
+
+// ---------------------------------------------------------------------------
+// The user PATCH route (role assignment and activation)
+// ---------------------------------------------------------------------------
+
+/// `PATCH /api/v1/users/{id}`: a role change, an activation flip, and
+/// both fields in one request — the response mirrors the fresh row, the
+/// `users` row follows, and each real change writes its audit row in the
+/// house order (the role row before the flag row).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_role_and_active_patch() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "patchee", Role::Issuer).await;
+    let uri = format!("/api/v1/users/{user_id}");
+
+    // Role: issuer -> viewer.
+    let role_res = patch_json(&fx, &uri, Some(&token), json!({ "role": "viewer" })).await;
+    let role_status = role_res.status();
+    let role_raw = axum::body::to_bytes(role_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let role_body: Value = serde_json::from_slice(&role_raw).unwrap();
+    let after_role: (String, bool) =
+        sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the user row after the role patch");
+
+    // Deactivate, then reactivate: is_active flips each way.
+    let deact_status = patch_json(&fx, &uri, Some(&token), json!({ "is_active": false }))
+        .await
+        .status();
+    let after_deact: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read is_active after the deactivation");
+    let act_status = patch_json(&fx, &uri, Some(&token), json!({ "is_active": true }))
+        .await
+        .status();
+    let after_act: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read is_active after the reactivation");
+
+    // Both fields in ONE request: role first, then the flag.
+    let both_res = patch_json(
+        &fx,
+        &uri,
+        Some(&token),
+        json!({ "role": "issuer", "is_active": false }),
+    )
+    .await;
+    let both_status = both_res.status();
+    let after_both: (String, bool) =
+        sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the user row after the combined patch");
+
+    let audits = audit_rows(&fx).await;
+    // The target tuples ride the same pre-cleanup capture window: the
+    // self-cleaning contract reads everything before cleanup deletes the
+    // audit rows.
+    let targets: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT action, target_type, target_id FROM audit_log WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read the patch audit target tuples");
+
+    fx.cleanup().await;
+
+    assert_eq!(role_status, StatusCode::OK, "the role patch");
+    assert_eq!(role_body["role"], "viewer", "the response carries the role");
+    assert_eq!(
+        role_body["is_active"], true,
+        "an inactive field is untouched"
+    );
+    assert_eq!(after_role, ("viewer".to_string(), true), "the row role");
+
+    assert_eq!(deact_status, StatusCode::OK, "the deactivation");
+    assert!(!after_deact, "is_active flips to FALSE");
+    assert_eq!(act_status, StatusCode::OK, "the reactivation");
+    assert!(after_act, "is_active flips back to TRUE");
+
+    assert_eq!(both_status, StatusCode::OK, "the combined patch");
+    assert_eq!(after_both, ("issuer".to_string(), false));
+
+    // Exactly the five expected audit actions. The first three come from
+    // three separate requests (distinct transaction timestamps, so their
+    // order under `ORDER BY created_at, id` is deterministic); the
+    // combined request's two rows share ONE `created_at` (`now()` is the
+    // transaction timestamp), so their relative order is decided by a
+    // caller-chosen UUIDv4 tie-break — asserted as a SET with per-action
+    // details, never positionally.
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions.len(),
+        5,
+        "exactly the five patch audit rows: {audits:?}"
+    );
+    assert_eq!(
+        actions[..3],
+        ["user_role_changed", "user_deactivated", "user_activated"],
+        "the single-field requests' audit rows in order: {audits:?}"
+    );
+    let combined_actions: std::collections::BTreeSet<&str> = actions[3..].iter().copied().collect();
+    assert_eq!(
+        combined_actions,
+        ["user_role_changed", "user_deactivated"]
+            .into_iter()
+            .collect(),
+        "the combined request's two audit rows, order aside: {audits:?}"
+    );
+    // The role rows carry from/to exactly; the flag rows are empty-detail.
+    assert_eq!(
+        audits[0].3,
+        json!({ "from": "issuer", "to": "viewer" }),
+        "the first role change's from/to"
+    );
+    assert_eq!(audits[1].3, json!({}), "user_deactivated");
+    assert_eq!(audits[2].3, json!({}), "user_activated");
+    for row in &audits[3..] {
+        match row.0.as_str() {
+            "user_role_changed" => assert_eq!(
+                row.3,
+                json!({ "from": "viewer", "to": "issuer" }),
+                "the combined request's role change details"
+            ),
+            "user_deactivated" => assert_eq!(row.3, json!({}), "the combined deactivate"),
+            other => panic!("unexpected audit action in the combined pair: {other}"),
+        }
+    }
+
+    // Every patch audit row targets the patched user with target_type
+    // "user" (the target tuple the route's audit entries carry; read back
+    // directly because the `audit_rows` helper does not select it).
+    assert_eq!(targets.len(), 5, "one audit row per audit_rows row");
+    assert!(
+        targets
+            .iter()
+            .all(|(_, target_type, target_id)| target_type == "user"
+                && *target_id == user_id.to_string()),
+        "every patch audit row targets the patched user: {targets:?}"
+    );
+}
+
+/// The last-admin guard on a ROLE change: the fixture's single active
+/// admin demoting themselves is refused 409 with the exact message; the
+/// row keeps its role; no audit rows are written.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn last_admin_role_demotion_refused() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    // The fixture admin is the tenant's only active admin, and the
+    // acting actor on its own account: the tenant-wide count refuses
+    // regardless of who is acting.
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({ "role": "viewer" }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the demotion refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// The same last-admin guard on an ACTIVATION change: `is_active: false`
+/// onto the tenant's only active admin is refused the same way.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn last_admin_deactivation_refused() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({ "is_active": false }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the deactivation refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// An empty PATCH body (`{}`) names no change at all: 400 with code
+/// `bad_request` and the fixed "nothing to update" message.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_patch_requires_payload() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the empty body");
+    assert_eq!(error_code(&body), "bad_request");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "nothing to update"
+    );
+}
+
+/// An unknown user id and another tenant's user id are both 404,
+/// indistinguishably (the PATCH body is otherwise valid).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_patch_unknown_and_foreign_ids_are_404() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let unknown_status = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", Uuid::new_v4()),
+        Some(&token),
+        json!({ "role": "viewer" }),
+    )
+    .await
+    .status();
+
+    // Another tenant's user, swept-then-seeded like the profile suite's
+    // foreign rows.
+    let foreign_name = "rt-api-foreign-user";
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user audit rows");
+    sqlx::query(
+        "DELETE FROM users WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-user tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-user tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_user = Uuid::new_v4();
+    insert_user(
+        &fx.pool,
+        foreign_tenant,
+        foreign_user,
+        "foreign-user",
+        Role::Viewer,
+    )
+    .await;
+    let foreign_status = patch_json(
+        &fx,
+        &format!("/api/v1/users/{foreign_user}"),
+        Some(&token),
+        json!({ "role": "admin" }),
+    )
+    .await
+    .status();
+
+    fx.cleanup().await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
 }

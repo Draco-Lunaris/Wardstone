@@ -19,6 +19,27 @@
 //! 8. the setup route is GONE (unmounted, a plain 404) once a tenant
 //!    exists.
 //!
+//! Task 19 adds TWO further DB-gated tests — the BROWSER-EQUIVALENT path
+//! over ws-web's composed front door (ws-web's setup surface, `/auth/ui`
+//! session relay, and `/api/v1` proxy against ws-api's REAL router on an
+//! in-process loopback listener, the session_test idiom):
+//!
+//! - `ui_session_end_to_end` — first-run setup through the composed
+//!   router, then the browser's day: the UI login (four cookie flags, an
+//!   identity body shaped to the EXACT MeResponse key set), cookie-only
+//!   proxied reads and writes (profile list, CSR issuance, a typed-reason
+//!   revocation, the trust chain, the estate statistics), the logout
+//!   (cookie cleared, the revoked server-side), and the dead session's
+//!   401 — with EVERY response body swept for `ws_rt_`/`ws_at_`/
+//!   `Bearer ` (the token boundary: the browser never holds a token).
+//! - `ui_oidc_end_to_end` — the generic-provider SSO round trip against
+//!   `common/oidc_provider.rs` (the Task 19 loopback provider fixture:
+//!   an openssl-generated RSA keypair and a genuinely RS256-signed
+//!   id_token): the config PUT through the proxy, the start redirect to
+//!   the fixture's authorization endpoint, the callback's code exchange
+//!   into a session, the on-the-fly SSO account, and a second round trip
+//!   resolving BY the stored subject.
+//!
 //! Run against the shared dev Postgres:
 //!
 //! ```sh
@@ -47,11 +68,12 @@
 //! together, before any of the suite's own rows are written and after
 //! the last of them is deleted.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -63,7 +85,15 @@ use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 
 use ws_api::state::{ApiConfig, AppState};
+use ws_web::session::store::SessionStore;
+use ws_web::session::{CSRF_HEADER_NAME, CSRF_HEADER_VALUE, SESSION_COOKIE};
 use ws_web::setup::{self, SetupFields, SetupState};
+
+// Task 19's shared fixture: the loopback OIDC provider stub
+// (tests/common/oidc_provider.rs).
+mod common;
+
+use common::oidc_provider::{OidcProvider, CODE};
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
 /// plus this suite's marker 0x0011 (the e2e suite's allocation; the other
@@ -284,6 +314,232 @@ fn mint_csr(cn: &str, names: &[&str]) -> String {
     csr.pem().unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// Task 19: the composed-front-door stack (ws-api on loopback + ws-web)
+// ---------------------------------------------------------------------------
+
+/// ws-api's REAL router on an ephemeral loopback listener (plain HTTP),
+/// built over the SAME pool and keys directory the setup bootstrapped —
+/// its base URL is what ws-web's proxy and session relay target (the
+/// session_test in-process idiom; the listener carries real routing).
+async fn spawn_api_router(pool: &PgPool, keys_dir: &std::path::Path) -> String {
+    let jwt = Arc::new(
+        ws_auth::jwt::JwtKeys::load_or_create(keys_dir).expect("load or create the JWT key pair"),
+    );
+    let config = ApiConfig::new(DOMAIN.to_string(), keys_dir.to_path_buf());
+    let state = AppState::new(pool.clone(), jwt, config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the loopback ws-api listener");
+    let addr = listener.local_addr().expect("the listener's local address");
+    tokio::spawn(async move {
+        axum::serve(listener, ws_api::router(state))
+            .await
+            .expect("serve the ws-api router");
+    });
+    format!("http://{addr}")
+}
+
+/// ws-web's composed front door (relay + proxy + SPA fallback) pointed at
+/// `api_base`: the production 15-minute session TTL, and NO per-IP rate
+/// limiter (in-process oneshot requests carry no `ConnectInfo` — the
+/// session_test reasoning).
+async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Router {
+    ws_web::web_router_with_store(
+        pool.clone(),
+        keys_dir.to_path_buf(),
+        PAGE_FINGERPRINT.to_string(),
+        HOSTNAME.to_string(),
+        api_base,
+        Arc::new(SessionStore::new(ws_web::DEFAULT_SESSION_TTL)),
+        None,
+    )
+    .await
+    .expect("build the composed front-door router")
+}
+
+/// The FIRST-RUN SETUP driven through the composed front door itself (the
+/// browser's POST /setup), and the RESTARTED front door after it. A
+/// Router's setup mounting is decided at BUILD time (`web_router`'s
+/// `tenant_exists` check), so the real lifecycle is two builds: the
+/// pre-setup build serves the POST, the binary self-exits per the setup
+/// contract, and the post-setup build is the restarted door the browser
+/// flow runs on. Returns the post-setup router and the setup body's text.
+async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
+    let api_base = spawn_api_router(&fixture.pool, &fixture.keys_dir).await;
+    let pre_setup = front(&fixture.pool, &fixture.keys_dir, &api_base).await;
+    let fields = SetupFields {
+        admin_username: "admin".to_string(),
+        admin_password: ADMIN_PASSWORD.to_string(),
+        default_domain: DOMAIN.to_string(),
+        admin_cidrs: vec!["10.0.0.0/8".to_string()],
+        server_hostname: HOSTNAME.to_string(),
+    };
+    let response = web_request(
+        &pre_setup,
+        Method::POST,
+        "/setup",
+        None,
+        false,
+        Some(serde_json::to_value(&fields).expect("the setup fields must serialize")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+    let setup_body = body_str(response).await;
+    let parsed = parse_json(&setup_body);
+    assert_eq!(parsed["status"], "ok", "the setup submit reports success");
+    assert_eq!(
+        parsed["restart"], true,
+        "the setup submit carries the restart contract (the ui process exits so \
+         compose brings it back on the CA-issued leaf)"
+    );
+    let web = front(&fixture.pool, &fixture.keys_dir, &api_base).await;
+    (web, setup_body)
+}
+
+/// The setup admin's login through the UI relay: 200 with the identity
+/// ONLY (the exact MeResponse key set, zero token fields — the shape pin
+/// that makes the token boundary structural, not just swept), and the
+/// cookie with all four flags. Returns the session id and the body text.
+async fn ui_login_admin(web: &Router) -> (Uuid, String) {
+    let response = web_request(
+        web,
+        Method::POST,
+        "/auth/ui/login",
+        None,
+        true,
+        Some(json!({"username": "admin", "password": ADMIN_PASSWORD})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the UI login succeeds");
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("the login sets the session cookie")
+        .to_str()
+        .expect("the cookie value is ASCII")
+        .to_owned();
+    assert!(
+        set_cookie.starts_with(&format!("{SESSION_COOKIE}=")),
+        "the cookie is the session cookie: {set_cookie}"
+    );
+    assert_cookie_flags(&set_cookie);
+    let text = body_str(response).await;
+    let body = parse_json(&text);
+    let expected_keys: HashSet<String> = [
+        "actor_type",
+        "actor_id",
+        "tenant_id",
+        "capabilities",
+        "username",
+        "display_name",
+        "role",
+        "mfa_enabled",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let got_keys: HashSet<String> = body
+        .as_object()
+        .expect("the login body is a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        got_keys, expected_keys,
+        "the login body is the identity only"
+    );
+    assert_eq!(body["username"], "admin");
+    assert_eq!(body["role"], "admin");
+    assert_eq!(body["actor_type"], "user");
+    (session_id_of(&set_cookie), text)
+}
+
+/// Drive one request through a router via `tower`'s oneshot (the
+/// session_test idiom): an optional session cookie, the CSRF marker the
+/// cookie-carrying mutating routes demand, a JSON body.
+async fn web_request(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: bool,
+    json_body: Option<Value>,
+) -> axum::http::Response<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if csrf {
+        builder = builder.header(CSRF_HEADER_NAME, CSRF_HEADER_VALUE);
+    }
+    let request = match json_body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("build the JSON request"),
+        None => builder.body(Body::empty()).expect("build the request"),
+    };
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router should respond")
+}
+
+/// Read a response body as text (the form the token-boundary sweep scans).
+async fn body_str(response: axum::http::Response<Body>) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 4 << 20)
+        .await
+        .expect("read the response body");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Parse a body's text as JSON (used after the text joined the sweep).
+fn parse_json(text: &str) -> Value {
+    serde_json::from_str(text).expect("the response body is JSON")
+}
+
+/// The raw `Cookie` header value presenting `id` as the session.
+fn cookie_raw(id: &Uuid) -> String {
+    format!("{SESSION_COOKIE}={id}")
+}
+
+/// The session id a successful login's `Set-Cookie` line carries.
+fn session_id_of(set_cookie: &str) -> Uuid {
+    let pair = set_cookie.split(';').next().expect("the cookie pair");
+    let value = pair
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
+        .expect("the cookie carries the session id");
+    Uuid::parse_str(value).expect("the cookie value is a session uuid")
+}
+
+/// The four cookie flags the relay pins, asserted on a `Set-Cookie` line.
+fn assert_cookie_flags(set_cookie: &str) {
+    for flag in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
+        assert!(
+            set_cookie.contains(flag),
+            "the cookie carries {flag}: {set_cookie}"
+        );
+    }
+}
+
+/// THE token-boundary assertion: no response body of the flow carries
+/// session or API-token material — the `ws_rt_` refresh-prefix, the
+/// `ws_at_` API-token-prefix, the `Bearer ` scheme word (the injected
+/// header's wire form), or any extra fixture-named marker.
+fn assert_token_boundary(bodies: &[String], extra_markers: &[&str]) {
+    let joined = bodies.join("\n");
+    let mut markers: Vec<&str> = vec!["ws_rt_", "ws_at_", "Bearer "];
+    markers.extend(extra_markers.iter().copied());
+    for marker in markers {
+        assert!(
+            !joined.contains(marker),
+            "a response body carries {marker:?} — the browser must never hold token material"
+        );
+    }
+}
+
 /// The end-to-end scenario, in this exact order (see the module docs).
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
@@ -452,7 +708,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         &router,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&access),
-        json!({"reason": "e2e smoke revocation"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK, "revoke the leaf");
@@ -477,8 +733,8 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         "the revoked leaf carries its revocation timestamp"
     );
     assert_eq!(
-        read_back["revocation_reason"], "e2e smoke revocation",
-        "the revoked leaf carries the reason"
+        read_back["revocation_reason"], "key_compromise",
+        "the revoked leaf carries the typed reason name"
     );
 
     // -- 7. A service identity's API token issues a second leaf --------------
@@ -551,6 +807,8 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         "http://127.0.0.1:9", // intentionally nothing listens here
+        ws_web::DEFAULT_SESSION_TTL,
+        None, // no rate limiter on the front-door suites' routers
     )
     .await
     .expect("the front-door router builds after setup");
@@ -717,6 +975,661 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         cert_id2.to_string(),
         "the API-token issuance row targets the second leaf"
     );
+}
+
+/// Task 19's main pin: the UI SESSION path end to end, over the REAL
+/// ws-api behind ws-web's composed front door. The setup runs through
+/// the composed router itself; everything after it is the browser's day:
+/// the cookie-flag login, cookie-only proxied reads and writes, the
+/// typed-reason revocation, the chain, the statistics, the logout, and
+/// the dead session's refusal — with EVERY response body swept for token
+/// material (the browser must never hold `ws_rt_`/`ws_at_`/`Bearer `).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ui_session_end_to_end() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // -- 1. First-run setup through the composed front door ------------------
+    let (web, setup_body) = setup_and_restarted_front(&fixture).await;
+    let mut bodies = vec![setup_body];
+
+    // The restarted door's setup surface is REPLACED (the unmounted
+    // router), so a POST that slips through — a stale bookmark — gets the
+    // plain 404 the setup/e2e suites pin: not refused, not routed at all.
+    let late_fields = SetupFields {
+        admin_username: "admin".to_string(),
+        admin_password: ADMIN_PASSWORD.to_string(),
+        default_domain: DOMAIN.to_string(),
+        admin_cidrs: vec!["10.0.0.0/8".to_string()],
+        server_hostname: HOSTNAME.to_string(),
+    };
+    let response = web_request(
+        &web,
+        Method::POST,
+        "/setup",
+        None,
+        false,
+        Some(serde_json::to_value(&late_fields).expect("the setup fields must serialize")),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the setup POST is not routed once a tenant exists"
+    );
+
+    // -- 2. The UI login: a cookie, an identity, and NO token ----------------
+    let (session_id, login_body) = ui_login_admin(&web).await;
+    bodies.push(login_body);
+    let cookie = cookie_raw(&session_id);
+
+    // -- 3. Cookie-only proxied reads: me, then the built-in profiles -------
+    // (the cookie in; ws-web injects the stored bearer — the browser never
+    // sees it — so every body from here joins the boundary sweep).
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the cookie session authenticates through injection"
+    );
+    let text = body_str(response).await;
+    let me = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(me["username"], "admin", "the injected identity resolved");
+    assert!(
+        me["tenant_id"].is_string() && me["actor_id"].is_string(),
+        "the identity carries its tenant and actor ids: {me}"
+    );
+
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/profiles",
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the profiles list reads");
+    let text = body_str(response).await;
+    let profiles = parse_json(&text);
+    bodies.push(text);
+    let profiles = profiles
+        .as_array()
+        .expect("the profiles list is a JSON array");
+    assert_eq!(
+        profiles.len(),
+        2,
+        "setup's two built-in profiles are all there is: {profiles:?}"
+    );
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile["name"] == "web-server"),
+        "the built-in web-server profile is present: {profiles:?}"
+    );
+    let profile_id: Uuid = profiles
+        .iter()
+        .find(|profile| profile["name"] == "web-server-ecdsa")
+        .and_then(|profile| profile["id"].as_str())
+        .expect("the built-in web-server-ecdsa profile is present")
+        .parse()
+        .expect("the profile id is a UUID");
+
+    // -- 4. Issue a leaf through the proxied POST (the CSR path) -------------
+    // The CSRF marker rides too — it is what the UI's own fetch sends, and
+    // what the proxy's rule demands of any cookie-carrying mutation.
+    let cn = "svc.wardstone-e2e.test";
+    let response = web_request(
+        &web,
+        Method::POST,
+        "/api/v1/certificates",
+        Some(&cookie),
+        true,
+        Some(json!({
+            "profile_id": profile_id,
+            "subject_cn": cn,
+            "sans": [cn],
+            "csr_pem": mint_csr(cn, &[cn])
+        })),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the proxied CSR issuance succeeds (the dual-path POST answers 200 \
+         through json_no_store — not 201)"
+    );
+    let text = body_str(response).await;
+    let issued = parse_json(&text);
+    bodies.push(text);
+    let cert_id: Uuid = issued["certificate_id"]
+        .as_str()
+        .expect("the issuance response carries the certificate id")
+        .parse()
+        .expect("the certificate id is a UUID");
+    assert!(
+        issued.get("private_key_pem").is_none(),
+        "the CSR path returns no private key (the CSR holder keeps it)"
+    );
+    let cert_pem: String = issued["cert_pem"]
+        .as_str()
+        .expect("the issuance response carries the certificate PEM")
+        .to_string();
+
+    // -- 5. Revoke with the TYPED reason (the Plan-2 API shape) --------------
+    let response = web_request(
+        &web,
+        Method::POST,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&cookie),
+        true,
+        Some(json!({"reason": "superseded", "detail": "replacing"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the revocation succeeds");
+    let text = body_str(response).await;
+    let revoked = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(
+        revoked["status"], "revoked",
+        "the revoke response reports the new status"
+    );
+    assert_eq!(
+        revoked["detail"], "replacing",
+        "the free-text detail travels the typed-reason request"
+    );
+
+    // -- 6. Read-back: the typed reason survives the round trip --------------
+    let response = web_request(
+        &web,
+        Method::GET,
+        &format!("/api/v1/certificates/{cert_id}"),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "read the revoked leaf");
+    let text = body_str(response).await;
+    let detail = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(detail["status"], "revoked");
+    assert!(
+        !detail["revoked_at"].is_null(),
+        "the revoked leaf carries its revocation timestamp"
+    );
+    assert_eq!(
+        detail["revocation_reason"], "superseded",
+        "the TYPED reason name, not free text"
+    );
+    assert_eq!(
+        detail["revocation_detail"], "replacing",
+        "the detail is stored verbatim"
+    );
+
+    // -- 7. The trust chain: leaf-first PEM -----------------------------------
+    let response = web_request(
+        &web,
+        Method::GET,
+        &format!("/api/v1/certificates/{cert_id}/chain"),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the chain reads");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str().expect("the content type is ASCII"))
+            .expect("the chain carries a content type"),
+        "application/x-pem-file",
+        "the chain is a PEM body"
+    );
+    let chain = body_str(response).await;
+    bodies.push(chain.clone());
+    assert!(
+        chain.matches("-----BEGIN CERTIFICATE-----").count() >= 2,
+        "the chain carries the leaf and its issuing root"
+    );
+    assert!(
+        chain.contains(&cert_pem),
+        "the chain is leaf-first (the issued PEM comes first)"
+    );
+
+    // -- 8. The estate statistics agree with what just happened -------------
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/certificates/statistics",
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the statistics read");
+    let text = body_str(response).await;
+    let statistics = parse_json(&text);
+    bodies.push(text);
+    // The fresh tenant's whole estate: the setup's CA-issued server leaf
+    // is the one ACTIVE row; the leaf this flow just revoked is the one
+    // REVOKED row.
+    assert_eq!(
+        statistics["active"], 1,
+        "the one active certificate is setup's server leaf: {statistics}"
+    );
+    assert_eq!(
+        statistics["revoked"], 1,
+        "the one revoked certificate is this flow's leaf: {statistics}"
+    );
+
+    // -- 9. Logout: revokes server-side, clears the cookie -------------------
+    let response = web_request(
+        &web,
+        Method::POST,
+        "/auth/ui/logout",
+        Some(&cookie),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "logout succeeds");
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("logout clears the cookie")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert!(
+        set_cookie.starts_with(&format!("{SESSION_COOKIE}=;")),
+        "the logout clears the cookie: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("Max-Age=0"),
+        "the cleared cookie carries Max-Age=0: {set_cookie}"
+    );
+    assert_cookie_flags(&set_cookie);
+
+    // -- 10. The dead session stays dead --------------------------------------
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "the cleared session cannot authenticate a new request"
+    );
+    let text = body_str(response).await;
+    bodies.push(text.clone());
+    assert_eq!(
+        parse_json(&text)["error"]["code"],
+        "unauthorized",
+        "ws-api's own error envelope passes through: {text}"
+    );
+
+    // -- 11. THE token boundary: no body of the WHOLE flow carries a token ---
+    assert_token_boundary(&bodies, &[]);
+
+    fixture.cleanup().await;
+}
+
+/// Task 19's second pin: the GENERIC-PROVIDER OIDC round trip through
+/// every seam. The provider is `common/oidc_provider.rs` — a loopback
+/// stub whose RSA keypair is generated at test time (the `openssl` CLI,
+/// the house pattern) and whose id_token is genuinely RS256-signed — so
+/// ws-api's REAL discovery/token-exchange/JWKS-verification runs, not a
+/// mock.
+///
+/// The account-resolution decision this test documents (ws-api HEAD,
+/// `routes/auth.rs::resolve_oidc_user`): match by stored `oidc_sub`
+/// first; link by email ONLY when the provider verifies it; CREATE
+/// otherwise. The fixture identity carries an email no seeded user holds
+/// (with `email_verified: true`), so the flow takes the CREATE path: a
+/// least-privilege `viewer` with `auth_provider = "oidc"` and the subject
+/// stored — NOT a link into the admin (whose row stays `local` and
+/// subject-less). The second round trip then resolves BY the stored
+/// subject: no second account is created.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ui_oidc_end_to_end() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // -- The loopback provider fixture ---------------------------------------
+    let client_id = "wardstone-ui-e2e";
+    let subject = "ws-oidc-sub-e2e-0001";
+    let email = "sso.user@wardstone-e2e.test";
+    let name = "sso.user"; // username_for sanitizes to exactly this
+    let provider = OidcProvider::spawn(client_id, subject, email, name);
+
+    // -- Setup through the composed front door, then the admin's session ----
+    let (web, setup_body) = setup_and_restarted_front(&fixture).await;
+    let mut bodies = vec![setup_body];
+    let (admin_session, login_body) = ui_login_admin(&web).await;
+    bodies.push(login_body);
+    let cookie = cookie_raw(&admin_session);
+
+    // -- Seed the provider config THROUGH the proxy ---------------------------
+    // The ManageSystem PUT rides the admin's cookie session (injected
+    // bearer + the CSRF marker); the discovery_url is the fixture's.
+    let response = web_request(
+        &web,
+        Method::PUT,
+        "/api/v1/oidc/config",
+        Some(&cookie),
+        true,
+        Some(json!({
+            "provider_type": "custom",
+            "display_name": "House OIDC (e2e fixture)",
+            "discovery_url": provider.discovery_url(),
+            "client_id": client_id,
+            "client_secret": "ws_test_secret_material",
+            "redirect_uri": format!("https://{HOSTNAME}/auth/ui/oidc/custom/callback"),
+            "scopes": "openid profile email",
+        })),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the provider config seeds through the proxied PUT"
+    );
+    let text = body_str(response).await;
+    let config = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(config["provider_type"], "custom");
+    assert_eq!(
+        config["client_secret_set"], true,
+        "the read shape reports a stored secret"
+    );
+    assert!(
+        config.get("client_secret").is_none(),
+        "the secret never leaves the server: {config}"
+    );
+
+    // The login-page's SSO flag, relayed PUBLICLY (a fresh browser's very
+    // first request, no session): configured, under the provider label
+    // the start route resolves.
+    let response = web_request(&web, Method::GET, "/auth/ui/config", None, false, None).await;
+    assert_eq!(response.status(), StatusCode::OK, "the flag reads pre-auth");
+    let text = body_str(response).await;
+    let flag = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(flag["oidc_configured"], true);
+    assert_eq!(
+        flag["provider"], "custom",
+        "the relay answers the provider-type label"
+    );
+
+    // -- The start: a verbatim 303 to the fixture's authorize endpoint -------
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/auth/ui/oidc/custom/start",
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "ws-api's Redirect::to is a 303, passed through untouched"
+    );
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("the redirect carries its Location")
+        .to_str()
+        .expect("the location is ASCII")
+        .to_owned();
+    assert!(
+        location.starts_with(&provider.authorization_endpoint()),
+        "the location IS the fixture's authorization endpoint: {location}"
+    );
+    for piece in [
+        "response_type=code",
+        "client_id=wardstone-ui-e2e",
+        "scope=openid",
+        "redirect_uri=",
+        HOSTNAME,
+    ] {
+        assert!(
+            location.contains(piece),
+            "the minted URL carries {piece}: {location}"
+        );
+    }
+    assert!(
+        !location.contains("client_secret"),
+        "the secret never travels in the authorization URL: {location}"
+    );
+    let state = location
+        .split("state=")
+        .nth(1)
+        .unwrap_or_default()
+        .split('&')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!state.is_empty(), "ws-api minted a nonempty csrf state");
+
+    // -- The callback: exchange at the fixture, session minted, 303 to / -----
+    // The provider bounces the browser HERE (the config's redirect_uri
+    // host), carrying the code and ws-api's own state.
+    let response = web_request(
+        &web,
+        Method::GET,
+        &format!("/auth/ui/oidc/custom/callback?code={CODE}&state={state}"),
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the exchange succeeded and the relay mints the session"
+    );
+    let back = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("the callback redirects")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert_eq!(back, "/", "the successful callback lands on the SPA root");
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("the callback sets the session cookie")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE}=")));
+    assert_cookie_flags(&set_cookie);
+    let sso_session = session_id_of(&set_cookie);
+
+    // -- The OIDC session resolves the created account ------------------------
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&cookie_raw(&sso_session)),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the SSO session authenticates through injection"
+    );
+    let text = body_str(response).await;
+    let me = parse_json(&text);
+    bodies.push(text);
+    assert_eq!(
+        me["username"], name,
+        "the created account answers with its sanitized username"
+    );
+    assert_eq!(
+        me["role"], "viewer",
+        "the on-the-fly account is the LEAST-PRIVILEGE role"
+    );
+    assert_eq!(me["actor_type"], "user");
+
+    // -- The account, read DIRECTLY from the DB -------------------------------
+    // The CREATE path's shape: the subject stored, `oidc` as the
+    // provider, the fixture email as the unique identifier.
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT username, role, auth_provider, email FROM users WHERE oidc_sub = $1",
+    )
+    .bind(subject)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read the subject-linked user rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one account carries the subject: {rows:?}"
+    );
+    assert_eq!(
+        rows[0],
+        (
+            name.to_string(),
+            "viewer".to_string(),
+            "oidc".to_string(),
+            email.to_string()
+        ),
+        "the created account is the SSO identity, least-privilege"
+    );
+
+    // The admin's own account is NOT linked (the email never matched, and
+    // nothing in the flow links without a match): still local, still
+    // subject-less.
+    let (admin_sub, admin_provider): (Option<String>, String) = sqlx::query_as(
+        "SELECT oidc_sub, auth_provider FROM users WHERE username = 'admin' \
+         AND tenant_id = (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(setup::DEFAULT_TENANT_NAME)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read the setup admin row");
+    assert!(
+        admin_sub.is_none(),
+        "the admin's account is not linked by the SSO flow: {admin_sub:?}"
+    );
+    assert_eq!(admin_provider, "local");
+
+    // -- Second round trip: resolution BY the stored subject ------------------
+    // The linkage `resolve_oidc_user` does on the FIRST login now short-
+    // circuits every later one: the same subject finds the SAME account,
+    // creating no duplicate.
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/auth/ui/oidc/custom/start",
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("the second start redirects")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let state_two = location
+        .split("state=")
+        .nth(1)
+        .unwrap_or_default()
+        .split('&')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !state_two.is_empty() && state_two != state,
+        "a fresh state mints per start (never reused): {state_two}"
+    );
+    let response = web_request(
+        &web,
+        Method::GET,
+        &format!("/auth/ui/oidc/custom/callback?code={CODE}&state={state_two}"),
+        None,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the second exchange resolves by the stored subject"
+    );
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("the second callback sets the cookie")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let second_session = session_id_of(&set_cookie);
+    let response = web_request(
+        &web,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&cookie_raw(&second_session)),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The second round trip's body joins the sweep too: the token-boundary
+    // claim at the test's end is exhaustive only if EVERY body the flow
+    // produced is in the set — this /me was the one straggler.
+    let me_text = body_str(response).await;
+    bodies.push(me_text.clone());
+    let me = parse_json(&me_text);
+    assert_eq!(
+        me["username"], name,
+        "the same account answers the second round trip"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE oidc_sub = $1")
+        .bind(subject)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the subject-linked users");
+    assert_eq!(
+        count, 1,
+        "the by-subject resolution created no duplicate account"
+    );
+
+    // -- THE token boundary: no body of the flow carries token material ------
+    // The fixture's own provider-side access token is an extra named
+    // marker: if it ever leaked into a browser-facing body, the boundary
+    // is broken even though it carries no ws_ prefix.
+    assert_token_boundary(&bodies, &[common::oidc_provider::FIXTURE_ACCESS_TOKEN]);
+
+    fixture.cleanup().await;
 }
 
 /// The front-door POST /setup's status (the GET was driven separately

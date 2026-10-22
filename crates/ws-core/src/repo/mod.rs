@@ -4,6 +4,7 @@ pub mod audit_repo;
 pub mod ca_repo;
 pub mod certificate_repo;
 pub mod credential_repo;
+pub mod crl_repo;
 pub mod ocsp_repo;
 pub mod oidc_repo;
 pub mod profile_repo;

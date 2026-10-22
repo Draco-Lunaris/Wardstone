@@ -1,14 +1,16 @@
-//! The user-management routes: list, create, deactivate.
+//! The user-management routes: list, create, patch, deactivate.
 //!
 //! Route capabilities (the plan's table): the list is `read_users`, the
-//! create and the deactivate are `manage_users`. The create and the
-//! deactivate write their `user_created` / `user_deactivated` audit rows
-//! in the SAME transaction as the change. User responses never carry
-//! password hashes or sealed MFA material.
+//! create, patch, and deactivate are `manage_users`. The create, patch,
+//! and deactivate write their `user_created` / `user_role_changed` /
+//! `user_activated` / `user_deactivated` audit rows in the SAME
+//! transaction as the change. User responses never carry password hashes
+//! or sealed MFA material.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,11 +29,13 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create_user).get(list_users))
+        .route("/{id}", patch(patch_user))
         .route("/{id}/deactivate", post(deactivate_user))
 }
 
 /// One user, as a read DTO — no password hash, no sealed MFA bytes.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct UserResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -68,6 +72,7 @@ impl UserResponse {
 
 /// The create body: a local account with a password (hashed argon2id).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateUserBody {
     pub username: String,
     #[serde(default)]
@@ -197,6 +202,156 @@ async fn deactivate_user(
         .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The body of the patch route: either or both fields. The role is the
+/// serde [`Role`] directly — any unknown spelling is a serde rejection
+/// into the extractor, mapped to 400 `bad_request` (never axum's default
+/// 422 rejection, whose body shape the SPA's error handling cannot read —
+/// the house idiom the revoke route pinned).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UpdateUserBody {
+    #[serde(default)]
+    pub role: Option<Role>,
+    #[serde(default)]
+    pub is_active: Option<bool>,
+}
+
+/// `PATCH /api/v1/users/{id}` — `manage_users`: role assignment and
+/// account activation in one route. A `role` change writes
+/// `user_role_changed` (details `{"from": ..., "to": ...}`);
+/// `is_active: false` is the [`UserRepo::deactivate`] path with the
+/// existing `user_deactivated` row; `is_active: true` is the
+/// [`UserRepo::set_active`] path with the NEW `user_activated` row. Both
+/// fields in one request apply role first, then the flag — in ONE
+/// transaction, so every audit row commits or rolls back with the change.
+/// A field naming the state the user already has is a no-op (no second
+/// audit row), mirroring the deactivate route's idempotence; re-activation
+/// has no special cases beyond the boolean — an SSO/OAuth identity returns
+/// to the login path with its provider linkage untouched, because the
+/// `users` row carries one `is_active` flag.
+///
+/// The last-admin guard [plan binding]: a change that would leave ZERO
+/// active `Admin` users in the tenant (the role out of `Admin`, or
+/// `is_active: false` onto an active admin) is refused `409` with the
+/// fixed message. The count runs INSIDE the same transaction as the
+/// update, but it is a NON-LOCKING read: under READ COMMITTED, two
+/// concurrent PATCHes demoting two DIFFERENT active admins can each count
+/// 2, both pass the guard, and both commit — leaving zero active admins.
+/// That residual race is accepted (the single-operator UI cannot issue
+/// two concurrent admin demotions against itself; a `FOR UPDATE` locking
+/// count was considered and parked for the final review's triage, so only
+/// the pinned in-transaction count is here). The acting actor may change
+/// or deactivate THEMSELVES when they are not the last admin — the count
+/// is tenant-wide, not actor-relative. Another tenant's user (or an
+/// absent one) is a 404, indistinguishably.
+async fn patch_user(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Result<Json<UpdateUserBody>, JsonRejection>,
+) -> Result<Json<UserResponse>, ApiError> {
+    auth.require(Capability::ManageUsers)
+        .map_err(ApiError::from)?;
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        code: "bad_request",
+        message: rejection.body_text(),
+    })?;
+    let UpdateUserBody { role, is_active } = body;
+    if role.is_none() && is_active.is_none() {
+        return Err(ApiError::bad_request("nothing to update"));
+    }
+
+    // Tenant-scoped resolve: the row feeds the audit's `from`, the guard
+    // condition, and the idempotence no-ops; a foreign or absent user is
+    // a 404, indistinguishably.
+    let user = UserRepo::new()
+        .get_by_id(&state.pool, id)
+        .await?
+        .filter(|user| user.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
+
+    // Whether the requested change removes this row from the ACTIVE admin
+    // pool: the count is only ever needed for exactly that case.
+    let removes_active_admin = user.role == Role::Admin
+        && user.is_active
+        && (role.is_some_and(|new_role| new_role != Role::Admin) || is_active == Some(false));
+
+    let mut tx = state.pool.begin().await?;
+    if removes_active_admin {
+        let active_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users \
+             WHERE tenant_id = $1 AND role = 'admin' AND is_active = TRUE",
+        )
+        .bind(auth.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_admins <= 1 {
+            return Err(ApiError::Conflict(
+                "refusing to remove the last active administrator".to_string(),
+            ));
+        }
+    }
+
+    // Role first, then the flag; the audit rows ride the same tx.
+    if let Some(new_role) = role.filter(|new_role| *new_role != user.role) {
+        UserRepo::new().update_role(&mut *tx, id, new_role).await?;
+        AuditRepo::new()
+            .record(
+                &mut *tx,
+                &audit_entry(
+                    &auth.0,
+                    "user_role_changed",
+                    "user",
+                    &id.to_string(),
+                    serde_json::json!({
+                        "from": user.role.as_str(),
+                        "to": new_role.as_str()
+                    }),
+                ),
+            )
+            .await?;
+    }
+    if let Some(active) = is_active {
+        if active && !user.is_active {
+            UserRepo::new().set_active(&mut *tx, id, true).await?;
+            AuditRepo::new()
+                .record(
+                    &mut *tx,
+                    &audit_entry(
+                        &auth.0,
+                        "user_activated",
+                        "user",
+                        &id.to_string(),
+                        serde_json::json!({}),
+                    ),
+                )
+                .await?;
+        } else if !active && user.is_active {
+            UserRepo::new().deactivate(&mut *tx, id).await?;
+            AuditRepo::new()
+                .record(
+                    &mut *tx,
+                    &audit_entry(
+                        &auth.0,
+                        "user_deactivated",
+                        "user",
+                        &id.to_string(),
+                        serde_json::json!({}),
+                    ),
+                )
+                .await?;
+        }
+    }
+    tx.commit().await?;
+
+    // A fresh read after the commit, the shape list/create respond with.
+    let fresh = UserRepo::new()
+        .get_by_id(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
+    Ok(Json(UserResponse::of(&fresh)))
 }
 
 /// `GET /api/v1/users` — `read_users`.

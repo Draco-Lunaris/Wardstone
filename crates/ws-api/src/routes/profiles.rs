@@ -31,13 +31,17 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create_profile).get(list_profiles))
-        .route("/{id}", get(get_profile).put(update_profile))
+        .route(
+            "/{id}",
+            get(get_profile).put(update_profile).delete(delete_profile),
+        )
         .route("/{id}/revisions", get(list_revisions))
 }
 
 /// The profile policy body (create carries `name`; update revises the
 /// policy of an existing profile and keeps its name).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ProfileBody {
     pub name: Option<String>,
     #[serde(default)]
@@ -59,6 +63,7 @@ pub struct ProfileBody {
 
 /// One profile revision, as a DTO.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevisionResponse {
     pub id: Uuid,
     pub profile_id: Uuid,
@@ -95,6 +100,7 @@ impl RevisionResponse {
 
 /// One profile and its current revision.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ProfileResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -327,6 +333,63 @@ async fn update_profile(
         current_revision: Some(RevisionResponse::of(&revision)),
         created_at: revision.created_at,
     }))
+}
+
+/// `DELETE /api/v1/profiles/{id}` — `manage_profiles`. Deletes the
+/// profile (its `profile_revisions` rows go ON DELETE CASCADE) and writes
+/// the `profile_deleted` audit row in the SAME transaction.
+///
+/// The refusal is an explicit pre-read, not a mapped foreign-key error:
+/// while ANY certificate (active or revoked — history matters in a CA,
+/// and a revoked certificate pins its policy revision the same as a live
+/// one) references a revision of the profile, the deletion is refused
+/// `409` with the fixed message, BEFORE the delete is attempted.
+/// [`ProfileRepo::is_referenced`] runs inside the SAME transaction as the
+/// delete, so a certificate issued concurrently is either visible to the
+/// check or blocked behind its row locks; the `certificates`
+/// `.profile_revision_id` foreign key that migration 008 carries stays
+/// the physical backstop against a commit-time race (a violation there
+/// surfaces as `CoreError::Database` → 500, a server-side data-shape
+/// event, never a silent delete). Another tenant's profile is a 404,
+/// indistinguishable from an absent one.
+async fn delete_profile(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    auth.require(Capability::ManageProfiles)
+        .map_err(ApiError::from)?;
+
+    let mut tx = state.pool.begin().await?;
+    let repos = ProfileRepo::new();
+    // Tenant-scoped read inside the transaction: the name feeds the audit
+    // row, and the tenant filter folds the 404s together.
+    let profile = repos
+        .get_profile(&mut *tx, id)
+        .await?
+        .filter(|profile| profile.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("profile not found".to_string()))?;
+    if repos.is_referenced(&mut *tx, id).await? {
+        return Err(ApiError::Conflict(
+            "profile is referenced by certificates and cannot be deleted".to_string(),
+        ));
+    }
+    repos.delete(&mut *tx, id).await?;
+    AuditRepo::new()
+        .record(
+            &mut *tx,
+            &audit_entry(
+                &auth.0,
+                "profile_deleted",
+                "profile",
+                &id.to_string(),
+                serde_json::json!({ "name": profile.name }),
+            ),
+        )
+        .await?;
+    tx.commit().await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/profiles` — `read_profiles`.

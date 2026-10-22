@@ -36,9 +36,10 @@
 
 use std::net::IpAddr;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
@@ -52,7 +53,9 @@ use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
 use ws_ca::serial::allocate_serial;
 use ws_core::error::CoreError;
 use ws_core::models::ca::CaModel;
-use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_core::models::certificate::{
+    CertStatus, CertificateFilter, CertificateModel, CertificateStatistics, RevocationReason,
+};
 use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::models::rbac::{Actor, Capability, KeyUsagePurpose};
 use ws_core::profile_match::san_is_permitted;
@@ -64,7 +67,7 @@ use ws_core::repo::profile_repo::ProfileRepo;
 
 use crate::auth_middleware::AuthActor;
 use crate::error::ApiError;
-use crate::routes::{audit_entry, audit_entry_with_id, json_no_store, ListQuery};
+use crate::routes::{audit_entry, audit_entry_with_id, json_no_store};
 use crate::state::AppState;
 
 /// How many times the issuance attempts against a (possibly moved) profile
@@ -75,7 +78,11 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(issue_certificate).get(list_certificates))
         .route("/pull", post(issue_certificate_one_shot))
+        // Exact-match wins anyway, but the literal `/statistics` is pinned
+        // BEFORE `/{id}` so the router reads in the order the routes nest.
+        .route("/statistics", get(certificate_statistics))
         .route("/{id}", get(get_certificate))
+        .route("/{id}/chain", get(get_certificate_chain))
         .route("/{id}/revoke", post(revoke_certificate))
 }
 
@@ -83,6 +90,7 @@ pub fn router() -> Router<AppState> {
 /// (capability `issue`); a body WITHOUT it selects the server-key-
 /// generation path (capability `generate_leaf_key`).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct IssueCertificateBody {
     pub profile_id: Uuid,
     pub subject_cn: String,
@@ -101,6 +109,7 @@ pub struct IssueCertificateBody {
 /// key-generation path ONLY — the private key, which appears exactly once
 /// and is never returned by any read endpoint.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct IssuedCertificateResponse {
     pub certificate_id: Uuid,
     pub cert_pem: String,
@@ -343,12 +352,22 @@ async fn issue_in_tx(
     // to zero rows, and the issuance retries against the new revision
     // instead of recording a stale one. (The serial is not allocated
     // until after the CAS, so `None` releases nothing.)
-    if ProfileRepo::new()
+    if let Err(e) = ProfileRepo::new()
         .update(&mut *exec, profile.id, Some(revision.id), revision.id)
         .await
-        .is_err()
     {
-        return Ok(None); // the caller's tx drops → rollback
+        // Only the revision-moved shape retries: the conditional write's
+        // collapse to zero rows surfaces as `CoreError::Config` — the
+        // exact case `update_profile` maps to its retry-able Conflict.
+        // The caller's tx drops (rollback) and the loop re-reads the
+        // fresh revision.
+        if let ws_core::error::CoreError::Config(_) = e {
+            return Ok(None);
+        }
+        // Any OTHER failure is a genuine database error: surface it
+        // through the CoreError→ApiError mapping instead of masquerading
+        // as a revision move and burning the retry budget on a 409.
+        return Err(ApiError::from(e));
     }
 
     // Task 8's transactional serial allocation: the serial the certificate
@@ -622,6 +641,7 @@ fn certificate_model(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_string(),
         created_at: Utc::now(),
     }
@@ -739,6 +759,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// The pull body: everything on the CSR path — the client keeps the key
 /// and presents its CSR.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct PullCertificateBody {
     pub profile_id: Uuid,
     pub subject_cn: String,
@@ -832,21 +853,87 @@ pub async fn pull_certificate(
     ))
 }
 
-/// `GET /api/v1/certificates` — one page, `read_certificates`.
+/// The `GET /api/v1/certificates` query: the shared paging fields plus the
+/// filter keys, all optional. `status` parses through `CertStatus`; `ca`
+/// must deserialize as a UUID.
+#[derive(Debug, Deserialize, Default)]
+pub struct CertificateListQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub status: Option<String>,
+    /// The profile NAME filter (the display label).
+    pub profile: Option<String>,
+    /// The issuing CA id filter.
+    #[serde(default)]
+    pub ca: Option<Uuid>,
+    /// Substring search across subject | serial_hex | certificate SANs.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+impl CertificateListQuery {
+    /// The defaults are the shared [`ListQuery`] ones: page 0, page size
+    /// 100 (clamped repo-side at 500 by `ws_core::repo::paging`).
+    pub fn page(&self) -> u32 {
+        self.page.unwrap_or(0)
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size.unwrap_or(100)
+    }
+}
+
+/// `GET /api/v1/certificates` — one page, `read_certificates`, through the
+/// composed [`CertificateFilter`] (a filter axis applies only when its
+/// query parameter is present). An unparseable `status` is a 400 — it never
+/// silently degenerates to "no filter".
 async fn list_certificates(
     auth: AuthActor,
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<CertificateListQuery>,
 ) -> Result<Json<Vec<CertificateResponse>>, ApiError> {
     auth.require(Capability::ReadCertificates)
         .map_err(ApiError::from)?;
+    let status = match query.status.as_deref() {
+        Some(raw) => Some(
+            raw.parse::<CertStatus>()
+                .map_err(|_| ApiError::bad_request("invalid status value"))?,
+        ),
+        None => None,
+    };
+    // The paging values are read BEFORE the filter consumes the query's
+    // fields (a partial move would borrow back the struct after it).
+    let (page, page_size) = (query.page(), query.page_size());
+    let filter = CertificateFilter {
+        status,
+        profile_name: query.profile,
+        ca_id: query.ca,
+        search: query.q,
+    };
     let certs = CertificateRepo::new()
-        .list_by_tenant(&state.pool, auth.tenant_id, query.page(), query.page_size())
+        .list_filtered(&state.pool, auth.tenant_id, &filter, page, page_size)
         .await?
         .iter()
         .map(CertificateResponse::from_model)
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(certs))
+}
+
+/// `GET /api/v1/certificates/statistics` — the estate's headline counts,
+/// `read_certificates`. The 30-day expiry horizon is pinned HERE (the repo
+/// method stays pure): "expiring soon" means an ACTIVE certificate whose
+/// `not_after` falls before now + 30 days.
+async fn certificate_statistics(
+    auth: AuthActor,
+    State(state): State<AppState>,
+) -> Result<Json<CertificateStatistics>, ApiError> {
+    auth.require(Capability::ReadCertificates)
+        .map_err(ApiError::from)?;
+    let expiring_before = Utc::now() + Duration::days(30);
+    let statistics = CertificateRepo::new()
+        .statistics(&state.pool, auth.tenant_id, expiring_before)
+        .await?;
+    Ok(Json(statistics))
 }
 
 /// `GET /api/v1/certificates/{id}` — one certificate, `read_certificates`.
@@ -869,6 +956,7 @@ async fn get_certificate(
 /// The certificate read DTO (no key fields exist — the certificate PEM is
 /// public certificate content, and a private key was never stored).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CertificateResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -886,6 +974,7 @@ pub struct CertificateResponse {
     pub status: String,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revocation_reason: Option<String>,
+    pub revocation_detail: Option<String>,
     pub source: String,
     pub created_at: DateTime<Utc>,
 }
@@ -912,6 +1001,7 @@ impl CertificateResponse {
             status,
             revoked_at: cert.revoked_at,
             revocation_reason: cert.revocation_reason.clone(),
+            revocation_detail: cert.revocation_detail.clone(),
             source: cert.source.clone(),
             created_at: cert.created_at,
         })
@@ -921,16 +1011,35 @@ impl CertificateResponse {
 /// `POST /api/v1/certificates/{id}/revoke` — idempotent; writes ONE
 /// `cert_revoked` audit row, in the same transaction as the revocation.
 /// Revoking an already-revoked certificate is a no-op (no second audit
-/// row), and revoking another tenant's certificate is a 404.
+/// row; the response echoes the FIRST revoke's stored pair), and
+/// revoking another tenant's certificate is a 404.
+///
+/// The reason is a TYPED [`RevocationReason`] — one of the nine RFC 5280
+/// names whose exact spellings ws-worker's CRL/OCSP builders parse into
+/// reason extensions. A missing or unknown name (a serde rejection on
+/// the body) is the client's error: 400 `bad_request`, never axum's
+/// default 422, whose body shape the SPA's error handling cannot read —
+/// as is a detail over 2000 characters.
 async fn revoke_certificate(
     auth: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(body): Json<RevokeBody>,
+    body: Result<Json<RevokeBody>, JsonRejection>,
 ) -> Result<Json<RevokeResponse>, ApiError> {
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        code: "bad_request",
+        message: rejection.body_text(),
+    })?;
     auth.require(Capability::Issue).map_err(ApiError::from)?;
-    if body.reason.trim().is_empty() {
-        return Err(ApiError::bad_request("a revocation reason is required"));
+
+    // The detail is optional free text, stored verbatim; a longer one is
+    // refused, never silently truncated.
+    if let Some(detail) = &body.detail {
+        if detail.chars().count() > 2000 {
+            return Err(ApiError::bad_request(
+                "the revocation detail must not exceed 2000 characters",
+            ));
+        }
     }
 
     let cert = CertificateRepo::new()
@@ -945,12 +1054,20 @@ async fn revoke_certificate(
         return Ok(Json(RevokeResponse {
             id,
             status: cert.status.as_str().to_string(),
+            detail: cert.revocation_detail.clone(),
         }));
+    }
+
+    // The audit carries the typed reason NAME (the same string the worker
+    // parses) and the detail key only when one was supplied.
+    let mut details = serde_json::json!({ "reason": body.reason.as_str() });
+    if let Some(detail) = &body.detail {
+        details["detail"] = serde_json::json!(detail);
     }
 
     let mut tx = state.pool.begin().await?;
     CertificateRepo::new()
-        .revoke(&mut *tx, id, &body.reason)
+        .revoke(&mut *tx, id, body.reason.as_str(), body.detail.as_deref())
         .await?;
     AuditRepo::new()
         .record(
@@ -960,7 +1077,7 @@ async fn revoke_certificate(
                 "cert_revoked",
                 "certificate",
                 &id.to_string(),
-                serde_json::json!({ "reason": body.reason }),
+                details,
             ),
         )
         .await?;
@@ -969,18 +1086,68 @@ async fn revoke_certificate(
     Ok(Json(RevokeResponse {
         id,
         status: "revoked".to_string(),
+        detail: body.detail,
     }))
 }
 
-/// The revoke body.
+/// The revoke body: a typed reason (one of the nine RFC 5280 section
+/// 5.3.1 names — the exact strings ws-worker's `reason_from_str` maps
+/// into CRL/OCSP reason extensions) and an optional free-text detail
+/// (≤ 2000 characters, stored verbatim in `certificates.revocation_detail`).
+///
+/// This REPLACES the old free-text `reason: String` body (a breaking
+/// change to the Plan 2 API shape): a free-text reason had no CRL/OCSP
+/// mapping worker-side, so revoking with one silently dropped the
+/// published reason extension. The only consumers are this repo's
+/// UI/e2e, updated in the same change.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevokeBody {
-    pub reason: String,
+    pub reason: RevocationReason,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
-/// The revoke response.
+/// The revoke response: the certificate id, its status, and the stored
+/// revocation detail echoed — the request's detail on the first revoke,
+/// the FIRST revoke's stored value on an already-revoked no-op (the
+/// round-trip contract the UI shows).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevokeResponse {
     pub id: Uuid,
     pub status: String,
+    pub detail: Option<String>,
+}
+
+/// `GET /api/v1/certificates/{id}/chain` — `read_certificates`. The trust
+/// chain the certificate verifies against, leaf-first: the certificate's
+/// own PEM FIRST, then its issuing CA's chain up to the root, as one
+/// concatenated PEM body (`application/x-pem-file`, the root-trust
+/// route's idiom). Another tenant's certificate is a 404, and the chain
+/// walk starts only from the tenant-checked certificate's own `ca_id`.
+async fn get_certificate_chain(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    auth.require(Capability::ReadCertificates)
+        .map_err(ApiError::from)?;
+    let cert = CertificateRepo::new()
+        .get(&state.pool, id)
+        .await?
+        .filter(|cert| cert.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("certificate not found".to_string()))?;
+    let chain = {
+        // One pooled connection serves the multi-statement walk (the
+        // repos' executor convention: several statements need a `&mut
+        // PgConnection`); the walk re-checks the verified tenant per hop.
+        let mut conn = state.pool.acquire().await?;
+        CaRepo::new()
+            .chain_to_root(&mut conn, auth.tenant_id, cert.ca_id)
+            .await?
+    };
+    let mut body = cert.cert_pem.clone();
+    body.extend(chain.iter().map(|ca| ca.cert_pem.as_str()));
+    Ok(([(header::CONTENT_TYPE, "application/x-pem-file")], body).into_response())
 }
