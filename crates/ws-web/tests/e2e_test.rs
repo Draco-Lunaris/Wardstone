@@ -452,7 +452,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         &router,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&access),
-        json!({"reason": "e2e smoke revocation"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK, "revoke the leaf");
@@ -477,8 +477,8 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         "the revoked leaf carries its revocation timestamp"
     );
     assert_eq!(
-        read_back["revocation_reason"], "e2e smoke revocation",
-        "the revoked leaf carries the reason"
+        read_back["revocation_reason"], "key_compromise",
+        "the revoked leaf carries the typed reason name"
     );
 
     // -- 7. A service identity's API token issues a second leaf --------------
