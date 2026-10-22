@@ -73,7 +73,11 @@ const SETUP_ACTOR: &str = "system:setup";
 /// profiles, the admin CIDRs, and the server's hostname — an explicit
 /// setup field for the UI's own SAN, NOT derived from the default domain
 /// and not the machine's hostname.
+///
+/// This struct IS the POST body (`Json<SetupFields>`), so it carries the
+/// binding spec's serde casing attribute like every other JSON DTO.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct SetupFields {
     /// The operator bootstrap account's login name (role: admin).
     pub admin_username: String,

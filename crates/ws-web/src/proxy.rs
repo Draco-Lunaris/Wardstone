@@ -20,12 +20,30 @@ use axum::routing::any;
 use axum::Router;
 use thiserror::Error;
 
+/// The proxy's connect timeout: an unreachable API process must fail the
+/// forward quickly, not pin the browser request while TCP retries.
+const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The proxy's total request timeout (connect through full response
+/// body). Generous for the API's interactive surface, but finite: a
+/// dropped-packet upstream must end in a typed 502 rather than wedging
+/// the ws-web connection indefinitely.
+const PROXY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Build the proxy router for the API's base URL over the internal
 /// network, e.g. `http://ws-api:8080` (Task 12's `WARDSTONE_API_URL`
 /// default). A trailing slash is tolerated and dropped.
 pub fn api_router(api_base_url: &str) -> Router {
+    // Both timeouts are deliberate: without them a black-holing upstream
+    // holds the browser request open with no bound, and this front door
+    // becomes a wedge vector. The client fails fast on connect and gives
+    // the API a generous-but-finite total to answer. The construction is
+    // fallible per the house rule (no panics in library code), so a failed
+    // build — an essentially unreachable TLS-backend init error — is
+    // carried as a fail-closed per-request 502, never an unbounded
+    // fallback client.
     let backend = Arc::new(ProxyBackend {
-        client: reqwest::Client::new(),
+        client: proxy_client().ok(),
         base: api_base_url.trim_end_matches('/').to_owned(),
     });
     Router::new()
@@ -34,19 +52,33 @@ pub fn api_router(api_base_url: &str) -> Router {
         .with_state(backend)
 }
 
-/// The proxy target: the reqwest client and the API base URL it forwards
-/// to. `Clone` (the axum state bound) is cheap — the client holds its own
-/// connection pool internals behind an `Arc` already, and the backend
-/// wraps in `Arc`.
+/// The proxy's reqwest client: the bounded construction (connect and
+/// total timeouts; the ws-auth `oidc::http_client` precedent for fallible
+/// client builds). `api_router`'s pinned signature is infallible, so its
+/// failure travels as `ProxyBackend.client == None`.
+fn proxy_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(PROXY_CONNECT_TIMEOUT)
+        .timeout(PROXY_TOTAL_TIMEOUT)
+        .build()
+}
+
+/// The proxy target: the reqwest client (unless the per-config
+/// construction failed — then every forward fails closed) and the API base
+/// URL it forwards to. `Clone` (the axum state bound) is cheap — the
+/// client holds its own connection pool internals behind an `Arc` already,
+/// and the backend wraps in `Arc`.
 #[derive(Debug, Clone)]
 struct ProxyBackend {
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
     base: String,
 }
 
-/// A proxy-side failure: the API is unreachable or misbehaved at the
-/// transport level. Surfaced as a 502 so the operator sees a forwarded
-/// failure, never a hang.
+/// A proxy-side failure: the API is unreachable, misbehaved at the
+/// transport level, or timed out (the client's bounded connect and total
+/// request timeouts turn a black-holing upstream into an error instead of
+/// an unbounded hang). Surfaced as a 502 so the operator sees a forwarded
+/// failure.
 #[derive(Debug, Error)]
 #[error("the API process is unreachable: {0}")]
 pub struct ProxyError(String);
@@ -73,7 +105,12 @@ async fn proxy_request(
         .unwrap_or_else(|| "/".to_owned());
     let target = format!("{}{}", backend.base, path_and_query);
 
-    let mut request = backend.client.request(method, &target);
+    let Some(client) = backend.client.as_ref() else {
+        return Err(ProxyError(
+            "the proxy HTTP client could not be initialized".to_owned(),
+        ));
+    };
+    let mut request = client.request(method, &target);
     for (name, value) in &headers {
         // Host and the hop-by-hop set are transport concerns the forward
         // re-derives; everything else (Authorization included) is the
