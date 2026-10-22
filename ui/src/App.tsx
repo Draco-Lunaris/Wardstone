@@ -9,13 +9,13 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Shell from "./components/Shell";
 import { useAuthState } from "./lib/auth";
 import Login from "./pages/Login";
+import CertificateDetail from "./pages/CertificateDetail";
+import Certificates from "./pages/Certificates";
+import Issuance from "./pages/Issuance";
 import {
   Admin,
   Audit,
   Cas,
-  CertificateDetail,
-  CertificateNew,
-  Certificates,
   Dashboard,
   Profiles,
   Tokens,
@@ -53,7 +53,7 @@ export default function App() {
       >
         <Route index element={<Dashboard />} />
         <Route path="certificates" element={<Certificates />} />
-        <Route path="certificates/new" element={<CertificateNew />} />
+        <Route path="certificates/new" element={<Issuance />} />
         <Route path="certificates/:id" element={<CertificateDetail />} />
         <Route path="profiles" element={<Profiles />} />
         <Route path="cas" element={<Cas />} />

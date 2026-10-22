@@ -1,6 +1,7 @@
-// The placeholder views for the sections Tasks 15-17 fill. One shape,
-// nine names — each says the section ships next, and nothing more: no
+// The placeholder views for the sections Tasks 16-17 fill. One shape,
+// five names — each says the section ships next, and nothing more: no
 // fake data, no fake chrome, nothing that looks finished but is not.
+// (The certificate views are real since Task 15.)
 
 type Stub = () => ReturnType<typeof StubSection>;
 
@@ -14,9 +15,6 @@ export function StubSection({ title }: { title: string }) {
 }
 
 export const Dashboard: Stub = () => <StubSection title="Dashboard" />;
-export const Certificates: Stub = () => <StubSection title="Certificates" />;
-export const CertificateNew: Stub = () => <StubSection title="Issue a Certificate" />;
-export const CertificateDetail: Stub = () => <StubSection title="Certificate" />;
 export const Profiles: Stub = () => <StubSection title="Profiles" />;
 export const Cas: Stub = () => <StubSection title="Certificate Authorities" />;
 export const Tokens: Stub = () => <StubSection title="API Tokens" />;
