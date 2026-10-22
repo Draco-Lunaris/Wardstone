@@ -209,7 +209,8 @@ describe("apiFetch success parsing", () => {
       ),
     );
 
-    const me = await apiFetch<{ username: string }>("/api/v1/me");
+    // Same-origin boot probe against a proxied API route, parsed as T.
+    const me = await apiFetch<{ username: string }>("/api/v1/auth/me");
     expect(me.username).toBe("admin");
   });
 

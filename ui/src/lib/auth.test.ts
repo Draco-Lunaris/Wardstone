@@ -4,7 +4,7 @@
 // tests stub `fetch` directly — the same boundary api.test.ts pins.
 //
 // Pinned flows:
-// - boot: GET /api/v1/me — 401 → unauthenticated, 200 → authenticated + me.
+// - boot: GET /api/v1/auth/me — 401 → unauthenticated, 200 → authenticated + me.
 // - login: idle → submitting → authenticated; the mfa_required envelope
 //   flips the TOTP step on (and a retry carries the code); a wrong-
 //   credentials envelope is surfaced VERBATIM; submitting clears.
@@ -56,8 +56,8 @@ afterEach(() => {
 });
 
 describe("boot", () => {
-  it("a 401 from /api/v1/me lands unauthenticated", async () => {
-    vi.stubGlobal("fetch", mockFetch([["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)]]));
+  it("a 401 from /api/v1/auth/me lands unauthenticated", async () => {
+    vi.stubGlobal("fetch", mockFetch([["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)]]));
 
     const store = new SessionStore();
     await store.bootOnce();
@@ -66,8 +66,8 @@ describe("boot", () => {
     expect(store.state.me).toBeNull();
   });
 
-  it("a 200 from /api/v1/me lands authenticated with the MeResponse", async () => {
-    vi.stubGlobal("fetch", mockFetch([["GET /api/v1/me", jsonResponse(200, ME)]]));
+  it("a 200 from /api/v1/auth/me lands authenticated with the MeResponse", async () => {
+    vi.stubGlobal("fetch", mockFetch([["GET /api/v1/auth/me", jsonResponse(200, ME)]]));
 
     const store = new SessionStore();
     await store.bootOnce();
@@ -86,6 +86,22 @@ describe("boot", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(store.state.status).toBe("unauthenticated");
   });
+
+  it("boot requests /api/v1/auth/me — the exact string is pinned", async () => {
+    // FIX ROUND 1: there is no /api/v1/me alias upstream — the proxy
+    // forwards paths verbatim, so a wrong spelling here 404s every boot
+    // and bounces every reload to /login. Pin the path the ws-web proxy
+    // must forward AND the one ws-api's auth nest actually serves.
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL) => jsonResponse(401, UNAUTHORIZED_ENVELOPE),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const store = new SessionStore();
+    await store.bootOnce();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/auth/me");
+  });
 });
 
 describe("login", () => {
@@ -93,7 +109,7 @@ describe("login", () => {
     vi.stubGlobal(
       "fetch",
       mockFetch([
-        ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+        ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
         ["POST /auth/ui/login", jsonResponse(200, ME)],
       ]),
     );
@@ -118,7 +134,7 @@ describe("login", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : String(input);
       const method = (init?.method ?? "GET").toUpperCase();
-      if (url === "/api/v1/me" && method === "GET") return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
+      if (url === "/api/v1/auth/me" && method === "GET") return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
       if (url === "/auth/ui/login" && method === "POST") {
         const body = JSON.parse(String(init?.body ?? "{}"));
         if (body.totp_code === undefined) return jsonResponse(401, MFA_ENVELOPE);
@@ -151,7 +167,7 @@ describe("login", () => {
     vi.stubGlobal(
       "fetch",
       mockFetch([
-        ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+        ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
         ["POST /auth/ui/login", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
       ]),
     );
@@ -174,7 +190,7 @@ describe("login", () => {
     vi.stubGlobal(
       "fetch",
       mockFetch([
-        ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+        ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
         [
           "POST /auth/ui/login",
           jsonResponse(429, "Too Many Requests! Wait for 3s", "text/plain; charset=utf-8"),
@@ -199,7 +215,7 @@ describe("logout", () => {
     vi.stubGlobal(
       "fetch",
       mockFetch([
-        ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+        ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
         ["POST /auth/ui/login", jsonResponse(200, ME)],
         ["POST /auth/ui/logout", new Response(null, { status: 204 })],
       ]),
@@ -222,7 +238,7 @@ describe("logout", () => {
     vi.stubGlobal(
       "fetch",
       mockFetch([
-        ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+        ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
         ["POST /auth/ui/login", jsonResponse(200, ME)],
         ["POST /auth/ui/logout", jsonResponse(500, "the upstream died", "text/plain")],
       ]),

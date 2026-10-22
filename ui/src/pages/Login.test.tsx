@@ -35,7 +35,7 @@ function mockFetch(routes: Array<[string, Response]>) {
  * config per-test, login POST per-test. */
 function renderLogin(config: Response, loginResponse?: Response) {
   const routes: Array<[string, Response]> = [
-    ["GET /api/v1/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
+    ["GET /api/v1/auth/me", jsonResponse(401, UNAUTHORIZED_ENVELOPE)],
     ["GET /auth/ui/config", config],
   ];
   if (loginResponse) routes.push(["POST /auth/ui/login", loginResponse]);
@@ -93,7 +93,7 @@ describe("Login", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : String(input);
         const method = (init?.method ?? "GET").toUpperCase();
-        if (method === "GET" && url === "/api/v1/me") {
+        if (method === "GET" && url === "/api/v1/auth/me") {
           return jsonResponse(401, UNAUTHORIZED_ENVELOPE);
         }
         if (method === "GET" && url === "/auth/ui/config") {

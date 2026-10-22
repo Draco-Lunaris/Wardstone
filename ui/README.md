@@ -41,18 +41,16 @@ npm run build       # tsc --noEmit (zero TS errors is the contract) + vite build
 ## The public auth-config route (`GET /auth/ui/config`)
 
 The login page's SSO button is driven by `GET /auth/ui/config`, a PUBLIC
-relay route added in Task 14 (`crates/ws-web/src/session/relay.rs`):
-ws-web relays `GET /api/v1/oidc/config` upstream and answers
-`{"oidc_configured": bool, "provider": string|null}` — a 200 maps to
-`true` (carrying the row's `provider_type` as the `provider` label,
-because ws-api resolves `/auth/ui/oidc/{provider}/start` against exactly
-that label), ANY other status to `false`. The flag is safe to expose: it
-never carries `redirect_uri`, `client_id`, discovery URLs, or secrets.
-
-Documented decision: ws-api gates `GET /api/v1/oidc/config` behind
-`manage_system`, so an unauthenticated probe gets an upstream 401 (not
-404) — which on the login page is always the case. The route therefore
-reads `false` until ws-api gains a public config-status surface (a ws-api
-task, not this relay's): the mapping is in place and tested (200 / 404 /
-401 stubs in `crates/ws-web/tests/ui_config_test.rs`), so relaxing
-ws-api's gate turns the SSO button on with no client-side change.
+relay route (`crates/ws-web/src/session/relay.rs`, `session::relay::ui_config`):
+ws-web relays `GET /api/v1/oidc/config/status` — ws-api's PUBLIC status
+surface (`crates/ws-api/src/routes/oidc.rs::config_status`; no capability
+gate and no auth extractor, because the caller is by definition
+unauthenticated) — and answers `{"oidc_configured": bool, "provider":
+string|null}`: a 200 maps `{"configured": bool, "provider_type": ...}`
+onto the UI's field names, any other status fails CLOSED to
+`false`/`null` (hide the button, never show one that cannot work). The
+flag never carries `client_id`, `redirect_uri`, discovery URLs, or
+secrets — only the boolean and the provider-type label the start route
+resolves. (Fix round 1: the original probe hit the ManageSystem-gated
+`GET /api/v1/oidc/config` and its 401 read as `false` forever — the
+public status route IS the fix.)

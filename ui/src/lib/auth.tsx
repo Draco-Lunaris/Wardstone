@@ -2,8 +2,8 @@
 // a React context shell over it. The session IS the cookie — the browser
 // never sees a token, so this layer's whole job is:
 //
-// - boot once off `GET /api/v1/me` (the cookie authenticates; a 401 means
-//   unauthenticated);
+// - boot once off `GET /api/v1/auth/me` (the cookie authenticates via
+//   ws-web's proxy; a 401 means unauthenticated);
 // - `login` against `POST /auth/ui/login`, keying the TOTP step on the
 //   `mfa_required` error code (the relay passes ws-api's envelope through
 //   verbatim) and landing the MeResponse in state;
@@ -114,7 +114,7 @@ export class SessionStore {
 
   private async boot(): Promise<void> {
     try {
-      const me = await apiFetch<MeResponse>("/api/v1/me");
+      const me = await apiFetch<MeResponse>("/api/v1/auth/me");
       this.set({ status: "authenticated", me });
     } catch {
       // ANY failure (the 401, a transport error, a 5xx) means the UI

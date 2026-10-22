@@ -189,32 +189,25 @@ async fn ui_login(
 
 /// `GET /auth/ui/config` — the login page's PUBLIC SSO flag.
 ///
-/// Relays `GET /api/v1/oidc/config` upstream and answers
-/// `{"oidc_configured": bool, "provider": string|null}`: a 200 maps to
-/// `true` carrying the row's `provider_type` (the label ws-api resolves
-/// the start route's `{provider}` path segment against — the flag alone
-/// would not let the button navigate anywhere), ANY other status maps to
-/// `{"oidc_configured": false, "provider": null}`.
+/// Relays `GET /api/v1/oidc/config/status` upstream — ws-api's PUBLIC
+/// status surface (no capability gate; `routes/oidc.rs::config_status`
+/// documents why it must answer pre-auth) — and answers
+/// `{"oidc_configured": bool, "provider": string|null}`: a 200 maps the
+/// upstream `{"configured": bool, "provider_type": ...}` onto the UI's
+/// field names (the label ws-api resolves the start route's `{provider}`
+/// against), ANY other status (404 shape, transport refusal beyond the
+/// 502 `client_or_502` already produces) maps to false/null — fail into
+/// hiding the button, never into showing one that cannot work.
 ///
-/// Public-safe by construction: the answer never carries the
+/// The relay adds nothing of its own and the answer never carries
 /// redirect_uri, client_id, discovery URL, or secret material — only the
 /// boolean and the provider-type label. `manage_system` is deliberately
 /// NOT consulted here: the login page (unauthenticated by definition) is
 /// the caller, and it must be able to ask whether SSO exists.
-///
-/// DECISION (documented in `ui/README.md`): ws-api gates its own config
-/// GET behind `manage_system`, so this probe — which carries no browser
-/// credentials, the browser having no session yet — receives an upstream
-/// 401 (not the 404 of an unset row) whenever nothing is signed in. Until
-/// ws-api publishes a public config-status surface, the mapping therefore
-/// answers `false` in production and the SSO button stays hidden; the
-/// mapping itself is already correct and test-covered
-/// (`crates/ws-web/tests/ui_config_test.rs`), so relaxing ws-api's gate
-/// turns the button on without any ws-web change.
 async fn ui_config(State(relay): State<RelayState>) -> Result<Response, ProxyError> {
     let client = client_or_502(&relay)?;
     let upstream = client
-        .get(format!("{}/api/v1/oidc/config", relay.base))
+        .get(format!("{}/api/v1/oidc/config/status", relay.base))
         .send()
         .await
         .map_err(|err| ProxyError(err.to_string()))?;
@@ -222,16 +215,26 @@ async fn ui_config(State(relay): State<RelayState>) -> Result<Response, ProxyErr
         let value: Value = upstream
             .json()
             .await
-            .map_err(|err| ProxyError(format!("the oidc config response was not JSON: {err}")))?;
+            .map_err(|err| ProxyError(format!("the oidc status response was not JSON: {err}")))?;
+        let configured = value
+            .get("configured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let provider = value
             .get("provider_type")
             .and_then(Value::as_str)
+            .filter(|_| configured)
             .map(str::to_owned);
-        Json(json!({ "oidc_configured": true, "provider": provider })).into_response()
+        if configured {
+            Json(json!({ "oidc_configured": true, "provider": provider })).into_response()
+        } else {
+            // A configured:false row (200, no SSO for the tenant) reads
+            // exactly like any refusal: no button.
+            Json(json!({ "oidc_configured": false, "provider": null })).into_response()
+        }
     } else {
-        // 404 (the row is unset) — and every other refusal, including the
-        // auth gate's 401/403 — reads "SSO is not configured": fail into
-        // hiding the button, never into showing one that cannot work.
+        // 404 (upstream shapes the suite may pin defensively) — and every
+        // other refusal — reads "SSO is not configured".
         Json(json!({ "oidc_configured": false, "provider": null })).into_response()
     };
     Ok(([(header::CACHE_CONTROL, "no-store".to_owned())], body).into_response())

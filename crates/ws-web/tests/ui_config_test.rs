@@ -1,20 +1,18 @@
 //! Task 14's public `/auth/ui/config` route, NON-DB: the relay router is
 //! driven through `tower`'s oneshot against a STUB upstream that serves
-//! `GET /api/v1/oidc/config` with canned answers (unlike [`ws_web`]'s
-//! session suite, this route's mapping needs no pool, no rows, no real
-//! auth flow).
+//! `GET /api/v1/oidc/config/status` — ws-api's PUBLIC status surface
+//! (fix round 1) — with canned answers (unlike [`ws_web`]'s session
+//! suite, this route's mapping needs no pool, no rows, no real auth
+//! flow).
 //!
 //! The mapping pinned here:
-//! - upstream 200 → `{"oidc_configured": true, "provider": <provider_type>}`
-//!   (the label ws-api resolves the start route's `{provider}` against);
-//! - upstream 404 → `{"oidc_configured": false, "provider": null}` (SSO
-//!   unset for the tenant);
-//! - upstream 401 → the same `false` — ws-api gates its config GET behind
-//!   `manage_system`, and this probe carries no browser credentials, so
-//!   the gate's refusal MUST read as "not configured" (hide the button),
-//!   never as an error the login page would have to handle. The decision
-//!   is documented in [`ws_web::session::relay::ui_config`] and
-//!   `ui/README.md`.
+//! - upstream 200 `{"configured": true, "provider_type": "keycloak"}` →
+//!   `{"oidc_configured": true, "provider": "keycloak"}` (the label
+//!   ws-api resolves the start route's `{provider}` against);
+//! - upstream 200 `{"configured": false, "provider_type": null}` (an
+//!   unset row — the status route answers 200, not 404) → `false`;
+//! - upstream 404 (defensive: any non-success) → `false` — the button
+//!   hides, never errors.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,15 +27,15 @@ use tower::ServiceExt;
 use ws_web::session::{relay_router, SessionStore};
 
 /// Spawn a stub upstream on an ephemeral loopback port answering
-/// `GET /api/v1/oidc/config` with exactly (status, body). Returns the
-/// base URL for the relay.
+/// `GET /api/v1/oidc/config/status` with exactly (status, body). Returns
+/// the base URL for the relay.
 async fn spawn_stub(status: StatusCode, body: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the stub upstream");
     let addr = listener.local_addr().expect("the stub's address");
     let app = Router::new().route(
-        "/api/v1/oidc/config",
+        "/api/v1/oidc/config/status",
         get(move || async move { (status, body) }),
     );
     tokio::spawn(async move {
@@ -81,15 +79,7 @@ async fn config_answer(base: &str) -> (StatusCode, Value, Option<String>) {
 async fn a_configured_upstream_row_maps_to_true_with_the_provider_label() {
     let base = spawn_stub(
         StatusCode::OK,
-        r#"{
-            "provider_type": "keycloak",
-            "display_name": "Keycloak",
-            "discovery_url": "https://idp.example.com/.well-known/openid-configuration",
-            "client_id": "wardstone",
-            "redirect_uri": "https://wardstone.example.com/auth/ui/oidc/keycloak/callback",
-            "scopes": "openid email profile",
-            "client_secret_set": true
-        }"#,
+        r#"{"configured": true, "provider_type": "keycloak"}"#,
     )
     .await;
 
@@ -105,10 +95,12 @@ async fn a_configured_upstream_row_maps_to_true_with_the_provider_label() {
 }
 
 #[tokio::test]
-async fn an_unset_row_404_maps_to_false() {
+async fn an_unset_row_configured_false_maps_to_false() {
+    // The status route answers 200 with `configured: false` when no
+    // provider row exists — the relay folds it into "no button".
     let base = spawn_stub(
-        StatusCode::NOT_FOUND,
-        r#"{"error":{"code":"not_found","message":"oidc is not configured for this tenant"}}"#,
+        StatusCode::OK,
+        r#"{"configured": false, "provider_type": null}"#,
     )
     .await;
 
@@ -119,12 +111,13 @@ async fn an_unset_row_404_maps_to_false() {
 }
 
 #[tokio::test]
-async fn the_auth_gates_401_maps_to_false_not_an_error() {
-    // ws-api's `manage_system` refusal, EXACTLY as the unauthenticated
-    // probe receives it: the relay folds it into "not configured".
+async fn a_non_success_upstream_maps_to_false_not_an_error() {
+    // Defensive pin: whatever non-success shape hits the probe (a 404
+    // from a future relay change, a proxy refusal), the login page gets
+    // "not configured", never an error it would have to handle.
     let base = spawn_stub(
-        StatusCode::UNAUTHORIZED,
-        r#"{"error":{"code":"unauthorized","message":"Authorization scheme must be Bearer"}}"#,
+        StatusCode::NOT_FOUND,
+        r#"{"error":{"code":"not_found","message":"no route"}}"#,
     )
     .await;
 
