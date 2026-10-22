@@ -55,6 +55,12 @@ sha2 = { workspace = true }
 # The self-signed setup certificate is minted with rcgen; the feature set
 # matches ws-ca's pin exactly (x509-parser, zeroize).
 rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+# The committed, built SPA (`ui/dist` at the workspace root) embedded into
+# the binary at compile time: release builds never need Node. The
+# include_dir! macro reads `$CARGO_MANIFEST_DIR/../ui/dist`, i.e. the exact
+# directory that is git-committed (ui/README.md documents the rebuild), so
+# the running binary always serves the SPA that was reviewed and committed.
+include_dir = "0.7"
 # The domain layer: models, repositories, the secret-encryption key file.
 ws-core = { path = "../ws-core" }
 # Authentication primitives: the argon2id password hash the setup admin

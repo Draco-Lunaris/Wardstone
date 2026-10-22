@@ -17,8 +17,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Method, Response as HttpResponse, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Router;
+use axum::{Json, Router};
 use thiserror::Error;
+
+use crate::session::{self, CSRF_HEADER_NAME, CSRF_HEADER_VALUE};
 
 /// The proxy's connect timeout: an unreachable API process must fail the
 /// forward quickly, not pin the browser request while TCP retries.
@@ -97,6 +99,24 @@ async fn proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    // The CSRF rule (Task 11): a request that presents a `wardstone_session`
+    // cookie and mutates (POST/PUT/PATCH/DELETE) must also carry
+    // `X-Requested-With: wardstone-ui` — the marker the Wardstone UI sets on
+    // its own fetches. A cross-site form post carries the browser's cookies
+    // but cannot set the header, so session cookies bought with a stolen
+    // login cannot be spent by third-party pages. Requests WITHOUT the
+    // session cookie (machine tokens, the pull flow) pass through
+    // untouched; the session id is only detected here, not yet resolved
+    // (Task 12 wires the store — the rule is detection-based until then).
+    if matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) && session::read_session_id(&headers).is_some()
+        && !has_csrf_header(&headers)
+    {
+        return Ok(csrf_forbidden_response());
+    }
+
     // The exact upstream path-and-query — the API owns its own route tree
     // under /api/v1, so the prefix is forwarded unchanged, not re-based.
     let path_and_query = uri
@@ -165,4 +185,31 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "trailer"
             | "upgrade"
     )
+}
+
+/// Does the request carry the CSRF marker header with the required value?
+/// A header present but not decodable as UTF-8, or present with any other
+/// value, is not the marker: fail closed.
+fn has_csrf_header(headers: &HeaderMap) -> bool {
+    headers
+        .get(CSRF_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == CSRF_HEADER_VALUE)
+}
+
+/// The rule's refusal: `403 Forbidden` with the API-standard error envelope,
+/// shape-consistent with ws-api's responses but distinct from the proxy's
+/// transport failures (a `ProxyError` is upstream-side; this is a request
+/// this front door refuses itself).
+fn csrf_forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": {
+                "code": "forbidden",
+                "message": "missing wardstone-ui request header"
+            }
+        })),
+    )
+        .into_response()
 }

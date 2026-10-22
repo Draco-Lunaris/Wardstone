@@ -12,16 +12,29 @@
 //!   ws-web; ws-api publishes no ports to the LAN, so every `/api/v1/*`
 //!   request is proxied verbatim to the API base URL over the internal
 //!   network. ws-api's own routes are never mounted here.
+//! - `ui` — the embedded SPA (`ui/dist`, git-committed and included into
+//!   the binary with `include_dir` at compile time): `/`, the hashed
+//!   `/assets/*`, and the SPA fallback, mounted LAST (the composed
+//!   router's fallback) so it never masks the API or setup routes above
+//!   it.
+//! - `session` — the browser-session cookie plumbing: the wire form of the
+//!   `wardstone_session` cookie and the `X-Requested-With: wardstone-ui`
+//!   CSRF marker the proxy's rule requires (Task 12 adds the store).
 //!
-//! The two are composed by [`web_router`]: the setup routes exist only
-//! while the default tenant does not (the setup endpoint is not routed
-//! once it does — the Review Focus item 5 — not merely refused), and the
-//! proxy is always mounted. [`serve_tls`] is the listener the Task 12
+//! The three are composed by [`web_router`]: the API proxy is always
+//! mounted, the setup routes exist only while the default tenant does not
+//! (the setup endpoint is not routed once it does — the Review Focus item
+//! 5 — not merely refused), and the SPA router rides the fallback, so
+//! earlier routes always win. [`serve_tls`] is the listener the Task 12
 //! binary puts that router on: HTTPS from the very first request, on
-//! either the setup certificate or the CA-issued leaf.
+//! either the setup certificate or the CA-issued leaf — with the client's
+//! socket address attached to every request (`ConnectInfo`, Task 12's
+//! per-IP limiter's key input).
 
 pub mod proxy;
+pub mod session;
 pub mod setup;
+pub mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,7 +70,13 @@ pub async fn web_router(
             hostname,
         }));
     }
-    Ok(app)
+    // The SPA router rides LAST: `fallback_service` runs only when no
+    // earlier route matched (the precedence the ui-serve suite pins), so
+    // the API proxy and the setup surface above are never masked. A Router
+    // is itself a fallback Service — `ui::ui_router()` carries its own
+    // route tree (`/`, `/assets/*`, the SPA catch-all) and its own
+    // routing.
+    Ok(app.fallback_service(ui::ui_router()))
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
@@ -106,7 +125,7 @@ pub async fn serve_tls(
         addr,
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config)),
     )
-    .serve(router.into_make_service())
+    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
     .await
     .map_err(CaError::Io)
 }
