@@ -1,0 +1,649 @@
+//! Integration tests for `ws-web` (Task 11): the first-run setup page and
+//! its submit, the unmounting of the setup route once the tenant exists,
+//! and the self-signed setup certificate with its SHA-256 fingerprint.
+//!
+//! These tests run against a live Postgres and are marked `#[ignore]`.
+//! Run them with:
+//!
+//! ```sh
+//! DATABASE_URL=postgres://wardstone:wardstone@localhost:5432/wardstone_test \
+//!     cargo test -p ws-web --test setup_test -- --include-ignored
+//! ```
+//!
+//! # Self-cleaning contract
+//!
+//! The shared `wardstone_test` database is also used by the ws-core and
+//! ws-api suites, one of which asserts that `tenants` is empty after its
+//! runs. Every test here sweeps away rows a previously crashed run may
+//! have left behind under the setup tenant's name, and every row the body
+//! inserts is deleted again BEFORE the assertions run (the same
+//! self-cleaning contract ws-api's suite uses), so a failing assertion can
+//! never leave rows behind. The results are captured before the cleanup.
+//!
+//! # Cross-process serialization
+//!
+//! Each test body holds a session-level Postgres advisory lock for its
+//! whole duration on [`ADVISORY_KEY`] — the "WARDST" family with this
+//! suite's marker 0x0010 (ws-core's suites hold 0x0003..0x0005, ws-ca's
+//! serial suite 0x0006, and this plan's other suites 0x000b..0x000f).
+//! The in-process mutex mirrors the ws-core pattern.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::pool::PoolConnection;
+use sqlx::PgPool;
+use tokio::sync::Mutex as TokioMutex;
+use tower::ServiceExt;
+use x509_parser::pem::parse_x509_pem;
+
+use ws_ca::keystore::KeyStore;
+use ws_core::db::connect;
+use ws_web::setup::{tls, SetupFields, SetupState};
+use ws_web::{run_setup, setup};
+
+/// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
+/// plus the suite marker 0x0010.
+const ADVISORY_KEY: i64 = 0x0057_4144_5354_0010;
+
+/// The setup flow's target display hostname (the CA-issued leaf's SAN).
+const HOSTNAME: &str = "wardstone-ui.test";
+
+/// A display-only fingerprint placeholder (the real one comes from
+/// `setup_certificate`; the page only echoes the state it was given).
+const PAGE_FINGERPRINT: &str = "abcd";
+
+/// In-process serialization, the whole-body lock pattern of the ws-core
+/// and ws-api suites: the harness runs tests on separate threads. A tokio
+/// mutex because the guard is held across `.await` points.
+static DB_TEST_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+
+/// The guard must be held (not dropped) until the test body finishes.
+#[must_use = "the database lock must stay bound for the whole test body"]
+async fn lock_db() -> tokio::sync::MutexGuard<'static, ()> {
+    DB_TEST_LOCK
+        .get_or_init(|| TokioMutex::new(()))
+        .lock()
+        .await
+}
+
+/// Take the session-level advisory lock `key` on a dedicated pooled
+/// connection (the ws-api/ws-ca suite pattern).
+async fn lock_advisory(pool: &PgPool, key: i64) -> PoolConnection<sqlx::Postgres> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("acquire connection for the advisory lock");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await
+        .expect("take pg_advisory_lock");
+    conn
+}
+
+/// Release the advisory lock taken by [`lock_advisory`] explicitly.
+async fn release_advisory(conn: &mut PoolConnection<sqlx::Postgres>, key: i64) {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut **conn)
+        .await
+        .expect("release pg_advisory_lock");
+}
+
+/// Test database URL; `DATABASE_URL` overrides it.
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://wardstone:wardstone@localhost:5432/wardstone_test".to_string()
+    })
+}
+
+/// Delete every row a previous run may have left under `name` (children
+/// first, then the tenant) — the FK-first sweep ws-api's suite uses.
+async fn sweep_tenant(pool: &PgPool, name: &str) {
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("sweep stale audit rows");
+    sqlx::query(
+        "DELETE FROM service_identity_capabilities WHERE service_identity_id IN \
+         (SELECT id FROM service_identities WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1))",
+    )
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("sweep stale capability grant rows");
+    for table in [
+        "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM used_serials WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM one_shot_tokens WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM service_identities WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM profiles WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM oidc_config WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM refresh_tokens WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM users WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM tenants WHERE name = $1",
+    ] {
+        sqlx::query(table)
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("sweep stale fixture-prefixed rows");
+    }
+}
+
+/// The setup fields the tests submit.
+fn test_fields() -> SetupFields {
+    SetupFields {
+        admin_username: "admin".to_string(),
+        admin_password: "correct horse battery staple".to_string(),
+        default_domain: "wardstone.test".to_string(),
+        admin_cidrs: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
+        server_hostname: HOSTNAME.to_string(),
+    }
+}
+
+/// A per-test fixture: the pool, a fresh keys directory, and the held
+/// advisory-lock connection.
+struct Fixture {
+    pool: PgPool,
+    keys_dir: PathBuf,
+    #[allow(dead_code)] // held for the whole body: serializes this suite
+    advisory: Option<PoolConnection<sqlx::Postgres>>,
+}
+
+/// The state the setup handlers need, from the fixture.
+fn setup_state(fixture: &Fixture) -> SetupState {
+    SetupState {
+        pool: fixture.pool.clone(),
+        keys_dir: fixture.keys_dir.clone(),
+        fingerprint: PAGE_FINGERPRINT.to_string(),
+        hostname: HOSTNAME.to_string(),
+    }
+}
+
+impl Fixture {
+    /// Delete every row this test created, release the advisory lock, and
+    /// remove the keys directory. Runs BEFORE the assertions so a failing
+    /// assert can never leave rows behind (the self-cleaning contract).
+    async fn cleanup(&mut self) {
+        sweep_tenant(&self.pool, setup::DEFAULT_TENANT_NAME).await;
+        if let Some(mut conn) = self.advisory.take() {
+            release_advisory(&mut conn, ADVISORY_KEY).await;
+        }
+        let _ = std::fs::remove_dir_all(&self.keys_dir);
+    }
+}
+
+/// Build the fixture: connect, take the advisory lock, sweep stale rows,
+/// and create a fresh keys directory.
+async fn fixture() -> Fixture {
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+    // Sweep-first: stale rows of a previously crashed run under the setup
+    // tenant's fixed name.
+    sweep_tenant(&pool, setup::DEFAULT_TENANT_NAME).await;
+
+    let keys_dir = std::env::temp_dir().join(format!(
+        "ws-web-test-keys-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    Fixture {
+        pool,
+        keys_dir,
+        advisory: Some(advisory),
+    }
+}
+
+/// Drive the router with a `POST /setup` carrying `fields` as JSON.
+async fn post_setup(router: Router, fields: &SetupFields) -> axum::http::Response<Body> {
+    let payload: Value = serde_json::to_value(fields).expect("the setup fields must serialize");
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("build the POST request"),
+        )
+        .await
+        .expect("in-process POST /setup")
+}
+
+async fn body_string(response: axum::http::Response<Body>) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read the response body");
+    String::from_utf8(bytes.to_vec()).expect("the setup bodies are UTF-8")
+}
+
+/// A GET /setup serves the page: 200, and the body carries the setup
+/// certificate's fingerprint (the operator verifies it out of band) and
+/// the instance hostname.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_page_serves_200_and_shows_the_fingerprint() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let router = setup::setup_router(setup_state(&fixture));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup");
+
+    assert_eq!(response.status(), StatusCode::OK, "the page serves");
+    let html = body_string(response).await;
+    assert!(
+        html.contains(PAGE_FINGERPRINT),
+        "the page must display the setup certificate's SHA-256 fingerprint"
+    );
+    assert!(
+        html.contains(HOSTNAME),
+        "the page must show the instance hostname the certificate is for"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// The POST creates the tenant, the root CA (key in the keystore), the
+/// admin user (argon2id hash, never plaintext), the two default profiles
+/// with non-empty key usages and EKUs, the secret-encryption key file, and
+/// the audit entries — and mints the server's own CA-issued leaf.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = test_fields();
+    let router = setup::setup_router(setup_state(&fixture));
+
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+
+    // Capture everything BEFORE the cleanup, then assert afterwards.
+    let pool = fixture.pool.clone();
+    let tenant_name = setup::DEFAULT_TENANT_NAME.to_string();
+    let tenant_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE name = $1")
+            .bind(&tenant_name)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup tenant");
+    let tenant_id = tenant_id.expect("setup creates exactly the one tenant");
+
+    let ca: Option<(uuid::Uuid, bool, String)> =
+        sqlx::query_as("SELECT id, is_root, subject FROM cas WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup root CA");
+    let (ca_id, ca_is_root, ca_subject) = ca.expect("setup creates the root CA");
+
+    let admin: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT username, password_hash FROM users WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query the setup admin");
+
+    let profiles: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM profiles WHERE tenant_id = $1 ORDER BY name")
+            .bind(tenant_id)
+            .fetch_all(&pool)
+            .await
+            .expect("query the default profiles");
+
+    let revisions: Vec<(uuid::Uuid, i32, Vec<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT profile_id, revision, key_usages, eku FROM profile_revisions \
+         WHERE profile_id IN (SELECT id FROM profiles WHERE tenant_id = $1) \
+         ORDER BY profile_id, revision",
+    )
+    .bind(tenant_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query the default profile revisions");
+
+    let certs: Vec<(
+        uuid::Uuid,
+        String,
+        String,
+        String,
+        String,
+        Option<uuid::Uuid>,
+    )> = sqlx::query_as(
+        "SELECT id, subject, status, source, profile_name, profile_revision_id \
+         FROM certificates WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query the server leaf certificate");
+
+    let audit_actions: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM audit_log WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_all(&pool)
+            .await
+            .expect("query the setup audit entries");
+
+    // The leaf's issuer chain and DER: parsed while the keys directory
+    // still exists (cleanup removes it just below).
+    let leaf_pem: String = match certs.first() {
+        Some((leaf_id, _, _, _, _, _)) => {
+            sqlx::query_scalar("SELECT cert_pem FROM certificates WHERE id = $1")
+                .bind(leaf_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch the leaf's PEM")
+        }
+        None => String::new(),
+    };
+    let key_store = KeyStore::open(&fixture.keys_dir).expect("reopen the keystore");
+    let root_key_loaded = key_store.load_ca_key(&ca_id).is_ok();
+    let leaf_key_loaded = certs
+        .first()
+        .map(|row| key_store.load_ca_key(&row.0).is_ok())
+        .unwrap_or(false);
+    let secret_key_exists = fixture
+        .keys_dir
+        .join(ws_api::state::SECRET_KEY_FILE)
+        .exists();
+
+    fixture.cleanup().await;
+
+    // Assertions (run after cleanup, per the self-cleaning contract).
+    assert!(ca_is_root, "the setup CA is a root");
+    assert_eq!(
+        ca_subject, "wardstone.test",
+        "the root's subject is the default domain the operator chose"
+    );
+    assert!(root_key_loaded, "the root's key envelope must load");
+
+    let (admin_name, admin_hash) = admin.expect("setup creates the admin user");
+    assert_eq!(admin_name, "admin");
+    let hash = admin_hash.expect("the admin carries a password hash");
+    assert!(
+        hash.starts_with("$argon2id$"),
+        "the stored hash must be an argon2id PHC string, got {hash:?}"
+    );
+    assert_ne!(
+        hash, fields.admin_password,
+        "the password is never plaintext"
+    );
+    assert!(
+        ws_auth::password::verify_password(&fields.admin_password, &hash)
+            .expect("verify the stored hash"),
+        "the stored argon2id hash must verify the submitted password"
+    );
+    assert!(
+        !ws_auth::password::verify_password("wrong password", &hash).unwrap_or(true),
+        "a wrong password must not verify"
+    );
+
+    assert_eq!(profiles.len(), 2, "the two default profiles exist");
+    let profile_names: Vec<&String> = profiles.iter().map(|(_, name)| name).collect();
+    assert!(profile_names.contains(&&"web-server".to_string()));
+    assert!(profile_names.contains(&&"web-server-ecdsa".to_string()));
+    assert_eq!(revisions.len(), 2, "each default profile has revision 1");
+    for (_, revision, key_usages, eku) in &revisions {
+        assert_eq!(*revision, 1, "the default profiles start at revision 1");
+        assert!(
+            !key_usages.is_empty(),
+            "a profile without key usages could issue nothing"
+        );
+        assert!(
+            !eku.is_empty(),
+            "a profile without an EKU list is incomplete"
+        );
+    }
+
+    assert_eq!(certs.len(), 1, "setup mints exactly the server's own leaf");
+    let (_leaf_id, leaf_subject, leaf_status, leaf_source, leaf_profile, leaf_revision) =
+        certs[0].clone();
+    assert_eq!(leaf_subject, format!("CN={HOSTNAME}"));
+    assert_eq!(leaf_status, "active");
+    assert_eq!(leaf_source, "manual");
+    assert_eq!(
+        leaf_profile, "web-server",
+        "the leaf follows the web-server profile"
+    );
+    assert!(
+        leaf_revision.is_some(),
+        "the leaf records its profile revision"
+    );
+    assert!(leaf_key_loaded, "the leaf's key envelope must load");
+
+    let leaf_pem_parsed = parse_x509_pem(leaf_pem.as_bytes())
+        .expect("the leaf certificate is valid PEM")
+        .1;
+    let leaf_cert = leaf_pem_parsed.parse_x509().expect("the leaf DER parses");
+    let leaf_issuer_cn = leaf_cert
+        .issuer()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_owned);
+    assert_eq!(
+        leaf_issuer_cn.as_deref(),
+        Some("wardstone.test"),
+        "the leaf is signed by the setup root"
+    );
+
+    assert!(
+        audit_actions
+            .iter()
+            .any(|action| action == "tenant_created"),
+        "setup audits the tenant creation"
+    );
+    assert!(
+        audit_actions.iter().any(|action| action == "ca_created"),
+        "setup audits the root CA creation"
+    );
+    assert!(
+        audit_actions.iter().any(|action| action == "user_created"),
+        "setup audits the admin user creation"
+    );
+    assert_eq!(
+        audit_actions
+            .iter()
+            .filter(|action| action.as_str() == "profile_created")
+            .count(),
+        2,
+        "each default profile creation is audited"
+    );
+    assert!(
+        audit_actions.iter().any(|action| action == "cert_issued"),
+        "the server leaf issuance is audited"
+    );
+
+    assert!(
+        secret_key_exists,
+        "the secret-encryption key file must exist before any user can enrol"
+    );
+}
+
+/// Run setup through the front-door composition: while no tenant exists
+/// the setup page routes; once the tenant exists the setup route is GONE —
+/// a request to it returns 404, not 403 — and /api/v1/* proxies onward.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = test_fields();
+
+    // Before setup: the front door mounts the setup page.
+    let before = ws_web::web_router(
+        fixture.pool.clone(),
+        fixture.keys_dir.clone(),
+        PAGE_FINGERPRINT.to_string(),
+        HOSTNAME.to_string(),
+        "http://127.0.0.1:9", // intentionally nothing listens here
+    )
+    .await
+    .expect("the front-door router builds while unconfigured");
+    let response = before
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "setup routes before setup"
+    );
+
+    // The setup submit itself runs through the pinned run_setup call.
+    {
+        let keys_dir = fixture.keys_dir.clone();
+        let mut keystore = KeyStore::open(&keys_dir).expect("open the keystore");
+        run_setup(&fields, &fixture.pool, &mut keystore)
+            .await
+            .expect("run_setup completes");
+    }
+
+    // After setup: rebuilding the front door leaves the setup route out —
+    // 404, not 403.
+    let after = ws_web::web_router(
+        fixture.pool.clone(),
+        fixture.keys_dir.clone(),
+        PAGE_FINGERPRINT.to_string(),
+        HOSTNAME.to_string(),
+        "http://127.0.0.1:9",
+    )
+    .await
+    .expect("the front-door router builds after setup");
+    let get = after
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup");
+    assert_eq!(get.status(), StatusCode::NOT_FOUND, "the setup GET is gone");
+    let post = post_setup(after.clone(), &fields).await;
+    assert_eq!(
+        post.status(),
+        StatusCode::NOT_FOUND,
+        "the setup POST is gone, not merely refused"
+    );
+
+    // The proxy covers /api/v1/*: with nothing listening at the base URL
+    // the forward fails visibly as a 502 (the API itself is mounted by the
+    // Task 12/13 composition, not here).
+    let proxied = after
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/healthz")
+                .body(Body::empty())
+                .expect("build the proxy request"),
+        )
+        .await
+        .expect("in-process proxy request");
+    assert_eq!(proxied.status(), StatusCode::BAD_GATEWAY);
+
+    fixture.cleanup().await;
+}
+
+/// The setup certificate is self-signed, carries the configured SAN, its
+/// returned fingerprint equals the SHA-256 of its own DER, and two calls
+/// yield two different certificates (each is minted fresh; the plan does
+/// NOT pin fingerprint stability across calls).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_san() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    let mut keystore = KeyStore::open(&fixture.keys_dir).expect("open the keystore");
+    let (pem1, fingerprint_hex1) =
+        tls::setup_certificate(&mut keystore, HOSTNAME).expect("mint the setup certificate");
+    let (pem2, fingerprint_hex2) =
+        tls::setup_certificate(&mut keystore, HOSTNAME).expect("re-mint the setup certificate");
+
+    let (_, pem) = parse_x509_pem(pem1.as_bytes()).expect("the certificate is valid PEM");
+    let der = pem.contents.clone();
+    assert_eq!(
+        hex::encode(Sha256::digest(&der)),
+        fingerprint_hex1,
+        "the returned fingerprint must equal the SHA-256 of the returned DER"
+    );
+
+    let cert = pem.parse_x509().expect("the DER parses");
+    assert_eq!(
+        cert.issuer(),
+        cert.subject(),
+        "the certificate is self-signed"
+    );
+    let san = cert
+        .subject_alternative_name()
+        .expect("the extensions parse")
+        .expect("the setup certificate carries the SAN");
+    let dns_names: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(name) => Some(name.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dns_names,
+        vec![HOSTNAME.to_string()],
+        "the setup certificate carries the configured SAN"
+    );
+
+    let (_, pem) = parse_x509_pem(pem2.as_bytes()).expect("the second PEM parses");
+    assert_ne!(
+        pem.contents, der,
+        "two calls mint two different certificates (fresh key each time)"
+    );
+    assert_ne!(
+        fingerprint_hex1, fingerprint_hex2,
+        "the fingerprints differ along with the certificates"
+    );
+
+    assert!(
+        keystore.master_key_path().exists(),
+        "the keystore master key is generated before the setup key is stored"
+    );
+    keystore
+        .load_setup_key()
+        .expect("the setup slot holds the freshly minted key");
+
+    fixture.cleanup().await;
+}

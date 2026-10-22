@@ -1,1 +1,153 @@
+//! ws-web: the TLS front door of the whole product — the first-run setup
+//! surface, the `/api/v1` path proxy to the API process, and the TLS
+//! listener glue the `wardstone` binary (Plan 2's Task 12) serves.
+//!
+//! - `setup` — the first-run flow: the setup page (GET), the setup submit
+//!   (POST, running the bootstrap transaction), the conditional mounting
+//!   ([`setup_router`] mounted only while no tenant exists —
+//!   [`setup::tenant_exists`]), and the self-signed setup certificate
+//!   whose SHA-256 fingerprint the page displays for out-of-band
+//!   verification.
+//! - `proxy` — the `/api/v1/*` forwarder: the browser talks ONLY to
+//!   ws-web; ws-api publishes no ports to the LAN, so every `/api/v1/*`
+//!   request is proxied verbatim to the API base URL over the internal
+//!   network. ws-api's own routes are never mounted here.
+//!
+//! The two are composed by [`web_router`]: the setup routes exist only
+//! while the default tenant does not (the setup endpoint is not routed
+//! once it does — the Review Focus item 5 — not merely refused), and the
+//! proxy is always mounted. [`serve_tls`] is the listener the Task 12
+//! binary puts that router on: HTTPS from the very first request, on
+//! either the setup certificate or the CA-issued leaf.
 
+pub mod proxy;
+pub mod setup;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use axum::Router;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use sqlx::PgPool;
+use ws_ca::error::CaError;
+
+pub use proxy::api_router;
+pub use setup::{run_setup, setup_router, tenant_exists, SetupFields, SetupState};
+
+/// The front-door router a fresh (`ui`-mode) process serves: the setup
+/// surface ONLY while the default tenant does not exist, plus the
+/// `/api/v1` proxy in every phase. The caller checks nothing — this
+/// function performs the `tenant_exists` check itself, so mounting (not
+/// refusal) is the unmount mechanism: with the tenant present there is no
+/// `/setup` route at all and a request to it is a plain 404.
+pub async fn web_router(
+    pool: PgPool,
+    keys_dir: PathBuf,
+    fingerprint: String,
+    hostname: String,
+    api_base_url: &str,
+) -> Result<Router, CaError> {
+    let mut app = api_router(api_base_url);
+    if !tenant_exists(&pool).await? {
+        app = app.merge(setup_router(SetupState {
+            pool,
+            keys_dir,
+            fingerprint,
+            hostname,
+        }));
+    }
+    Ok(app)
+}
+
+/// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
+/// with a PKCS#8 DER private key (the exact form every envelope-encrypted
+/// key in the keystore holds and every issued certificate is stored in).
+///
+/// The `ring` crypto provider is selected explicitly: the workspace pins
+/// BOTH rustls edges with default features OFF (see the workspace
+/// `Cargo.toml` — `aws-lc-rs` cannot build in this container image), and
+/// no global default is installed, so this process makes the choice
+/// per-config instead of relying on mutable process-wide state.
+pub fn rustls_server_config(
+    cert_pem: &str,
+    key_der: &[u8],
+) -> Result<rustls::ServerConfig, CaError> {
+    let cert = rustls::pki_types::CertificateDer::from(pem_to_der(cert_pem)?);
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.to_vec());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| CaError::X509(format!("tls: protocol versions: {err}")))?
+        // No client certificate is accepted: the browser authenticates
+        // with its login, not with client certificates.
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key.into())
+        .map_err(|err| CaError::X509(format!("tls: certificate/key pair rejected: {err}")))
+}
+
+/// Serve `router` under TLS from `cert_pem` + `key_der` (PKCS#8 DER) on
+/// `addr`. The Task 12 `ui` binary calls this on [`web_router`]'s output
+/// with EITHER the setup certificate (the keystore setup slot,
+/// `ca/setup.key`) while no tenant exists, OR the CA-issued server leaf
+/// (cert: the `certificates` row, key: the envelope under the
+/// certificate's id) after setup — a process restart, not a hot reload,
+/// is the TLS switch between the two.
+pub async fn serve_tls(
+    addr: SocketAddr,
+    router: Router,
+    cert_pem: &str,
+    key_der: &[u8],
+) -> Result<(), CaError> {
+    let config = rustls_server_config(cert_pem, key_der)?;
+    // axum-server keeps the rustls config under an ArcSwap so an operator
+    // tooling path could hot-reload it; we pass ours in wrapped once.
+    axum_server::tls_rustls::bind_rustls(
+        addr,
+        axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config)),
+    )
+    .serve(router.into_make_service())
+    .await
+    .map_err(CaError::Io)
+}
+
+/// A PEM body's DER bytes: the base64 payload between the BEGIN/END
+/// lines. The workspace's own base64 encoder (the one ws-ca's keystore
+/// and ws-api's export use); no extra PEM-parsing crate on top of rustls's
+/// pki-types, which take DER only.
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, CaError> {
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    BASE64
+        .decode(body)
+        .map_err(|_| CaError::X509("pem body is not valid base64".to_owned()))
+}
+
+/// # Unit tests
+#[cfg(test)]
+mod tests {
+    // A nested module does not inherit the crate root's trait import; the
+    // Engine trait must be in scope for `STANDARD.encode` here.
+    use base64::Engine as _;
+
+    use super::pem_to_der;
+
+    /// The PEM/DER helper accepts the exact PEM shapes ws-ca emits
+    /// (64-character-wrapped base64 payloads between the BEGIN/END lines)
+    /// and refuses a non-base64 body.
+    #[test]
+    fn test_pem_to_der_round_trips_and_refuses_garbage() {
+        let der = b"some der bytes that must survive the round trip";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{encoded}\n-----END CERTIFICATE-----\n");
+        assert_eq!(
+            pem_to_der(&pem).expect("decode the PEM body"),
+            der.to_vec(),
+            "the DER bytes must survive the PEM wrapper"
+        );
+        let bad = "-----BEGIN CERTIFICATE-----\nnot base64!!!\n-----END CERTIFICATE-----\n";
+        assert!(pem_to_der(bad).is_err(), "a non-base64 body is refused");
+    }
+}

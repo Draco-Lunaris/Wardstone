@@ -161,6 +161,15 @@ impl KeyStore {
         self.dir.join(MASTER_FILE)
     }
 
+    /// The keys directory this store was opened on. `ws-web`'s setup flow
+    /// derives sibling key-file paths from it (the secret-encryption key
+    /// file lives under the same keys directory the keystore does —
+    /// `ws_api::state::SECRET_KEY_FILE`), so the caller does not have to
+    /// carry the directory separately from the store.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Guarantee that a master KEK exists: if the file is present, validate
     /// it (a file shorter than 32 bytes is [`CaError::Corrupt`]); if it is
     /// absent, generate 32 OS-entropy bytes and write them mode 0600.

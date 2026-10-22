@@ -5,3 +5,75 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The TLS front door: the setup page and the /api/v1 proxy are axum
+# Routers served under TLS by the Task 12 binary via ws-web's own serve
+# glue (axum-server).
+axum = { workspace = true }
+# The TLS listener itself: axum-server's tls-rustls support module over
+# the workspace's ring-backed rustls pin (see the workspace Cargo.toml:
+# default features of both rustls edges are OFF so aws-lc-rs never enters
+# the graph).
+axum-server = { workspace = true }
+tokio-rustls = { workspace = true }
+# rustls types (ServerConfig, pki-types DER wrappers) for the TLS wiring.
+rustls = { workspace = true }
+# The /api/v1 path proxy: the browser talks ONLY to ws-web; ws-api
+# publishes no ports to the LAN, so ws-web forwards /api/v1/* over the
+# internal network to the API base URL.
+reqwest = { workspace = true }
+# PgPool and queries; the features are already unified across the
+# workspace (ws-core carries macros/migrate/uuid/chrono/ipnet/json).
+sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
+# Async bodies, spawn_blocking for the CPU-bound key generation.
+tokio = { workspace = true }
+# The setup form fields (serde) and the audit details payloads.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Model ids, timestamps.
+uuid = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+# Typed error enum with thiserror for the submit handler's IntoResponse.
+thiserror = { workspace = true }
+# Setup/proxy diagnostics (the Task 12 binary initializes the subscriber).
+tracing = { workspace = true }
+# Hex encoding of the setup certificate's SHA-256 fingerprint (the same
+# encoder ws-auth's token digests use).
+hex = { workspace = true }
+# PEM body decoding for the TLS certificate/key wiring (the same encoder
+# ws-ca's keystore and ws-api's export use).
+base64 = { workspace = true }
+# Zeroizing the leaf key DER copies between generation and the keystore
+# envelope (the same pattern ws-ca/key material handling uses).
+zeroize = { workspace = true }
+# 16 fresh OS-entropy bytes for the setup certificate's serial (rand 0.10
+# SysRng, the house pattern — rcgen's default serial is deterministic and
+# the house refuses it: ws-ca's `new_serial` documents why).
+rand = { workspace = true }
+# SHA-256 fingerprint of the setup certificate's DER (displayed on the
+# setup page so the operator verifies it out of band).
+sha2 = { workspace = true }
+# The self-signed setup certificate is minted with rcgen; the feature set
+# matches ws-ca's pin exactly (x509-parser, zeroize).
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+# The domain layer: models, repositories, the secret-encryption key file.
+ws-core = { path = "../ws-core" }
+# Authentication primitives: the argon2id password hash the setup admin
+# user stores.
+ws-auth = { path = "../ws-auth" }
+# The CA engine: root-CA creation, the keystore (setup slot), leaf-key
+# generation, the serial allocator.
+ws-ca = { path = "../ws-ca" }
+# The API surface the proxy targets. ws-web does NOT mount ws-api's
+# routes (the two are separate processes); the dependency carries the
+# deployment vocabulary the setup flow must agree with: the
+# secret-encryption key file name (`ws_api::state::SECRET_KEY_FILE`) and
+# the config values the setup page collects (domain, keys dir, admin
+# CIDRs — `ws_api::state::ApiConfig`).
+ws-api = { path = "../ws-api" }
+
+[dev-dependencies]
+# In-process request driving (`oneshot`) for the setup router.
+tower = { workspace = true }
+# Parsing the minted setup certificate in the tests (self-signedness,
+# SAN, DER fingerprint checks).
+x509-parser = { workspace = true }
