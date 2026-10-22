@@ -228,7 +228,9 @@ impl CertificateRepo {
     /// (`tenant_id` is always present); every value binds as a parameter —
     /// nothing is ever stringified into the SQL. The search needle binds
     /// ONCE (`$n`) and is reused at three placeholders: subject, serial
-    /// hex, and the unnest-ed `san_dns` rows.
+    /// hex, and the unnest-ed `san_dns` rows — LITERALLY (`%`, `_`, and `\`
+    /// are escaped and the ILIKE clauses carry `ESCAPE '\'`, so the
+    /// operator's `q` never widens into a wildcard).
     pub async fn list_filtered(
         &self,
         executor: impl PgExecutor<'_>,
@@ -264,8 +266,9 @@ impl CertificateRepo {
         }
         if filter.search.is_some() {
             sql.push_str(&format!(
-                " AND (subject ILIKE ${next} OR serial_hex ILIKE ${next} \
-                 OR EXISTS (SELECT 1 FROM unnest(san_dns) d WHERE d ILIKE ${next}))"
+                " AND (subject ILIKE ${next} ESCAPE '\\' OR serial_hex ILIKE ${next} \
+                 ESCAPE '\\' OR EXISTS (SELECT 1 FROM unnest(san_dns) d \
+                 WHERE d ILIKE ${next} ESCAPE '\\'))"
             ));
             // The pattern is ONE parameter slot (reused at its three
             // references) — it still advances the placeholder counter.
@@ -287,8 +290,17 @@ impl CertificateRepo {
             query = query.bind(ca_id);
         }
         if let Some(search) = &filter.search {
-            // One bind, reused at three placeholders.
-            query = query.bind(format!("%{}%", search));
+            // One bind, reused at three placeholders — and the needle is
+            // LITERAL: `%`, `_`, and `\` are escaped (backslash first, or
+            // its own escape would unescape) so a metacharacter in the
+            // operator's `q` matches itself instead of widening the search
+            // into a prefix/substring wildcard. The `ESCAPE '\'` clause on
+            // all three ILIKE references makes the pair agree.
+            let escaped = search
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            query = query.bind(format!("%{escaped}%"));
         }
         let query = query.bind(limit).bind(offset);
 

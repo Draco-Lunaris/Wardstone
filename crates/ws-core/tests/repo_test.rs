@@ -48,7 +48,7 @@ use ws_core::db::connect;
 use ws_core::error::CoreError;
 use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::{CaModel, KeyType};
-use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_core::models::certificate::{CertStatus, CertificateFilter, CertificateModel};
 use ws_core::models::credential::{
     OidcConfigModel, OneShotTokenModel, RefreshTokenModel, ServiceIdentityModel,
 };
@@ -749,6 +749,123 @@ async fn list_slim_projects_only_the_slim_columns() {
     assert!(
         other_tenant.is_empty(),
         "another tenant's rows are invisible"
+    );
+}
+
+/// The search needle is LITERAL: `%`, `_`, and `\` in it match themselves —
+/// the SQL carries `ESCAPE '\'` on all three ILIKE clauses and the needle
+/// is escaped before the `%needle%` wrap — so a metacharacter in the
+/// operator's `q` can never widen the search into a wildcard. The
+/// metachar-free search tests in the api suite pin the substring behavior;
+/// this test pins the literal one. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn list_filtered_searches_the_needle_literally() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_CERTS).await;
+
+    sweep_cert_rows(&pool).await;
+
+    let tenant = TenantRepo::new()
+        .insert(&pool, CERTS_TENANT)
+        .await
+        .expect("insert test tenant for certificate rows");
+    let ca = cert_ca_model(tenant.id);
+    CaRepo::new()
+        .insert(&pool, &ca)
+        .await
+        .expect("insert test CA row");
+
+    let now = Utc::now().trunc_subsecs(0);
+    // The helper's own subject is "CN=leaf.example" — no metacharacters,
+    // but with a `_`-widened needle it WOULD match ("leaf" + any char).
+    let plain = cert_model(tenant.id, ca.id, 0x77, now + chrono::Duration::days(5));
+    let mut percent = cert_model(tenant.id, ca.id, 0x88, now + chrono::Duration::days(50));
+    percent.subject = "CN=50%off".to_string();
+    let mut underscore = cert_model(tenant.id, ca.id, 0x99, now + chrono::Duration::days(90));
+    underscore.subject = "CN=leaf_example".to_string();
+
+    let certs = CertificateRepo::new();
+    certs
+        .insert(&pool, &plain)
+        .await
+        .expect("insert plain cert");
+    certs
+        .insert(&pool, &percent)
+        .await
+        .expect("insert percent cert");
+    certs
+        .insert(&pool, &underscore)
+        .await
+        .expect("insert underscore cert");
+
+    let percent_filter = CertificateFilter {
+        status: None,
+        profile_name: None,
+        ca_id: None,
+        search: Some("50%".to_string()),
+    };
+    let e_percent_filter = CertificateFilter {
+        status: None,
+        profile_name: None,
+        ca_id: None,
+        search: Some("e%".to_string()),
+    };
+    let underscore_filter = CertificateFilter {
+        status: None,
+        profile_name: None,
+        ca_id: None,
+        search: Some("leaf_".to_string()),
+    };
+    let backslash_filter = CertificateFilter {
+        status: None,
+        profile_name: None,
+        ca_id: None,
+        search: Some("leaf.example\\".to_string()),
+    };
+    let percent_literal = certs
+        .list_filtered(&pool, tenant.id, &percent_filter, 0, 10)
+        .await;
+    let percent_widens_nothing = certs
+        .list_filtered(&pool, tenant.id, &e_percent_filter, 0, 10)
+        .await;
+    let underscore_literal = certs
+        .list_filtered(&pool, tenant.id, &underscore_filter, 0, 10)
+        .await;
+    let backslash_literal = certs
+        .list_filtered(&pool, tenant.id, &backslash_filter, 0, 10)
+        .await;
+
+    // Cleanup BEFORE asserting.
+    delete_cert_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY_CERTS).await;
+
+    let percent_literal = percent_literal.expect("search 50%");
+    assert_eq!(
+        percent_literal.len(),
+        1,
+        "a percent needle matches the literal percent only: {percent_literal:?}"
+    );
+    assert_eq!(percent_literal[0].id, percent.id);
+    assert!(
+        percent_widens_nothing.expect("search e%").is_empty(),
+        "`%` in the needle is a literal percent, never a wildcard"
+    );
+    let underscore_literal = underscore_literal.expect("search leaf_");
+    assert_eq!(
+        underscore_literal.len(),
+        1,
+        "`_` is a literal underscore, never a one-char wildcard: {underscore_literal:?}"
+    );
+    assert_eq!(underscore_literal[0].id, underscore.id);
+    assert!(
+        backslash_literal
+            .expect("search with a backslash needle")
+            .is_empty(),
+        "a backslash needle matches a literal backslash (none here)"
     );
 }
 
