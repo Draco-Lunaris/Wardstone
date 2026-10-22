@@ -596,3 +596,75 @@ code {
     padding: 1rem;
   }
 }
+
+/* Task 16 section: the dashboard expiry list reuses the stat tiles and
+   cert table; below, the CA detail row, the credential reveal, and the
+   audit/profile inline subpanels. */
+
+h2 {
+  font-size: 1.1rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+  margin: 1rem 0 0.25rem;
+  color: var(--ink-soft);
+}
+
+.subpanel {
+  margin: 0.25rem 0 0.5rem;
+}
+
+.ca-detail-cell {
+  padding: 0;
+}
+
+.subpanel .detail-actions {
+  margin-top: 0.75rem;
+}
+
+.subpanel textarea {
+  width: 100%;
+  max-width: 46rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.aia-list {
+  margin: 0.25rem 0;
+  padding-left: 1.2rem;
+}
+
+.aia-list li {
+  margin: 0.15rem 0;
+}
+
+.token-reveal {
+  max-width: 34rem;
+  margin: 0.5rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  user-select: all;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+.cap-check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.2rem 0;
+}
+
+.cap-check input {
+  width: auto;
+}
+
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin: 0.5rem 0;
+}

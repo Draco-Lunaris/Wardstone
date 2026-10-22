@@ -1,7 +1,8 @@
 // The router map. `/login` is public; everything else lives behind
 // <RequireAuth>, which resolves the session store's one boot and bounces
-// the unknown to `/login`. Tasks 15-17 replace the stub views with real
-// ones — the routes themselves are the contract here.
+// the unknown to `/login`. Tasks 15-17 replaced the stub views with real
+// ones (Admin ships in Task 17) — the routes themselves are the contract
+// here.
 
 import type { ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
@@ -9,17 +10,15 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Shell from "./components/Shell";
 import { useAuthState } from "./lib/auth";
 import Login from "./pages/Login";
+import Audit from "./pages/Audit";
+import Cas from "./pages/Cas";
 import CertificateDetail from "./pages/CertificateDetail";
 import Certificates from "./pages/Certificates";
+import Dashboard from "./pages/Dashboard";
 import Issuance from "./pages/Issuance";
-import {
-  Admin,
-  Audit,
-  Cas,
-  Dashboard,
-  Profiles,
-  Tokens,
-} from "./pages/Stub";
+import Profiles from "./pages/Profiles";
+import Tokens from "./pages/Tokens";
+import { Admin } from "./pages/Stub";
 
 /** The guard: unauthenticated → /login (replace, so a back button never
  * re-enters the guarded shell); booting → a quiet "checking" pane instead

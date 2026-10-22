@@ -25,6 +25,7 @@ import {
   fetchText,
   makeOneTimeDownload,
   parseSans,
+  parseAiaUris,
   REVOCATION_REASONS,
   hasCapability,
 } from "./certs";
@@ -287,3 +288,51 @@ async function errorOf(promise: Promise<unknown>): Promise<ApiError> {
   }
   throw new Error("the call unexpectedly succeeded");
 }
+
+// The AIA (authority information access) field-only parser. The fixture
+// PEMs below are REAL certificates — self-signed test-authoring-time
+// builds (openssl 3.0.13, ed25519), the first carrying an
+// authorityInfoAccess extension with one OCSP and one caIssuers URI, the
+// second carrying none (ws-ca's test suite generates its certs at
+// runtime, so no static fixture existed to copy; these stand in).
+const FIXTURE_WITH_AIA_PEM = `-----BEGIN CERTIFICATE-----
+MIIBqjCCAVygAwIBAgIUGcuWCnYcSiJ07/hMDXpAFvw7iAswBQYDK2VwMCExHzAd
+BgNVBAMMFndhcmRzdG9uZS1maXh0dXJlLXRlc3QwHhcNMjYxMDIyMTk0ODA4WhcN
+MjYxMTIxMTk0ODA4WjAhMR8wHQYDVQQDDBZ3YXJkc3RvbmUtZml4dHVyZS10ZXN0
+MCowBQYDK2VwAyEARHdkIwO4DmAxojM5Y37xHmmPQ1tjuCt8UC1psPNQgJCjgaUw
+gaIwDAYDVR0TBAUwAwEB/zBzBggrBgEFBQcBAQRnMGUwMAYIKwYBBQUHMAGGJGh0
+dHA6Ly9vY3NwLndhcmRzdG9uZS50ZXN0L3Jlc3BvbmRlcjAxBggrBgEFBQcwAoYl
+aHR0cDovL29jc3Aud2FyZHN0b25lLnRlc3QvaXNzdWVyLmNydDAdBgNVHQ4EFgQU
+VokyUeyGEfXXq+gFWyJXQBS+3JswBQYDK2VwA0EAMs+WwgeKQ1ETYKs8uww0Peyi
+zUt6yeT3ekmUbuaXo7YblM18EJbeKHcl+pGdNTESh+7+2lJCfsvnLZStWWL0Dw==
+-----END CERTIFICATE-----`;
+
+const FIXTURE_PLAIN_PEM = `-----BEGIN CERTIFICATE-----
+MIIBNDCB56ADAgECAhQjs939PNTcWw3CWGdCwJ63ZClXOTAFBgMrZXAwIjEgMB4G
+A1UEAwwXd2FyZHN0b25lLXBsYWluLWZpeHR1cmUwHhcNMjYxMDIyMTk0OTI1WhcN
+MjYxMTIxMTk0OTI1WjAiMSAwHgYDVQQDDBd3YXJkc3RvbmUtcGxhaW4tZml4dHVy
+ZTAqMAUGAytlcAMhAAesyWPH4Gcyj9PGIUffA1R/fXVurAVDlI9zGnsUgQRkoy8w
+LTAMBgNVHRMEBTADAQH/MB0GA1UdDgQWBBQKWXjApipDaLCdWHgVgQ2iZa241DAF
+BgMrZXADQQDnmo0iRRCnDhvq7TaBMe9zWlwiklZZYxre8ZRfuh1WQ+Iv7ZHcbUMG
+CfPYcJKu2WahMififl/qIB99L/eEnpUG
+-----END CERTIFICATE-----`;
+
+describe("parseAiaUris", () => {
+  it("extracts the OCSP and caIssuers URIs with their method OIDs", () => {
+    expect(parseAiaUris(FIXTURE_WITH_AIA_PEM)).toEqual([
+      { method: "1.3.6.1.5.5.7.48.1", uri: "http://ocsp.wardstone.test/responder" },
+      { method: "1.3.6.1.5.5.7.48.2", uri: "http://ocsp.wardstone.test/issuer.crt" },
+    ]);
+  });
+
+  it("returns no entries for a certificate without the AIA extension", () => {
+    expect(parseAiaUris(FIXTURE_PLAIN_PEM)).toEqual([]);
+  });
+
+  it("returns no entries for non-PEM input", () => {
+    expect(parseAiaUris("garbage")).toEqual([]);
+    expect(parseAiaUris("-----BEGIN CERTIFICATE-----\\nnot base64\\n-----END CERTIFICATE-----")).toEqual(
+      [],
+    );
+  });
+});

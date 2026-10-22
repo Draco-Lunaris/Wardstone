@@ -1,7 +1,8 @@
-// The placeholder views for the sections Tasks 16-17 fill. One shape,
-// five names — each says the section ships next, and nothing more: no
-// fake data, no fake chrome, nothing that looks finished but is not.
-// (The certificate views are real since Task 15.)
+// The placeholder that remains: Admin ships in Task 17. One shape — it
+// says the section ships next, and nothing more: no fake data, no fake
+// chrome, nothing that looks finished but is not. (The certificate views
+// are real since Task 15; the dashboard, profiles, CAs, tokens, and
+// audit views are real since Task 16.)
 
 type Stub = () => ReturnType<typeof StubSection>;
 
@@ -14,9 +15,4 @@ export function StubSection({ title }: { title: string }) {
   );
 }
 
-export const Dashboard: Stub = () => <StubSection title="Dashboard" />;
-export const Profiles: Stub = () => <StubSection title="Profiles" />;
-export const Cas: Stub = () => <StubSection title="Certificate Authorities" />;
-export const Tokens: Stub = () => <StubSection title="API Tokens" />;
-export const Audit: Stub = () => <StubSection title="Audit Log" />;
 export const Admin: Stub = () => <StubSection title="Admin" />;

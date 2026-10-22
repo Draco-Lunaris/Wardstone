@@ -117,6 +117,7 @@ export interface ProfileRevision {
   eku: string[];
   lifetime_days: number;
   san_patterns: string[];
+  created_at: string;
 }
 
 /** One CA, the fields the issuer filter needs
@@ -127,6 +128,28 @@ export interface CaSummary {
   name: string;
   subject: string;
   is_root: boolean;
+}
+
+/** One FULL CA row from `GET /api/v1/cas` (the `CaResponse` shape):
+ * `CaSummary` plus the validity/key fields the CAs page renders and the
+ * PUBLIC certificate PEM the AIA parser reads client-side (cert fields
+ * only — keys never transit this layer). */
+export interface Ca extends CaSummary {
+  parent_id: string | null;
+  key_type: string;
+  not_before: string;
+  not_after: string;
+  cert_pem: string;
+  created_at: string;
+}
+
+/** The `GET /api/v1/cas/{id}/crl` body (the newest published CRL); the
+ * route answers 404 `not_found` when the CA has none. */
+export interface CrlInfo {
+  ca_id: string;
+  issued_at: string;
+  next_update: string;
+  crl_pem: string;
 }
 
 /** `POST /api/v1/certificates/{id}/revoke`'s body. The reason is TYPED —
@@ -295,9 +318,25 @@ export function fetchProfile(id: string): Promise<Profile> {
   return apiFetch<Profile>(`/api/v1/profiles/${encodeURIComponent(id)}`);
 }
 
-/** `GET /api/v1/cas` — the CA list (the issuer filter's options). */
-export function fetchCas(): Promise<CaSummary[]> {
-  return apiFetch<CaSummary[]>("/api/v1/cas");
+/** `GET /api/v1/cas` — the CA list (the issuer filter's options; the CAs
+ * page renders the full rows). */
+export function fetchCas(): Promise<Ca[]> {
+  return apiFetch<Ca[]>("/api/v1/cas");
+}
+
+/** `GET /api/v1/cas/{id}/crl` — the CA's newest published CRL, or `null`
+ * when none has been published yet (the route's 404 `not_found` — an
+ * ordinary state, so the page can say so instead of erroring). Any other
+ * failure surfaces as its ApiError verbatim. */
+export async function fetchCasCrl(id: string): Promise<CrlInfo | null> {
+  try {
+    return await apiFetch<CrlInfo>(`/api/v1/cas/${encodeURIComponent(id)}/crl`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -373,4 +412,160 @@ export function parseSans(text: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
+}
+
+// # The AIA field parser (certificate FIELDS only — keys never)
+//
+// One focused DER walk: find the certificate's
+// id-pe-authorityInfoAccess extension (OID 1.3.6.1.5.5.7.1.1) and list
+// its URI access descriptions, so the CAs page can show the OCSP /
+// caIssuers endpoints operators would otherwise reach for `openssl x509`
+// for. Everything malformed (not a PEM, not base64, broken DER, missing
+// extension) yields entries-nothing: the parser is display-only and the
+// PEM download remains the honest fallback.
+
+/** One authority-information-access entry: the accessMethod's dotted OID
+ * (`1.3.6.1.5.5.7.48.1` is OCSP, `.2` caIssuers) and its `URI:` general
+ * name. */
+export interface AiaAccess {
+  method: string;
+  uri: string;
+}
+
+const AIA_OID = new Uint8Array([0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01]);
+
+export function parseAiaUris(pem: string): AiaAccess[] {
+  const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
+  if (!match) {
+    return [];
+  }
+  let der: Uint8Array;
+  try {
+    const binaryWindow = atob(match[0].replace(/-----(BEGIN|END) CERTIFICATE-----/g, "").replace(/\s+/g, ""));
+    der = Uint8Array.from(binaryWindow, (char) => char.charCodeAt(0));
+  } catch {
+    return [];
+  }
+  try {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    const certificate = readTlv(der, 0);
+    const tbs = readTlv(der, certificate.dataStart);
+    // Walk tbsCertificate's children; the extensions sit in the [3]
+    // EXPLICIT tag (0xA3): SEQUENCE OF Extension, each
+    // SEQUENCE { extnID OID, critical BOOLEAN?, extnValue OCTET STRING }.
+    let offset = tbs.dataStart;
+    while (offset < tbs.end) {
+      const child = readTlv(der, offset);
+      if (child.tag === 0xa3) {
+        const access = walkAiaExtension(der, child);
+        if (access) {
+          return access;
+        }
+      }
+      offset = child.next;
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/** Inside the [3] EXPLICIT: find the AIA extension and decode its value
+ * (itself a DER SEQUENCE OF AccessDescription) into URI entries. */
+function walkAiaExtension(der: Uint8Array, explicit: Tlv): AiaAccess[] | null {
+  const extensions = readTlv(der, explicit.dataStart); // SEQUENCE OF Extension
+  let offset = extensions.dataStart;
+  while (offset < extensions.end) {
+    const extension = readTlv(der, offset);
+    const oid = readTlv(der, extension.dataStart);
+    const value = readTlv(der, oid.next); // OCTET STRING (critical BYTE is optional and between the two)
+    if (matchesOid(der, oid, AIA_OID)) {
+      const aia = new Uint8Array(der.subarray(value.dataStart, value.end));
+      return readAccessDescriptions(aia);
+    }
+    offset = extension.next;
+  }
+  return null;
+}
+
+/** AuthorityInfoAccessSyntax ::= SEQUENCE OF
+ * AccessDescription ::= SEQUENCE { accessMethod OID,
+ * accessLocation [6] IMPLICIT IA5String (tag 0x86 = uniformResourceIdentifier). */
+function readAccessDescriptions(aia: Uint8Array): AiaAccess[] {
+  const entries: AiaAccess[] = [];
+  const list = readTlv(aia, 0);
+  let offset = list.dataStart;
+  while (offset < list.end) {
+    const access = readTlv(aia, offset);
+    const method = readTlv(aia, access.dataStart);
+    const location = readTlv(aia, method.next);
+    if (method.tag === 0x06 && location.tag === 0x86) {
+      entries.push({
+        method: decodeOid(aia, method.dataStart, method.end),
+        uri: new TextDecoder("ascii").decode(aia.subarray(location.dataStart, location.end)),
+      });
+    }
+    offset = access.next;
+  }
+  return entries;
+}
+
+/** One BER tag-length-value, short-form tags (everything in an X.509
+ * certificate is below tag 32) and short/long-form lengths. */
+interface Tlv {
+  tag: number;
+  dataStart: number;
+  end: number;
+  next: number;
+}
+
+function readTlv(bytes: Uint8Array, offset: number): Tlv {
+  if (offset + 2 > bytes.length) {
+    throw new RangeError("truncated DER");
+  }
+  const tag = bytes[offset];
+  let cursor = offset + 1;
+  let length = bytes[cursor];
+  cursor += 1;
+  if (length > 0x7f) {
+    const width = length & 0x7f;
+    if (width === 0 || width > 4 || cursor + width > bytes.length) {
+      throw new RangeError("unsupported DER length form");
+    }
+    length = 0;
+    for (let index = 0; index < width; index += 1) {
+      length = length * 256 + bytes[cursor + index];
+    }
+    cursor += width;
+  }
+  const end = cursor + length;
+  if (end > bytes.length) {
+    throw new RangeError("DER length overruns the buffer");
+  }
+  return { tag, dataStart: cursor, end, next: end };
+}
+
+/** Whether a TLV's contents equal the expected OID byte pattern. */
+function matchesOid(bytes: Uint8Array, oid: Tlv, expected: Uint8Array): boolean {
+  if (oid.tag !== 0x06 || oid.end - oid.dataStart !== expected.length) {
+    return false;
+  }
+  return expected.every((byte, index) => bytes[oid.dataStart + index] === byte);
+}
+
+/** A DER OBJECT IDENTIFIER's contents as dotted decimal. */
+function decodeOid(bytes: Uint8Array, start: number, end: number): string {
+  const parts: number[] = [
+    Math.floor(bytes[start] / 40),
+    bytes[start] % 40,
+  ];
+  let value = 0;
+  for (let cursor = start + 1; cursor < end; cursor += 1) {
+    value = value * 128 + (bytes[cursor] & 0x7f);
+    if ((bytes[cursor] & 0x80) === 0) {
+      parts.push(value);
+      value = 0;
+    }
+  }
+  return parts.join(".");
 }
