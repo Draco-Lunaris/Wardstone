@@ -17,7 +17,7 @@ Two of four planned plans are merged. Plan 1 (core CA — ws-core persistence, w
 ## DB-Gated Test Conventions (binding)
 
 - Test DB: `postgres://wardstone:wardstone@localhost:5432/wardstone_test`.
-- Every DB-gated suite takes a unique advisory-lock key from the `0x0057_4144_5354_00xx` family — **0003 through 0011 are taken**; the next free key is `0012`. Never reuse a key.
+- Every DB-gated suite takes a unique advisory-lock key from the `0x0057_4144_5354_00xx` family — **0003 through 0013 are taken** (`0012` = `ws-api oidc_test`, `0013` = `ws-web session_test`); the next free key is `0014`. Never reuse a key.
 - Every suite sweeps its own rows (FK order) BEFORE each test and **DELETEs the rows it created at the END of each test** — `crates/ws-core/tests/db_test.rs` snapshots the tenant-name set before/after and proves `connect()` itself never seeds a tenant.
 - Migration files in `crates/ws-core/migrations/` are ADD-ONLY: sqlx checksums them (SHA-384 over raw bytes), so editing an applied migration breaks every deployed database. Bump `REQUIRED_MIGRATION_COUNT` in `crates/ws-core/src/db.rs` when adding one; `connect()` runs migrations before the count check.
 

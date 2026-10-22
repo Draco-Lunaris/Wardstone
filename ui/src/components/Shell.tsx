@@ -15,7 +15,8 @@ import { hasCapability } from "../lib/certs";
 
 /** (label, path, required capability) pairs — nav order pinned to the
  * wireframe; `null` means the entry is for every authenticated actor
- * (Dashboard is the home route; Admin's gating lands with Task 17). */
+ * (Dashboard is the home route; the Admin link stays capability-free —
+ * the Task 17 admin console gates its tabs section-level inside the page). */
 const NAV: Array<[string, string, string | null]> = [
   ["Dashboard", "/", null],
   ["Certificates", "/certificates", "read_certificates"],

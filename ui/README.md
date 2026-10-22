@@ -20,7 +20,7 @@ the committed copy is the contract.
 
 Vite is pinned (`base: "/"`, `outDir: "dist"`) in `vite.config.ts`; the
 embedding path comes from the ws-web crate
-(`crates/ws-web/src/ui.rs`, `include_dir!("$CARGO_MANIFEST_DIR/../ui/dist")`).
+(`crates/ws-web/src/ui.rs`, `include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist")`).
 
 ## Developing against a running ws-web
 

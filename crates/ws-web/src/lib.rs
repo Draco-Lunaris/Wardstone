@@ -66,9 +66,11 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
 /// surface ONLY while the default tenant does not exist, plus the
 /// `/api/v1` proxy and the `/auth/ui` session relay in every phase. The
 /// caller checks nothing — this function performs the `tenant_exists`
-/// check itself, so mounting (not refusal) is the unmount mechanism: with
-/// the tenant present there is no `/setup` route at all and a request to
-/// it is a plain 404.
+/// check itself, so the unmount mechanism is the EXPLICIT replacement
+/// router: with the tenant present the setup routes are swapped for
+/// [`setup_unmounted_router`]'s plain 404s — a request to `/setup` never
+/// reaches the SPA fallback, which would otherwise answer 200 +
+/// `index.html`.
 ///
 /// The session store is constructed here with `session_access_ttl` (the
 /// 15-minute [`DEFAULT_SESSION_TTL`] for the binary); tests that need a
