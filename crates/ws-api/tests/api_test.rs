@@ -2674,3 +2674,203 @@ async fn chain_routes_walk_to_root() {
         "the CA chain never contains a leaf certificate"
     );
 }
+
+/// The chain walk refuses a CROSS-TENANT parent. The schema normally
+/// refuses it too — migration 008's `cas_parent_tenant_fk` composite
+/// foreign key keeps a CA's parent in-tenant — so this regression
+/// temporarily DROPS that constraint to bend the schema by direct UPDATE
+/// (re-adding it VALIDATED after cleanup, and the sweep-first section also
+/// heals a constraint a crashed run may have left dropped). The bend: a
+/// second tenant seeded raw, the actor tenant's sub-CA's `parent_id`
+/// repointed at the foreign CA, and both chain routes must answer 500
+/// (`internal` — the `CoreError::Config` mapping) WITHOUT the foreign
+/// CA's PEM. Cross-tenant parents are prevented at `create_ca` (the API
+/// filters the named parent to the actor's tenant — the foreign rows here
+/// are seeded raw precisely because the API refuses); the walk's per-hop
+/// tenant check is the third belt, behind the schema and the API.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn chain_walk_refuses_cross_tenant_parent() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, root_id) = setup_profile_and_ca(&fx).await;
+
+    // The sub-CA under the fixture root, through the API: the parent check
+    // at create_ca accepts this one (same tenant).
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "chain-cross-tenant",
+            "subject": "Wardstone Cross-Tenant Chain",
+            "key_type": "ed25519",
+            "is_root": false,
+            "parent_id": root_id
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the sub-CA");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let sub: Value = serde_json::from_slice(&raw).unwrap();
+    let sub_id = sub["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // Sweep-first, then the second tenant and its CA, seeded raw: the API
+    // would refuse a cross-tenant parent — that refusal is exactly what
+    // this belt is for.
+    sqlx::query("DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-chain cas rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-chain tenant");
+    // Heal the schema a previously crashed run may have damaged (this test
+    // drops cas_parent_tenant_fk to bend the edge): re-add it if absent.
+    // The sweep-first contract covers the schema, not just the rows.
+    sqlx::query(
+        "DO $$ BEGIN \
+         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cas_parent_tenant_fk') THEN \
+         ALTER TABLE cas ADD CONSTRAINT cas_parent_tenant_fk \
+         FOREIGN KEY (parent_id, tenant_id) REFERENCES cas (id, tenant_id) \
+         DEFERRABLE INITIALLY DEFERRED; \
+         END IF; END $$;",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("heal cas_parent_tenant_fk if a crashed run dropped it");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind("rt-api-foreign-chain")
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign tenant");
+    let foreign_ca = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO cas (id, tenant_id, name, subject, is_root, parent_id, key_type, \
+         not_before, not_after, cert_pem, key_file, created_at) \
+         VALUES ($1, $2, $3, $4, true, NULL, 'ed25519', now(), now(), $5, 'ca/foreign.key', now())",
+    )
+    .bind(foreign_ca)
+    .bind(foreign_tenant)
+    .bind("foreign-root-ca")
+    .bind("Wardstone Foreign Root")
+    .bind("-----BEGIN CERTIFICATE-----\nFOREIGNCHAINPEM\n-----END CERTIFICATE-----\n")
+    .execute(&fx.pool)
+    .await
+    .expect("insert the foreign ca");
+
+    // Bend the schema: the sub's parent becomes the foreign CA. The 008
+    // foreign key would refuse this write — the schema itself keeps a CA's
+    // parent in-tenant — so the constraint is dropped for the bend
+    // (re-added validated after cleanup).
+    sqlx::query("ALTER TABLE cas DROP CONSTRAINT cas_parent_tenant_fk")
+        .execute(&fx.pool)
+        .await
+        .expect("drop cas_parent_tenant_fk for the bend");
+    sqlx::query("UPDATE cas SET parent_id = $2 WHERE id = $1")
+        .bind(sub_id)
+        .bind(foreign_ca)
+        .execute(&fx.pool)
+        .await
+        .expect("seed the cross-tenant parent");
+
+    // A leaf issued through the normal helper, repointed at the sub (same
+    // tenant), so the certificate chain route walks the bent edge too.
+    let (leaf_status, leaf_body) = issue_csr(
+        &fx,
+        profile_id,
+        "x.chain.wardstone.test",
+        &["x.chain.wardstone.test"],
+    )
+    .await;
+    assert_eq!(leaf_status, StatusCode::OK, "issue the leaf: {leaf_body}");
+    let leaf_id = leaf_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    sqlx::query("UPDATE certificates SET ca_id = $2 WHERE id = $1")
+        .bind(leaf_id)
+        .bind(sub_id)
+        .execute(&fx.pool)
+        .await
+        .expect("repoint the leaf at the sub");
+
+    // Both GETs run BEFORE cleanup (the self-cleaning contract).
+    let ca_res = get_bearer(&fx, &format!("/api/v1/cas/{sub_id}/chain"), &token).await;
+    let ca_status = ca_res.status();
+    let raw = axum::body::to_bytes(ca_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ca_text = String::from_utf8(raw.to_vec()).unwrap();
+    let ca_body: Value = serde_json::from_str(&ca_text).unwrap_or(json!({}));
+    let cert_res = get_bearer(
+        &fx,
+        &format!("/api/v1/certificates/{leaf_id}/chain"),
+        &token,
+    )
+    .await;
+    let cert_status = cert_res.status();
+    let raw = axum::body::to_bytes(cert_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let cert_text = String::from_utf8(raw.to_vec()).unwrap();
+    let cert_body: Value = serde_json::from_str(&cert_text).unwrap_or(json!({}));
+
+    // Cleanup covers the fixture tenant; the schema FK is restored BEFORE
+    // the foreign rows go (nothing references the foreign CA by then: the
+    // bent sub row was deleted with the fixture rows, so the re-added
+    // constraint validates cleanly), then the foreign rows.
+    fx.cleanup().await;
+    sqlx::query(
+        "ALTER TABLE cas ADD CONSTRAINT cas_parent_tenant_fk \
+         FOREIGN KEY (parent_id, tenant_id) REFERENCES cas (id, tenant_id) \
+         DEFERRABLE INITIALLY DEFERRED",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("re-add cas_parent_tenant_fk");
+    sqlx::query("DELETE FROM cas WHERE tenant_id = $1")
+        .bind(foreign_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the foreign cas rows");
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(foreign_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the foreign tenant");
+
+    assert_eq!(
+        ca_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the CA chain walk refuses a cross-tenant parent"
+    );
+    assert_eq!(
+        error_code(&ca_body),
+        "internal",
+        "the CoreError::Config mapping"
+    );
+    assert!(
+        !ca_text.contains("FOREIGNCHAINPEM"),
+        "the foreign CA's PEM never enters the response: {ca_text}"
+    );
+    assert_eq!(
+        cert_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the certificate chain walk refuses a cross-tenant parent"
+    );
+    assert_eq!(error_code(&cert_body), "internal");
+    assert!(
+        !cert_text.contains("FOREIGNCHAINPEM"),
+        "the foreign CA's PEM never enters the response: {cert_text}"
+    );
+}

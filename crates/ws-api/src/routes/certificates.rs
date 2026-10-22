@@ -1078,9 +1078,11 @@ async fn get_certificate_chain(
     let chain = {
         // One pooled connection serves the multi-statement walk (the
         // repos' executor convention: several statements need a `&mut
-        // PgConnection`).
+        // PgConnection`); the walk re-checks the verified tenant per hop.
         let mut conn = state.pool.acquire().await?;
-        CaRepo::new().chain_to_root(&mut conn, cert.ca_id).await?
+        CaRepo::new()
+            .chain_to_root(&mut conn, auth.tenant_id, cert.ca_id)
+            .await?
     };
     let mut body = cert.cert_pem.clone();
     body.extend(chain.iter().map(|ca| ca.cert_pem.as_str()));
