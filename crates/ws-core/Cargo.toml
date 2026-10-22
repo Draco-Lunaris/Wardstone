@@ -8,6 +8,15 @@ rust-version.workspace = true
 # "ipnet" adds the std::net::IpAddr <-> inet binding (and its array form)
 # used by the certificates table's san_ips inet[] column (migration 002).
 sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono", "ipnet"] }
+# XChaCha20-Poly1305 sealing of small secrets at rest (crypto.rs SecretBox:
+# the TOTP/WebAuthn secret-encryption key file); the "zeroize" feature
+# wipes the cipher's retained key copy (same features as ws-ca's keystore).
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
+# Zeroizing key/plaintext material in SecretBox (key, AEAD output).
+zeroize = { workspace = true }
+# OS entropy for fresh secret-encryption keys and AEAD nonces (rand 0.10
+# SysRng, the house pattern).
+rand = { workspace = true }
 # jsonb decode/encode for the audit_log details column (migration 003).
 serde_json = { workspace = true }
 thiserror = { workspace = true }

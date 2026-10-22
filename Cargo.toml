@@ -57,7 +57,88 @@ tracing = { version = "0.1.44" }
 thiserror = { version = "2.0.21" }
 anyhow = { version = "1.0.104" }
 
+# The `wardstone` binary's log subscriber (Task 12): the fmt layer plus
+# the RUST_LOG env filter. `env-filter` is NOT a default feature of the
+# crate; without it RUST_LOG is silently ignored. Exact caret pin per the
+# shared-version note above.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+# JWT: Ed25519 (EdDSA) access tokens. House pin (linux-patch-manager). The
+# `rust_crypto` feature selects the pure-Rust ed25519-dalek backend over
+# aws-lc-rs, which needs a C toolchain absent from the container image; the
+# default `use_pem` feature provides EncodingKey/DecodingKey::from_ed_pem.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# Ed25519 keypair generation for the JWT signing/verification key pair (the
+# `pkcs8` feature provides the PKCS#8/SPKI encoders; keys stay in PEM form).
+ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
+
+# PKCS#8/SPKI DER encoding for the JWT key pair. The `pem` feature provides
+# to_pkcs8_pem / to_public_key_pem and LineEnding (der/pem -> pem-rfc7468).
+pkcs8 = { version = "0.10.2", features = ["pem"] }
+
+# Hex encoding for auth token material (house pin; Task 8's token digests).
+hex = "0.4"
+
+# TOTP MFA (ws-auth): HMAC-SHA1 RFC 6238 authenticator-compatible codes. The
+# `gen_secret` feature keys the fresh-secret generator; `otpauth` builds
+# per-user otpauth:// URIs. House pin (linux-patch-manager pm-auth).
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+
+# OIDC discovery / code-exchange / JWKS HTTP client (ws-auth). House pin
+# (linux-patch-manager). Default features are OFF so the default-tls feature
+# (native-tls/OpenSSL, absent from this container image) is never pulled; the
+# pure-Rust rustls backend is pinned instead.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# HMAC-SHA1 signing backend for the TOTP code-computation regression test's
+# independent RFC 6238 check (dev-only in ws-auth; never used by production
+# code). 0.13 is the only live 0.x line in this timeline's index; it pairs
+# with digest 0.11, so ws-auth's test pins sha1 0.11 crate-locally.
+hmac = { version = "0.13", default-features = false }
+
 # Timestamp type of rcgen's CertificateParams (not_before/not_after):
 # issue.rs converts caller chrono instants to time::OffsetDateTime at the
 # rcgen boundary. Already resolved in the lock via rcgen.
 time = { version = "0.3.55", default-features = false, features = ["std"] }
+
+# HTTP framework of the REST surface (ws-api, Task 10). House pin
+# (linux-patch-manager pm-web).
+axum = { version = "0.8.9" }
+
+# Tower middleware plumbing for the access-log layer (ws-api). The `util`
+# feature is required to build `Service`/`Layer` combinators by hand.
+tower = { version = "0.5.3", features = ["util"] }
+
+# tower-http for security/response headers on the ws-api router.
+tower-http = { version = "0.6.11", features = ["set-header"] }
+
+# GCRA rate limiting (ws-api's public auth routes): the house's rate-limit
+# runtime. Version aligned to tower_governor 0.8.0's requirement (it pulls
+# governor 0.10.x); the two-version lock split of pm-web is not reproduced
+# here.
+governor = { version = "0.10.4" }
+
+# The Governor tower Layer/Service adapter over `governor` (ws-api).
+# House pin (linux-patch-manager pm-web).
+tower_governor = { version = "0.8.0" }
+
+# The TLS front door (ws-web, Task 11): axum-server hosts the UI listener
+# on top of axum 0.8 / hyper 1. `tls-rustls-no-provider` (which the plain
+# `tls-rustls` feature implies) selects axum-server's rustls TLS module, but
+# the plain feature ALSO force-enables `rustls/aws-lc-rs` — a crypto
+# provider whose build needs a C toolchain absent from this container image
+# — so the no-provider feature is pinned and ws-web installs the `ring`
+# provider in code (`rustls_server_config`). Verified with
+# `cargo tree -e features`: no aws-lc crate enters the graph via ws-web.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+
+# rustls + tokio-rustls backend choice (ws-web): the `ring` provider only.
+# Both crates' default features enable `aws-lc-rs` (their default crypto
+# provider), which requires a C toolchain absent from this container image
+# — the same constraint ws-auth's jsonwebtoken `rust_crypto` pin already
+# recorded — so BOTH are pinned with default-features = false and the
+# `ring` feature explicitly. Verified in Task 11 with
+# `cargo tree -e features`: no aws-lc crate enters the graph via ws-web.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

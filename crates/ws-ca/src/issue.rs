@@ -36,11 +36,17 @@
 //!
 //! Mirrors the CA profile of [`crate::ca`]: subject is a single
 //! `CN=<common name>` (UTF8String) taken from the spec override or the
-//! CSR's CN; SANs from [`LeafSpec::sans`] (DNS/IP/email); KeyUsage exactly
-//! as requested, critical; BasicConstraints `CA:FALSE` critical; SKI per
+//! CSR's CN; SANs from [`LeafSpec::sans`] (DNS/IP/email); KeyUsage and
+//! ExtendedKeyUsage exactly as requested (KeyUsage critical; both lists
+//! refused when empty, because an ABSENT extension is more permissive
+//! than any pinned list); BasicConstraints `CA:FALSE` critical; SKI per
 //! rcgen's default; `not_before` is midnight UTC one day before today
-//! (Task 5's clock-skew margin), `not_after` the spec's instant or, when
-//! unset, exactly `crate::ca::CaLifetime::Leaf`'s 30 days after `not_before`.
+//! (Task 5's clock-skew margin) and is computed here, never supplied by
+//! the caller; `not_after = not_before + lifetime` — the spec's
+//! `lifetime` is the certificate's SPAN. A leaf whose span reaches
+//! beyond the issuing CA's `notAfter` is refused, never silently clamped
+//! (Plan 1 clamped; a certificate that silently differs from its profile
+//! is a policy violation invisible to the caller and the auditor).
 //!
 //! # Key material handling
 //!
@@ -52,7 +58,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     PublicKeyData, SanType, SerialNumber, SignatureAlgorithm, PKCS_ECDSA_P256_SHA256,
     PKCS_ECDSA_P384_SHA384, PKCS_ED25519, PKCS_RSA_SHA256,
 };
@@ -67,6 +73,14 @@ use crate::ca::{
     ensure_issuer_is_ca, ensure_parent_key_matches_cert, issuer_not_after, ZeroizingKey,
 };
 use crate::error::CaError;
+use crate::leafkey::LeafKeyType;
+
+/// [`ws_core::models::rbac::KeyUsagePurpose`], re-exported: Wardstone's
+/// ONE key-usage vocabulary. `ws-core` owns the enum (Task 2);
+/// `ws-ca` re-exports it so profiles can name it through `ws-ca`
+/// alone, and converts it to the engine's type at the boundary
+/// ([`key_usage_to_rcgen`]).
+pub use ws_core::models::rbac::KeyUsagePurpose;
 
 /// One subject alternative name that a leaf may carry.
 ///
@@ -84,6 +98,71 @@ pub enum SanEntry {
     /// An email address (rfc822Name). Reserved for the future S/MIME
     /// profile.
     Email(String),
+}
+
+/// One RFC 5280 extended key usage (EKU), as a leaf profile's `ekus`
+/// list spells it and as the issuance engine receives it — the
+/// snake_case house spelling, NOT the RFC's camelCase OID aliases
+/// (which would spell `serverAuth`).
+///
+/// rcgen's enum has two more variants, `Any` (anyExtendedKeyUsage) and
+/// `Other(Vec<u64>)`: deliberately absent here, because a profile cannot
+/// express "usable for any purpose" or an unknown OID — a certificate
+/// usable for anything is exactly what an ABSENT EKU extension means,
+/// and an absent extension is precisely what [`sign_leaf_with`]'s
+/// empty-list refusal exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtKeyUsagePurpose {
+    /// TLS server authentication (`id-kp-serverAuth`).
+    ServerAuth,
+    /// TLS client authentication (`id-kp-clientAuth`).
+    ClientAuth,
+    /// Code signing (`id-kp-codeSigning`).
+    CodeSigning,
+    /// Email protection / S/MIME (`id-kp-emailProtection`).
+    EmailProtection,
+    /// OCSP response signing (`id-kp-OCSPSigning`).
+    OcspSigning,
+    /// Timestamping (`id-kp-timeStamping`).
+    TimeStamping,
+}
+
+/// Every [`ExtKeyUsagePurpose`], for round-trip tests.
+pub const ALL_EXT_KEY_USAGE_PURPOSES: &[ExtKeyUsagePurpose] = &[
+    ExtKeyUsagePurpose::ServerAuth,
+    ExtKeyUsagePurpose::ClientAuth,
+    ExtKeyUsagePurpose::CodeSigning,
+    ExtKeyUsagePurpose::EmailProtection,
+    ExtKeyUsagePurpose::OcspSigning,
+    ExtKeyUsagePurpose::TimeStamping,
+];
+
+impl ExtKeyUsagePurpose {
+    /// The value a leaf profile stores in its `ekus` list (the TEXT[]
+    /// element; plain snake_case — identical to the serde name, written
+    /// once).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtKeyUsagePurpose::ServerAuth => "server_auth",
+            ExtKeyUsagePurpose::ClientAuth => "client_auth",
+            ExtKeyUsagePurpose::CodeSigning => "code_signing",
+            ExtKeyUsagePurpose::EmailProtection => "email_protection",
+            ExtKeyUsagePurpose::OcspSigning => "ocsp_signing",
+            ExtKeyUsagePurpose::TimeStamping => "time_stamping",
+        }
+    }
+
+    /// Fallible parse from the TEXT[] element value (house idiom;
+    /// inherent rather than `FromStr` because there is no error type to
+    /// carry).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        ALL_EXT_KEY_USAGE_PURPOSES
+            .iter()
+            .copied()
+            .find(|e| e.as_str() == s)
+    }
 }
 
 /// What a CSR requests, as reported by [`validate_csr`].
@@ -108,17 +187,40 @@ pub struct CsrInfo {
 /// Policy for one leaf certificate, supplied by the caller.
 ///
 /// The serial is caller-owned: Task-8's DB-backed allocation supplies it
-/// in later plans; issuance never mints one.
+/// in later plans; issuance never mints one. There is deliberately NO
+/// `Default` derive: a derived default would yield empty `ekus` and
+/// `key_usages` — exactly the lists [`sign_leaf_with`] refuses — and a
+/// zero `lifetime` plus `serial = 0`, an illegal RFC 5280 serial.
 #[derive(Debug, Clone)]
 pub struct LeafSpec {
     /// Subject alternative names to place on the leaf. Comes from CA
     /// policy, not from the CSR's requested extensions.
     pub sans: Vec<SanEntry>,
     /// KeyUsage bits to place on the leaf (critical, exactly as given).
+    /// MUST be non-empty: [`sign_leaf_with`] refuses an empty list,
+    /// because an absent keyUsage extension is MORE permissive than any
+    /// pinned list (RFC 5280 section 4.2.1.3 — without it the
+    /// certificate is unrestricted).
     pub key_usages: Vec<KeyUsagePurpose>,
-    /// Expiry instant; `None` selects the leaf default of 30 days
-    /// (`crate::ca::CaLifetime::Leaf`) after `not_before`.
-    pub not_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// ExtendedKeyUsage purposes to place on the leaf. MUST be
+    /// non-empty, for the same reason (RFC 5280 section 4.2.1.12).
+    pub ekus: Vec<ExtKeyUsagePurpose>,
+    /// The key type the profile pins: the CSR's actual key must match it
+    /// EXACTLY — the exact algorithm for the non-RSA pins, and for the
+    /// RSA pins the exact algorithm AND the exact modulus size (an
+    /// `rsa2048` profile rejects a 3072-bit CSR). Plan 2's setup page
+    /// generates the leaf key from this same pin via
+    /// [`crate::leafkey::generate_leaf_key`].
+    pub key_type: LeafKeyType,
+    /// The certificate's validity SPAN. `ws-ca` computes `not_before`
+    /// (midnight UTC one day before today — the clock-skew margin)
+    /// internally and sets `not_after = not_before + lifetime`, so a
+    /// span, never an absolute instant: the caller cannot observe the
+    /// internal `not_before`, and an absolute `not_after` would make the
+    /// actual span depend on issuance time (up to a day off the
+    /// profile's number). Whole seconds; a profile's `lifetime_days`
+    /// maps 1:1 onto this field.
+    pub lifetime: chrono::Duration,
     /// Subject common name override. `None` keeps the CSR's own CN. The
     /// final subject must be non-empty: a whitespace override over a
     /// CN-less request is a typed error, never a subject-less certificate.
@@ -141,12 +243,6 @@ pub struct IssuedLeaf {
     /// Not-after instant (whole seconds, UTC).
     pub not_after: chrono::DateTime<chrono::Utc>,
 }
-
-/// The leaf validity default in days, pinned to `crate::ca::CaLifetime::Leaf`'s 30
-/// days: a mismatch fails this module's tests rather than drifting.
-/// (A const expression over `duration()` would need a const fn, so the
-/// pin lives in the test suite instead.)
-const LEAF_VALIDITY_DAYS: i64 = 30;
 
 /// Human-readable subject-public-key-algorithm name for a parsed SPKI, as
 /// consumed by [`supported_key_alg`].
@@ -334,6 +430,47 @@ fn csr_public_key_data(alg: &str, key_bits: &[u8]) -> Result<CsrPublicKey, CaErr
     })
 }
 
+/// Convert Wardstone's ONE key-usage vocabulary onto the engine's type.
+///
+/// A free function on purpose: a method on [`KeyUsagePurpose`] would put
+/// `rcgen` into `ws-core` (the crate that owns the enum), and an
+/// `impl From<ws_core::KeyUsagePurpose> for rcgen::KeyUsagePurpose`
+/// would violate the orphan rule (E0210).
+pub fn key_usage_to_rcgen(k: KeyUsagePurpose) -> rcgen::KeyUsagePurpose {
+    match k {
+        KeyUsagePurpose::DigitalSignature => rcgen::KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment => rcgen::KeyUsagePurpose::KeyEncipherment,
+        KeyUsagePurpose::DataEncipherment => rcgen::KeyUsagePurpose::DataEncipherment,
+        KeyUsagePurpose::KeyAgreement => rcgen::KeyUsagePurpose::KeyAgreement,
+        KeyUsagePurpose::KeyCertSign => rcgen::KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign => rcgen::KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::ContentCommitment => rcgen::KeyUsagePurpose::ContentCommitment,
+        KeyUsagePurpose::EncipherOnly => rcgen::KeyUsagePurpose::EncipherOnly,
+        KeyUsagePurpose::DecipherOnly => rcgen::KeyUsagePurpose::DecipherOnly,
+    }
+}
+
+/// Convert Wardstone's EKU vocabulary onto the engine's type.
+///
+/// rcgen's enum has two extra variants, `Any` and `Other(Vec<u64>)`:
+/// deliberately unreachable here — [`LeafSpec::ekus`] cannot express
+/// "any purpose" or an unknown OID, so the conversion is a total match
+/// over Wardstone's six variants and a future Wardstone variant fails
+/// compilation here instead of silently not being encoded.
+///
+/// A free function, like [`key_usage_to_rcgen`] (same orphan-rule and
+/// dependency-direction reasoning).
+pub fn eku_to_rcgen(e: ExtKeyUsagePurpose) -> ExtendedKeyUsagePurpose {
+    match e {
+        ExtKeyUsagePurpose::ServerAuth => ExtendedKeyUsagePurpose::ServerAuth,
+        ExtKeyUsagePurpose::ClientAuth => ExtendedKeyUsagePurpose::ClientAuth,
+        ExtKeyUsagePurpose::CodeSigning => ExtendedKeyUsagePurpose::CodeSigning,
+        ExtKeyUsagePurpose::EmailProtection => ExtendedKeyUsagePurpose::EmailProtection,
+        ExtKeyUsagePurpose::OcspSigning => ExtendedKeyUsagePurpose::OcspSigning,
+        ExtKeyUsagePurpose::TimeStamping => ExtendedKeyUsagePurpose::TimeStamping,
+    }
+}
+
 /// Issue a leaf certificate from a CSR, signed by the CA whose certificate
 /// and key are supplied (`ca_cert_pem` + `ca_key_der` must pair — they are
 /// checked against each other, as in [`crate::ca::create_sub_ca`]).
@@ -349,6 +486,29 @@ pub fn sign_leaf_with(
     csr_pem: &str,
     spec: &LeafSpec,
 ) -> Result<IssuedLeaf, CaError> {
+    // Profile obligations first, before any key is loaded or parsed: an
+    // empty key-usage or EKU list would mint a certificate whose ABSENT
+    // extension is MORE permissive than any pinned list (RFC 5280
+    // sections 4.2.1.3 and 4.2.1.12 — without keyUsage the certificate
+    // is unrestricted), so "no pins" can only be a caller bug, never a
+    // profile. Refused with a typed error, never issued.
+    if spec.key_usages.is_empty() {
+        return Err(CaError::X509(
+            "leaf keyUsage is empty: an absent keyUsage extension is more permissive than \
+             any pinned list (RFC 5280 section 4.2.1.3); a leaf profile must pin at least \
+             one key usage"
+                .to_owned(),
+        ));
+    }
+    if spec.ekus.is_empty() {
+        return Err(CaError::X509(
+            "leaf extendedKeyUsage is empty: an absent extendedKeyUsage extension is more \
+             permissive than any pinned list (RFC 5280 section 4.2.1.12); a leaf profile \
+             must pin at least one EKU"
+                .to_owned(),
+        ));
+    }
+
     // Issuer side: load the CA key (zeroized on every exit path) and prove
     // the certificate/key pair belongs together before the issuer DN from
     // the certificate and the signature from the key are combined.
@@ -368,7 +528,34 @@ pub fn sign_leaf_with(
     let csr = parse_csr_der(&csr_der)?;
     let spki = &csr.certification_request_info.subject_pki;
     let alg = alg_name(spki);
-    gate_supported_key(&alg, spki)?;
+    let csr_rsa_bits = gate_supported_key(&alg, spki)?;
+    // The profile's key-type pin: the CSR's key must match it EXACTLY --
+    // the exact algorithm for the non-RSA pins, and for the RSA pins the
+    // exact algorithm AND the exact modulus size (an Rsa2048 pin rejects
+    // a 3072- or 4096-bit CSR; the enum deliberately narrows the
+    // accepted set to the two supported sizes, and a floor under the pin
+    // would undo that narrowing). A different family, or a modulus of
+    // the wrong size, is a typed rejection: issuing a certificate whose
+    // key contradicts its recorded profile is a policy violation
+    // invisible to the auditor.
+    let (pinned_alg, pinned_rsa_bits) = spec.key_type.csr_constraint();
+    if alg != pinned_alg {
+        return Err(CaError::UnsupportedKeyType(format!(
+            "CSR key algorithm {alg} does not match the profile-pinned leaf key type {} \
+             (which requires {pinned_alg})",
+            spec.key_type.as_str()
+        )));
+    }
+    if let Some(pinned_bits) = pinned_rsa_bits {
+        let bits = csr_rsa_bits.unwrap_or(0);
+        if bits != pinned_bits {
+            return Err(CaError::UnsupportedKeyType(format!(
+                "CSR RSA key is {bits} bits; the profile pins leaf key type {} \
+                 ({pinned_alg}) of exactly {pinned_bits} bits",
+                spec.key_type.as_str()
+            )));
+        }
+    }
 
     // Pinned hard requirement: the requester's self-signature must verify
     // (proof of possession) before this CA signs for the key.
@@ -404,31 +591,36 @@ pub fn sign_leaf_with(
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, cn);
 
-    // Validity: not_before is midnight UTC one day before today (Task 5's
-    // clock-skew margin); not_after is the spec instant or, unset, exactly
-    // the leaf lifetime later. Both ends are whole seconds.
-    //
-    // The leaf is CLAMPED to the issuing CA certificate's own notAfter: a
-    // leaf that outlives its issuer is a self-inflicted outage for the
-    // remaining life of the chain (a leaf valid to 2036 under a CA that
-    // dies in 2031). When the clamp leaves no valid window at all, the
-    // request is refused with a typed error rather than minting a
-    // certificate that is invalid the moment it exists.
-    let (not_before, not_after) = validity_window(spec.not_after)?;
-    let issuer_not_after = issuer_not_after(ca_cert_pem)?;
-    let not_after = if not_after.unix_timestamp() > issuer_not_after.timestamp() {
-        unix_secs_to_offset(issuer_not_after.timestamp())?
-    } else {
-        not_after
-    };
-    // Sanity: an explicit not_after at or before not_before would issue an
-    // already-invalid leaf (negative window); reject it typed rather than
-    // mint a certificate no relying party would trust.
-    if not_after.unix_timestamp() <= not_before.unix_timestamp() {
+    // The lifetime must be positive: a zero or negative span would issue
+    // a certificate whose validity window never opens.
+    if spec.lifetime.num_seconds() <= 0 {
         return Err(CaError::X509(format!(
-            "leaf not_after ({}) is not after not_before ({})",
+            "leaf lifetime must be positive, but {} seconds was requested; not_after would \
+             be at or before not_before",
+            spec.lifetime.num_seconds()
+        )));
+    }
+    // Validity: not_before is midnight UTC one day before today (Task 5's
+    // clock-skew margin), computed HERE — the caller can never observe
+    // it, which is why the spec carries a span — and not_after is exactly
+    // `not_before + lifetime`: the span the profile asked for is the span
+    // the certificate carries.
+    //
+    // A leaf whose span reaches beyond the issuing CA certificate's own
+    // notAfter is REFUSED — a deliberate change from Plan 1, which
+    // silently clamped not_after to the issuer's expiry and thereby
+    // minted a certificate that silently differs from its profile,
+    // invisible to both the caller and the auditor. The refusal names
+    // both instants so the caller can shorten the profile's lifetime or
+    // renew the CA.
+    let (not_before, not_after) = validity_window(&spec.lifetime)?;
+    let issuer_not_after = issuer_not_after(ca_cert_pem)?;
+    if not_after.unix_timestamp() > issuer_not_after.timestamp() {
+        return Err(CaError::X509(format!(
+            "leaf not_after ({}) outlives the issuing CA certificate's notAfter ({}); \
+             shorten the profile's lifetime or renew the CA",
             not_after.unix_timestamp(),
-            not_before.unix_timestamp()
+            issuer_not_after.timestamp()
         )));
     }
 
@@ -453,7 +645,13 @@ pub fn sign_leaf_with(
     // End-entity: explicit CA:FALSE BasicConstraints (critical), so the
     // issued profile is deterministic for CRL/chain consumers.
     params.is_ca = IsCa::ExplicitNoCa;
-    params.key_usages = spec.key_usages.clone();
+    params.key_usages = spec
+        .key_usages
+        .iter()
+        .copied()
+        .map(key_usage_to_rcgen)
+        .collect();
+    params.extended_key_usages = spec.ekus.iter().copied().map(eku_to_rcgen).collect();
     params.subject_alt_names = spec
         .sans
         .iter()
@@ -477,43 +675,54 @@ pub fn sign_leaf_with(
 /// [`supported_key_alg`], plus RSA's >= 2048-bit floor read from the
 /// parsed SPKI modulus. Everything else is a typed
 /// [`CaError::UnsupportedKeyType`] naming the offending algorithm.
-fn gate_supported_key(alg: &str, spki: &SubjectPublicKeyInfo<'_>) -> Result<(), CaError> {
+///
+/// Returns the parsed RSA modulus size in bits when the key is RSA
+/// (`None` otherwise), for the caller's profile key-type pin check.
+fn gate_supported_key(
+    alg: &str,
+    spki: &SubjectPublicKeyInfo<'_>,
+) -> Result<Option<usize>, CaError> {
     if !supported_key_alg(alg) {
         return Err(CaError::UnsupportedKeyType(format!(
             "CSR key algorithm {alg} is not supported \
              (supported: Ed25519, ECDSA P-256, ECDSA P-384, RSA >= 2048 bits)"
         )));
     }
-    if alg == "RSA" {
-        // x509-parser's RSAPublicKey::key_size() strips only a leading
-        // zero byte, and a DER INTEGER prepends that sign octet exactly
-        // when the modulus' MSB is set. A 2048-bit modulus has its MSB
-        // set by definition, so it always reports exactly 2048. The
-        // undercount only appears on a modulus of 2041-2047 bits, whose
-        // MSB is clear and which therefore carries NO sign octet: it
-        // reports 8 * 255 = 2040 and is over-rejected here. The check may
-        // over-reject but never over-accept, and stays that way on
-        // purpose; do not "fix" it into a permissive check.
-        let bits = match spki.parsed() {
-            Ok(x509_parser::public_key::PublicKey::RSA(rsa)) => rsa.key_size(),
-            // A SPKI the RSA parser cannot crack cannot be signed for.
-            _ => 0,
-        };
-        if bits < 2048 {
-            return Err(CaError::UnsupportedKeyType(format!(
-                "CSR RSA key is {bits} bits; the minimum supported RSA key size is 2048 bits"
-            )));
-        }
+    if alg != "RSA" {
+        return Ok(None);
     }
-    Ok(())
+    // x509-parser's RSAPublicKey::key_size() strips only a leading
+    // zero byte, and a DER INTEGER prepends that sign octet exactly
+    // when the modulus' MSB is set. A 2048-bit modulus has its MSB
+    // set by definition, so it always reports exactly 2048. The
+    // undercount only appears on a modulus of 2041-2047 bits, whose
+    // MSB is clear and which therefore carries NO sign octet: it
+    // reports 8 * 255 = 2040 and is over-rejected here. The check may
+    // over-reject but never over-accept, and stays that way on
+    // purpose; do not "fix" it into a permissive check.
+    let bits = match spki.parsed() {
+        Ok(x509_parser::public_key::PublicKey::RSA(rsa)) => rsa.key_size(),
+        // A SPKI the RSA parser cannot crack cannot be signed for.
+        _ => 0,
+    };
+    if bits < 2048 {
+        return Err(CaError::UnsupportedKeyType(format!(
+            "CSR RSA key is {bits} bits; the minimum supported RSA key size is 2048 bits"
+        )));
+    }
+    Ok(Some(bits))
 }
 
 /// Leaf validity window as rcgen [`OffsetDateTime`]s: `not_before` is
-/// midnight UTC one day before today, `not_after` the spec instant
-/// (whole seconds) or exactly `crate::ca::CaLifetime::Leaf` days after
-/// `not_before` when unset.
+/// midnight UTC one day before today (the clock-skew margin, computed
+/// here — the caller can never observe it, which is why the spec carries
+/// a span), and `not_after` is exactly `not_before + lifetime`: the span
+/// the profile asked for, to the second.
+///
+/// The positive-lifetime precondition is [`sign_leaf_with`]'s (it
+/// rejects a non-positive span before calling this).
 fn validity_window(
-    not_after: Option<chrono::DateTime<chrono::Utc>>,
+    lifetime: &chrono::Duration,
 ) -> Result<(OffsetDateTime, OffsetDateTime), CaError> {
     let nb_date = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
     let nb_secs = nb_date
@@ -521,10 +730,9 @@ fn validity_window(
         .ok_or_else(|| CaError::X509("invalid not_before midnight".to_owned()))?
         .and_utc()
         .timestamp();
-    let na_secs = match not_after {
-        Some(na) => na.timestamp(),
-        None => nb_secs + LEAF_VALIDITY_DAYS * 86_400,
-    };
+    let na_secs = nb_secs
+        .checked_add(lifetime.num_seconds())
+        .ok_or_else(|| CaError::X509("certificate validity window is out of range".to_owned()))?;
     let nb = unix_secs_to_offset(nb_secs)?;
     let na = unix_secs_to_offset(na_secs)?;
     Ok((nb, na))

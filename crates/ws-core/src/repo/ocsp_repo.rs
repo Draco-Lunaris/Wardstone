@@ -8,7 +8,7 @@
 //! answer a client should be given.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::error::CoreError;
@@ -16,9 +16,14 @@ use crate::models::ocsp::{OcspResponseModel, OcspStatus};
 use crate::repo::tenant_repo::map_unique;
 
 /// Data access for [`OcspResponseModel`] rows.
-pub struct OcspRepo {
-    pool: PgPool,
-}
+///
+/// Stateless by design: the repository holds no pool, and every method
+/// takes `executor: impl PgExecutor<'_>` so a mutation and its audit row
+/// can share one transaction (callers pass `&pool`, or `&mut *tx` inside a
+/// transaction — `&mut Transaction` does not implement `PgExecutor` in
+/// sqlx 0.8.6).
+#[derive(Default)]
+pub struct OcspRepo;
 
 /// Inline row shape for `sqlx::query_as` (house style: hand-mapped to the
 /// model). `status` is the raw text column, decoded via
@@ -36,16 +41,28 @@ struct OcspResponseRow {
 }
 
 impl OcspRepo {
-    /// Build a repository bound to the shared pool.
-    pub fn new(pool: &PgPool) -> Self {
-        OcspRepo { pool: pool.clone() }
+    /// Build the (stateless) repository.
+    ///
+    /// The body is the plan's house shape verbatim
+    /// (`Self::default()`), satisfied by the derived `Default`
+    /// (`clippy::new_without_default` is an error here under the house
+    /// rule); the allow silences the newer, contradicting
+    /// `clippy::default_constructed_unit_structs` style lint, which the
+    /// house shape deliberately does not adopt.
+    #[allow(clippy::default_constructed_unit_structs)]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Insert one OCSP response row exactly as given. A
     /// unique-violation on `(ca_id, serial, this_update)` — the same
     /// response published twice — becomes [`CoreError::Duplicate`], never
     /// a silent overwrite.
-    pub async fn insert(&self, response: &OcspResponseModel) -> Result<(), CoreError> {
+    pub async fn insert(
+        &self,
+        executor: impl PgExecutor<'_>,
+        response: &OcspResponseModel,
+    ) -> Result<(), CoreError> {
         sqlx::query(
             "INSERT INTO ocsp_responses (id, tenant_id, ca_id, serial, status, this_update, \
              next_update, resp_der) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -58,7 +75,7 @@ impl OcspRepo {
         .bind(response.this_update)
         .bind(response.next_update)
         .bind(&response.resp_der)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .map_err(map_unique)?;
         Ok(())
@@ -69,6 +86,7 @@ impl OcspRepo {
     /// CA has never answered for that serial.
     pub async fn get_latest(
         &self,
+        executor: impl PgExecutor<'_>,
         ca_id: Uuid,
         serial: i64,
     ) -> Result<Option<OcspResponseModel>, CoreError> {
@@ -79,7 +97,7 @@ impl OcspRepo {
         )
         .bind(ca_id)
         .bind(serial)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {

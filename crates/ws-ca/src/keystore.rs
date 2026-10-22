@@ -11,6 +11,14 @@
 //! data on the inner layer, so an envelope pasted into the wrong CA slot
 //! fails decryption instead of silently loading the wrong key.
 //!
+//! The setup certificate's private key is stored the same way
+//! ([`KeyStore::store_setup_key`]) under `<dir>/ca/setup.key`, with the
+//! fixed literal `wardstone-setup-key/v1` — not a CA id — as its inner
+//! associated data. The slot lives inside `ca/` with a `.key` suffix, so
+//! it counts as a stored key towards `ensure_master_key`'s
+//! populated-store guard: a store holding only a setup key never
+//! silently gets a fresh master either.
+//!
 //! Error contract of [`KeyStore::load_ca_key`], so operators can tell key
 //! loss from file damage:
 //! - wrong master key (outer AEAD fails to authenticate) →
@@ -58,6 +66,11 @@ const ENVELOPE_KEY_TYPE: &str = "xchacha20poly1305";
 const CA_SUBDIR: &str = "ca";
 /// Master KEK file name inside the keys directory.
 const MASTER_FILE: &str = "master.key";
+/// Setup-key envelope file name inside the `ca/` subdirectory.
+const SETUP_FILE: &str = "setup.key";
+/// Inner-layer associated data for the setup-key envelope. Deliberately
+/// NOT a CA id: the setup key belongs to no CA.
+const SETUP_KEY_AAD: &str = "wardstone-setup-key/v1";
 
 /// On-disk envelope for one CA key. All binary fields are standard-alphabet
 /// base64; field order in the written JSON matches this declaration.
@@ -148,6 +161,15 @@ impl KeyStore {
         self.dir.join(MASTER_FILE)
     }
 
+    /// The keys directory this store was opened on. `ws-web`'s setup flow
+    /// derives sibling key-file paths from it (the secret-encryption key
+    /// file lives under the same keys directory the keystore does —
+    /// `ws_api::state::SECRET_KEY_FILE`), so the caller does not have to
+    /// carry the directory separately from the store.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Guarantee that a master KEK exists: if the file is present, validate
     /// it (a file shorter than 32 bytes is [`CaError::Corrupt`]); if it is
     /// absent, generate 32 OS-entropy bytes and write them mode 0600.
@@ -185,6 +207,20 @@ impl KeyStore {
     /// previous run); storing without one is `Corrupt`, never a silent
     /// master generation.
     pub fn store_ca_key(&mut self, ca_id: &Uuid, der_private_key: &[u8]) -> Result<(), CaError> {
+        self.store_envelope(&self.ca_key_path(ca_id), &aad_for(ca_id), der_private_key)
+    }
+
+    /// Store one envelope: the engine behind
+    /// [`store_ca_key`](Self::store_ca_key) and
+    /// [`store_setup_key`](Self::store_setup_key) alike. `aad` binds the
+    /// plaintext to its slot; `path` is the envelope file (inside `ca/`,
+    /// `.key` suffix — the directory layout `has_stored_keys` scans).
+    fn store_envelope(
+        &mut self,
+        path: &Path,
+        aad: &str,
+        der_private_key: &[u8],
+    ) -> Result<(), CaError> {
         let kek = self.read_master_key()?;
         let wrap = cipher_for(kek.as_slice())?;
 
@@ -198,7 +234,7 @@ impl KeyStore {
                 &XNonce::from(*nonce_inner),
                 Payload {
                     msg: der_private_key,
-                    aad: aad_for(ca_id).as_bytes(),
+                    aad: aad.as_bytes(),
                 },
             )
             .map_err(|_| CaError::Io(std::io::Error::other("aead encrypt failed")))?;
@@ -230,7 +266,7 @@ impl KeyStore {
         // never a permissive directory.
         #[cfg(unix)]
         set_permissions(&ca_dir, 0o700)?;
-        write_private(&self.ca_key_path(ca_id), json.as_bytes())?;
+        write_private(path, json.as_bytes())?;
         Ok(())
     }
 
@@ -245,7 +281,14 @@ impl KeyStore {
     /// [`CaError::Corrupt`]; a missing envelope is [`CaError::NotFound`].
     /// A failed load never writes anything.
     pub fn load_ca_key(&self, ca_id: &Uuid) -> Result<Zeroizing<Vec<u8>>, CaError> {
-        let raw = match fs::read(self.ca_key_path(ca_id)) {
+        self.load_envelope(&self.ca_key_path(ca_id), &aad_for(ca_id))
+    }
+
+    /// Load one envelope: the engine behind
+    /// [`load_ca_key`](Self::load_ca_key) and
+    /// [`load_setup_key`](Self::load_setup_key) alike.
+    fn load_envelope(&self, path: &Path, aad: &str) -> Result<Zeroizing<Vec<u8>>, CaError> {
+        let raw = match fs::read(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(CaError::NotFound),
             Err(e) => return Err(CaError::Io(e)),
@@ -283,7 +326,6 @@ impl KeyStore {
         let ciphertext = STANDARD
             .decode(&envelope.ciphertext)
             .map_err(|_| CaError::Corrupt)?;
-        let aad = aad_for(ca_id);
         let plaintext = match inner.decrypt(
             &nonce_inner,
             Payload {
@@ -295,6 +337,37 @@ impl KeyStore {
             Err(_) => return Err(CaError::Corrupt),
         };
         Ok(Zeroizing::new(plaintext))
+    }
+
+    /// Store the setup certificate's private key under
+    /// `<dir>/ca/setup.key` as an envelope exactly like a CA key's: a
+    /// fresh DEK, the inner AEAD binding the fixed associated-data
+    /// literal (NOT a CA id), the DEK wrapped under the master KEK, the
+    /// file written mode 0600. Re-storing replaces the envelope with a
+    /// new DEK and fresh nonces.
+    ///
+    /// The file lives INSIDE the `ca/` directory `has_stored_keys` scans,
+    /// so a store whose only key is the setup key is a populated store:
+    /// [`ensure_master_key`](Self::ensure_master_key) refuses to mint a
+    /// fresh master over it (`Corrupt`), exactly as it does over CA key
+    /// envelopes. The master key must already exist, as for
+    /// [`store_ca_key`](Self::store_ca_key).
+    pub fn store_setup_key(&mut self, der: &[u8]) -> Result<(), CaError> {
+        self.store_envelope(&self.setup_key_path(), SETUP_KEY_AAD, der)
+    }
+
+    /// Load and decrypt the setup certificate's private key. Error
+    /// contract identical to [`load_ca_key`](Self::load_ca_key): an
+    /// envelope that fails the inner AEAD (wrong slot, wrong master key,
+    /// damage) is `Corrupt`/`WrongKey`; a missing envelope is
+    /// [`CaError::NotFound`]. A failed load never writes anything.
+    pub fn load_setup_key(&self) -> Result<Zeroizing<Vec<u8>>, CaError> {
+        self.load_envelope(&self.setup_key_path(), SETUP_KEY_AAD)
+    }
+
+    /// Path of the setup-key envelope file (`<dir>/ca/setup.key`).
+    pub fn setup_key_path(&self) -> PathBuf {
+        self.dir.join(CA_SUBDIR).join(SETUP_FILE)
     }
 
     /// Path of the envelope file for `ca_id`.
@@ -322,7 +395,10 @@ impl KeyStore {
         Ok(kek)
     }
 
-    /// Whether at least one `*.key` envelope is present in `ca/`.
+    /// Whether at least one `*.key` envelope is present in `ca/` — CA key
+    /// envelopes and the setup key alike (both live there with a `.key`
+    /// suffix, so a store whose only key is the setup key counts as
+    /// populated).
     /// An unreadable `ca/` directory is an error, never "no keys" —
     /// treating it as empty could authorize a master regeneration.
     fn has_stored_keys(&self) -> Result<bool, CaError> {
@@ -359,7 +435,9 @@ fn cipher_for(key_bytes: &[u8]) -> Result<XChaCha20Poly1305, CaError> {
 
 /// Inner-layer associated data, binding an envelope to its CA slot: two
 /// envelopes swapped between CAs fail decryption (as `Corrupt`) instead of
-/// silently loading the wrong key.
+/// silently loading the wrong key. The setup key's slot is bound by the
+/// fixed literal [`SETUP_KEY_AAD`] instead, which is why a setup envelope
+/// in a CA slot (or vice versa) fails the same way.
 fn aad_for(ca_id: &Uuid) -> String {
     format!("wardstone-ca-key/v1/{ca_id}")
 }

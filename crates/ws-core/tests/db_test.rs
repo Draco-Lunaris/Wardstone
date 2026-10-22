@@ -34,13 +34,41 @@ fn database_url() -> String {
 }
 
 /// `connect` runs migration 001: the `_sqlx_migrations` bookkeeping table ends
-/// up with `REQUIRED_MIGRATION_COUNT` rows and `tenants` exists but is empty
-/// (the default tenant is inserted by Plan 2's bootstrap, not by migration 001).
+/// up with `REQUIRED_MIGRATION_COUNT` rows, and `tenants` exists — migration
+/// 001 seeds NO tenant (Plan 2's first-run setup inserts the default tenant).
+///
+/// The original assertion pinned `tenants == 0`; Plan 2's DB-gated suites
+/// legitimately create tenants (the setup flow, `POST /api/v1/tenants`, the
+/// e2e), so the property is scoped to what migration 001 can own: the
+/// tenant-name SET is snapshotted before and after the `connect` under test,
+/// and `connect` must not change it — whether that set is empty (a virgin
+/// database, where the tenants table does not exist before the first connect
+/// and the snapshot is empty by construction) or carries another suite's
+/// rows.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn connect_runs_migrations() {
     let _db = lock_db().await;
-    let pool = connect(&database_url())
+    let url = database_url();
+    // Snapshot the tenant names BEFORE the connect under test, over a plain
+    // pooled connection (the connect under test brings its own migrations).
+    let probe = sqlx::PgPool::connect(&url)
+        .await
+        .expect("open a probe pool to snapshot the tenant names");
+    let before: Vec<String> = match sqlx::query_scalar("SELECT name FROM tenants ORDER BY name")
+        .fetch_all(&probe)
+        .await
+    {
+        Ok(names) => names,
+        // 42P01 = undefined_table: a virgin database, nothing seeded.
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P01") => {
+            Vec::new()
+        }
+        Err(err) => panic!("could not snapshot the tenant names: {err}"),
+    };
+    probe.close().await;
+
+    let pool = connect(&url)
         .await
         .expect("connect should succeed and apply migration 001");
 
@@ -54,13 +82,14 @@ async fn connect_runs_migrations() {
         "connect should leave exactly REQUIRED_MIGRATION_COUNT applied migrations"
     );
 
-    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants")
-        .fetch_one(&pool)
+    let after: Vec<String> = sqlx::query_scalar("SELECT name FROM tenants ORDER BY name")
+        .fetch_all(&pool)
         .await
-        .expect("query tenants count");
+        .expect("query the tenant names after connect");
     assert_eq!(
-        tenants, 0,
-        "migration 001 must not seed a default tenant; Plan 2's bootstrap does that"
+        after, before,
+        "connect must not seed or add tenants: migration 001 creates the table and \
+         nothing else (Plan 2's first-run setup inserts the default tenant)"
     );
 }
 

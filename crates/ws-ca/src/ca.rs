@@ -309,6 +309,30 @@ pub(crate) fn issuer_not_after(
     Ok(issuer_facts(issuer_cert_pem)?.not_after)
 }
 
+/// A certificate's X.509 validity window, `(not_before, not_after)` —
+/// the facts a caller storing a fresh CA (Plan 2's API writes the `cas`
+/// row) reads from the CREATED certificate rather than re-deriving from
+/// the engine's own validity arithmetic.
+///
+/// The engine computes the window itself (midnight-UTC skew margins,
+/// issuer caps); this function merely reports what the certificate
+/// actually carries, so the stored row can never disagree with the
+/// issued structure.
+pub fn certificate_validity(
+    cert_pem: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), CaError> {
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|_| CaError::X509("certificate is not valid PEM".to_owned()))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| CaError::X509("certificate failed to parse".to_owned()))?;
+    let not_before = chrono::DateTime::from_timestamp(cert.validity().not_before.timestamp(), 0)
+        .ok_or_else(|| CaError::X509("certificate notBefore is out of range".to_owned()))?;
+    let not_after = chrono::DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| CaError::X509("certificate notAfter is out of range".to_owned()))?;
+    Ok((not_before, not_after))
+}
+
 /// Common [`CertificateParams`]: subject CN, validity window, fresh
 /// OS-entropy serial, rcgen defaults for everything else (SKI
 /// derivation; no SANs or extended key usages — CAs carry none).
@@ -387,12 +411,18 @@ fn ymd(dt: &chrono::DateTime<Utc>) -> (i32, u8, u8) {
 fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
     match key_type {
         KeyType::Ed25519 => Ok(KeyPair::generate_for(&PKCS_ED25519)?),
-        KeyType::Rsa2048 => generate_rsa(2048),
-        KeyType::Rsa3072 => generate_rsa(3072),
+        KeyType::Rsa2048 => Ok(generate_rsa(2048)?.0),
+        KeyType::Rsa3072 => Ok(generate_rsa(3072)?.0),
     }
 }
 
 /// Generate an RSA key of `bits` and import it into rcgen as PKCS#8 DER.
+///
+/// `pub(crate)`, and returning the PKCS#8 DER (in a [`Zeroizing`] buffer)
+/// alongside the rcgen key pair: [`crate::leafkey::generate_leaf_key`]
+/// shares exactly this helper and needs the plaintext DER for the
+/// encrypted setup-key slot — re-serializing the pair instead would mint
+/// a second plaintext copy the wrapper cannot reach.
 ///
 /// Error mapping (no variant carries key material; `rsa`'s error Display
 /// is static text): generation failure maps to [`CaError::Io`] — the
@@ -428,7 +458,7 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
 /// entry point. The observable behaviour for a caller — a typed error,
 /// no key, no panic, and never a silently weak key — is what a
 /// fallible API would give.
-fn generate_rsa(bits: usize) -> Result<KeyPair, CaError> {
+pub(crate) fn generate_rsa(bits: usize) -> Result<(KeyPair, Zeroizing<Vec<u8>>), CaError> {
     let mut rng = FallibleSysRng::new();
     let key = RsaPrivateKey::new(&mut rng, bits);
     if rng.degraded {
@@ -449,7 +479,8 @@ fn generate_rsa(bits: usize) -> Result<KeyPair, CaError> {
         .to_pkcs8_der()
         .map_err(|e| CaError::X509(format!("rsa key pkcs8 encoding failed: {e}")))?;
     let der = Zeroizing::new(pkcs8.as_bytes().to_vec());
-    Ok(KeyPair::try_from(der.as_slice())?)
+    let key_pair = KeyPair::try_from(der.as_slice())?;
+    Ok((key_pair, der))
 }
 
 /// Label embedded in the degraded-mode fallback seed. Public on purpose:

@@ -1,0 +1,156 @@
+//! Ed25519 JWT issuing/validation tests: the access-token round trip, the
+//! error taxonomy (`TokenInvalid` / `TokenExpired`), and the on-disk key pair
+//! that `JwtKeys::load_or_create` generates on a virgin volume.
+
+use std::fs;
+use std::path::PathBuf;
+
+use chrono::Utc;
+use uuid::Uuid;
+use ws_auth::error::AuthError;
+use ws_auth::jwt::{issue_access_token, validate_access_token, AccessClaims, JwtKeys};
+
+/// On-disk location of the JWT key pair (layout: `<dir>/jwt-{signing,verify}-key.pem`).
+const SIGNING_KEY_FILE: &str = "jwt-signing-key.pem";
+const VERIFY_KEY_FILE: &str = "jwt-verify-key.pem";
+
+fn temp_keys_dir(test_name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ws-auth-jwt-{test_name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Mint claims for now + `ttl_secs`, with a fresh jti and the given session id.
+fn fresh_claims(username: &str, role: &str, sid: Option<Uuid>, ttl_secs: i64) -> AccessClaims {
+    AccessClaims::new(Uuid::new_v4(), username, role, sid, ttl_secs)
+}
+
+#[test]
+fn access_token_validates_and_carries_its_claims() {
+    let dir = temp_keys_dir("roundtrip");
+    let keys = JwtKeys::load_or_create(&dir).unwrap();
+
+    let sid = Uuid::new_v4();
+    let claims = fresh_claims("carol", "issuer", Some(sid), 900);
+    let token = issue_access_token(&claims, &keys).unwrap();
+    let decoded = validate_access_token(&token, &keys).unwrap();
+
+    assert_eq!(decoded.user_id, claims.user_id);
+    assert_eq!(decoded.username, "carol");
+    assert_eq!(decoded.role, "issuer");
+    assert_eq!(decoded.sid, Some(sid));
+    assert_eq!(decoded.jti, claims.jti);
+    assert_eq!(decoded.exp, claims.exp);
+    assert_eq!(decoded.iat, claims.iat);
+}
+
+#[test]
+fn token_signed_with_a_different_key_is_token_invalid() {
+    let dir_a = temp_keys_dir("wrong-key-a");
+    let keys_a = JwtKeys::load_or_create(&dir_a).unwrap();
+    let dir_b = temp_keys_dir("wrong-key-b");
+    let keys_b = JwtKeys::load_or_create(&dir_b).unwrap();
+
+    let claims = fresh_claims("carol", "admin", None, 900);
+    let token = issue_access_token(&claims, &keys_a).unwrap();
+
+    let err = validate_access_token(&token, &keys_b).unwrap_err();
+    assert!(
+        matches!(err, AuthError::TokenInvalid),
+        "a foreign-key token must map to TokenInvalid, got {err:?}"
+    );
+}
+
+#[test]
+fn expired_token_is_token_expired() {
+    let dir = temp_keys_dir("expired");
+    let keys = JwtKeys::load_or_create(&dir).unwrap();
+
+    let mut claims = fresh_claims("carol", "admin", None, 900);
+    claims.exp = Utc::now().timestamp() - 3600;
+
+    let token = issue_access_token(&claims, &keys).unwrap();
+    let err = validate_access_token(&token, &keys).unwrap_err();
+    assert!(
+        matches!(err, AuthError::TokenExpired),
+        "an expired token must map to TokenExpired, got {err:?}"
+    );
+}
+
+#[test]
+fn tampered_payload_is_token_invalid() {
+    let dir = temp_keys_dir("tampered");
+    let keys = JwtKeys::load_or_create(&dir).unwrap();
+
+    let claims = fresh_claims("carol", "admin", None, 900);
+    let token = issue_access_token(&claims, &keys).unwrap();
+
+    // Flip the payload segment to a different claim set; the header and the
+    // signature stay intact, so validation must fail on the signature.
+    let other = issue_access_token(&fresh_claims("mallory", "viewer", None, 900), &keys).unwrap();
+    let parts: Vec<&str> = token.split('.').collect();
+    let other_parts: Vec<&str> = other.split('.').collect();
+    let tampered = format!("{}.{}.{}", parts[0], other_parts[1], parts[2]);
+
+    let err = validate_access_token(&tampered, &keys).unwrap_err();
+    assert!(
+        matches!(err, AuthError::TokenInvalid),
+        "a tampered payload must map to TokenInvalid, got {err:?}"
+    );
+}
+
+#[test]
+fn load_or_create_on_a_missing_directory_generates_the_key_pair() {
+    let dir = temp_keys_dir("generate");
+    assert!(!dir.exists(), "the fixture must start from nothing");
+
+    let keys = JwtKeys::load_or_create(&dir).unwrap();
+
+    assert!(dir.exists(), "a virgin volume must gain the keys directory");
+    assert!(dir.join(SIGNING_KEY_FILE).exists());
+    assert!(dir.join(VERIFY_KEY_FILE).exists());
+    assert!(!keys.signing_key_pem.trim().is_empty());
+    assert!(!keys.verification_key_pem.trim().is_empty());
+}
+
+#[test]
+fn a_second_load_returns_the_same_keys() {
+    let dir = temp_keys_dir("stable");
+    let first = JwtKeys::load_or_create(&dir).unwrap();
+    let second = JwtKeys::load_or_create(&dir).unwrap();
+
+    assert_eq!(first.signing_key_pem, second.signing_key_pem);
+    assert_eq!(first.verification_key_pem, second.verification_key_pem);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_signing_key_file_is_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_keys_dir("mode");
+    let _keys = JwtKeys::load_or_create(&dir).unwrap();
+
+    let mode = fs::metadata(dir.join(SIGNING_KEY_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the signing key holds private material and must be 0600"
+    );
+}
+
+#[test]
+fn a_token_signed_with_the_loaded_keys_validates() {
+    let dir = temp_keys_dir("loaded");
+    // First call generates; the second loads the same pair from disk.
+    let first = JwtKeys::load_or_create(&dir).unwrap();
+    let loaded = JwtKeys::load_or_create(&dir).unwrap();
+
+    let claims = fresh_claims("carol", "admin", None, 900);
+    let token = issue_access_token(&claims, &first).unwrap();
+    let decoded = validate_access_token(&token, &loaded).unwrap();
+    assert_eq!(decoded.username, "carol");
+}

@@ -59,11 +59,12 @@ use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use ws_ca::ca::{create_root, create_sub_ca, CaLifetime, CaSpec, KeyType};
-use ws_ca::issue::{sign_leaf_with, LeafSpec, SanEntry};
+use ws_ca::issue::{sign_leaf_with, ExtKeyUsagePurpose, KeyUsagePurpose, LeafSpec, SanEntry};
 use ws_ca::keystore::KeyStore;
+use ws_ca::leafkey::LeafKeyType;
 use ws_ca::serial::allocate_serial;
 use ws_core::db::connect;
-use ws_core::models::audit::{ActorType, AuditEntry};
+use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_core::models::ocsp::OcspStatus;
@@ -386,6 +387,8 @@ fn audit_entry(
         id: uuid::Uuid::new_v4(),
         tenant_id,
         actor_type: ActorType::User,
+        auth_method: AuthMethod::Session,
+        session_id: None,
         actor_id: "smoke-test".to_owned(),
         action: action.to_owned(),
         target_type: target_type.to_owned(),
@@ -432,11 +435,11 @@ async fn test_end_to_end_ca_forest() {
     .expect("create the sub-CA under the root");
 
     // --- The tenant and the CA rows -----------------------------------
-    let tenant = TenantRepo::new(&pool)
-        .insert(SMOKE_TENANT)
+    let tenant = TenantRepo::new()
+        .insert(&pool, SMOKE_TENANT)
         .await
         .expect("insert the smoke tenant");
-    let cas = CaRepo::new(&pool);
+    let cas = CaRepo::new();
     let root_row = CaModel {
         id: root.key_pair_id,
         tenant_id: tenant.id,
@@ -451,7 +454,9 @@ async fn test_end_to_end_ca_forest() {
         key_file: key_file_path(&keys_dir, &root.key_pair_id),
         created_at: Utc::now(),
     };
-    cas.insert(&root_row).await.expect("insert the root CA row");
+    cas.insert(&pool, &root_row)
+        .await
+        .expect("insert the root CA row");
     let sub_row = CaModel {
         id: sub.key_pair_id,
         tenant_id: tenant.id,
@@ -466,42 +471,50 @@ async fn test_end_to_end_ca_forest() {
         key_file: key_file_path(&keys_dir, &sub.key_pair_id),
         created_at: Utc::now(),
     };
-    cas.insert(&sub_row).await.expect("insert the sub-CA row");
+    cas.insert(&pool, &sub_row)
+        .await
+        .expect("insert the sub-CA row");
 
     // The forest really is a forest: the sub-CA is a child of the root.
     let children = cas
-        .children_of(root.key_pair_id)
+        .children_of(&pool, root.key_pair_id)
         .await
         .expect("list the root's children");
     let child_ids: Vec<uuid::Uuid> = children.iter().map(|ca| ca.id).collect();
     let fetched_sub = cas
-        .get(sub.key_pair_id)
+        .get(&pool, sub.key_pair_id)
         .await
         .expect("fetch the sub-CA row")
         .expect("the sub-CA row is present");
 
     // --- The audit trail: the CA creations ----------------------------
-    let audit = AuditRepo::new(&pool);
+    let audit = AuditRepo::new();
     tokio::time::sleep(AUDIT_GAP).await;
     audit
-        .record(&audit_entry(
-            tenant.id,
-            "ca_created",
-            "ca",
-            &root.key_pair_id.to_string(),
-            serde_json::json!({"name": ROOT_CA_NAME, "is_root": true}),
-        ))
+        .record(
+            &pool,
+            &audit_entry(
+                tenant.id,
+                "ca_created",
+                "ca",
+                &root.key_pair_id.to_string(),
+                serde_json::json!({"name": ROOT_CA_NAME, "is_root": true}),
+            ),
+        )
         .await
         .expect("record the root CA creation");
     tokio::time::sleep(AUDIT_GAP).await;
     audit
-        .record(&audit_entry(
-            tenant.id,
-            "ca_created",
-            "ca",
-            &sub.key_pair_id.to_string(),
-            serde_json::json!({"name": SUB_CA_NAME, "is_root": false}),
-        ))
+        .record(
+            &pool,
+            &audit_entry(
+                tenant.id,
+                "ca_created",
+                "ca",
+                &sub.key_pair_id.to_string(),
+                serde_json::json!({"name": SUB_CA_NAME, "is_root": false}),
+            ),
+        )
         .await
         .expect("record the sub-CA creation");
 
@@ -516,8 +529,10 @@ async fn test_end_to_end_ca_forest() {
         &csr_pem,
         &LeafSpec {
             sans: vec![SanEntry::Dns(LEAF_SAN.to_owned())],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            not_after: Some(Utc::now() + Duration::days(30)),
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: Duration::days(30),
             subject_cn: None,
             serial,
         },
@@ -525,12 +540,13 @@ async fn test_end_to_end_ca_forest() {
     .expect("issue the leaf from the sub-CA");
 
     // The certificate record: the real values the issuance produced.
-    let certs = CertificateRepo::new(&pool);
+    let certs = CertificateRepo::new();
     let cert_id = uuid::Uuid::new_v4();
     let cert_row = CertificateModel {
         id: cert_id,
         tenant_id: tenant.id,
         ca_id: sub.key_pair_id,
+        profile_revision_id: None,
         profile_name: LEAF_PROFILE.to_owned(),
         subject: format!("CN={LEAF_CN}"),
         serial,
@@ -548,13 +564,13 @@ async fn test_end_to_end_ca_forest() {
         created_at: Utc::now(),
     };
     certs
-        .insert(&cert_row)
+        .insert(&pool, &cert_row)
         .await
         .expect("insert the certificate row");
 
     tokio::time::sleep(AUDIT_GAP).await;
     audit
-        .record(&audit_entry(
+        .record(&pool, &audit_entry(
             tenant.id,
             "cert_issued",
             "certificate",
@@ -566,18 +582,21 @@ async fn test_end_to_end_ca_forest() {
 
     // --- The revocation -----------------------------------------------
     certs
-        .revoke(cert_id, REVOCATION_REASON)
+        .revoke(&pool, cert_id, REVOCATION_REASON)
         .await
         .expect("revoke the certificate");
     tokio::time::sleep(AUDIT_GAP).await;
     audit
-        .record(&audit_entry(
-            tenant.id,
-            "cert_revoked",
-            "certificate",
-            &cert_id.to_string(),
-            serde_json::json!({"reason": REVOCATION_REASON}),
-        ))
+        .record(
+            &pool,
+            &audit_entry(
+                tenant.id,
+                "cert_revoked",
+                "certificate",
+                &cert_id.to_string(),
+                serde_json::json!({"reason": REVOCATION_REASON}),
+            ),
+        )
         .await
         .expect("record the revocation");
 
@@ -592,7 +611,7 @@ async fn test_end_to_end_ca_forest() {
 
     // --- Read every result before the cleanup -------------------------
     let revoked_row = certs
-        .get(cert_id)
+        .get(&pool, cert_id)
         .await
         .expect("read the certificate row")
         .expect("the certificate row is present");
@@ -615,16 +634,17 @@ async fn test_end_to_end_ca_forest() {
             .bind(i64::try_from(serial).expect("the serial fits the bigint column"))
             .fetch_one(&pool)
             .await;
-    let ocsp = OcspRepo::new(&pool);
+    let ocsp = OcspRepo::new();
     let latest_ocsp = ocsp
         .get_latest(
+            &pool,
             sub.key_pair_id,
             i64::try_from(serial).expect("the serial fits the bigint column"),
         )
         .await
         .expect("read the latest OCSP response");
     let audit_entries = audit
-        .list_by_tenant(tenant.id, 0, 100)
+        .list_by_tenant(&pool, tenant.id, 0, 100)
         .await
         .expect("list the tenant's audit entries");
     // The restart simulation: the in-process key store goes away

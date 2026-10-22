@@ -1,0 +1,206 @@
+# Wardstone — the PRODUCTION compose bundle.
+#
+# One image, THREE services, TWO Wardstone processes:
+#
+#   ws-web — `wardstone ui`: the TLS front door. The FIRST-RUN setup page
+#     while no tenant exists, the CA-issued `web-server` leaf afterwards,
+#     and the `/api/v1` proxy in every phase. This is the ONLY service
+#     that publishes a port to the LAN.
+#   ws-api — `wardstone api`: the REST surface, plain HTTP, publishing NO
+#     ports. The browser never talks to it directly: ws-web path-proxies
+#     `/api/v1/*` to it over the internal compose network (the default
+#     `WARDSTONE_API_URL` below is the binary's own default, spelled out
+#     so the pairing is visible).
+#   db   — the bundled Postgres 18 (the Bundled variant; see docker/
+#     README.md for the External variant, which points DATABASE_URL at an
+#     existing database and drops this service).
+#
+# The ui and api processes are deliberately SEPARATE processes with the
+# same image and different commands: independently restartable by design
+# (the ws-api process keeps serving while the ui process restarts onto a
+# re-issued leaf, and vice versa).
+#
+# Usage:
+#
+#   WARDSTONE_SERVER_HOSTNAME=ca.example.test \
+#   WARDSTONE_DB_PASSWORD=… \
+#   docker compose -f docker/compose.yml up -d
+#
+# The two `:?` variables are REQUIRED by design: without a real hostname
+# the setup certificate would serve a placeholder SAN, and without a
+# password the bundled Postgres would be guessable.
+#
+# The image: compose does not build anything in this bundle — the image is
+# supplied by the release flow (see "The image and the keys volume" in
+# docker/README.md for its contract: the wardstone binary on PATH with NO
+# entrypoint (the commands below carry BOTH words, so an ENTRYPOINT would
+# double the binary into argv and crash-loop), a non-root run user, and a
+# `wardstone`-owned `/var/lib/wardstone/keys`).
+# `WARDSTONE_IMAGE` overrides the tag (the e2e harness uses this to point
+# at a locally built image):
+#
+#   WARDSTONE_IMAGE=wardstone:local docker compose -f docker/compose.yml up -d
+#
+# Rate limiting (the binary's house contract, not a compose knob): the
+# `api` process applies per-IP GCRA rate limiting on the public auth
+# routes ALWAYS-ON with the house defaults (one credit per 500 ms, burst
+# 20 per IP). `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `WARDSTONE_RATE_LIMIT_BURST`
+# may override them — this bundle deliberately does NOT set either (the
+# defaults are already the house values). If you do set them: positive
+# integers only — zero or unparsable values fail the boot loudly, they do
+# not disable the limiter.
+
+name: wardstone
+
+services:
+  ws-web:
+    image: ${WARDSTONE_IMAGE:-wardstone:latest}
+    container_name: wardstone-ui
+    # REQUIRED, not a convenience: the ui process deliberately SELF-EXITS
+    # with exit code 0 once the setup flow commits the tenant (the setup
+    # POST answers `{"restart": true}` and the process follows through so
+    # the next boot serves the CA-issued leaf instead of the setup
+    # certificate). Only a restart policy actually brings it back.
+    # `no` would leave a freshly set-up instance dead on the floor.
+    restart: unless-stopped
+    command: ["wardstone", "ui"]
+    environment:
+      # The single Postgres URL both processes share. In the Bundled
+      # variant it points at the `db` service below; the External variant
+      # replaces this with the operator's own database (docker/README.md).
+      DATABASE_URL: postgres://wardstone:${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}@db:5432/wardstone
+      # The keystore directory: master KEK, CA key envelopes, the setup
+      # slot, the JWT key pair, and the secret-encryption key file all
+      # live under it — the SAME volume for BOTH Wardstone services, so
+      # whichever process boots first finds a complete keystore.
+      WARDSTONE_KEYS_DIR: /var/lib/wardstone/keys
+      # The setup certificate's SAN and the API's domain context. Both
+      # Wardstone services read it; a placeholder SAN is a misconfiguration
+      # you cannot fix with the API, so an Operator must set it.
+      WARDSTONE_SERVER_HOSTNAME: ${WARDSTONE_SERVER_HOSTNAME:?set WARDSTONE_SERVER_HOSTNAME (the certificate SAN, e.g. ca.example.test)}
+      # ws-web's proxy target: the api service name on the internal
+      # network (the binary's default, spelled out so the pairing of the
+      # two services is legible without reading the binary).
+      WARDSTONE_API_URL: http://ws-api:8080
+      # The api mode's own default bind is 0.0.0.0:8080 to match the
+      # WARDSTONE_API_URL default; the ui binds its TLS port. (One
+      # variable, per-service values — the binary's contract.)
+      WARDSTONE_BIND: 0.0.0.0:8443
+    ports:
+      # The ONLY published port of the bundle (the Global Constraint: the
+      # browser talks to ws-web; ws-api publishes no ports). Bind the host
+      # side to a specific interface by editing the left side, e.g.
+      # "192.168.1.10:8443:8443".
+      - "8443:8443"
+    volumes:
+      # Named volume so the keys survive `up`/`down`/redeploys. The key
+      # FILES are written by the binary itself — the JWT signing key with
+      # mode 0600 — and end up owned by the container's non-root user;
+      # compose only has to provide the directory (see the image contract
+      # in docker/README.md for why the volume starts out usable).
+      - wardstone-keys:/var/lib/wardstone/keys
+    depends_on:
+      db:
+        condition: service_healthy
+      # Started-before is enough: the proxy answers 502 against a dead
+      # upstream, and the ui process is the one operators watch.
+      ws-api:
+        condition: service_started
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  ws-api:
+    image: ${WARDSTONE_IMAGE:-wardstone:latest}
+    container_name: wardstone-api
+    restart: unless-stopped
+    command: ["wardstone", "api"]
+    environment:
+      DATABASE_URL: postgres://wardstone:${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}@db:5432/wardstone
+      WARDSTONE_KEYS_DIR: /var/lib/wardstone/keys
+      WARDSTONE_SERVER_HOSTNAME: ${WARDSTONE_SERVER_HOSTNAME:?set WARDSTONE_SERVER_HOSTNAME (the certificate SAN, e.g. ca.example.test)}
+      # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
+      # the binary ignores the variable in this mode.
+      WARDSTONE_BIND: 0.0.0.0:8080
+    # NO `ports:` — intentionally. The REST surface is reachable ONLY over
+    # the internal compose network via ws-web's proxy (the Global
+    # Constraint). An External deployment that fronts this service with
+    # its own reverse proxy adds its own port publishing to ITS copy of
+    # this file — see "The External variant" in docker/README.md.
+    volumes:
+      - wardstone-keys:/var/lib/wardstone/keys
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  db:
+    image: postgres:18-alpine
+    container_name: wardstone-db
+    restart: unless-stopped
+    environment:
+      # The credentials the Wardstone services' DATABASE_URL above is
+      # built from; the password is the operator's `WARDSTONE_DB_PASSWORD`.
+      POSTGRES_USER: wardstone
+      POSTGRES_PASSWORD: ${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}
+      POSTGRES_DB: wardstone
+    volumes:
+      # PERSISTENT, unlike the dev bundle: this volume holds the CA. It is
+      # NOT dropped by a redeploy; `docker compose down` keeps it, and
+      # `down -v` would destroy it — never run `down -v` against the
+      # production bundle (docker/README.md says what the volume contains
+      # and what the keys volume does NOT contain).
+      #
+      # The mount point is `/var/lib/postgresql`, NOT
+      # `/var/lib/postgresql/data`: Postgres 18 moved PGDATA to
+      # `/var/lib/postgresql/18/docker` and its entrypoint refuses to
+      # start when it finds data at the old path. Mounting the parent
+      # directory is what the image's own guidance asks for.
+      - wardstone-pgdata:/var/lib/postgresql
+    healthcheck:
+      # `pg_isready` alone reports "accepting connections" before the init
+      # scripts have finished, so the check also runs a real query against
+      # the database the services use. The password comes from the
+      # container's own `POSTGRES_PASSWORD` (a compose `$$` keeps the
+      # expansion inside the container, where healthcheck processes run
+      # with the configured env; the image's entrypoint unsets POSTGRES_*
+      # only in the server process it execs). TCP, not the unix socket:
+      # the socket is governed by peer authentication, which this client
+      # does not satisfy.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U wardstone -d wardstone && PGPASSWORD=$${POSTGRES_PASSWORD} psql -h 127.0.0.1 -U wardstone -d wardstone -c 'SELECT 1' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  internal:
+    name: wardstone-internal
+    driver: bridge
+
+volumes:
+  wardstone-keys:
+    name: wardstone-keys
+  wardstone-pgdata:
+    name: wardstone-pgdata

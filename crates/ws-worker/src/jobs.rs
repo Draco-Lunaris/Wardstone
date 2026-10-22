@@ -27,7 +27,7 @@ use ws_ca::crl::{build_crl, CrlReason, CrlSpec, RevocationEntry};
 use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_ca::ocsp::{build_ocsp_response, OcspResponseSpec, OcspStatus};
-use ws_core::models::audit::{ActorType, AuditEntry};
+use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::CertificateModel;
 use ws_core::models::ocsp::OcspResponseModel;
@@ -134,9 +134,9 @@ enum CaPlan {
 /// logs the job as failed and the next tick retries.
 pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u64, WorkerError> {
     let cas = list_all_cas(pool).await?;
-    let certs = CertificateRepo::new(pool);
-    let ocsp = OcspRepo::new(pool);
-    let audit = AuditRepo::new(pool);
+    let certs = CertificateRepo::new();
+    let ocsp = OcspRepo::new();
+    let audit = AuditRepo::new();
 
     let mut published = 0u64;
     let mut first_failure: Option<WorkerError> = None;
@@ -171,7 +171,7 @@ async fn regen_one_ca(
     let now = Utc::now();
     let published_crl = latest_crl(pool, ca.id).await?;
     let revoked_rows = certs
-        .list_revoked_since(ca.id, DateTime::UNIX_EPOCH)
+        .list_revoked_since(pool, ca.id, DateTime::UNIX_EPOCH)
         .await?;
 
     // A revoked certificate without a revocation instant is data-level
@@ -209,7 +209,7 @@ async fn regen_one_ca(
         })
         .collect::<Result<Vec<_>, WorkerError>>()?;
 
-    let plan = plan_for(ca, &published_crl, &revoked, ocsp, now).await?;
+    let plan = plan_for(pool, ca, &published_crl, &revoked, ocsp, now).await?;
     let CaPlan::Publish {
         publish_crl,
         stale_ocsp,
@@ -291,21 +291,26 @@ async fn regen_one_ca(
         .await?;
 
         audit
-            .record(&AuditEntry {
-                id: Uuid::new_v4(),
-                tenant_id: ca.tenant_id,
-                actor_type: ActorType::System,
-                actor_id: AUDIT_ACTOR_ID.to_owned(),
-                action: AUDIT_ACTION_CRL_BUILT.to_owned(),
-                target_type: "ca".to_owned(),
-                target_id: ca.id.to_string(),
-                details: json!({
-                    "ca_name": ca.name,
-                    "revoked": revoked.len(),
-                    "next_update": crl.next_update.to_rfc3339(),
-                }),
-                created_at: Utc::now(),
-            })
+            .record(
+                pool,
+                &AuditEntry {
+                    id: Uuid::new_v4(),
+                    tenant_id: ca.tenant_id,
+                    actor_type: ActorType::System,
+                    auth_method: AuthMethod::System,
+                    session_id: None,
+                    actor_id: AUDIT_ACTOR_ID.to_owned(),
+                    action: AUDIT_ACTION_CRL_BUILT.to_owned(),
+                    target_type: "ca".to_owned(),
+                    target_id: ca.id.to_string(),
+                    details: json!({
+                        "ca_name": ca.name,
+                        "revoked": revoked.len(),
+                        "next_update": crl.next_update.to_rfc3339(),
+                    }),
+                    created_at: Utc::now(),
+                },
+            )
             .await?;
     }
 
@@ -339,16 +344,19 @@ async fn regen_one_ca(
                 cert.cert.serial
             ))
         })?;
-        ocsp.insert(&OcspResponseModel {
-            id: Uuid::new_v4(),
-            tenant_id: ca.tenant_id,
-            ca_id: ca.id,
-            serial,
-            status: OcspStatus::Revoked,
-            this_update,
-            next_update,
-            resp_der: response,
-        })
+        ocsp.insert(
+            pool,
+            &OcspResponseModel {
+                id: Uuid::new_v4(),
+                tenant_id: ca.tenant_id,
+                ca_id: ca.id,
+                serial,
+                status: OcspStatus::Revoked,
+                this_update,
+                next_update,
+                resp_der: response,
+            },
+        )
         .await?;
     }
 
@@ -357,6 +365,7 @@ async fn regen_one_ca(
 
 /// Decide what one CA needs published.
 async fn plan_for(
+    pool: &PgPool,
     ca: &CaModel,
     published_crl: &Option<PublishedCrl>,
     revoked: &[RevokedCert],
@@ -376,7 +385,7 @@ async fn plan_for(
                 cert.cert.serial
             ))
         })?;
-        let latest = ocsp.get_latest(ca.id, serial).await?;
+        let latest = ocsp.get_latest(pool, ca.id, serial).await?;
         let needs_response = match latest {
             None => true,
             Some(response) => response.this_update < cert.revoked_at || response.next_update < now,

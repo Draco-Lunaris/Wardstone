@@ -8,10 +8,13 @@
 
 use std::fs;
 
+use chrono::Duration;
 use sha2::{Digest, Sha256};
 use ws_ca::ca::{create_root, create_sub_ca, CaLifetime, CaSpec, KeyType};
 use ws_ca::error::CaError;
+use ws_ca::issue::{ExtKeyUsagePurpose, KeyUsagePurpose};
 use ws_ca::keystore::KeyStore;
+use ws_ca::leafkey::LeafKeyType;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::pem::parse_x509_pem;
@@ -327,8 +330,10 @@ fn end_entity_cert(ks: &mut KeyStore) -> (String, Vec<u8>) {
         &csr.pem().unwrap(),
         &LeafSpec {
             sans: vec![SanEntry::Dns("not-a-ca.example".to_owned())],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: Duration::days(30),
             subject_cn: None,
             serial: 0x1234,
         },
@@ -562,8 +567,10 @@ fn test_issuer_without_key_cert_sign_is_refused() {
         &csr.pem().unwrap(),
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: Duration::days(30),
             subject_cn: None,
             serial: 0x2468,
         },
@@ -576,4 +583,100 @@ fn test_issuer_without_key_cert_sign_is_refused() {
         ),
         other => panic!("expected a typed CaError::X509, got {other:?}"),
     }
+}
+
+/// The setup-key slot: the setup certificate's private key stored as an
+/// ordinary envelope under `<dir>/ca/setup.key` — encrypted at rest under
+/// the master KEK exactly like a CA key — and loadable back by the byte.
+#[test]
+fn test_setup_key_round_trips() {
+    let mut ks = temp_keystore("setup-key-roundtrip");
+    // Any DER bytes work for the envelope; the keystore sees an opaque
+    // plaintext.
+    let der: Vec<u8> = (0u8..=63).collect();
+    ks.store_setup_key(&der).unwrap();
+
+    // The slot lives INSIDE the `ca/` directory `has_stored_keys` scans,
+    // with a `.key` suffix — that is what makes it visible to
+    // `ensure_master_key`'s populated-store guard.
+    let path = ks.setup_key_path();
+    assert!(
+        path.ends_with(std::path::Path::new("ca/setup.key")),
+        "the setup key must live at <dir>/ca/setup.key, got {}",
+        path.display()
+    );
+    assert!(path.exists(), "the envelope must be on disk after storing");
+
+    // Round-trip: the exact bytes come back (zeroized on drop).
+    let loaded = ks.load_setup_key().unwrap();
+    assert_eq!(loaded.as_slice(), der.as_slice());
+
+    // Mode 0600, like every key-store file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+/// Storing a setup key makes the store POPULATED: deleting `master.key`
+/// afterwards must make `ensure_master_key` refuse (`Corrupt`) rather
+/// than mint a fresh master — which would silently orphan the setup key
+/// (every future load of it would fail with `WrongKey` for data that was
+/// never wrong).
+#[test]
+fn test_ensure_master_key_refuses_when_only_setup_key_exists() {
+    let mut ks = temp_keystore("setup-key-refuse-regen");
+    let der: Vec<u8> = (0u8..=63).collect();
+    ks.store_setup_key(&der).unwrap();
+
+    fs::remove_file(ks.master_key_path()).unwrap();
+
+    assert!(
+        matches!(ks.ensure_master_key(), Err(CaError::Corrupt)),
+        "the setup key visible to has_stored_keys must stop a fresh master"
+    );
+
+    // The refusal must not have "repaired" anything: the envelope is
+    // untouched on disk.
+    assert!(ks.setup_key_path().exists());
+}
+
+/// The setup envelope's associated data is NOT a CA id — it is the fixed
+/// literal `wardstone-setup-key/v1` — so an envelope pasted into a CA
+/// slot (or vice versa) fails decryption as `Corrupt` instead of silently
+/// loading the wrong key.
+#[test]
+fn test_setup_envelope_will_not_load_as_a_ca_key() {
+    use uuid::Uuid;
+
+    let mut ks = temp_keystore("setup-key-aad");
+    let ca_id = Uuid::new_v4();
+    let ca_der: Vec<u8> = (128u8..=191).collect();
+    let setup_der: Vec<u8> = (64u8..=127).collect();
+    ks.store_ca_key(&ca_id, &ca_der).unwrap();
+    ks.store_setup_key(&setup_der).unwrap();
+
+    // Paste the setup envelope into the CA slot, and the CA envelope into
+    // the setup slot — both loads must fail typed.
+    let setup_env = std::fs::read_to_string(ks.setup_key_path()).unwrap();
+    let ca_env = {
+        let mut p = ks.master_key_path();
+        p.pop();
+        p.join("ca").join(format!("{ca_id}.key"))
+    };
+    let ca_env_bytes = std::fs::read(&ca_env).unwrap();
+    std::fs::write(ks.setup_key_path(), &ca_env_bytes).unwrap();
+    std::fs::write(&ca_env, setup_env.as_bytes()).unwrap();
+
+    assert!(
+        matches!(ks.load_setup_key(), Err(CaError::Corrupt)),
+        "a CA key envelope in the setup slot must fail decryption"
+    );
+    assert!(
+        matches!(ks.load_ca_key(&ca_id), Err(CaError::Corrupt)),
+        "a setup envelope in a CA slot must fail decryption"
+    );
 }

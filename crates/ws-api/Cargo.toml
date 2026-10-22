@@ -5,3 +5,60 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The async HTTP framework: the REST surface is an axum Router the binary
+# (Task 13) serves. Router/extraction/response shapes are axum 0.8.
+axum = { workspace = true }
+# Service/layer plumbing for the access-log middleware (request/response
+# bodies are never touched by it).
+tower = { workspace = true }
+# Response headers (Cache-Control: no-store on the secret-bearing
+# responses) applied by the router itself.
+tower-http = { workspace = true }
+# GCRA per-IP rate limiting over the public auth routes (the house
+# pattern: one GovernorLayer per router).
+governor = { workspace = true }
+tower_governor = { workspace = true }
+# PgPool and transactions; the features are already unified across the
+# workspace (ws-core carries macros/migrate/uuid/chrono/ipnet/json).
+sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
+# Async test bodies and spawn_blocking for the CPU-bound crypto calls.
+tokio = { workspace = true }
+# Request/response DTOs.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# PEM body encoding for the exported CA private key (the keystore stores
+# PKCS#8 DER; the export response is the PEM the operator saves). The
+# workspace's base64 pin — the same encoder ws-ca's keystore uses.
+base64 = { workspace = true }
+# Hex encoding of the minted OIDC csrf state (32 random bytes presented
+# as hex — the same token encoding ws-auth's opaque tokens use).
+hex = { workspace = true }
+# OS entropy for the minted OIDC csrf state (the house rand 0.10 SysRng).
+rand = { workspace = true }
+# Model ids, timestamps, and query parameters.
+uuid = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
+# Typed error enum with thiserror + IntoResponse.
+thiserror = { workspace = true }
+# The access-log middleware and operator-facing auth diagnostics.
+tracing = { workspace = true }
+# The domain layer: models, repositories, the SAN matcher, the actor
+# vocabulary.
+ws-core = { path = "../ws-core" }
+# Authentication primitives: JWT issuing/validation, passwords, refresh
+# tokens, TOTP, OIDC, service identities, one-shot tokens.
+ws-auth = { path = "../ws-auth" }
+# The CA engine: CSR validation, leaf signing, CA creation, keystore, the
+# serial allocator, leaf-key generation.
+ws-ca = { path = "../ws-ca" }
+# PKCS#10 CSR building for the server-key-generation path: the handler
+# mints a fresh leaf key with ws_ca::leafkey::generate_leaf_key and wraps
+# it in a self-signed CSR (subject + SANs) fed to sign_leaf_with. The
+# feature set matches ws-ca's pin exactly.
+rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
+
+[dev-dependencies]
+# The TOTP test computes RFC 6238 codes with the workspace's own totp-rs
+# pin (the same parameters ws-auth's mfa_totp module verifies with);
+# never used by production code.
+totp-rs = { workspace = true }

@@ -2,8 +2,9 @@
 #
 # This is a LOCAL DEV AND TEST database only — a throwaway Postgres for the
 # DB-gated test suites and for local poking at the schema. It is not the
-# production bundle: the production compose file (Wardstone + Postgres, one
-# image, `ui`/`api` invocation modes) arrives in a later plan.
+# production bundle: that is `docker/compose.yml` (Wardstone + Postgres, one
+# image, `ui`/`api` invocation modes), which persists its data and exposes
+# none of its internals.
 #
 # Usage:
 #

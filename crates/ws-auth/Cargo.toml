@@ -5,3 +5,64 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Argon2id password hashing (workspace pin; default features enable the
+# auto-salted `PasswordHasher::hash_password`).
+argon2 = { workspace = true }
+# iat/exp unix timestamps on the JWT claims (house pattern).
+chrono = { workspace = true }
+# Ed25519 keypair generation for the JWT signing/verification key pair
+# (keys are kept in PEM form, matching the house layout).
+ed25519-dalek = { workspace = true }
+# JWT issuing/validation with the pure-Rust Ed25519 backend.
+jsonwebtoken = { workspace = true }
+# PKCS#8/SPKI encoders plus the `pem` feature (to_pkcs8_pem /
+# to_public_key_pem / LineEnding) for writing the key pair.
+pkcs8 = { workspace = true }
+# OIDC discovery / code-exchange / JWKS HTTP fetches (rustls backend).
+reqwest = { workspace = true }
+# TOTP MFA: RFC 6238 codes, fresh secrets, otpauth:// enrollment URIs
+# (house pin + features, linux-patch-manager pm-auth).
+totp-rs = { workspace = true }
+# OS entropy for the fresh Ed25519 seed (house pattern: rand 0.10 SysRng).
+rand = { workspace = true }
+# ID token signature verification reuses the JWT codec; JWKS documents are
+# raw serde_json values (the house pattern).
+serde_json = { workspace = true }
+# Claims types are the JWT payload (jsonwebtoken serializes via serde).
+serde = { workspace = true }
+# Zero-wipe the fresh Ed25519 seed after the key is built.
+zeroize = { workspace = true }
+# Hex encoding of opaque token material: the 32 random minted bytes are
+# presented to the client as `{prefix}{hex}` (the house's token encoding,
+# pm-auth/src/refresh.rs:38-48) and their verifier hash is stored as
+# hex(Sha256(raw_bytes)).
+hex = { workspace = true }
+# SHA-256 for the opaque token verifier hashes — the house's refresh-token
+# precedent (pm-auth/src/refresh.rs:11,46,100,153), NOT argon2id: argon2id's
+# slowness defends user-chosen passwords, while these 256-bit random tokens
+# are hashed with the fast digest their entropy deserves.
+sha2 = { workspace = true }
+# Executor-typed database access (sqlx::PgExecutor) for the token flows:
+# the auth layer takes an executor as its first argument and stays agnostic
+# of pools vs transactions, matching ws-core's stateless-repo shape.
+sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
+# Typed error enum shared by every later auth task.
+thiserror = { workspace = true }
+# Claims carry UUIDs: user_id and the refresh-token session id (sid).
+uuid = { workspace = true, features = ["serde"] }
+# The shared access vocabulary (capabilities, roles, actor types) lives in
+# ws-core — the schema owner; a ws-core dependency on ws-auth instead
+# would be a Cargo cycle. Task 1 deferred this edge; re-exports it at the
+# crate root.
+ws-core = { path = "../ws-core" }
+
+[dev-dependencies]
+# The TOTP test computes a code with an independent RFC 6238 HMAC-SHA1
+# implementation to pin verify_code against the spec, not just against itself.
+hmac = { version = "0.13", default-features = false }
+# Digest for the TOTP test's HMAC. Crate-local 0.11 pin: hmac 0.13 requires
+# digest 0.11, while the workspace sha1 0.10.7 (digest 0.10, ws-ca's OCSP
+# hashes) cannot unify with it. Test-only; never compiled into production code.
+sha1 = "0.11"
+# Async test runtime for the OIDC reqwest call paths (discovery, code exchange).
+tokio = { workspace = true }

@@ -15,7 +15,6 @@
 use std::fs;
 use std::net::IpAddr;
 
-use chrono::SubsecRound;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
@@ -24,8 +23,14 @@ use x509_parser::prelude::FromDer;
 
 use ws_ca::ca::{create_root, CaLifetime, CaSpec, KeyType};
 use ws_ca::error::CaError;
-use ws_ca::issue::{supported_key_alg, validate_csr, LeafSpec, SanEntry};
+use ws_ca::issue::{
+    eku_to_rcgen, key_usage_to_rcgen, supported_key_alg, validate_csr, ExtKeyUsagePurpose,
+    LeafSpec, SanEntry,
+};
+// The one key-usage vocabulary, re-exported by ws-ca from ws-core.
+use ws_ca::issue::KeyUsagePurpose;
 use ws_ca::keystore::KeyStore;
+use ws_ca::leafkey::LeafKeyType;
 
 /// A structurally valid CSR minted by OpenSSL with an unsupported key
 /// algorithm (ECDSA P-521). Its self-signature verifies (proof of
@@ -169,6 +174,34 @@ k3qwzHedBrnXMO/MSS670KBTf5tZPbWqW+5OOWCDp2e/qM9vulR9vTGOICzYRmXX
 gy9zt0EtkDHzd0iC9wgHIRIJ3mw7SWmTDEgGgx39FPj6oDb7lYJA3sXK684cOewP
 td77SW39sAaaAwWsG3ipFo3Sv/0hBY0rK+wZhqpF77BHnpezCKSG2livtN97n9Zt
 Ll3dytFzElBbATfhvMNZiQtOoNzRdPORzup05EW8j/b/GrIIpjr8DOg=
+-----END CERTIFICATE REQUEST-----
+";
+
+/// Dedicated RSA-3072 issuance fixture (same mint as the RSA-2048 one;
+/// `openssl req -verify` OK at generation time): pins the EXACT-match
+/// rule for RSA pins — an RSA-3072 CSR is refused under an Rsa2048 pin
+/// and issues only under the exact Rsa3072 pin.
+const MATRIX_RSA3072_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIIDZTCCAc0CAQAwIDEeMBwGA1UEAwwVbWF0cml4LXJzMzA3Mi5leGFtcGxlMIIB
+ojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsac2K2LmTWDC+XCbDiaP2IBe
+noUS46dBbolg/ge6r7D6UCtvBDHLw1NH/puQiEDg/8hU+h+ERPq1NBXaNDP9XGOp
+ZFWmpttl2B2ybV2rczjnU/DNiicIlS2s/k7oWD0JIMc50YHvk5s4E9j691sNMjtU
+a+ChS0urNYZJ6yLndKK81wrxKQzHBUG24KwL6kyECwFlI2QD1r7dY+Yv+q4J11Ub
+LCyj23z9mV04V3lj/vs8Tg5FZYjH38kEa2qaBqCHlGpbKpEPqIKfwYg2CPxkSU3k
+Bh4lT0xy5JWKo66IN30l5/dFRHLE5TKQzZN3LnHqiR58LIrGMxXgOHvB3gqrbsJA
+QFYVA+bFpgONYhyTsbfvV46Y7wPSA8//lzxWRXjxW+j3VFMTI9SxnuyfcL9pSbZW
+7IXYIO791Ss5RwN0Xw0WAUodOBuhNE20oIQIeei7idwTmmqhpFejOZgAE/R5Ipj6
+mHrP0Ev82y+lTQF4kYztDQG/HqEBqT5dSHYpiNc3AgMBAAGgADANBgkqhkiG9w0B
+AQsFAAOCAYEAYlesUM3++2ACqJ7xybieQI0DTouiNM7zbTHiXWMuxpMatdk2QFd/
+/AwXEXZaWsiLxEOtc54W6pqoJexgCObu+9FXwNtIxFonWWW5FKw+hKbQW7W6stKB
+HUhspmsUKbyt9LZ3j70OBtdqpV+Cv7G0MOvQsoU4MH7+KNaei+Hk0LPhIUmIoQLX
+oWx6Z5JSiFjeEn2FWN52YA1mb7XZ08ETga5HVFWKzoVwqXQvExSnX9H0UXy1Q+QT
+3y1dn2OIVduEYnQ2vAtUBtA8dpLi2VUPzWWbbzfWz4UWb1Ly0J7jsqNKoswRScdr
+VLt4VvO/0kVosItTrkj/dijRTdnX8a3pmkkVAFHSsF+vxbE2mMIkjOTYSgv4Emwl
+Q4WSLVbTa7yDo6TXW3UWX4P1YzsyGxftcQ5co54IT+b0NEgnjwdZx9Z9EcWsE1Cw
+BDO6XQFxrm3QHTnBl1gL1S3DaepDdyF9GzUR43p4SqH9FE1du5yBs4myG+2SmY9+
+BzOP3jsC70WZ
 -----END CERTIFICATE REQUEST-----
 ";
 
@@ -339,8 +372,10 @@ fn test_issue_from_csr_rejects_unsupported_key() {
     let root = ed25519_root(&mut ks);
     let spec = LeafSpec {
         sans: vec![SanEntry::Dns("ignored.example".to_owned())],
-        key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-        not_after: None,
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type: LeafKeyType::EcdsaP256,
+        lifetime: chrono::Duration::days(30),
         subject_cn: None,
         serial: 1,
     };
@@ -402,8 +437,10 @@ fn test_issue_from_csr_rejects_bad_signature() {
         TAMPERED_SIG_CSR_PEM,
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
             serial: 1,
         },
@@ -424,8 +461,10 @@ fn test_issue_from_csr_rejects_bad_signature() {
         TAMPER_ORIGINAL_CSR_PEM,
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
             serial: 2,
         },
@@ -448,10 +487,12 @@ fn test_issue_leaf_happy_path() {
     let spec = LeafSpec {
         sans,
         key_usages: vec![
-            rcgen::KeyUsagePurpose::DigitalSignature,
-            rcgen::KeyUsagePurpose::KeyEncipherment,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
         ],
-        not_after: None,
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type: LeafKeyType::EcdsaP256,
+        lifetime: chrono::Duration::days(30),
         subject_cn: Some("leaf-subject.example".to_owned()),
         serial,
     };
@@ -464,7 +505,7 @@ fn test_issue_leaf_happy_path() {
     assert_eq!(
         issued.not_after - issued.not_before,
         chrono::Duration::days(30),
-        "default leaf validity is exactly 30 days"
+        "the spec's 30-day lifetime becomes the certificate's span exactly"
     );
     assert!(issued.not_before <= chrono::Utc::now() + chrono::Duration::minutes(5));
 
@@ -560,16 +601,22 @@ fn test_issue_leaf_happy_path() {
 }
 
 #[test]
-fn test_issue_leaf_respects_explicit_not_after_and_optional_cn() {
-    let mut ks = temp_keystore("explicit-validity");
+fn test_issue_leaf_lifetime_span_is_exact_and_optional_cn() {
+    let mut ks = temp_keystore("lifetime-span");
     let root = ed25519_root(&mut ks);
 
     let csr = mint_p256_csr(Some("minimal.example"), &[]);
-    let not_after = (chrono::Utc::now() + chrono::Duration::days(7)).trunc_subsecs(0);
     let spec = LeafSpec {
         sans: vec![],
-        key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-        not_after: Some(not_after),
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type: LeafKeyType::EcdsaP256,
+        // The lifetime is the certificate's SPAN: ws-ca computes
+        // not_before (the midnight UTC skew margin) internally, and
+        // not_after is exactly one lifetime later. The caller can never
+        // supply an absolute instant (it cannot observe the internal
+        // not_before), so the span it asks for is the span it gets.
+        lifetime: chrono::Duration::days(7),
         // subject_cn None: keep the CSR's own subject (minted with CN).
         subject_cn: None,
         serial: 42,
@@ -578,13 +625,25 @@ fn test_issue_leaf_respects_explicit_not_after_and_optional_cn() {
     let issued =
         ws_ca::issue::sign_leaf_with(&root.cert_pem, &root.private_key_der, &csr, &spec).unwrap();
     assert_eq!(issued.serial, 42);
-    // With an explicit not_after, the spec instant is honored exactly
-    // (not_before is still the midnight skew margin, so the window is not
-    // 7 days on the dot — the two endpoints are asserted individually).
-    assert_eq!(issued.not_after.timestamp(), not_after.timestamp());
-    assert!(issued.not_before <= chrono::Utc::now());
+    assert_eq!(
+        issued.not_after - issued.not_before,
+        chrono::Duration::days(7),
+        "the issued span must equal the requested lifetime exactly"
+    );
 
     let cert = parse_cert(&issued.cert_pem);
+    let validity = cert.validity();
+    assert_eq!(
+        validity.not_after.timestamp() - validity.not_before.timestamp(),
+        7 * 86_400,
+        "the parsed certificate must span exactly the requested lifetime"
+    );
+    assert_eq!(
+        validity.not_before.timestamp(),
+        issued.not_before.timestamp()
+    );
+    assert_eq!(validity.not_after.timestamp(), issued.not_after.timestamp());
+
     // No SANs requested -> no SAN extension on the leaf.
     assert!(
         cert_general_names(&cert).is_none(),
@@ -613,8 +672,10 @@ fn test_issue_leaf_rejects_unusable_subject() {
     let root = ed25519_root(&mut ks);
     let base = LeafSpec {
         sans: vec![],
-        key_usages: vec![],
-        not_after: None,
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type: LeafKeyType::EcdsaP256,
+        lifetime: chrono::Duration::days(30),
         subject_cn: None,
         serial: 7,
     };
@@ -663,8 +724,10 @@ fn test_issue_leaf_serial_encodes_edge_values() {
     let csr = mint_p256_csr(Some("serial.example"), &[]);
     let spec_for = |serial: u128| LeafSpec {
         sans: vec![],
-        key_usages: vec![],
-        not_after: None,
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type: LeafKeyType::EcdsaP256,
+        lifetime: chrono::Duration::days(30),
         subject_cn: None,
         serial,
     };
@@ -732,14 +795,22 @@ fn test_issue_leaf_serial_encodes_edge_values() {
 /// `validate_csr`. This exercises `alg_name`'s OID arms and
 /// `csr_public_key_data`'s algorithm mapping for every supported family
 /// from a second, independent encoder.
-fn issue_from_matrix_csr(root: &ws_ca::ca::CreatedCa, csr_pem: &str, expected_alg: &str) {
+fn issue_from_matrix_csr(
+    root: &ws_ca::ca::CreatedCa,
+    csr_pem: &str,
+    expected_alg: &str,
+    key_type: LeafKeyType,
+) {
     let info = validate_csr(csr_pem).unwrap();
     assert_eq!(info.public_key_alg, expected_alg);
 
     let spec = LeafSpec {
         sans: vec![],
-        key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-        not_after: None,
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        // The pin matches the CSR's actual algorithm for each matrix row.
+        key_type,
+        lifetime: chrono::Duration::days(30),
         subject_cn: None,
         serial: 77,
     };
@@ -777,64 +848,53 @@ fn test_issue_leaf_algorithm_matrix_from_openssl_csrs() {
     let root = ed25519_root(&mut ks);
 
     // One leaf per supported algorithm, each from a fresh openssl-minted
-    // fixture (all `openssl req -verify` OK at generation time).
-    issue_from_matrix_csr(&root, MATRIX_ED25519_CSR_PEM, "Ed25519");
-    issue_from_matrix_csr(&root, MATRIX_P384_CSR_PEM, "ECDSA P-384");
-    issue_from_matrix_csr(&root, MATRIX_RSA2048_CSR_PEM, "RSA");
+    // fixture (all `openssl req -verify` OK at generation time), each under
+    // the matching profile pin.
+    issue_from_matrix_csr(
+        &root,
+        MATRIX_ED25519_CSR_PEM,
+        "Ed25519",
+        LeafKeyType::Ed25519,
+    );
+    issue_from_matrix_csr(
+        &root,
+        MATRIX_P384_CSR_PEM,
+        "ECDSA P-384",
+        LeafKeyType::EcdsaP384,
+    );
+    issue_from_matrix_csr(&root, MATRIX_RSA2048_CSR_PEM, "RSA", LeafKeyType::Rsa2048);
 }
 
+/// A non-positive lifetime would issue a certificate whose window never
+/// opens (not_after at or before not_before): typed rejection, never
+/// issuance.
 #[test]
-fn test_issue_leaf_rejects_not_after_before_not_before() {
-    let mut ks = temp_keystore("past-not-after");
+fn test_issue_leaf_refuses_non_positive_lifetime() {
+    let mut ks = temp_keystore("zero-lifetime");
     let root = ed25519_root(&mut ks);
     let csr = mint_p256_csr(Some("expired.example"), &[]);
 
-    // An already-past not_after would issue an expired-on-arrival leaf:
-    // typed rejection, never issuance. Two days back lands strictly before
-    // not_before (midnight UTC yesterday); one day back would be inside
-    // the window (yesterday's time-of-day is after midnight yesterday).
-    let past = (chrono::Utc::now() - chrono::Duration::days(2)).trunc_subsecs(0);
-    let err = ws_ca::issue::sign_leaf_with(
-        &root.cert_pem,
-        &root.private_key_der,
-        &csr,
-        &LeafSpec {
-            sans: vec![],
-            key_usages: vec![],
-            not_after: Some(past),
-            subject_cn: None,
-            serial: 5,
-        },
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, CaError::X509(ref msg) if msg.contains("not_after")),
-        "a past not_after must be a typed X509 rejection, got {err:?}"
-    );
-
-    // not_after exactly at not_before (midnight yesterday) is likewise a
-    // non-positive window.
-    let midnight_yesterday = {
-        let nb = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
-        nb.and_hms_opt(0, 0, 0).unwrap().and_utc()
-    };
-    let err = ws_ca::issue::sign_leaf_with(
-        &root.cert_pem,
-        &root.private_key_der,
-        &csr,
-        &LeafSpec {
-            sans: vec![],
-            key_usages: vec![],
-            not_after: Some(midnight_yesterday),
-            subject_cn: None,
-            serial: 6,
-        },
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, CaError::X509(ref msg) if msg.contains("not_after")),
-        "not_after == not_before must be a typed X509 rejection, got {err:?}"
-    );
+    for lifetime in [chrono::Duration::zero(), chrono::Duration::seconds(-86_400)] {
+        let err = ws_ca::issue::sign_leaf_with(
+            &root.cert_pem,
+            &root.private_key_der,
+            &csr,
+            &LeafSpec {
+                sans: vec![],
+                key_usages: vec![KeyUsagePurpose::DigitalSignature],
+                ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+                key_type: LeafKeyType::EcdsaP256,
+                lifetime,
+                subject_cn: None,
+                serial: 5,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CaError::X509(ref msg) if msg.contains("lifetime")),
+            "a non-positive lifetime must be a typed X509 rejection, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -855,8 +915,10 @@ fn test_issue_leaf_keeps_csr_public_key_not_ca_key() {
         &csr_a,
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
             serial: 9001,
         },
@@ -916,8 +978,10 @@ fn end_entity_issuer(ks: &mut KeyStore) -> (String, Vec<u8>) {
         &csr.pem().unwrap(),
         &LeafSpec {
             sans: vec![SanEntry::Dns("not-a-ca.example".to_owned())],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
             serial: 0x4321,
         },
@@ -941,8 +1005,10 @@ fn test_issue_leaf_from_non_ca_issuer_is_refused() {
         &csr,
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: None,
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
             serial: 0x1111,
         },
@@ -957,47 +1023,326 @@ fn test_issue_leaf_from_non_ca_issuer_is_refused() {
     }
 }
 
-/// A leaf's validity is CLAMPED to the issuing CA's `notAfter`: a leaf
-/// that outlives its issuer is a self-inflicted outage for the rest of
-/// the chain's life.
+/// A leaf whose lifetime spans beyond the issuing CA's `notAfter` is
+/// REFUSED — Plan 1 silently clamped it, and a certificate that silently
+/// differs from its profile is a policy violation invisible to both the
+/// caller and the auditor. The refusal names both instants.
 #[test]
-fn test_issue_leaf_validity_is_clamped_to_ca_not_after() {
-    let mut ks = temp_keystore("leaf-clamped-validity");
+fn test_issue_leaf_refuses_lifetime_beyond_ca_not_after() {
+    let mut ks = temp_keystore("leaf-beyond-ca");
     let root = ed25519_root(&mut ks);
-    let csr = mint_p256_csr(Some("clamped.example"), &[]);
+    let csr = mint_p256_csr(Some("beyond.example"), &[]);
 
-    // Ask for a leaf that outlives the root by decades.
-    let beyond = chrono::Utc::now() + chrono::Duration::days(3650);
+    // Ask for a leaf that outlives the 10-year root.
+    let lifetime = chrono::Duration::days(7300);
+    // ws-ca computes not_before internally (midnight UTC one day before
+    // today); recompute the same instant here so the requested not_after
+    // — the one the engine would have baked into the certificate — can be
+    // named in the assertions.
+    let not_before = (chrono::Utc::now() - chrono::Duration::days(1))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let requested_not_after = not_before + lifetime;
+
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime,
+            subject_cn: None,
+            serial: 0x2222,
+        },
+    )
+    .unwrap_err();
+    match err {
+        CaError::X509(msg) => {
+            let ca_not_after = parse_cert(&root.cert_pem).validity().not_after.timestamp();
+            assert!(
+                msg.contains(&requested_not_after.timestamp().to_string()),
+                "the refusal must name the leaf's requested not_after \
+                 ({requested_not_after}), got: {msg}"
+            );
+            assert!(
+                msg.contains(&ca_not_after.to_string()),
+                "the refusal must name the CA's not_after ({ca_not_after}), got: {msg}"
+            );
+        }
+        other => panic!("expected a typed CaError::X509, got {other:?}"),
+    }
+}
+
+/// A leaf with pinned EKUs carries the extendedKeyUsage extension with
+/// exactly those purposes.
+#[test]
+fn test_issue_leaf_carries_eku_extension() {
+    let mut ks = temp_keystore("eku-carried");
+    let root = ed25519_root(&mut ks);
+    let csr = mint_p256_csr(Some("eku.example"), &[]);
+
     let issued = ws_ca::issue::sign_leaf_with(
         &root.cert_pem,
         &root.private_key_der,
         &csr,
         &LeafSpec {
             sans: vec![],
-            key_usages: vec![],
-            not_after: Some(beyond),
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![
+                ExtKeyUsagePurpose::ServerAuth,
+                ExtKeyUsagePurpose::ClientAuth,
+                ExtKeyUsagePurpose::TimeStamping,
+            ],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
             subject_cn: None,
-            serial: 0x2222,
+            serial: 0xE0,
         },
     )
-    .expect("issue the clamped leaf");
+    .unwrap();
 
-    let ca_not_after = parse_cert(&root.cert_pem).validity().not_after.timestamp();
-    assert_eq!(
-        issued.not_after.timestamp(),
-        ca_not_after,
-        "the leaf's not_after must be clamped to the CA's not_after"
-    );
-    let leaf_not_after = parse_cert(&issued.cert_pem)
-        .validity()
-        .not_after
-        .timestamp();
-    assert_eq!(
-        leaf_not_after, ca_not_after,
-        "the issued certificate's own not_after must match the clamp"
-    );
+    let cert = parse_cert(&issued.cert_pem);
+    let eku = cert
+        .extended_key_usage()
+        .unwrap()
+        .expect("the extendedKeyUsage extension must be present");
+    assert!(eku.value.server_auth, "EKU must carry id-kp-serverAuth");
+    assert!(eku.value.client_auth, "EKU must carry id-kp-clientAuth");
+    assert!(eku.value.time_stamping, "EKU must carry id-kp-timeStamping");
     assert!(
-        issued.not_after > issued.not_before,
-        "the clamped window must still be valid"
+        !eku.value.code_signing && !eku.value.email_protection && !eku.value.ocsp_signing,
+        "unpinned EKU purposes must be absent"
+    );
+}
+
+/// An empty EKU list is illegal: an ABSENT extendedKeyUsage extension is
+/// more permissive than any pinned list (RFC 5280 section 4.2.1.12 — a
+/// certificate without it is usable for every purpose), so "no EKUs" can
+/// only be a caller bug, never a profile. Typed rejection, never issuance.
+#[test]
+fn test_issue_leaf_refuses_empty_eku_list() {
+    let mut ks = temp_keystore("empty-eku");
+    let root = ed25519_root(&mut ks);
+    let csr = mint_p256_csr(Some("no-eku.example"), &[]);
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
+            subject_cn: None,
+            serial: 0xE1,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::X509(ref msg) if msg.contains("extendedKeyUsage")),
+        "an empty EKU list must be a typed X509 rejection, got {err:?}"
+    );
+}
+
+/// An empty key-usage list is illegal for the same reason: an ABSENT
+/// keyUsage extension makes the certificate UNRESTRICTED (RFC 5280
+/// section 4.2.1.3), which is more permissive than any pinned list.
+#[test]
+fn test_issue_leaf_refuses_empty_key_usage_list() {
+    let mut ks = temp_keystore("empty-ku");
+    let root = ed25519_root(&mut ks);
+    let csr = mint_p256_csr(Some("no-ku.example"), &[]);
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
+            subject_cn: None,
+            serial: 0xE1,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::X509(ref msg) if msg.contains("keyUsage")),
+        "an empty key-usage list must be a typed X509 rejection, got {err:?}"
+    );
+}
+
+/// The profile's key_type pin is enforced against the CSR's actual key:
+/// a matching pin issues; a mismatched family, or an RSA key whose
+/// modulus size differs from the pinned size, is a typed rejection —
+/// the pin matches EXACTLY (RSA included), so the deliberately narrowed
+/// accepted set cannot be widened by a stronger-than-pinned key.
+#[test]
+fn test_issue_leaf_key_type_pin() {
+    let mut ks = temp_keystore("key-pin");
+    let root = ed25519_root(&mut ks);
+    let p256_csr = mint_p256_csr(Some("pin.example"), &[]);
+
+    let spec_for = |key_type: LeafKeyType, serial: u128| LeafSpec {
+        sans: vec![],
+        key_usages: vec![KeyUsagePurpose::DigitalSignature],
+        ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+        key_type,
+        lifetime: chrono::Duration::days(30),
+        subject_cn: None,
+        serial,
+    };
+
+    // Matching pin: a P-256 CSR against an EcdsaP256 profile issues.
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &p256_csr,
+        &spec_for(LeafKeyType::EcdsaP256, 0xE2),
+    )
+    .unwrap();
+    assert_eq!(issued.serial, 0xE2);
+
+    // Mismatched family: a P-256 CSR against an Rsa2048 profile is a
+    // typed rejection naming both the CSR's algorithm and the pin.
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &p256_csr,
+        &spec_for(LeafKeyType::Rsa2048, 0xE3),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::UnsupportedKeyType(ref msg)
+            if msg.contains("RSA") && msg.contains("P-256")),
+        "a P-256 CSR under an Rsa2048 pin must be an UnsupportedKeyType naming both \
+         algorithms, got {err:?}"
+    );
+
+    // Wrong modulus size, weaker side: an RSA-2048 CSR against an
+    // Rsa3072 profile — the family matches, the size does not.
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA2048_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa3072, 0xE4),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::UnsupportedKeyType(ref msg) if msg.contains("3072")),
+        "an RSA-2048 CSR under an Rsa3072 pin must be refused citing the pinned \
+         size, got {err:?}"
+    );
+
+    // Wrong modulus size, stronger side (the exact-match rule): an
+    // RSA-3072 CSR against an Rsa2048 profile is refused too. A stronger
+    // key than pinned is STILL a policy violation — the cert row and the
+    // audit record would read `rsa2048` while the issued key is 3072
+    // bits, and nothing an auditor can see marks the contradiction.
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA3072_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa2048, 0xE6),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::UnsupportedKeyType(ref msg) if msg.contains("2048")),
+        "an RSA-3072 CSR under an Rsa2048 pin must be refused citing the pinned \
+         size, got {err:?}"
+    );
+
+    // The matching RSA pins issue: each CSR under the pin of its exact
+    // size.
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA2048_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa2048, 0xE5),
+    )
+    .unwrap();
+    assert_eq!(issued.serial, 0xE5);
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA3072_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa3072, 0xE7),
+    )
+    .unwrap();
+    assert_eq!(issued.serial, 0xE7);
+}
+
+/// The boundary converters map every Wardstone variant onto the engine's
+/// enum, by value. (Free functions on purpose: a method would put `rcgen`
+/// into `ws-core`, and a `From` impl would violate the orphan rule.)
+#[test]
+fn test_key_usage_and_eku_converters_map_every_variant() {
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::DigitalSignature),
+        rcgen::KeyUsagePurpose::DigitalSignature
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::KeyEncipherment),
+        rcgen::KeyUsagePurpose::KeyEncipherment
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::DataEncipherment),
+        rcgen::KeyUsagePurpose::DataEncipherment
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::KeyAgreement),
+        rcgen::KeyUsagePurpose::KeyAgreement
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::KeyCertSign),
+        rcgen::KeyUsagePurpose::KeyCertSign
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::CrlSign),
+        rcgen::KeyUsagePurpose::CrlSign
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::ContentCommitment),
+        rcgen::KeyUsagePurpose::ContentCommitment
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::EncipherOnly),
+        rcgen::KeyUsagePurpose::EncipherOnly
+    );
+    assert_eq!(
+        key_usage_to_rcgen(KeyUsagePurpose::DecipherOnly),
+        rcgen::KeyUsagePurpose::DecipherOnly
+    );
+
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::ServerAuth),
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth
+    );
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::ClientAuth),
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth
+    );
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::CodeSigning),
+        rcgen::ExtendedKeyUsagePurpose::CodeSigning
+    );
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::EmailProtection),
+        rcgen::ExtendedKeyUsagePurpose::EmailProtection
+    );
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::OcspSigning),
+        rcgen::ExtendedKeyUsagePurpose::OcspSigning
+    );
+    assert_eq!(
+        eku_to_rcgen(ExtKeyUsagePurpose::TimeStamping),
+        rcgen::ExtendedKeyUsagePurpose::TimeStamping
     );
 }
