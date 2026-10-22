@@ -12,6 +12,9 @@
 //! - `service_identity` — service identities and the API tokens they mint,
 //!   for scripted automation: a stored SHA-256 verifier, the plaintext
 //!   returned once, and the resolved `Actor`.
+//! - `one_shot` — single-use operator tokens for the token-gated pull
+//!   flow: a stored SHA-256 verifier, the plaintext returned once, the
+//!   lookup-only resolution, and the atomic single-use claim.
 //! - `refresh` — session refresh tokens (the house's opaque-token flow):
 //!   issue, authenticate, rotate, revoke.
 //! - `error` — the shared `AuthError` vocabulary (401/403/404 mapping).
@@ -25,6 +28,7 @@ pub mod error;
 pub mod jwt;
 pub mod mfa_totp;
 pub mod oidc;
+pub mod one_shot;
 pub mod password;
 pub mod refresh;
 pub mod service_identity;
