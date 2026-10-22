@@ -31,3 +31,18 @@ fn hash_is_a_phc_argon2id_string() {
         "the stored credential must be a PHC argon2id string, got {hash}"
     );
 }
+
+#[test]
+fn hash_carries_the_house_calibration() {
+    let hash = hash_password("same password").unwrap();
+    // The house's calibrated cost (pm-auth/src/password.rs): 64 MiB of
+    // memory, 3 iterations, 1 lane — pinned so it cannot quietly weaken.
+    assert!(
+        hash.contains("m=65536"),
+        "64 MiB memory cost must be pinned in the PHC params, got {hash}"
+    );
+    assert!(
+        hash.contains("t=3") && hash.contains("p=1"),
+        "3 iterations and 1 lane must be pinned in the PHC params, got {hash}"
+    );
+}

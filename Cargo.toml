@@ -71,11 +71,7 @@ ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 # to_pkcs8_pem / to_public_key_pem and LineEnding (der/pem -> pem-rfc7468).
 pkcs8 = { version = "0.10.2", features = ["pem"] }
 
-# PEM codec (house pin "3"; jsonwebtoken 10's use_pem parser uses the same
-# major). Carried as the plan's PEM-handling pin for ws-auth.
-pem = "3"
-
-# Hex encoding for auth token material (house pin; used from Task 8 on).
+# Hex encoding for auth token material (house pin; Task 8's token digests).
 hex = "0.4"
 
 # Timestamp type of rcgen's CertificateParams (not_before/not_after):
