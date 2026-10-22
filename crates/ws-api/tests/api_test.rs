@@ -4073,3 +4073,168 @@ async fn user_patch_unknown_and_foreign_ids_are_404() {
     assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
     assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
 }
+
+/// The deactivate route runs the SAME self-deactivation policy the PATCH
+/// route pins: the acting actor may deactivate THEMSELVES when the tenant
+/// retains another active admin (the count is tenant-wide, not actor-
+/// relative). The route's `user_deactivated` audit row is untouched, and a
+/// second deactivate of the now-inactive user is an idempotent no-op.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn self_deactivation_allowed_with_a_second_admin() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    // A second ACTIVE admin so the self-deactivation is not the
+    // last-admin case.
+    insert_user(
+        &fx.pool,
+        fx.tenant_id,
+        Uuid::new_v4(),
+        "admin-two",
+        Role::Admin,
+    )
+    .await;
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let after = sqlx::query_scalar::<_, bool>("SELECT is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row after self-deactivation");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "the self-deactivation");
+    assert!(!after, "is_active flips to FALSE");
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["user_deactivated"],
+        "exactly one audit row: {audits:?}"
+    );
+}
+
+/// The last-admin guard applies to the self-deactivation too: with NO
+/// second active admin, the actor deactivating their own account is
+/// refused 409 with the exact PATCH-route message, the row is unchanged,
+/// and no audit rows are written.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn self_deactivation_still_refused_as_last_admin() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the last-admin refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// The deactivate route keeps its tenant scoping: another tenant's user
+/// (and an absent one) is a 404, indistinguishably.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn deactivate_unknown_and_foreign_ids_are_404() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let unknown_status = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", Uuid::new_v4()),
+        Some(&token),
+        json!({}),
+    )
+    .await
+    .status();
+
+    let foreign_name = "rt-api-foreign-deactivate-user";
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user audit rows");
+    sqlx::query(
+        "DELETE FROM users WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-user tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-user tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_user = Uuid::new_v4();
+    insert_user(
+        &fx.pool,
+        foreign_tenant,
+        foreign_user,
+        "foreign-deactivate-user",
+        Role::Viewer,
+    )
+    .await;
+    let foreign_status = post_json(
+        &fx,
+        &format!("/api/v1/users/{foreign_user}/deactivate"),
+        Some(&token),
+        json!({}),
+    )
+    .await
+    .status();
+
+    fx.cleanup().await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
+}
