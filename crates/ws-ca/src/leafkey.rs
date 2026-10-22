@@ -72,13 +72,18 @@ impl LeafKeyType {
     }
 
     /// The CSR algorithm name — as `ws_ca::issue`'s SPKI parser spells it —
-    /// that this pin accepts, and the pinned RSA modulus strength in bits
+    /// that this pin accepts, and the pinned RSA modulus size in bits
     /// (`None` for the non-RSA pins).
     ///
-    /// Both RSA sizes accept the RSA family: the pin names the MINIMUM
-    /// strength, so `Rsa2048` accepts a 3072-bit CSR while `Rsa3072`
-    /// refuses a 2048-bit one — a stronger key than pinned is never a
-    /// violation, a weaker one is.
+    /// The pin is an EXACT match, the RSA family included: a profile
+    /// pinning `Rsa2048` rejects both an RSA-3072 and an RSA-4096 CSR,
+    /// and an RSA-4096 key is not pinnable at all — the enum deliberately
+    /// narrows the accepted set to the two supported sizes, so opening a
+    /// floor under the pin would undo that narrowing. A CSR whose modulus
+    /// size differs from the pin is refused: an issued certificate whose
+    /// key contradicts the recorded profile is a policy violation
+    /// invisible to the caller and the auditor, the same class the
+    /// not_after clamp refusal exists to eliminate.
     pub(crate) fn csr_constraint(&self) -> (&'static str, Option<usize>) {
         match self {
             LeafKeyType::Rsa2048 => ("RSA", Some(2048)),

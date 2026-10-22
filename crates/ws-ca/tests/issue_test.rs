@@ -177,6 +177,34 @@ Ll3dytFzElBbATfhvMNZiQtOoNzRdPORzup05EW8j/b/GrIIpjr8DOg=
 -----END CERTIFICATE REQUEST-----
 ";
 
+/// Dedicated RSA-3072 issuance fixture (same mint as the RSA-2048 one;
+/// `openssl req -verify` OK at generation time): pins the EXACT-match
+/// rule for RSA pins — an RSA-3072 CSR is refused under an Rsa2048 pin
+/// and issues only under the exact Rsa3072 pin.
+const MATRIX_RSA3072_CSR_PEM: &str = "\
+-----BEGIN CERTIFICATE REQUEST-----
+MIIDZTCCAc0CAQAwIDEeMBwGA1UEAwwVbWF0cml4LXJzMzA3Mi5leGFtcGxlMIIB
+ojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsac2K2LmTWDC+XCbDiaP2IBe
+noUS46dBbolg/ge6r7D6UCtvBDHLw1NH/puQiEDg/8hU+h+ERPq1NBXaNDP9XGOp
+ZFWmpttl2B2ybV2rczjnU/DNiicIlS2s/k7oWD0JIMc50YHvk5s4E9j691sNMjtU
+a+ChS0urNYZJ6yLndKK81wrxKQzHBUG24KwL6kyECwFlI2QD1r7dY+Yv+q4J11Ub
+LCyj23z9mV04V3lj/vs8Tg5FZYjH38kEa2qaBqCHlGpbKpEPqIKfwYg2CPxkSU3k
+Bh4lT0xy5JWKo66IN30l5/dFRHLE5TKQzZN3LnHqiR58LIrGMxXgOHvB3gqrbsJA
+QFYVA+bFpgONYhyTsbfvV46Y7wPSA8//lzxWRXjxW+j3VFMTI9SxnuyfcL9pSbZW
+7IXYIO791Ss5RwN0Xw0WAUodOBuhNE20oIQIeei7idwTmmqhpFejOZgAE/R5Ipj6
+mHrP0Ev82y+lTQF4kYztDQG/HqEBqT5dSHYpiNc3AgMBAAGgADANBgkqhkiG9w0B
+AQsFAAOCAYEAYlesUM3++2ACqJ7xybieQI0DTouiNM7zbTHiXWMuxpMatdk2QFd/
+/AwXEXZaWsiLxEOtc54W6pqoJexgCObu+9FXwNtIxFonWWW5FKw+hKbQW7W6stKB
+HUhspmsUKbyt9LZ3j70OBtdqpV+Cv7G0MOvQsoU4MH7+KNaei+Hk0LPhIUmIoQLX
+oWx6Z5JSiFjeEn2FWN52YA1mb7XZ08ETga5HVFWKzoVwqXQvExSnX9H0UXy1Q+QT
+3y1dn2OIVduEYnQ2vAtUBtA8dpLi2VUPzWWbbzfWz4UWb1Ly0J7jsqNKoswRScdr
+VLt4VvO/0kVosItTrkj/dijRTdnX8a3pmkkVAFHSsF+vxbE2mMIkjOTYSgv4Emwl
+Q4WSLVbTa7yDo6TXW3UWX4P1YzsyGxftcQ5co54IT+b0NEgnjwdZx9Z9EcWsE1Cw
+BDO6XQFxrm3QHTnBl1gL1S3DaepDdyF9GzUR43p4SqH9FE1du5yBs4myG+2SmY9+
+BzOP3jsC70WZ
+-----END CERTIFICATE REQUEST-----
+";
+
 /// Per-test temp keystore, mirroring the creation suite's pattern: unique
 /// per test name and process id, swept before use so stale runs can't
 /// interfere.
@@ -1151,9 +1179,11 @@ fn test_issue_leaf_refuses_empty_key_usage_list() {
     );
 }
 
-/// The profile's key_type pin is enforced against the CSR's actual key
-/// algorithm: a matching pin issues, a mismatched family or a weaker key
-/// under a stronger RSA pin is a typed rejection.
+/// The profile's key_type pin is enforced against the CSR's actual key:
+/// a matching pin issues; a mismatched family, or an RSA key whose
+/// modulus size differs from the pinned size, is a typed rejection —
+/// the pin matches EXACTLY (RSA included), so the deliberately narrowed
+/// accepted set cannot be widened by a stronger-than-pinned key.
 #[test]
 fn test_issue_leaf_key_type_pin() {
     let mut ks = temp_keystore("key-pin");
@@ -1196,8 +1226,8 @@ fn test_issue_leaf_key_type_pin() {
          algorithms, got {err:?}"
     );
 
-    // Weaker key under a stronger pin: an RSA-2048 CSR against an
-    // Rsa3072 profile — the family matches, the strength does not.
+    // Wrong modulus size, weaker side: an RSA-2048 CSR against an
+    // Rsa3072 profile — the family matches, the size does not.
     let err = ws_ca::issue::sign_leaf_with(
         &root.cert_pem,
         &root.private_key_der,
@@ -1208,10 +1238,29 @@ fn test_issue_leaf_key_type_pin() {
     assert!(
         matches!(err, CaError::UnsupportedKeyType(ref msg) if msg.contains("3072")),
         "an RSA-2048 CSR under an Rsa3072 pin must be refused citing the pinned \
-         strength, got {err:?}"
+         size, got {err:?}"
     );
 
-    // And the same CSR under the matching Rsa2048 pin issues.
+    // Wrong modulus size, stronger side (the exact-match rule): an
+    // RSA-3072 CSR against an Rsa2048 profile is refused too. A stronger
+    // key than pinned is STILL a policy violation — the cert row and the
+    // audit record would read `rsa2048` while the issued key is 3072
+    // bits, and nothing an auditor can see marks the contradiction.
+    let err = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA3072_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa2048, 0xE6),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CaError::UnsupportedKeyType(ref msg) if msg.contains("2048")),
+        "an RSA-3072 CSR under an Rsa2048 pin must be refused citing the pinned \
+         size, got {err:?}"
+    );
+
+    // The matching RSA pins issue: each CSR under the pin of its exact
+    // size.
     let issued = ws_ca::issue::sign_leaf_with(
         &root.cert_pem,
         &root.private_key_der,
@@ -1220,6 +1269,14 @@ fn test_issue_leaf_key_type_pin() {
     )
     .unwrap();
     assert_eq!(issued.serial, 0xE5);
+    let issued = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA3072_CSR_PEM,
+        &spec_for(LeafKeyType::Rsa3072, 0xE7),
+    )
+    .unwrap();
+    assert_eq!(issued.serial, 0xE7);
 }
 
 /// The boundary converters map every Wardstone variant onto the engine's

@@ -205,10 +205,11 @@ pub struct LeafSpec {
     /// ExtendedKeyUsage purposes to place on the leaf. MUST be
     /// non-empty, for the same reason (RFC 5280 section 4.2.1.12).
     pub ekus: Vec<ExtKeyUsagePurpose>,
-    /// The key type the profile pins: the CSR's actual key algorithm
-    /// must satisfy it — the exact algorithm for the non-RSA pins, the
-    /// RSA family plus the pinned modulus floor for the RSA pins. Plan
-    /// 2's setup page generates the leaf key from this same pin via
+    /// The key type the profile pins: the CSR's actual key must match it
+    /// EXACTLY — the exact algorithm for the non-RSA pins, and for the
+    /// RSA pins the exact algorithm AND the exact modulus size (an
+    /// `rsa2048` profile rejects a 3072-bit CSR). Plan 2's setup page
+    /// generates the leaf key from this same pin via
     /// [`crate::leafkey::generate_leaf_key`].
     pub key_type: LeafKeyType,
     /// The certificate's validity SPAN. `ws-ca` computes `not_before`
@@ -528,12 +529,15 @@ pub fn sign_leaf_with(
     let spki = &csr.certification_request_info.subject_pki;
     let alg = alg_name(spki);
     let csr_rsa_bits = gate_supported_key(&alg, spki)?;
-    // The profile's key-type pin: the CSR's key must satisfy it — the
-    // exact algorithm for the non-RSA pins, the RSA family plus the
-    // pinned modulus floor for the RSA pins. A different family, or a
-    // weaker key under a stronger pin, is a typed rejection: issuing a
-    // certificate whose key does not match its profile is a policy
-    // violation.
+    // The profile's key-type pin: the CSR's key must match it EXACTLY --
+    // the exact algorithm for the non-RSA pins, and for the RSA pins the
+    // exact algorithm AND the exact modulus size (an Rsa2048 pin rejects
+    // a 3072- or 4096-bit CSR; the enum deliberately narrows the
+    // accepted set to the two supported sizes, and a floor under the pin
+    // would undo that narrowing). A different family, or a modulus of
+    // the wrong size, is a typed rejection: issuing a certificate whose
+    // key contradicts its recorded profile is a policy violation
+    // invisible to the auditor.
     let (pinned_alg, pinned_rsa_bits) = spec.key_type.csr_constraint();
     if alg != pinned_alg {
         return Err(CaError::UnsupportedKeyType(format!(
@@ -542,12 +546,12 @@ pub fn sign_leaf_with(
             spec.key_type.as_str()
         )));
     }
-    if let Some(min_bits) = pinned_rsa_bits {
+    if let Some(pinned_bits) = pinned_rsa_bits {
         let bits = csr_rsa_bits.unwrap_or(0);
-        if bits < min_bits {
+        if bits != pinned_bits {
             return Err(CaError::UnsupportedKeyType(format!(
                 "CSR RSA key is {bits} bits; the profile pins leaf key type {} \
-                 ({pinned_alg}) of at least {min_bits} bits",
+                 ({pinned_alg}) of exactly {pinned_bits} bits",
                 spec.key_type.as_str()
             )));
         }
