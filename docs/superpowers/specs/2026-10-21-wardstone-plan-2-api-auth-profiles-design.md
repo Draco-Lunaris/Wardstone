@@ -469,7 +469,7 @@ only in test fixtures. This plan is where the real writers land.
 - `actor_type` gains the value `one_shot_token` (it already has `user`,
   `acme_account`, `system`; `api_token` is added here). It is a text column with no
   CHECK constraint, so this is a value addition at the database level — **but the Rust
-  `ActorType` enum (`ws-core/src/models/audit.rs:16-23`) is closed and its `from_str`
+  `ActorType` enum (`ws-core/src/models/rbac.rs` (moved there from `models/audit.rs`, which now re-exports it)) is closed and its `from_str`
   rejects unknown strings**, so it gains two variants in the same change.
 - **`auth_method`** — a first-class column, NOT NULL: one value per authentication
   method — `session`, `api_token`, `one_shot`, `acme_account`, and **`system`** for the
@@ -597,7 +597,7 @@ ws-api     — the REST API (/api/v1/) and, later, ACME
 ws-web     — TLS front door; path-proxies /api/v1/* to ws-api; serves the setup page
 ws-core    — domain models, repos, migrations (extended); owns the access vocabulary
 ws-ca      — CA engine (extended: EKU support, leaf key generation, setup-key slot)
-ws-worker  — background jobs (unchanged in this plan)
+ws-worker  — background jobs (extended: the audit write gains auth_method; the repos widen)
 ```
 
 **The dependency graph is acyclic, and the edges are a hard constraint:**
@@ -823,7 +823,7 @@ non-empty table, so the order matters:
 
 `actor_type` is a plain `text NOT NULL` column with no CHECK, so the new values are a
 data change — **but the Rust `ActorType` enum
-(`ws-core/src/models/audit.rs:19-28`) is a closed enum whose `from_str` rejects
+(`ws-core/src/models/rbac.rs` (moved there from `models/audit.rs`, which now re-exports it)) is a closed enum whose `from_str` rejects
 unknown strings**, so it gains two variants (`api_token`, `one_shot_token`) in the
 same change.
 
@@ -954,6 +954,6 @@ production compose bundle being in scope; OIDC configuration being per-tenant; t
 
 **Builder's calls (this plan), flagged for the owner to overrule:** the built-in
 default profiles' exact content (two profiles — `web-server` on RSA-2048 and
-`web-server-ecdsa` on P-256, both 30-day spans, `serverAuth`, scoped to the setup
+`web-server-ecdsa` on P-256, both 30-day spans, `server_auth`, scoped to the setup
 domain and admin CIDRs); the subject CN being subject to the profile's pattern list
 like every other name; the leaf-key enum's member set.
