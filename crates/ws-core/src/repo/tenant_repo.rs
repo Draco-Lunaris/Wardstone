@@ -98,6 +98,26 @@ impl TenantRepo {
 
         Ok(rows.into_iter().map(Into::into).collect())
     }
+
+    /// The FIRST-created tenant — the install's setup tenant. Ordering by
+    /// `created_at ASC` (the `id ASC` tiebreak keeps the selection
+    /// deterministic if two rows ever share an instant) deliberately
+    /// ignores the name: `list`'s name order is a display choice, and
+    /// "alphabetically first" is not "first".
+    pub async fn oldest(
+        &self,
+        executor: impl PgExecutor<'_>,
+    ) -> Result<Option<crate::models::tenant::Tenant>, CoreError> {
+        let row: Option<TenantRow> = sqlx::query_as(
+            "SELECT id, name, created_at FROM tenants \
+             ORDER BY created_at ASC, id ASC \
+             LIMIT 1",
+        )
+        .fetch_optional(executor)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
 }
 
 /// Map a query error, translating the Postgres unique-violation code (23505)

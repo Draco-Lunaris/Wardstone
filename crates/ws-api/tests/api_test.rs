@@ -61,6 +61,11 @@ const ADVISORY_KEY: i64 = 0x0057_4144_5354_000f;
 /// The tenant name this suite owns; swept before use, deleted at the end.
 const API_TENANT: &str = "rt-api-tenant";
 
+/// The earlier-sorted, later-created tenant of the primary-tenant test;
+/// swept before use so a crashed run's debris cannot collide with the
+/// insert below.
+const LOGIN_ORDER_TENANT: &str = "aaa-login-order-tenant";
+
 /// In-process serialization, the same whole-body lock pattern as the
 /// ws-core suites: the harness runs tests on separate threads. A tokio
 /// mutex because the guard is held across `.await` points.
@@ -308,6 +313,40 @@ async fn insert_user(pool: &PgPool, tenant_id: Uuid, id: Uuid, username: &str, r
         )
         .await
         .expect("insert fixture user");
+}
+
+/// Attach an argon2id-hashed password to an (already inserted) user row:
+/// the hash is computed in a blocking thread, exactly like the login
+/// handler hashes nothing but the verify does.
+async fn set_password(pool: &PgPool, user_id: Uuid, password: String) {
+    let hash = tokio::task::spawn_blocking(move || ws_auth::password::hash_password(&password))
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("set the user's password hash");
+}
+
+/// Compute a current TOTP code for a base32 secret with the workspace's
+/// totp-rs pin (shared by the MFA-flow and the login tests).
+fn current_totp_code(secret: &str, account: &str) -> String {
+    use totp_rs::{Algorithm, Secret, TOTP};
+    let secret = Secret::Encoded(secret.to_string());
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().unwrap(),
+        None,
+        account.to_string(),
+    )
+    .unwrap();
+    totp.generate_current().unwrap()
 }
 
 /// The actor shape of the fixture's admin user (used as the creator for
@@ -1627,29 +1666,12 @@ async fn totp_mfa_flow_with_audit_rows() {
         .unwrap()
         .contains("otpauth://"));
 
-    // Compute a current code with the workspace's totp-rs pin.
-    fn current_code(secret: &str) -> String {
-        use totp_rs::{Algorithm, Secret, TOTP};
-        let secret = Secret::Encoded(secret.to_string());
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            secret.to_bytes().unwrap(),
-            None,
-            "totp-operator".to_string(),
-        )
-        .unwrap();
-        totp.generate_current().unwrap()
-    }
-
     // Activate with the first code.
     let res = post_json(
         &fx,
         "/api/v1/auth/totp/activate",
         Some(&token),
-        json!({"code": current_code(&secret)}),
+        json!({"code": current_totp_code(&secret, username)}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1669,7 +1691,7 @@ async fn totp_mfa_flow_with_audit_rows() {
         &fx,
         "/api/v1/auth/totp/deactivate",
         Some(&token),
-        json!({"code": current_code(&secret)}),
+        json!({"code": current_totp_code(&secret, username)}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1682,6 +1704,203 @@ async fn totp_mfa_flow_with_audit_rows() {
         assert_eq!(rows[0].2, "session");
         assert_eq!(rows[0].3, json!({}), "{action} carries no details keys");
     }
+
+    fx.cleanup().await;
+}
+
+/// Login resolves the primary tenant by CREATION order (the setup
+/// tenant), never by name: a second tenant whose name sorts EARLIER but
+/// whose created_at is LATER must not win. The fixture tenant is
+/// backdated with the house direct-UPDATE idiom so it is provably the
+/// oldest row in the shared database, and the young tenant is backdated
+/// to be unambiguously younger while sorting first alphabetically.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_resolves_oldest_primary_tenant() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    sweep_tenant(&fx.pool, LOGIN_ORDER_TENANT).await;
+
+    // 2000-01-01 and 2001-01-01: two fixed instants one year apart so the
+    // creation order is deterministic against the clock and against any
+    // concurrent suite's tenants (all far newer than 2000).
+    let year_2000 = DateTime::from_timestamp(946_684_800, 0).unwrap();
+    let year_2001 = DateTime::from_timestamp(978_307_200, 0).unwrap();
+
+    sqlx::query("UPDATE tenants SET created_at = $1 WHERE id = $2")
+        .bind(year_2000)
+        .bind(fx.tenant_id)
+        .execute(&fx.pool)
+        .await
+        .expect("backdate the fixture tenant to 2000");
+
+    // The password user lives in the fixture (setup) tenant.
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "setup-admin", Role::Admin).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+
+    // The younger tenant, whose name sorts FIRST: the alphabetical-
+    // resolution bug this test pins would pick this row and the login
+    // below would fail (the admin is in the older tenant).
+    let young_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(young_tenant)
+        .bind(LOGIN_ORDER_TENANT)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the younger tenant");
+    fx.extra_tenants.lock().unwrap().push(young_tenant);
+    sqlx::query("UPDATE tenants SET created_at = $1 WHERE id = $2")
+        .bind(year_2001)
+        .bind(young_tenant)
+        .execute(&fx.pool)
+        .await
+        .expect("backdate the younger tenant to 2001");
+
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "setup-admin", "password": "correct horse battery staple"}),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "login lands on the setup tenant"
+    );
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let login: Value = serde_json::from_slice(&raw).unwrap();
+    let access = login["access_token"].as_str().unwrap().to_string();
+
+    // The session actor's tenant is the OLDEST tenant.
+    let res = get_bearer(&fx, "/api/v1/auth/me", &access).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let me: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        me["tenant_id"].as_str().unwrap(),
+        fx.tenant_id.to_string(),
+        "the login session belongs to the first-created tenant"
+    );
+
+    fx.cleanup().await;
+}
+
+/// Login without the TOTP code an MFA-enabled account requires: 401 whose
+/// body carries the STRUCTURED code `mfa_required` (not the generic
+/// `unauthorized`), so the SPA can route the user to the MFA prompt.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_mfa_error_carries_code() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let user_id = Uuid::new_v4();
+    let username = "mfa-login-operator";
+    insert_user(&fx.pool, fx.tenant_id, user_id, username, Role::Issuer).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+    let token = session_token(&fx, user_id, username, "issuer");
+
+    // Enroll + activate the account's TOTP (the lifecycle the MFA flow
+    // test pins, compressed to the two calls).
+    let res = post_json(&fx, "/api/v1/auth/totp/enroll", Some(&token), json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let enrolled: Value = serde_json::from_slice(&raw).unwrap();
+    let secret = enrolled["secret"].as_str().unwrap().to_string();
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/totp/activate",
+        Some(&token),
+        json!({"code": current_totp_code(&secret, username)}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Login with the right password but no code: 401, code `mfa_required`.
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": username, "password": "correct horse battery staple"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(error_code(&body), "mfa_required");
+
+    fx.cleanup().await;
+}
+
+/// An unknown username and a known username with a wrong password answer
+/// IDENTICALLY — same 401, same body — the uniform-credentials rule. The
+/// unknown-user path burns the same argon2id time as the verify path (the
+/// constant-time treatment); the timing itself is not observable in the
+/// response, so this pins the observable shape the rule requires.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn login_unknown_user_matches_known_user_error_shape() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "padded-user", Role::Issuer).await;
+    set_password(
+        &fx.pool,
+        user_id,
+        "correct horse battery staple".to_string(),
+    )
+    .await;
+
+    let unknown = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "no-such-user", "password": "some wrong password"}),
+    )
+    .await;
+    let known = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        json!({"username": "padded-user", "password": "some wrong password"}),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(known.status(), StatusCode::UNAUTHORIZED);
+    let unknown = axum::body::to_bytes(unknown.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let known = axum::body::to_bytes(known.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let unknown: Value = serde_json::from_slice(&unknown).unwrap();
+    let known: Value = serde_json::from_slice(&known).unwrap();
+    assert_eq!(
+        unknown, known,
+        "unknown-user and wrong-password bodies are identical"
+    );
+    assert_eq!(error_code(&unknown), "unauthorized");
 
     fx.cleanup().await;
 }
