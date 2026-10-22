@@ -44,6 +44,7 @@ pub fn router() -> Router<AppState> {
 
 /// The CA creation body.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateCaBody {
     /// Operator-facing name (unique per tenant).
     pub name: String,
@@ -61,6 +62,7 @@ pub struct CreateCaBody {
 
 /// One CA, as a DTO (the certificate PEM is public; no key path).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CaResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -225,6 +227,7 @@ async fn list_cas(
 
 /// The export body (the reason lands in the audit details).
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct ExportCaKeyBody {
     #[serde(default)]
     pub reason: Option<String>,
@@ -234,6 +237,7 @@ pub struct ExportCaKeyBody {
 /// per request for operator backup — the server keeps its copy, and the
 /// response is never cached.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ExportedCaKey {
     pub key_pem: String,
 }

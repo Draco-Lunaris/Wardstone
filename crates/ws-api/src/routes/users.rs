@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
 
 /// One user, as a read DTO — no password hash, no sealed MFA bytes.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct UserResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -71,6 +72,7 @@ impl UserResponse {
 
 /// The create body: a local account with a password (hashed argon2id).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateUserBody {
     pub username: String,
     #[serde(default)]
@@ -208,6 +210,7 @@ async fn deactivate_user(
 /// 422 rejection, whose body shape the SPA's error handling cannot read —
 /// the house idiom the revoke route pinned).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct UpdateUserBody {
     #[serde(default)]
     pub role: Option<Role>,

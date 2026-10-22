@@ -90,6 +90,7 @@ pub fn router() -> Router<AppState> {
 /// (capability `issue`); a body WITHOUT it selects the server-key-
 /// generation path (capability `generate_leaf_key`).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct IssueCertificateBody {
     pub profile_id: Uuid,
     pub subject_cn: String,
@@ -108,6 +109,7 @@ pub struct IssueCertificateBody {
 /// key-generation path ONLY — the private key, which appears exactly once
 /// and is never returned by any read endpoint.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct IssuedCertificateResponse {
     pub certificate_id: Uuid,
     pub cert_pem: String,
@@ -747,6 +749,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// The pull body: everything on the CSR path — the client keeps the key
 /// and presents its CSR.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct PullCertificateBody {
     pub profile_id: Uuid,
     pub subject_cn: String,
@@ -943,6 +946,7 @@ async fn get_certificate(
 /// The certificate read DTO (no key fields exist — the certificate PEM is
 /// public certificate content, and a private key was never stored).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CertificateResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -1087,6 +1091,7 @@ async fn revoke_certificate(
 /// published reason extension. The only consumers are this repo's
 /// UI/e2e, updated in the same change.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevokeBody {
     pub reason: RevocationReason,
     #[serde(default)]
@@ -1098,6 +1103,7 @@ pub struct RevokeBody {
 /// the FIRST revoke's stored value on an already-revoked no-op (the
 /// round-trip contract the UI shows).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevokeResponse {
     pub id: Uuid,
     pub status: String,

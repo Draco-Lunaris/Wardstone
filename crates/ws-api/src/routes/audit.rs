@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
 /// malformed datetime is an axum `Query` rejection (400), never a silent
 /// drop of the bound. The export route deliberately keeps bare paging.
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct AuditListQuery {
     pub page: Option<u32>,
     pub page_size: Option<u32>,

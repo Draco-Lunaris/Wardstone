@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
 /// The profile policy body (create carries `name`; update revises the
 /// policy of an existing profile and keeps its name).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ProfileBody {
     pub name: Option<String>,
     #[serde(default)]
@@ -62,6 +63,7 @@ pub struct ProfileBody {
 
 /// One profile revision, as a DTO.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RevisionResponse {
     pub id: Uuid,
     pub profile_id: Uuid,
@@ -98,6 +100,7 @@ impl RevisionResponse {
 
 /// One profile and its current revision.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ProfileResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,

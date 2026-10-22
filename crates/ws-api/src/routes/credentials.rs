@@ -53,6 +53,7 @@ pub fn one_shot_tokens_router() -> Router<AppState> {
 
 /// One service identity, as a read DTO (never the token hash).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ServiceIdentityResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -67,6 +68,7 @@ pub struct ServiceIdentityResponse {
 /// The create body: the token's capability grant, chosen explicitly at
 /// creation (and capped by the creator's own set inside ws-auth).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateServiceIdentityBody {
     pub name: String,
     #[serde(default)]
@@ -77,6 +79,7 @@ pub struct CreateServiceIdentityBody {
 
 /// The mint response: the plaintext token appears exactly once.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ServiceIdentityCreated {
     pub id: Uuid,
     pub name: String,
@@ -252,6 +255,7 @@ async fn find_service_identity(
 
 /// The one-shot mint body: the pull-flow window in minutes.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateOneShotTokenBody {
     #[serde(default)]
     pub ttl_minutes: Option<u32>,
@@ -259,6 +263,7 @@ pub struct CreateOneShotTokenBody {
 
 /// The mint response: the plaintext token appears exactly once.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OneShotTokenCreated {
     pub id: Uuid,
     pub token: String,
@@ -352,6 +357,7 @@ async fn list_one_shot_tokens(
 /// One one-shot token, as a read DTO (never the token hash; `minted_by`
 /// is the minting user's id).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OneShotTokenResponse {
     pub id: Uuid,
     pub minted_by: Option<String>,

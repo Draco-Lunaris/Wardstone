@@ -88,6 +88,7 @@ async fn config_status(
 
 /// The provider configuration, as the UI reads it — never the secret.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OidcConfigResponse {
     pub provider_type: String,
     pub display_name: String,
@@ -104,6 +105,7 @@ pub struct OidcConfigResponse {
 /// EXISTING row; a new row without a secret is a 400 (an empty string is
 /// the public-client convention and is accepted as `Some("")`).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct UpsertOidcConfigBody {
     pub provider_type: String,
     pub display_name: String,
@@ -120,6 +122,7 @@ pub struct UpsertOidcConfigBody {
 /// `override` carries an upsert-shaped payload to probe INSTEAD of the
 /// saved configuration.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OidcTestBody {
     #[serde(default, rename = "override")]
     pub r#override: Option<UpsertOidcConfigBody>,
@@ -128,6 +131,7 @@ pub struct OidcTestBody {
 /// A successful discovery probe: exactly the fields Wardstone consumes
 /// (the `OidcDiscovery` shape).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OidcDiscoveryResponse {
     pub issuer: String,
     pub authorization_endpoint: String,

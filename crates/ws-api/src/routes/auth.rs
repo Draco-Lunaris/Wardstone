@@ -152,6 +152,7 @@ struct SessionTokens {
 /// The login body: username + password, plus the TOTP code when the
 /// account has MFA enabled.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LoginBody {
     pub username: String,
     pub password: String,
@@ -269,6 +270,7 @@ async fn verify_totp_of_user(
 
 /// The refresh body.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RefreshBody {
     pub refresh_token: String,
 }
@@ -348,6 +350,7 @@ async fn mint_session(state: &AppState, user: &UserModel) -> Result<SessionToken
 
 /// The logout body: the refresh token this session owns.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LogoutBody {
     pub refresh_token: String,
 }
@@ -431,6 +434,7 @@ async fn me(auth: AuthActor, State(state): State<AppState>) -> Result<Json<MeRes
 /// The `me` response: the actor's identity and capability set; the user's
 /// own fields only when the actor is a human session.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct MeResponse {
     pub actor_type: String,
     pub actor_id: String,
@@ -444,6 +448,7 @@ pub struct MeResponse {
 
 /// The TOTP mutation bodies (`activate`/`deactivate` verify a code).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TotpCodeBody {
     pub code: String,
 }
@@ -451,6 +456,7 @@ pub struct TotpCodeBody {
 /// The enroll response: the base32 secret (shown once to scan/configure)
 /// and the otpauth:// provisioning URI.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct TotpEnrolled {
     pub secret: String,
     pub provisioning_uri: String,
@@ -640,6 +646,7 @@ async fn oidc_start(
 
 /// The query parameters of the callback.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct OidcCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
