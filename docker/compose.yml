@@ -43,12 +43,16 @@
 #
 # Rate limiting (the binary's house contract, not a compose knob): the
 # `api` process applies per-IP GCRA rate limiting on the public auth
-# routes ALWAYS-ON with the house defaults (one credit per 500 ms, burst
-# 20 per IP). `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `WARDSTONE_RATE_LIMIT_BURST`
-# may override them — this bundle deliberately does NOT set either (the
-# defaults are already the house values). If you do set them: positive
-# integers only — zero or unparsable values fail the boot loudly, they do
-# not disable the limiter.
+# routes UNLESS `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` is truthy — and THIS
+# bundle sets it for ws-api (below): every operator login reaches ws-api
+# through ws-web's proxy from ONE loopback IP, so the per-IP limiter
+# would throttle ALL operators collectively; ws-web enforces per-client
+# limits on its `/auth/ui/*` routes instead (Task 13). Where the limiter
+# stays on, `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `WARDSTONE_RATE_LIMIT_BURST`
+# may override the house defaults (one credit per 500 ms, burst 20 per
+# IP) — this bundle deliberately does NOT set either. Positive integers
+# only: zero or unparsable values fail the boot loudly, they do not
+# disable the limiter.
 
 name: wardstone
 
@@ -126,6 +130,8 @@ services:
       # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
       # the binary ignores the variable in this mode.
       WARDSTONE_BIND: 0.0.0.0:8080
+      # UI logins reach ws-api from one loopback IP (ws-web's proxy), so the per-IP limiter would throttle ALL operators collectively; ws-web enforces per-client limits on /auth/ui/* (Task 13).
+      WARDSTONE_AUTH_RATE_LIMIT_DISABLED: "true"
     # NO `ports:` — intentionally. The REST surface is reachable ONLY over
     # the internal compose network via ws-web's proxy (the Global
     # Constraint). An External deployment that fronts this service with

@@ -80,12 +80,20 @@ struct BootConfig {
     /// [`DEFAULT_BIND`].
     bind: SocketAddr,
     /// The public auth routes' rate limit (`api` only — the layer lives
-    /// in ws-api; `ui` mounts none of those routes). Defaults to the
-    /// house constants; `WARDSTONE_RATE_LIMIT_PER_MILLIS` /
-    /// `WARDSTONE_RATE_LIMIT_BURST` may configure them for the compose
-    /// bundle. A zero value is a boot failure, not a silent un-limited
-    /// listener.
-    rate_limit: ws_api::AuthRateLimit,
+    /// in ws-api and is keyed on the peer IP; `ui` mounts none of those
+    /// routes, so a ui boot ignores this field entirely, including the
+    /// disable switch below). `Some` (the limiter mounted) with the
+    /// house defaults unless `WARDSTONE_RATE_LIMIT_PER_MILLIS` /
+    /// `WARDSTONE_RATE_LIMIT_BURST` configure them; a zero value is a
+    /// boot failure, not a silent un-limited listener. `None` when
+    /// `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` is truthy — the UI-fronted
+    /// shape, where every operator login reaches ws-api through ws-web's
+    /// proxy from ONE loopback IP and a per-IP limiter would throttle
+    /// ALL operators collectively (ws-web enforces the per-client limit
+    /// on `/auth/ui/*` instead). When the disable var is truthy the
+    /// rate-limit env vars are NOT read or validated at all: any value
+    /// they carry is inert.
+    auth_rate_limit: Option<ws_api::AuthRateLimit>,
 }
 
 /// Variables whose absence is fatal, with their roles — listed together
@@ -188,7 +196,14 @@ fn usage_text() -> String {
          \x20 WARDSTONE_SERVER_HOSTNAME  the setup certificate's SAN (optional)\n\
          \x20 WARDSTONE_API_URL          the UI's proxy target (ui; default \
          {DEFAULT_API_URL})\n\
-         \x20 WARDSTONE_BIND             the listen address (default {DEFAULT_BIND})\n"
+         \x20 WARDSTONE_BIND             the listen address (default \
+         {DEFAULT_BIND})\n\
+         \x20 WARDSTONE_RATE_LIMIT_PER_MILLIS / _BURST\n\
+         \x20                            the api's auth rate limit values \
+         (api; defaults {DEFAULT_RATE_PER_MILLIS}/{DEFAULT_RATE_BURST})\n\
+         \x20 WARDSTONE_AUTH_RATE_LIMIT_DISABLED\n\
+         \x20                            `true` disables the api's auth \
+         rate limiter (api; for UI-fronted deployments)\n"
     )
 }
 
@@ -231,7 +246,7 @@ fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<BootConfig, Bo
         Some(value) => value,
     };
 
-    let rate_limit = rate_limit_from(&lookup, DEFAULT_RATE_PER_MILLIS, DEFAULT_RATE_BURST)?;
+    let auth_rate_limit = auth_rate_limit_from(&lookup)?;
 
     Ok(BootConfig {
         database_url,
@@ -239,8 +254,44 @@ fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<BootConfig, Bo
         server_hostname: lookup("WARDSTONE_SERVER_HOSTNAME"),
         api_url,
         bind,
-        rate_limit,
+        auth_rate_limit,
     })
+}
+
+/// The public auth routes' rate limit: `Some` unless truthy
+/// `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` turns the limiter OFF
+/// (`auth_rate_limit: None`). Only `1` and `true` — case-insensitive —
+/// are disable words; any OTHER non-blank value fails the boot loudly
+/// with the variable and its value named (`false`, `0`, `no` are NOT
+/// disable words: a mistyped switch must never silently change the
+/// security posture). When the switch is truthy the rate-limit env vars
+/// are not read at all — a deployment that disabled the limiter cannot
+/// be held back by stale `WARDSTONE_RATE_LIMIT_*` leftovers, however
+/// garbled. Unset or blank keeps the limiter on with the configured (or
+/// default) values, and the zero/unparsable checks in [`rate_limit_from`]
+/// stay in force.
+fn auth_rate_limit_from(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ws_api::AuthRateLimit>, BootError> {
+    match lookup("WARDSTONE_AUTH_RATE_LIMIT_DISABLED") {
+        None => Ok(Some(rate_limit_from(
+            lookup,
+            DEFAULT_RATE_PER_MILLIS,
+            DEFAULT_RATE_BURST,
+        )?)),
+        Some(value) => {
+            let word = value.trim();
+            if word == "1" || word.eq_ignore_ascii_case("true") {
+                Ok(None)
+            } else {
+                Err(BootError::Config(format!(
+                    "WARDSTONE_AUTH_RATE_LIMIT_DISABLED only takes `1` or `true` \
+                     (case-insensitive) to disable the auth rate limiter; got \
+                     {value:?}"
+                )))
+            }
+        }
+    }
 }
 
 /// The public auth routes' rate limit: the house defaults unless
@@ -494,10 +545,13 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
         // no runtime behavior from this field, so the empty vector is the
         // honest value a directly-served `api` process has at boot.
         admin_cidrs: Vec::new(),
-        // The per-IP GCRA on the public auth routes: configured (the
-        // house defaults) so the `GovernorLayer` is actually mounted —
-        // ws-api's `None` branch is the TESTS-ONLY shape.
-        auth_rate_limit: Some(cfg.rate_limit),
+        // The per-IP GCRA on the public auth routes: `Some` (the governor
+        // mounted) unless `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` was truthy
+        // — the UI-fronted deployment's switch, where logins arrive from
+        // ws-web's proxy's ONE loopback IP and ws-web enforces the
+        // per-client limit on `/auth/ui/*` itself. ws-api's layer skips
+        // when `None`.
+        auth_rate_limit: cfg.auth_rate_limit,
     };
     let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
 
@@ -581,8 +635,11 @@ mod tests {
         assert!(cfg.server_hostname.is_none(), "no hostname configured");
         assert_eq!(cfg.api_url, "http://ws-api:8080");
         assert_eq!(cfg.bind, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8443)));
-        assert_eq!(cfg.rate_limit.per_millis, 500);
-        assert_eq!(cfg.rate_limit.burst, 20);
+        let rl = cfg
+            .auth_rate_limit
+            .expect("the limiter is configured when the disable var is unset");
+        assert_eq!(rl.per_millis, 500);
+        assert_eq!(rl.burst, 20);
     }
 
     /// Every override is honored; a missing variable is named in the error.
@@ -601,7 +658,8 @@ mod tests {
         assert_eq!(cfg.server_hostname.as_deref(), Some("ca.example.test"));
         assert_eq!(cfg.api_url, "http://api.internal:9000");
         assert_eq!(cfg.bind, SocketAddr::from((Ipv4Addr::LOCALHOST, 9443)));
-        assert_eq!((cfg.rate_limit.per_millis, cfg.rate_limit.burst), (100, 5));
+        let rl = cfg.auth_rate_limit.expect("the limiter is configured");
+        assert_eq!((rl.per_millis, rl.burst), (100, 5));
 
         let err = config_from(table(&[MINIMAL[0]])).expect_err("a missing keys dir must fail");
         assert!(
@@ -666,6 +724,74 @@ mod tests {
             err.to_string().contains("WARDSTONE_RATE_LIMIT_PER_MILLIS"),
             "the error names the variable: {err}"
         );
+    }
+
+    /// The `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` switch: only `1` and
+    /// `true` (case-insensitive) disable the limiter — and make the
+    /// rate-limit env vars entirely inert (zero, garbage: ignored).
+    /// Unset or blank keeps it on; ANY other non-blank value fails the
+    /// boot loudly, naming the variable and the offending value (`false`
+    /// and `0` are deliberately NOT disable words — a mistyped switch
+    /// must never silently change the security posture).
+    #[test]
+    fn auth_rate_limit_disabled_switch_semantics() {
+        let truthy = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+            // Values that would be LOUD boot failures with the limiter on:
+            // with the limiter off they are simply not read.
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
+            ("WARDSTONE_RATE_LIMIT_BURST", "0"),
+        ];
+        let cfg = config_from(table(&truthy)).expect("`true` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "the limiter is off");
+
+        let upper = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "TRUE"),
+        ];
+        let cfg = config_from(table(&upper)).expect("`TRUE` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "case-insensitive");
+
+        let one = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "1"),
+        ];
+        let cfg = config_from(table(&one)).expect("`1` disables the limiter");
+        assert!(cfg.auth_rate_limit.is_none(), "the numeric disable word");
+
+        let blank = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", ""),
+        ];
+        let cfg = config_from(table(&blank)).expect("blank equals unset");
+        assert!(
+            cfg.auth_rate_limit.is_some(),
+            "blank/unset keeps the limiter on"
+        );
+
+        for word in ["false", "0", "no", "on", "yes"] {
+            let entries = [
+                MINIMAL[0],
+                MINIMAL[1],
+                ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", word),
+            ];
+            let err =
+                config_from(table(&entries)).expect_err("a non-disable word fails the boot loudly");
+            let message = err.to_string();
+            assert!(
+                message.contains("WARDSTONE_AUTH_RATE_LIMIT_DISABLED"),
+                "the error names the variable: {message}"
+            );
+            assert!(
+                message.contains(word),
+                "the error names the offending value: {message}"
+            );
+        }
     }
 
     /// A `web-server`-shaped [`CertificateModel`] with the given status
