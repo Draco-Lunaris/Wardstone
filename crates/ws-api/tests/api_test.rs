@@ -376,6 +376,18 @@ async fn get_bearer(fixture: &Fixture, uri: &str, token: &str) -> TestResponse {
     send(fixture, req).await
 }
 
+/// A DELETE request with a bearer header (the no-body verbs, shaped like
+/// [`get_bearer`]).
+async fn delete_bearer(fixture: &Fixture, uri: &str, token: &str) -> TestResponse {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer(token))
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    send(fixture, req).await
+}
+
 /// A POST request with a JSON body and (optional) bearer header.
 async fn post_json(
     fixture: &Fixture,
@@ -3060,4 +3072,134 @@ async fn chain_walk_refuses_cross_tenant_parent() {
         !cert_text.contains("FOREIGNCHAINPEM"),
         "the foreign CA's PEM never enters the response: {cert_text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Profile deletion with reference refusal (Plan 3 Task 6)
+// ---------------------------------------------------------------------------
+
+/// `DELETE /api/v1/profiles/{id}`: an UNREFERENCED profile deletes (204,
+/// gone on re-read, one `profile_deleted` audit row carrying the profile's
+/// name), a profile any certificate references is refused with 409 and the
+/// fixed message (the setup built-ins — e.g. a default web-server profile
+/// that an issued leaf pins — are exactly this case), and an unknown or
+/// another tenant's profile id is a 404, indistinguishably. All captured
+/// response data is asserted after cleanup.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_delete_refuses_when_referenced() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    // The unreferenced path: a fresh profile nothing has issued from.
+    let profile_id = create_filter_profile(&fx, &token, "delete-me").await;
+    let delete_uri = format!("/api/v1/profiles/{profile_id}");
+    let delete_status = delete_bearer(&fx, &delete_uri, &token).await.status();
+    // The re-read and the audited row are captured BEFORE cleanup.
+    let get_res = get_bearer(&fx, &delete_uri, &token).await;
+    let get_status = get_res.status();
+    let audit_res = get_bearer(&fx, "/api/v1/audit?action=profile_deleted", &token).await;
+    let audit_status = audit_res.status();
+    let audit_raw = axum::body::to_bytes(audit_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let audit: Value = serde_json::from_slice(&audit_raw).unwrap();
+
+    // The referenced path: a leaf issued from the fixture profile pins its
+    // revision (active history counts — a revoked one would too), so the
+    // deletion is refused. A setup-built-in profile in the same position
+    // (e.g. the default web-server profile behind the fixture leaf)
+    // refuses the same way.
+    let (referenced_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (issue_status, issue_body) = issue_csr(
+        &fx,
+        referenced_id,
+        "leaf.delete.wardstone.test",
+        &["leaf.delete.wardstone.test"],
+    )
+    .await;
+    assert_eq!(issue_status, StatusCode::OK, "issue the leaf: {issue_body}");
+    let ref_res = delete_bearer(&fx, &format!("/api/v1/profiles/{referenced_id}"), &token).await;
+    let ref_status = ref_res.status();
+    let ref_raw = axum::body::to_bytes(ref_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ref_body: Value = serde_json::from_slice(&ref_raw).unwrap();
+
+    // Unknown id and another tenant's id are both 404.
+    let unknown_status =
+        delete_bearer(&fx, &format!("/api/v1/profiles/{}", Uuid::new_v4()), &token)
+            .await
+            .status();
+    let foreign_name = "rt-api-foreign-profile";
+    sqlx::query("DELETE FROM profiles WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-profile rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-profile tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-profile tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_profile = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO profiles (id, tenant_id, name, description, current_revision_id, created_at) \
+         VALUES ($1, $2, 'foreign-profile', NULL, NULL, now())",
+    )
+    .bind(foreign_profile)
+    .bind(foreign_tenant)
+    .execute(&fx.pool)
+    .await
+    .expect("insert the foreign-profile row");
+    let foreign_status = delete_bearer(&fx, &format!("/api/v1/profiles/{foreign_profile}"), &token)
+        .await
+        .status();
+
+    fx.cleanup().await;
+
+    // Unreferenced: 204, and the profile is gone on re-read.
+    assert_eq!(
+        delete_status,
+        StatusCode::NO_CONTENT,
+        "an unreferenced profile deletes"
+    );
+    assert_eq!(get_status, StatusCode::NOT_FOUND, "gone after the delete");
+
+    // Exactly one `profile_deleted` row, with the profile's name.
+    assert_eq!(
+        audit_status,
+        StatusCode::OK,
+        "the audit list serves the action filter"
+    );
+    let deleted = audit.as_array().expect("the audit list is an array");
+    assert_eq!(
+        deleted.len(),
+        1,
+        "exactly one profile_deleted row: {deleted:?}"
+    );
+    assert_eq!(deleted[0]["target_type"], "profile");
+    assert_eq!(deleted[0]["target_id"], profile_id.to_string());
+    assert_eq!(deleted[0]["details"], json!({ "name": "delete-me" }));
+
+    // Referenced: 409 with the fixed message, code `conflict`.
+    assert_eq!(ref_status, StatusCode::CONFLICT, "the referenced refusal");
+    assert_eq!(error_code(&ref_body), "conflict");
+    assert_eq!(
+        ref_body["error"]["message"].as_str().unwrap(),
+        "profile is referenced by certificates and cannot be deleted"
+    );
+
+    // Unknown and foreign ids are 404, indistinguishably.
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
 }
