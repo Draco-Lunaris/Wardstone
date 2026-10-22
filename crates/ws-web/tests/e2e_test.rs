@@ -614,13 +614,35 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         .expect("the profile pins an EKU, so the leaf carries it");
     assert!(eku.value.server_auth, "the leaf carries the profile's EKU");
 
-    // The certificate's span equals the profile's lifetime EXACTLY (not
-    //_after = not_before + lifetime — the skew margin lives in not_before).
+    // The response DTO's span equals the profile's lifetime EXACTLY
+    // (not_after = not_before + lifetime — the skew margin lives in
+    // not_before).
     assert_eq!(
         issued_not_after - issued_not_before,
         Duration::days(lifetime_days),
         "the leaf's span is the profile's {}-day lifetime exactly",
         lifetime_days
+    );
+    // The ENCODED certificate says the same thing: the parsed DER's own
+    // validity carries the exact span, and it never diverges from the
+    // response DTO's timestamps (the same DER-vs-DTO pair ws-ca's issue
+    // tests pin).
+    let validity = cert.validity();
+    assert_eq!(
+        validity.not_after.timestamp() - validity.not_before.timestamp(),
+        lifetime_days * 86_400,
+        "the encoded certificate's span is the profile's {}-day lifetime exactly",
+        lifetime_days
+    );
+    assert_eq!(
+        validity.not_before.timestamp(),
+        issued_not_before.timestamp(),
+        "the response DTO's not_before is the encoded certificate's"
+    );
+    assert_eq!(
+        validity.not_after.timestamp(),
+        issued_not_after.timestamp(),
+        "the response DTO's not_after is the encoded certificate's"
     );
 
     // The audit trail: chronological order (the export is newest-first),
