@@ -63,7 +63,7 @@ use ws_ca::issue::{sign_leaf_with, LeafSpec, SanEntry};
 use ws_ca::keystore::KeyStore;
 use ws_ca::serial::allocate_serial;
 use ws_core::db::connect;
-use ws_core::models::audit::{ActorType, AuditEntry};
+use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_core::models::ocsp::OcspStatus;
@@ -386,6 +386,8 @@ fn audit_entry(
         id: uuid::Uuid::new_v4(),
         tenant_id,
         actor_type: ActorType::User,
+        auth_method: AuthMethod::Session,
+        session_id: None,
         actor_id: "smoke-test".to_owned(),
         action: action.to_owned(),
         target_type: target_type.to_owned(),
@@ -531,6 +533,7 @@ async fn test_end_to_end_ca_forest() {
         id: cert_id,
         tenant_id: tenant.id,
         ca_id: sub.key_pair_id,
+        profile_revision_id: None,
         profile_name: LEAF_PROFILE.to_owned(),
         subject: format!("CN={LEAF_CN}"),
         serial,

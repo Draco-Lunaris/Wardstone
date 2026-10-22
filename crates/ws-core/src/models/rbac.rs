@@ -112,6 +112,82 @@ impl Capability {
     }
 }
 
+/// Every key usage a profile revision may permit, in fixed list order: a
+/// new usage cannot be added without a deliberate decision in the enum
+/// and its `as_str`/`from_str` arms.
+pub const ALL_KEY_USAGE_PURPOSES: &[KeyUsagePurpose] = &[
+    KeyUsagePurpose::DigitalSignature,
+    KeyUsagePurpose::KeyEncipherment,
+    KeyUsagePurpose::DataEncipherment,
+    KeyUsagePurpose::KeyAgreement,
+    KeyUsagePurpose::KeyCertSign,
+    KeyUsagePurpose::CrlSign,
+    KeyUsagePurpose::ContentCommitment,
+    KeyUsagePurpose::EncipherOnly,
+    KeyUsagePurpose::DecipherOnly,
+];
+
+/// One RFC 5280 key usage, as a profile's `key_usages` TEXT[] spells it
+/// and as the issuance engine receives it — Wardstone's ONE key-usage
+/// vocabulary (`ws-ca` re-exports it and converts to its engine's type
+/// at the boundary; the RFC camelCase aliases like `digitalSignature`
+/// are deliberately not used).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyUsagePurpose {
+    /// Signatures on certificates and CRLs where digital signatures are
+    /// required.
+    DigitalSignature,
+    /// Enciphering symmetric keys (RSA key transport; the classic
+    /// `keyEncipherment` of RSA server certificates).
+    KeyEncipherment,
+    /// Enciphering raw user data without an intermediate key.
+    DataEncipherment,
+    /// Key agreement (ECDH).
+    KeyAgreement,
+    /// Verifying signatures on public-key certificates.
+    KeyCertSign,
+    /// Verifying signatures on revocation lists.
+    CrlSign,
+    /// Signatures with a claim of legal commitment (the RFC name is
+    /// `nonRepudiation`; Wardstone spells the newer alias).
+    ContentCommitment,
+    /// Enciphering data as part of a key-agreement sender side.
+    EncipherOnly,
+    /// Deciphering data as part of a key-agreement receiver side.
+    DecipherOnly,
+}
+
+impl KeyUsagePurpose {
+    /// The value stored in a profile's `key_usages` TEXT[] element
+    /// (`snake_case` variant name — identical to the serde name, written
+    /// once).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KeyUsagePurpose::DigitalSignature => "digital_signature",
+            KeyUsagePurpose::KeyEncipherment => "key_encipherment",
+            KeyUsagePurpose::DataEncipherment => "data_encipherment",
+            KeyUsagePurpose::KeyAgreement => "key_agreement",
+            KeyUsagePurpose::KeyCertSign => "key_cert_sign",
+            KeyUsagePurpose::CrlSign => "crl_sign",
+            KeyUsagePurpose::ContentCommitment => "content_commitment",
+            KeyUsagePurpose::EncipherOnly => "encipher_only",
+            KeyUsagePurpose::DecipherOnly => "decipher_only",
+        }
+    }
+
+    /// Fallible parse from the TEXT[] element value (house idiom;
+    /// inherent rather than `FromStr` because there is no error type to
+    /// carry).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        ALL_KEY_USAGE_PURPOSES
+            .iter()
+            .copied()
+            .find(|k| k.as_str() == s)
+    }
+}
+
 /// The role of a human user, selecting its capability bundle via
 /// [`role_capabilities`]. Stored in TEXT columns as its serde name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,8 +409,8 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::{
-        role_capabilities, Actor, ActorType, AuthMethod, Capability, Role, UnknownActorType,
-        ALL_CAPABILITIES,
+        role_capabilities, Actor, ActorType, AuthMethod, Capability, KeyUsagePurpose, Role,
+        UnknownActorType, ALL_CAPABILITIES, ALL_KEY_USAGE_PURPOSES,
     };
     use crate::error::CoreError;
 
@@ -383,5 +459,21 @@ mod tests {
             "nope".parse::<ActorType>(),
             Err(UnknownActorType("nope".to_string()))
         );
+    }
+
+    /// Every key usage round-trips through its `snake_case` spelling, the
+    /// spelling is stable against the pinned list, and unknown aliases
+    /// (the RFC camelCase forms) do not parse.
+    #[test]
+    fn key_usage_purpose_roundtrip() {
+        for usage in ALL_KEY_USAGE_PURPOSES {
+            assert_eq!(KeyUsagePurpose::from_str(usage.as_str()), Some(*usage));
+        }
+        assert_eq!(
+            KeyUsagePurpose::from_str("digitalSignature"),
+            None,
+            "the RFC camelCase alias must not parse"
+        );
+        assert_eq!(KeyUsagePurpose::from_str("non_repudiation"), None);
     }
 }

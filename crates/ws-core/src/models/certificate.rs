@@ -78,7 +78,13 @@ pub struct CertificateModel {
     pub tenant_id: Uuid,
     /// Issuing CA (`cas.id`, insert-time FK).
     pub ca_id: Uuid,
-    /// Free-form profile label (a profiles table arrives in Plan 2).
+    /// The profile revision the certificate's policy is pinned to
+    /// (`profile_revisions.id`, nullable insert-time FK). The authority
+    /// for the certificate's policy; `None` for rows predating the
+    /// profiles schema.
+    pub profile_revision_id: Option<Uuid>,
+    /// Free-form profile label, retained as the DISPLAY form of the
+    /// profile (`profile_name` column; denormalised, not authoritative).
     pub profile_name: String,
     /// Certificate subject DN string.
     pub subject: String,

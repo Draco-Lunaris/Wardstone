@@ -27,7 +27,7 @@ use ws_ca::crl::{build_crl, CrlReason, CrlSpec, RevocationEntry};
 use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_ca::ocsp::{build_ocsp_response, OcspResponseSpec, OcspStatus};
-use ws_core::models::audit::{ActorType, AuditEntry};
+use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::CertificateModel;
 use ws_core::models::ocsp::OcspResponseModel;
@@ -295,6 +295,8 @@ async fn regen_one_ca(
                 id: Uuid::new_v4(),
                 tenant_id: ca.tenant_id,
                 actor_type: ActorType::System,
+                auth_method: AuthMethod::System,
+                session_id: None,
                 actor_id: AUDIT_ACTOR_ID.to_owned(),
                 action: AUDIT_ACTION_CRL_BUILT.to_owned(),
                 target_type: "ca".to_owned(),

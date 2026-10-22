@@ -23,6 +23,7 @@ struct CertificateRow {
     id: Uuid,
     tenant_id: Uuid,
     ca_id: Uuid,
+    profile_revision_id: Option<Uuid>,
     profile_name: String,
     subject: String,
     serial: i64,
@@ -49,21 +50,25 @@ impl CertificateRepo {
     /// Insert a certificate row exactly as given (every field, `created_at`
     /// included: the model is authoritative, so `get` returns the same
     /// row). `serial` binds through the i64 column form; `status` binds
-    /// its text representation; a unique-violation on `(ca_id, serial)`
+    /// its text representation; `profile_revision_id` binds nullable (the
+    /// policy authority, `profile_name` the display label). A
+    /// unique-violation on `(ca_id, serial)`
     /// becomes [`CoreError::Duplicate`].
     pub async fn insert(&self, cert: &CertificateModel) -> Result<(), CoreError> {
         let serial = serial_to_i64(cert.serial)?;
         sqlx::query(
-            "INSERT INTO certificates (id, tenant_id, ca_id, profile_name, subject, serial, \
+            "INSERT INTO certificates (id, tenant_id, ca_id, profile_name, \
+             profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
              revoked_at, revocation_reason, source, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18)",
+             $17, $18, $19)",
         )
         .bind(cert.id)
         .bind(cert.tenant_id)
         .bind(cert.ca_id)
         .bind(&cert.profile_name)
+        .bind(cert.profile_revision_id)
         .bind(&cert.subject)
         .bind(serial)
         .bind(&cert.serial_hex)
@@ -87,9 +92,9 @@ impl CertificateRepo {
     /// Fetch a certificate by id; `None` when absent.
     pub async fn get(&self, id: Uuid) -> Result<Option<CertificateModel>, CoreError> {
         let row: Option<CertificateRow> = sqlx::query_as(
-            "SELECT id, tenant_id, ca_id, profile_name, subject, serial, serial_hex, \
-             san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, revoked_at, \
-             revocation_reason, source, created_at FROM certificates WHERE id = $1",
+            "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
+             serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+             revoked_at, revocation_reason, source, created_at FROM certificates WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -112,9 +117,9 @@ impl CertificateRepo {
     ) -> Result<Vec<CertificateModel>, CoreError> {
         let (limit, offset) = paging(page, page_size)?;
         let rows: Vec<CertificateRow> = sqlx::query_as(
-            "SELECT id, tenant_id, ca_id, profile_name, subject, serial, serial_hex, \
-             san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, revoked_at, \
-             revocation_reason, source, created_at \
+            "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
+             serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+             revoked_at, revocation_reason, source, created_at \
              FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC \
              LIMIT $2 OFFSET $3",
         )
@@ -143,9 +148,9 @@ impl CertificateRepo {
     ) -> Result<Vec<CertificateModel>, CoreError> {
         let (limit, offset) = paging(page, page_size)?;
         let rows: Vec<CertificateRow> = sqlx::query_as(
-            "SELECT id, tenant_id, ca_id, profile_name, subject, serial, serial_hex, \
-             san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, revoked_at, \
-             revocation_reason, source, created_at \
+            "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
+             serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+             revoked_at, revocation_reason, source, created_at \
              FROM certificates WHERE tenant_id = $1 AND status = 'active' \
              AND not_after < $2 ORDER BY not_after ASC LIMIT $3 OFFSET $4",
         )
@@ -187,9 +192,9 @@ impl CertificateRepo {
         since: DateTime<Utc>,
     ) -> Result<Vec<CertificateModel>, CoreError> {
         let rows: Vec<CertificateRow> = sqlx::query_as(
-            "SELECT id, tenant_id, ca_id, profile_name, subject, serial, serial_hex, \
-             san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, revoked_at, \
-             revocation_reason, source, created_at \
+            "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
+             serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+             revoked_at, revocation_reason, source, created_at \
              FROM certificates WHERE ca_id = $1 AND status = 'revoked' \
              AND revoked_at >= $2 ORDER BY revoked_at",
         )
@@ -224,6 +229,7 @@ impl CertificateRow {
             id: self.id,
             tenant_id: self.tenant_id,
             ca_id: self.ca_id,
+            profile_revision_id: self.profile_revision_id,
             profile_name: self.profile_name,
             subject: self.subject,
             serial,
