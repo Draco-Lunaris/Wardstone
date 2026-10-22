@@ -3292,6 +3292,15 @@ async fn user_role_and_active_patch() {
             .expect("read the user row after the combined patch");
 
     let audits = audit_rows(&fx).await;
+    // The target tuples ride the same pre-cleanup capture window: the
+    // self-cleaning contract reads everything before cleanup deletes the
+    // audit rows.
+    let targets: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT action, target_type, target_id FROM audit_log WHERE tenant_id = $1")
+            .bind(fx.tenant_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read the patch audit target tuples");
 
     fx.cleanup().await;
 
@@ -3311,19 +3320,31 @@ async fn user_role_and_active_patch() {
     assert_eq!(both_status, StatusCode::OK, "the combined patch");
     assert_eq!(after_both, ("issuer".to_string(), false));
 
-    // Exactly the five expected audit actions, in the request order with
-    // the combined request's role row BEFORE its flag row.
+    // Exactly the five expected audit actions. The first three come from
+    // three separate requests (distinct transaction timestamps, so their
+    // order under `ORDER BY created_at, id` is deterministic); the
+    // combined request's two rows share ONE `created_at` (`now()` is the
+    // transaction timestamp), so their relative order is decided by a
+    // caller-chosen UUIDv4 tie-break — asserted as a SET with per-action
+    // details, never positionally.
     let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
     assert_eq!(
-        actions,
-        vec![
-            "user_role_changed",
-            "user_deactivated",
-            "user_activated",
-            "user_role_changed",
-            "user_deactivated",
-        ],
-        "the patch audit rows in order: {audits:?}"
+        actions.len(),
+        5,
+        "exactly the five patch audit rows: {audits:?}"
+    );
+    assert_eq!(
+        actions[..3],
+        ["user_role_changed", "user_deactivated", "user_activated"],
+        "the single-field requests' audit rows in order: {audits:?}"
+    );
+    let combined_actions: std::collections::BTreeSet<&str> = actions[3..].iter().copied().collect();
+    assert_eq!(
+        combined_actions,
+        ["user_role_changed", "user_deactivated"]
+            .into_iter()
+            .collect(),
+        "the combined request's two audit rows, order aside: {audits:?}"
     );
     // The role rows carry from/to exactly; the flag rows are empty-detail.
     assert_eq!(
@@ -3333,12 +3354,29 @@ async fn user_role_and_active_patch() {
     );
     assert_eq!(audits[1].3, json!({}), "user_deactivated");
     assert_eq!(audits[2].3, json!({}), "user_activated");
-    assert_eq!(
-        audits[3].3,
-        json!({ "from": "viewer", "to": "issuer" }),
-        "the combined request's role change"
+    for row in &audits[3..] {
+        match row.0.as_str() {
+            "user_role_changed" => assert_eq!(
+                row.3,
+                json!({ "from": "viewer", "to": "issuer" }),
+                "the combined request's role change details"
+            ),
+            "user_deactivated" => assert_eq!(row.3, json!({}), "the combined deactivate"),
+            other => panic!("unexpected audit action in the combined pair: {other}"),
+        }
+    }
+
+    // Every patch audit row targets the patched user with target_type
+    // "user" (the target tuple the route's audit entries carry; read back
+    // directly because the `audit_rows` helper does not select it).
+    assert_eq!(targets.len(), 5, "one audit row per audit_rows row");
+    assert!(
+        targets
+            .iter()
+            .all(|(_, target_type, target_id)| target_type == "user"
+                && *target_id == user_id.to_string()),
+        "every patch audit row targets the patched user: {targets:?}"
     );
-    assert_eq!(audits[4].3, json!({}), "the combined request's deactivate");
 }
 
 /// The last-admin guard on a ROLE change: the fixture's single active

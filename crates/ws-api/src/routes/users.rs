@@ -233,8 +233,13 @@ pub struct UpdateUserBody {
 /// active `Admin` users in the tenant (the role out of `Admin`, or
 /// `is_active: false` onto an active admin) is refused `409` with the
 /// fixed message. The count runs INSIDE the same transaction as the
-/// update, so a concurrent change to another admin is either visible to
-/// the count or blocked behind its row locks. The acting actor may change
+/// update, but it is a NON-LOCKING read: under READ COMMITTED, two
+/// concurrent PATCHes demoting two DIFFERENT active admins can each count
+/// 2, both pass the guard, and both commit — leaving zero active admins.
+/// That residual race is accepted (the single-operator UI cannot issue
+/// two concurrent admin demotions against itself; a `FOR UPDATE` locking
+/// count was considered and parked for the final review's triage, so only
+/// the pinned in-transaction count is here). The acting actor may change
 /// or deactivate THEMSELVES when they are not the last admin — the count
 /// is tenant-wide, not actor-relative. Another tenant's user (or an
 /// absent one) is a 404, indistinguishably.
