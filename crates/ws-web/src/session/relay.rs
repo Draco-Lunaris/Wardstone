@@ -20,6 +20,11 @@
 //!   clears the cookie. Idempotent: an unknown or missing session gets the
 //!   same quiet 204. The CSRF marker rule guards this mutating
 //!   cookie-carrying route exactly like the proxy guards `/api/v1`.
+//! - `GET /auth/ui/config` — the login page's PUBLIC SSO flag: relays
+//!   `GET /api/v1/oidc/config` and answers `{"oidc_configured": bool,
+//!   "provider": string|null}` so the browser can render the
+//!   "Sign in with SSO" button before any session exists. See
+//!   [`ui_config`] for the decision this route documents.
 //!
 //! [`rotate_once`] is the shared rotation critical section: the proxy's
 //! injection path and logout's rotate-and-retry both run their one ws-api
@@ -55,7 +60,7 @@ pub struct RelayState {
     pub(crate) base: String,
 }
 
-/// The relay's router: the four `/auth/ui` routes, mounted by
+/// The relay's router: the five `/auth/ui` routes, mounted by
 /// [`crate::web_router_with_store`] at the same precedence as `/api/v1`
 /// (before the SPA fallback).
 ///
@@ -81,6 +86,7 @@ pub fn relay_router(
     };
     let router = Router::new()
         .route("/auth/ui/login", post(ui_login))
+        .route("/auth/ui/config", get(ui_config))
         .route("/auth/ui/logout", post(ui_logout))
         .route("/auth/ui/oidc/{provider}/start", get(ui_oidc_start))
         .route("/auth/ui/oidc/{provider}/callback", get(ui_oidc_callback))
@@ -179,6 +185,56 @@ async fn ui_login(
         identity,
         build_session_cookie(&session_id.to_string()),
     ))
+}
+
+/// `GET /auth/ui/config` — the login page's PUBLIC SSO flag.
+///
+/// Relays `GET /api/v1/oidc/config` upstream and answers
+/// `{"oidc_configured": bool, "provider": string|null}`: a 200 maps to
+/// `true` carrying the row's `provider_type` (the label ws-api resolves
+/// the start route's `{provider}` path segment against — the flag alone
+/// would not let the button navigate anywhere), ANY other status maps to
+/// `{"oidc_configured": false, "provider": null}`.
+///
+/// Public-safe by construction: the answer never carries the
+/// redirect_uri, client_id, discovery URL, or secret material — only the
+/// boolean and the provider-type label. `manage_system` is deliberately
+/// NOT consulted here: the login page (unauthenticated by definition) is
+/// the caller, and it must be able to ask whether SSO exists.
+///
+/// DECISION (documented in `ui/README.md`): ws-api gates its own config
+/// GET behind `manage_system`, so this probe — which carries no browser
+/// credentials, the browser having no session yet — receives an upstream
+/// 401 (not the 404 of an unset row) whenever nothing is signed in. Until
+/// ws-api publishes a public config-status surface, the mapping therefore
+/// answers `false` in production and the SSO button stays hidden; the
+/// mapping itself is already correct and test-covered
+/// (`crates/ws-web/tests/ui_config_test.rs`), so relaxing ws-api's gate
+/// turns the button on without any ws-web change.
+async fn ui_config(State(relay): State<RelayState>) -> Result<Response, ProxyError> {
+    let client = client_or_502(&relay)?;
+    let upstream = client
+        .get(format!("{}/api/v1/oidc/config", relay.base))
+        .send()
+        .await
+        .map_err(|err| ProxyError(err.to_string()))?;
+    let body = if upstream.status().is_success() {
+        let value: Value = upstream
+            .json()
+            .await
+            .map_err(|err| ProxyError(format!("the oidc config response was not JSON: {err}")))?;
+        let provider = value
+            .get("provider_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Json(json!({ "oidc_configured": true, "provider": provider })).into_response()
+    } else {
+        // 404 (the row is unset) — and every other refusal, including the
+        // auth gate's 401/403 — reads "SSO is not configured": fail into
+        // hiding the button, never into showing one that cannot work.
+        Json(json!({ "oidc_configured": false, "provider": null })).into_response()
+    };
+    Ok(([(header::CACHE_CONTROL, "no-store".to_owned())], body).into_response())
 }
 
 /// `GET /auth/ui/oidc/{provider}/start` — pure redirect passthrough.
