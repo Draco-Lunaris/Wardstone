@@ -1716,6 +1716,78 @@ async fn profile_revision_optimistic_concurrency() {
     );
 }
 
+/// The description-edit write: `set_description` replaces the stored
+/// description (the value the next read returns), a blank or empty string
+/// lands as NULL (the round-trip contract the PUT path's response echoes),
+/// and `None` clears it too. A missing profile row is a zero-row update,
+/// still `Ok`. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn set_description_roundtrips_and_blanks_to_null() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
+
+    sweep_auth_rows(&pool, AUTH_TENANT).await;
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
+        .await
+        .expect("insert test tenant for profile rows");
+
+    let repo = ProfileRepo::new();
+    let mut profile = profile_model(tenant.id);
+    profile.description = None;
+    repo.insert_profile(&pool, &profile)
+        .await
+        .expect("insert profile");
+
+    let edited = repo
+        .set_description(&pool, profile.id, Some("the new wording"))
+        .await;
+    let after_edit = repo.get_profile(&pool, profile.id).await;
+    let blank = repo.set_description(&pool, profile.id, Some("   ")).await;
+    let after_blank = repo.get_profile(&pool, profile.id).await;
+    let empty = repo.set_description(&pool, profile.id, Some("")).await;
+    let after_empty = repo.get_profile(&pool, profile.id).await;
+    let none = repo.set_description(&pool, profile.id, None).await;
+    let after_none = repo.get_profile(&pool, profile.id).await;
+    let restored = repo
+        .set_description(&pool, profile.id, Some("restored"))
+        .await;
+    let final_profile = repo.get_profile(&pool, profile.id).await;
+    let missing = repo
+        .set_description(&pool, uuid::Uuid::new_v4(), Some("x"))
+        .await;
+
+    // Cleanup BEFORE asserting.
+    delete_auth_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY_AUTH).await;
+
+    edited.expect("set the description");
+    blank.expect("set a blank description");
+    empty.expect("set an empty description");
+    none.expect("clear the description");
+    restored.expect("set the description again");
+    missing.expect("a missing profile is a zero-row update, not an error");
+
+    let after_edit = after_edit.expect("get after edit").expect("row present");
+    assert_eq!(
+        after_edit.description.as_deref(),
+        Some("the new wording"),
+        "the description round-trips"
+    );
+    let after_blank = after_blank.expect("get after blank").expect("row present");
+    assert_eq!(after_blank.description, None, "a blank string stores NULL");
+    let after_empty = after_empty.expect("get after empty").expect("row present");
+    assert_eq!(after_empty.description, None, "an empty string stores NULL");
+    let after_none = after_none.expect("get after none").expect("row present");
+    assert_eq!(after_none.description, None, "an absent description clears");
+    let final_profile = final_profile.expect("final get").expect("row present");
+    assert_eq!(final_profile.description.as_deref(), Some("restored"));
+}
+
 /// A service identity's capabilities are stored and read back; the
 /// listing finds it and revoke stamps `revoked_at`; and a one-shot token
 /// is retrievable by hash, with `consume_one_shot_by_hash` succeeding

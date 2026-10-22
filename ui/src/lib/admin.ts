@@ -238,10 +238,13 @@ export const PROFILE_EKUS = [
 /** The create/update body (the routes' `ProfileBody`, snake_case). The
  * name is the CREATE-only field: the update route revises the policy and
  * keeps the profile's name (the history's spine — every revision a live
- * profile ever had carries that name). */
+ * profile ever had carries that name). The description is carried on BOTH
+ * paths since the PUT persists it: on edit it is ALWAYS present — a
+ * trimmed string, or `null` when blank (the server stores blank as NULL
+ * and echoes the stored value). */
 export interface ProfileUpsertBody {
   name?: string;
-  description?: string;
+  description?: string | null;
   key_type: string;
   key_usages: string[];
   eku: string[];
@@ -269,16 +272,16 @@ export type ProfilePayloadResult =
 /**
  * Build the profile create/edit body, pure. On create the name is
  * required (trimmed — the server's same 400 wording otherwise) and the
- * description is carried when typed; on edit BOTH keys are omitted even
- * though the form still shows them locked: the update route appends a
- * policy revision and repoints `current_revision_id` ONLY (no SQL on the
- * PUT path persists `profiles.description`), so a description sent there
- * would visibly succeed and silently not persist. A blank description on
- * create maps to the ABSENT key (the server stores the description
- * verbatim, so the UI's emptiness discipline is the difference between
- * "no description" and a phantom blank). Lists pass through with empty
- * entries dropped — the server owns the deeper validation (unknown usage
- * spellings, unparsable SAN patterns, the fail-closed `*.`).
+ * description is carried when typed (a blank maps to the ABSENT key — the
+ * server stores the description verbatim, so the UI's emptiness discipline
+ * is the difference between "no description" and a phantom blank). On edit
+ * the name stays OMITTED (the update route keeps it), but the description
+ * is now ALWAYS present: the PUT persists it in the same revision
+ * transaction, a trimmed value rides as-is, and a blank one rides as
+ * `null` — the server stores that as NULL, and its response echoes the
+ * STORED value. Lists pass through with empty entries dropped — the
+ * server owns the deeper validation (unknown usage spellings, unparsable
+ * SAN patterns, the fail-closed `*.`).
  */
 export function buildProfilePayload(fields: ProfileFormFields, editing: boolean): ProfilePayloadResult {
   const lifetime = Number(fields.lifetime_days.trim());
@@ -302,6 +305,8 @@ export function buildProfilePayload(fields: ProfileFormFields, editing: boolean)
     if (description) {
       body.description = description;
     }
+  } else {
+    body.description = fields.description.trim() || null;
   }
   return { body, error: null };
 }

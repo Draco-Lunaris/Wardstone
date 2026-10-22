@@ -2622,6 +2622,117 @@ async fn profile_creation_refuses_the_star_dot_pattern() {
     fx.cleanup().await;
 }
 
+/// The PUT edit path persists the description (the round-trip the admin
+/// table renders): a description on the PUT body lands in the row the list
+/// serves, the PUT response echoes the STORED value (not merely the
+/// request's), a blank one stores NULL and round-trips as `null`, and the
+/// create path is unchanged. One profile, edited twice.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_put_persists_the_description() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let policy = json!({
+        "key_type": "ecdsa-p256",
+        "key_usages": ["digital_signature"],
+        "eku": ["server_auth"],
+        "lifetime_days": 30,
+        "san_patterns": ["d.test"]
+    });
+
+    let mut create_body = policy.clone();
+    create_body["name"] = json!("desc-edit");
+    create_body["description"] = json!("first wording");
+    let create_res = post_json(&fx, "/api/v1/profiles", Some(&token), create_body).await;
+    assert_eq!(
+        create_res.status(),
+        StatusCode::CREATED,
+        "create the profile"
+    );
+    let raw = axum::body::to_bytes(create_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&raw).unwrap();
+    let profile_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        created["description"], "first wording",
+        "the create path persists and echoes the description (unchanged)"
+    );
+
+    let mut edit_body = policy.clone();
+    edit_body["description"] = json!("second wording");
+    let edit_res = put_json(
+        &fx,
+        &format!("/api/v1/profiles/{profile_id}"),
+        Some(&token),
+        edit_body,
+    )
+    .await;
+    let edit_status = edit_res.status();
+    let raw = axum::body::to_bytes(edit_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let edited: Value = serde_json::from_slice(&raw).unwrap();
+    let first_list = get_json(&fx, "/api/v1/profiles", &token).await;
+
+    let mut blank_body = policy.clone();
+    blank_body["description"] = json!("   ");
+    let blank_res = put_json(
+        &fx,
+        &format!("/api/v1/profiles/{profile_id}"),
+        Some(&token),
+        blank_body,
+    )
+    .await;
+    let blank_status = blank_res.status();
+    let raw = axum::body::to_bytes(blank_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let blanked: Value = serde_json::from_slice(&raw).unwrap();
+    let second_list = get_json(&fx, "/api/v1/profiles", &token).await;
+
+    let audits = audit_rows(&fx).await;
+    let row_description = |list: &Value| -> Value {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .find(|profile| profile["id"].as_str() == Some(profile_id.as_str()))
+            .map(|profile| profile["description"].clone())
+            .expect("the edited profile appears in the list")
+    };
+
+    fx.cleanup().await;
+
+    assert_eq!(edit_status, StatusCode::OK, "the description edit");
+    assert_eq!(
+        edited["description"], "second wording",
+        "the PUT response echoes the STORED description"
+    );
+    assert_eq!(
+        row_description(&first_list),
+        json!("second wording"),
+        "the edit persisted into the row the list serves"
+    );
+    assert_eq!(blank_status, StatusCode::OK, "the blank edit");
+    assert_eq!(
+        blanked["description"],
+        json!(null),
+        "a blank description stores NULL and the response echoes null"
+    );
+    assert_eq!(
+        row_description(&second_list),
+        json!(null),
+        "the cleared description round-trips as null"
+    );
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["profile_created", "profile_revised", "profile_revised"],
+        "exactly the create and the two edit audit rows: {audits:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The filtered listing and estate statistics (Plan 3 Task 1)
 // ---------------------------------------------------------------------------

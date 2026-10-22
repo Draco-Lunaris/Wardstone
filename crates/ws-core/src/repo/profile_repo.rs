@@ -279,6 +279,31 @@ impl ProfileRepo {
         Ok(())
     }
 
+    /// Replace the profile's `description` — the edit-path write the PUT
+    /// route runs INSIDE the same revision transaction as the repoint, so
+    /// a saved description and its revision commit or roll back together.
+    ///
+    /// The stored value is normalized here, in exactly one place: a blank
+    /// or empty string is stored as NULL, so "no description" round-trips
+    /// as `null` instead of a phantom `""` (the route's response echoes the
+    /// STORED value, which makes the normalization observable). `None`
+    /// clears the column too. A missing profile row updates zero rows and
+    /// stays `Ok` — existence is the caller's check.
+    pub async fn set_description(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        description: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let description = description.map(str::trim).filter(|d| !d.is_empty());
+        sqlx::query("UPDATE profiles SET description = $2 WHERE id = $1")
+            .bind(id)
+            .bind(description)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// Delete a profile. `profile_revisions` rows go with it
     /// (ON DELETE CASCADE); a revision a certificate still references
     /// keeps the certificate's FK holding, so deletion of a referenced

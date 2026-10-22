@@ -5,7 +5,8 @@
 // deleted; the setup-built-in profiles are typically in that state. The
 // update route appends a new revision and keeps the profile's name: the
 // name field stays locked while editing, because every revision a live
-// profile ever had carries that name.
+// profile ever had carries that name. The description is editable on both
+// paths now — the PUT persists it in the same revision transaction.
 //
 // Reads gate on read_profiles, the mutations on manage_profiles — the
 // server is the real boundary; the gating here only hides what would 403.
@@ -351,14 +352,7 @@ export default function AdminProfiles() {
               id="profile-description"
               value={draft.description}
               onChange={(event) => setDraft({ ...draft, description: event.target.value })}
-              disabled={editingId !== null}
             />
-            {editingId !== null && (
-              <p className="muted">
-                The profile description is fixed in v1 — it cannot be edited after creation, so
-                the edit PUT leaves it out rather than pretending to save it.
-              </p>
-            )}
 
             <label htmlFor="profile-key-type">Key type</label>
             <select
