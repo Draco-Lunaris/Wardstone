@@ -1,0 +1,42 @@
+[package]
+name = "wardstone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Wardstone binary: `wardstone ui` (the TLS front door) and `wardstone api` (the REST API), one image, two modes"
+
+[dependencies]
+# The async runtime: both serving modes are single tokio tasks with a
+# possible setup-completion watcher (the workspace pin already carries
+# feature `full`).
+tokio = { workspace = true }
+# Process-level diagnostics: the binary initializes the subscriber.
+tracing = { workspace = true }
+# The subscriber: fmt + RUST_LOG env filter (workspace pin, `env-filter`
+# feature — not a default feature of the crate).
+tracing-subscriber = { workspace = true }
+# The REST router (api mode) and its serving shape: `axum::serve` with
+# `into_make_service_with_connect_info` so the GovernorLayer per-IP key
+# extractor sees real peer addresses.
+axum = { workspace = true }
+# The typed boot error enum (thiserror, the house vocabulary everywhere).
+thiserror = { workspace = true }
+# PgPool in the boot helpers' signatures; features are unified across the
+# workspace (ws-core carries macros/migrate/uuid/chrono/ipnet/json).
+sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
+# The domain layer: migrations, pool connect, repos, models.
+ws-core = { path = "../ws-core" }
+# Authentication primitives: the JWT key pair lifecycle (`load_or_create`).
+ws-auth = { path = "../ws-auth" }
+# The REST surface: `router(AppState)` and the config vocabulary.
+ws-api = { path = "../ws-api" }
+# The TLS front door: `web_router`, `serve_tls`, the setup certificate.
+ws-web = { path = "../ws-web" }
+# The CA engine: the keystore (setup slot, per-certificate key envelopes).
+ws-ca = { path = "../ws-ca" }
+
+[dev-dependencies]
+# Model ids and the created_at clock for the serving-leaf selection tests
+# (workspace pins; the workspace uuid pin carries `v4`).
+uuid = { workspace = true }
+chrono = { workspace = true }

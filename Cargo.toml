@@ -57,6 +57,12 @@ tracing = { version = "0.1.44" }
 thiserror = { version = "2.0.21" }
 anyhow = { version = "1.0.104" }
 
+# The `wardstone` binary's log subscriber (Task 12): the fmt layer plus
+# the RUST_LOG env filter. `env-filter` is NOT a default feature of the
+# crate; without it RUST_LOG is silently ignored. Exact caret pin per the
+# shared-version note above.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
 # JWT: Ed25519 (EdDSA) access tokens. House pin (linux-patch-manager). The
 # `rust_crypto` feature selects the pure-Rust ed25519-dalek backend over
 # aws-lc-rs, which needs a C toolchain absent from the container image; the
