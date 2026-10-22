@@ -4,6 +4,7 @@ pub mod audit;
 pub mod ca;
 pub mod certificate;
 pub mod credential;
+pub mod crl;
 pub mod ocsp;
 pub mod profile;
 pub mod rbac;

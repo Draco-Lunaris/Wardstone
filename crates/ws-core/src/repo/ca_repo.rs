@@ -8,6 +8,10 @@ use crate::error::CoreError;
 use crate::models::ca::{CaModel, KeyType};
 use crate::repo::tenant_repo::map_unique;
 
+/// How many CAs a leaf-to-root walk may visit: the depth bound that also
+/// breaks a corrupt `parent_id` cycle.
+const MAX_CHAIN_DEPTH: usize = 8;
+
 /// Data access for [`CaModel`] rows.
 ///
 /// Stateless by design: the repository holds no pool, and every method
@@ -141,6 +145,49 @@ impl CaRepo {
         rows.into_iter()
             .map(CaRow::try_into_model)
             .collect::<Result<Vec<_>, CoreError>>()
+    }
+
+    /// The chain from the named CA up to its trust anchor, leaf-first: the
+    /// named CA itself first, then its parent's, up to the CA whose
+    /// `parent_id` is `None`.
+    ///
+    /// The executor is `&mut sqlx::PgConnection`, not a generic
+    /// `impl PgExecutor<'_>`: this walk runs SEVERAL statements on it, and
+    /// an `impl PgExecutor` parameter is consumed by the first query (the
+    /// house note on the certificates route's `issue_in_tx` core — callers
+    /// pass `&mut *conn` on a pooled connection, or `&mut *tx` on a
+    /// transaction). A walk that has not reached a root within
+    /// [`MAX_CHAIN_DEPTH`] hops (a corrupt `parent_id` loop in the data) is
+    /// [`CoreError::Config`] — data-level damage, not a per-request
+    /// failure — and so is a missing mid-chain parent (a dangling
+    /// `parent_id`): the walk refuses rather than silently truncating the
+    /// chain it was asked to assemble. The CALLER (the route) has already
+    /// established that the starting CA exists in the actor's tenant; the
+    /// steps stay inside that tenant because a child's `parent_id` names
+    /// its issuer and the composite tenant/CA constraint (migration 006)
+    /// keeps a child row's tenant equal to its parent's.
+    pub async fn chain_to_root(
+        &self,
+        executor: &mut sqlx::PgConnection,
+        ca_id: Uuid,
+    ) -> Result<Vec<CaModel>, CoreError> {
+        let mut chain = Vec::new();
+        let mut current_id = ca_id;
+        // `&mut *executor` reborrows the connection fresh for every hop.
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let ca = self.get(&mut *executor, current_id).await?.ok_or_else(|| {
+                CoreError::Config(format!("ca {current_id} is missing from its own chain"))
+            })?;
+            let parent_id = ca.parent_id;
+            chain.push(ca);
+            match parent_id {
+                None => return Ok(chain),
+                Some(parent_id) => current_id = parent_id,
+            }
+        }
+        Err(CoreError::Config(
+            "ca chain exceeds depth or cycles".to_string(),
+        ))
     }
 }
 

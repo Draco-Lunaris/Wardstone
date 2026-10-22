@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::Router;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, SubsecRound, Utc};
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -2386,5 +2386,291 @@ async fn audit_filter_by_date_and_action() {
         targets(&bracket),
         vec![b_target, a_target],
         "the from/to bracket excludes both too-old and too-new rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The CRL retrieval and trust-chain routes (Plan 3 Task 3)
+// ---------------------------------------------------------------------------
+
+/// The CRL route serves the NEWEST published CRL for the CA. Two `crls`
+/// rows are seeded by direct INSERT into the ws-worker-owned table (its job
+/// path is untouched — the rows are the seed, not a writer) with distinct
+/// `issued_at` stamps, and the response must carry the newer row's
+/// `issued_at`, `next_update`, and PEM verbatim, nothing more. A CA that
+/// exists but never published a CRL is a 404 `not_found`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn crl_route_serves_newest() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (_profile_id, ca_id) = setup_profile_and_ca(&fx).await;
+
+    // Two CRL rows: OLD two hours ago (already expired), NEW half an hour
+    // ago. `issued_at` is seeded explicitly — the route's ORDER BY keys on
+    // it, so no backdating of anything else is involved. The stamps are
+    // rounded to microsecond precision: a `timestamptz` column truncates
+    // finer digits on write, and the comparison must compare what is
+    // stored, not what was bound.
+    let now = Utc::now().round_subsecs(6);
+    let old_pem = "-----BEGIN X509 CRL-----\nOLDTESTCRL\n-----END X509 CRL-----\n";
+    let new_pem = "-----BEGIN X509 CRL-----\nNEWTESTCRL\n-----END X509 CRL-----\n";
+    let old_issued = now - Duration::hours(2);
+    let old_next = now - Duration::hours(1);
+    let new_issued = now - Duration::minutes(30);
+    let new_next = now + Duration::hours(12);
+    let seeds = [
+        (old_issued, old_next, old_pem),
+        (new_issued, new_next, new_pem),
+    ];
+    for (seeded_issued, seeded_next, crl_pem) in seeds {
+        sqlx::query(
+            "INSERT INTO crls (id, tenant_id, ca_id, issued_at, next_update, crl_pem) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fx.tenant_id)
+        .bind(ca_id)
+        .bind(seeded_issued)
+        .bind(seeded_next)
+        .bind(crl_pem)
+        .execute(&fx.pool)
+        .await
+        .expect("seed a crls row");
+    }
+
+    // The sibling CA that exists but has never published a CRL.
+    let empty_res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "crl-empty-root",
+            "subject": "Wardstone CRL Empty",
+            "key_type": "ed25519",
+            "is_root": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        empty_res.status(),
+        StatusCode::CREATED,
+        "create the CA without CRLs"
+    );
+    let raw = axum::body::to_bytes(empty_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let empty_ca: Value = serde_json::from_slice(&raw).unwrap();
+    let empty_ca_id = empty_ca["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // Both GETs run BEFORE cleanup (the self-cleaning contract).
+    let res = get_bearer(&fx, &format!("/api/v1/cas/{ca_id}/crl"), &token).await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    let no_crl_res = get_bearer(&fx, &format!("/api/v1/cas/{empty_ca_id}/crl"), &token).await;
+    let no_crl_status = no_crl_res.status();
+    let raw = axum::body::to_bytes(no_crl_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let no_crl_body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+
+    // Drop the seeded CRL rows before cleanup: cleanup deletes the `cas`
+    // rows, and the `crls` rows' foreign keys would block those deletes.
+    sqlx::query("DELETE FROM crls WHERE tenant_id = $1")
+        .bind(fx.tenant_id)
+        .execute(&fx.pool)
+        .await
+        .expect("delete the seeded crls rows");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "the CRL route answers");
+    assert_eq!(
+        body["ca_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        ca_id,
+        "the served CRL names the requested CA"
+    );
+    assert_eq!(
+        body["issued_at"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap(),
+        new_issued,
+        "the NEWEST row's issued_at"
+    );
+    assert_eq!(
+        body["next_update"]
+            .as_str()
+            .unwrap()
+            .parse::<DateTime<Utc>>()
+            .unwrap(),
+        new_next,
+        "the newest row's next_update"
+    );
+    assert_eq!(
+        body["crl_pem"].as_str(),
+        Some(new_pem),
+        "the newest row's PEM, verbatim"
+    );
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        4,
+        "exactly ca_id, issued_at, next_update, crl_pem"
+    );
+
+    assert_eq!(
+        no_crl_status,
+        StatusCode::NOT_FOUND,
+        "no published CRL is 404"
+    );
+    assert_eq!(error_code(&no_crl_body), "not_found");
+}
+
+/// The chain routes assemble the trust chain leaf-first with the PEM body
+/// `application/x-pem-file`: `/cas/{id}/chain` concatenates the CA's
+/// certificate up to its root's (a leaf certificate never appears), and
+/// `/certificates/{id}/chain` puts the leaf PEM FIRST, then its issuing
+/// chain. The leaf is issued through the normal issuance helper and its
+/// `ca_id` is then repointed at the intermediate by direct UPDATE — the
+/// issuance helper always issues from the tenant's root, and the same-
+/// tenant repoint keeps the composite tenant/CA foreign key intact.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn chain_routes_walk_to_root() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, root_id) = setup_profile_and_ca(&fx).await;
+
+    // The intermediate under the root, through the API (create_ca).
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "chain-intermediate",
+            "subject": "Wardstone Chain Intermediate",
+            "key_type": "ed25519",
+            "is_root": false,
+            "parent_id": root_id
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the intermediate");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let intermediate: Value = serde_json::from_slice(&raw).unwrap();
+    let intermediate_id = intermediate["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let intermediate_pem = intermediate["cert_pem"].as_str().unwrap().to_string();
+
+    // The root's PEM, from the list (setup_profile_and_ca discards the body).
+    let listed = get_json(&fx, "/api/v1/cas", &token).await;
+    let root_pem = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ca| ca["id"].as_str().unwrap().parse::<Uuid>().unwrap() == root_id)
+        .expect("the fixture root is listed")["cert_pem"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A leaf through the normal issuance helper, then repointed under the
+    // intermediate (same tenant). The name fits the fixture profile's
+    // `wardstone.test` SAN allow-list.
+    let (leaf_status, leaf_body) = issue_csr(
+        &fx,
+        profile_id,
+        "leaf.chain.wardstone.test",
+        &["leaf.chain.wardstone.test"],
+    )
+    .await;
+    assert_eq!(leaf_status, StatusCode::OK, "issue the leaf: {leaf_body}");
+    let leaf_id = leaf_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let leaf_pem = leaf_body["cert_pem"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE certificates SET ca_id = $2 WHERE id = $1")
+        .bind(leaf_id)
+        .bind(intermediate_id)
+        .execute(&fx.pool)
+        .await
+        .expect("repoint the leaf at the intermediate");
+
+    // Both chain GETs run BEFORE cleanup (the self-cleaning contract).
+    let cert_res = get_bearer(
+        &fx,
+        &format!("/api/v1/certificates/{leaf_id}/chain"),
+        &token,
+    )
+    .await;
+    let cert_status = cert_res.status();
+    let cert_type = cert_res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let cert_raw = axum::body::to_bytes(cert_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let cert_chain = String::from_utf8(cert_raw.to_vec()).unwrap();
+    let ca_res = get_bearer(&fx, &format!("/api/v1/cas/{intermediate_id}/chain"), &token).await;
+    let ca_status = ca_res.status();
+    let ca_raw = axum::body::to_bytes(ca_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ca_chain = String::from_utf8(ca_raw.to_vec()).unwrap();
+
+    fx.cleanup().await;
+
+    assert_eq!(
+        cert_status,
+        StatusCode::OK,
+        "the certificate chain route answers"
+    );
+    assert_eq!(
+        cert_type, "application/x-pem-file",
+        "the chain body's content type"
+    );
+    let leaf_at = cert_chain
+        .find(&leaf_pem)
+        .expect("the leaf's PEM in the body");
+    let intermediate_at = cert_chain
+        .find(&intermediate_pem)
+        .expect("the intermediate's PEM in the body");
+    let root_at = cert_chain
+        .find(&root_pem)
+        .expect("the root's PEM in the body");
+    assert!(
+        leaf_at < intermediate_at && intermediate_at < root_at,
+        "the certificate chain is leaf-first: leaf, intermediate, root"
+    );
+
+    assert_eq!(ca_status, StatusCode::OK, "the CA chain route answers");
+    let int_at = ca_chain
+        .find(&intermediate_pem)
+        .expect("the intermediate's PEM in the body");
+    let root_at2 = ca_chain
+        .find(&root_pem)
+        .expect("the root's PEM in the body");
+    assert!(
+        int_at < root_at2,
+        "the CA chain walks intermediate then root"
+    );
+    assert!(
+        ca_chain.find(&leaf_pem).is_none(),
+        "the CA chain never contains a leaf certificate"
     );
 }

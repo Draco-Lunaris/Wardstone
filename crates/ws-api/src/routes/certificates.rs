@@ -38,7 +38,7 @@ use std::net::IpAddr;
 
 use axum::extract::{Path, Query, State};
 use axum::http::header;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
@@ -81,6 +81,7 @@ pub fn router() -> Router<AppState> {
         // BEFORE `/{id}` so the router reads in the order the routes nest.
         .route("/statistics", get(certificate_statistics))
         .route("/{id}", get(get_certificate))
+        .route("/{id}/chain", get(get_certificate_chain))
         .route("/{id}/revoke", post(revoke_certificate))
 }
 
@@ -1054,4 +1055,34 @@ pub struct RevokeBody {
 pub struct RevokeResponse {
     pub id: Uuid,
     pub status: String,
+}
+
+/// `GET /api/v1/certificates/{id}/chain` — `read_certificates`. The trust
+/// chain the certificate verifies against, leaf-first: the certificate's
+/// own PEM FIRST, then its issuing CA's chain up to the root, as one
+/// concatenated PEM body (`application/x-pem-file`, the root-trust
+/// route's idiom). Another tenant's certificate is a 404, and the chain
+/// walk starts only from the tenant-checked certificate's own `ca_id`.
+async fn get_certificate_chain(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    auth.require(Capability::ReadCertificates)
+        .map_err(ApiError::from)?;
+    let cert = CertificateRepo::new()
+        .get(&state.pool, id)
+        .await?
+        .filter(|cert| cert.tenant_id == auth.tenant_id)
+        .ok_or_else(|| ApiError::NotFound("certificate not found".to_string()))?;
+    let chain = {
+        // One pooled connection serves the multi-statement walk (the
+        // repos' executor convention: several statements need a `&mut
+        // PgConnection`).
+        let mut conn = state.pool.acquire().await?;
+        CaRepo::new().chain_to_root(&mut conn, cert.ca_id).await?
+    };
+    let mut body = cert.cert_pem.clone();
+    body.extend(chain.iter().map(|ca| ca.cert_pem.as_str()));
+    Ok(([(header::CONTENT_TYPE, "application/x-pem-file")], body).into_response())
 }
