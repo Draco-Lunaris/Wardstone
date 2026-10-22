@@ -6,10 +6,12 @@
 //!
 //! The setup endpoint is NOT ROUTED once the tenant exists — not merely
 //! refused. [`setup_router`] is mounted by [`crate::web_router`] only
-//! while [`tenant_exists`] is false; with the tenant present there is no
-//! `/setup` route at all and a request to it gets axum's plain 404. The
-//! binary (Task 12) and this crate's own composition perform the same
-//! check at startup.
+//! while [`tenant_exists`] is false; with the tenant present the
+//! composition mounts [`setup_unmounted_router`] instead — GET and POST
+//! `/setup` are explicit, plain 404s, NOT left to the SPA fallback (which
+//! would answer the extension-less path with the UI document, i.e. the
+//! endpoint would not actually be unrouted). The binary (Task 12) and
+//! this crate's own composition perform the same check at startup.
 //!
 //! # The TLS switch
 //!
@@ -128,6 +130,24 @@ pub fn setup_router(state: SetupState) -> axum::Router {
             axum::routing::get(page::setup_page).post(page::submit_setup),
         )
         .with_state(state)
+}
+
+/// The unmount contract's OTHER branch: what [`crate::web_router`] mounts
+/// when [`tenant_exists`] is true. `GET /setup` and `POST /setup` are
+/// explicit, plain 404s — the exact shape the setup/e2e suites pin ("404,
+/// not 403"), matching axum's own unrouted response (empty body).
+///
+/// The counterpart must be mounted EXPLICITLY, in the same if/else that
+/// decides [`setup_router`] — either the setup routes or their 404s are
+/// mounted, never neither. Left to ws-web's SPA fallback, the unmounted
+/// `/setup` is an extension-less GET and would come back 200 + the index
+/// document: the endpoint would not be unrouted, it would be impersonated
+/// by the UI.
+pub fn setup_unmounted_router() -> axum::Router {
+    async fn setup_gone() -> axum::http::StatusCode {
+        axum::http::StatusCode::NOT_FOUND
+    }
+    axum::Router::new().route(SETUP_ROUTE, axum::routing::get(setup_gone).post(setup_gone))
 }
 
 /// Whether the default tenant exists — the check the caller performs

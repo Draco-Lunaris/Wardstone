@@ -388,3 +388,67 @@ async fn csrf_ok_cases_pass_the_check_into_the_proxy() {
         "GET carries no rule"
     );
 }
+
+/// # The unmounted setup routes (the non-DB half of the unmount contract)
+
+#[tokio::test]
+async fn unmounted_setup_routes_are_explicit_404s_over_the_fallback() {
+    // The composed shape of the CONFIGURED branch of `web_router`: the
+    // setup routes are gone and their EXPLICIT 404 replacement stands in
+    // — left to the SPA fallback, the extension-less `GET /setup` would
+    // come back 200 + index.html and the endpoint would not actually be
+    // unrouted (the defect this composition fixed).
+    let router = stub_health_router().merge(ws_web::setup_unmounted_router());
+
+    // GET /setup is 404, not the UI document.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "GET /setup is gone, not the document"
+    );
+
+    // POST /setup too — a plain 404, not a refusal (never 403).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "POST /setup is gone, not merely refused"
+    );
+
+    // The replacement is surgical: other extension-less client routes
+    // still fall back to the document, so the SPA routing survives.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/certificates")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the SPA fallback still serves other client routes"
+    );
+}

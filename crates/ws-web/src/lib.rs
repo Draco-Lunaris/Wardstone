@@ -51,7 +51,9 @@ use session::relay::relay_router;
 use session::store::SessionStore;
 
 pub use proxy::api_router;
-pub use setup::{run_setup, setup_router, tenant_exists, SetupFields, SetupState};
+pub use setup::{
+    run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
+};
 
 /// The default server-side access-token lifetime ws-web bookkeeps (15
 /// minutes, matching ws-api's JWT access-token TTL): past this stamp the
@@ -126,6 +128,13 @@ pub async fn web_router_with_store(
     let api = api_router(api_base_url).layer(Extension(store.clone()));
     let relay = relay_router(store, api_base_url, rate_limit);
     let mut app = Router::new().merge(relay).merge(api);
+    // The setup mounting contract, structurally: BOTH branches live in
+    // this one if/else, so either the setup routes or their explicit 404
+    // replacement ([`setup_unmounted_router`]) is mounted — never
+    // neither. The explicit replacement is load-bearing: the SPA
+    // fallback below catches any extension-less GET, so an unmounted
+    // `/setup` left to it would answer 200 + index.html instead of the
+    // plain 404 the setup/e2e suites pin (404, not 403).
     if !tenant_exists(&pool).await? {
         app = app.merge(setup_router(SetupState {
             pool,
@@ -133,6 +142,8 @@ pub async fn web_router_with_store(
             fingerprint,
             hostname,
         }));
+    } else {
+        app = app.merge(setup_unmounted_router());
     }
     // The SPA router rides LAST: `fallback_service` runs only when no
     // earlier route matched (the precedence the ui-serve suite pins), so
