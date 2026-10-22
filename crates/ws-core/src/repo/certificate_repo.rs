@@ -7,7 +7,9 @@ use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::error::CoreError;
-use crate::models::certificate::{CertStatus, CertificateModel};
+use crate::models::certificate::{
+    CertStatus, CertificateFilter, CertificateModel, CertificateStatistics,
+};
 use crate::repo::tenant_repo::map_unique;
 
 /// Data access for [`CertificateModel`] rows.
@@ -188,6 +190,118 @@ impl CertificateRepo {
         rows.into_iter()
             .map(CertificateRow::try_into_model)
             .collect::<Result<Vec<_>, CoreError>>()
+    }
+
+    /// The tenant's certificates through a composed filter, one page at a
+    /// time, latest expiry first (`not_after` DESC, same as
+    /// [`CertificateRepo::list_by_tenant`]), LIMIT/OFFSET paging through
+    /// the shared [`crate::repo::paging`] helper.
+    ///
+    /// The WHERE clause composes ONLY the filter fields that are `Some`
+    /// (`tenant_id` is always present); every value binds as a parameter —
+    /// nothing is ever stringified into the SQL. The search needle binds
+    /// ONCE (`$n`) and is reused at three placeholders: subject, serial
+    /// hex, and the unnest-ed `san_dns` rows.
+    pub async fn list_filtered(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        filter: &CertificateFilter,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<CertificateModel>, CoreError> {
+        // Compose the SQL FIRST (nothing may re-borrow the string after the
+        // query takes it), then bind in the same order the placeholders
+        // were written. `format!` + `push_str` is infallible — the house
+        // rule forbids `unwrap`/`expect` outside tests.
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
+        let mut sql = String::from(
+            "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
+             serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
+             revoked_at, revocation_reason, source, created_at \
+             FROM certificates WHERE tenant_id = $1",
+        );
+        let mut next = 2usize; // the next placeholder's 1-based index
+
+        if filter.status.is_some() {
+            sql.push_str(&format!(" AND status = ${next}"));
+            next += 1;
+        }
+        if filter.profile_name.is_some() {
+            sql.push_str(&format!(" AND profile_name = ${next}"));
+            next += 1;
+        }
+        if filter.ca_id.is_some() {
+            sql.push_str(&format!(" AND ca_id = ${next}"));
+            next += 1;
+        }
+        if filter.search.is_some() {
+            sql.push_str(&format!(
+                " AND (subject ILIKE ${next} OR serial_hex ILIKE ${next} \
+                 OR EXISTS (SELECT 1 FROM unnest(san_dns) d WHERE d ILIKE ${next}))"
+            ));
+            // The pattern is ONE parameter slot (reused at its three
+            // references) — it still advances the placeholder counter.
+            next += 1;
+        }
+        sql.push_str(&format!(
+            " ORDER BY not_after DESC LIMIT ${next} OFFSET ${}",
+            next + 1
+        ));
+
+        let mut query = sqlx::query_as::<_, CertificateRow>(&sql).bind(tenant_id);
+        if let Some(status) = &filter.status {
+            query = query.bind(status.as_str());
+        }
+        if let Some(profile_name) = &filter.profile_name {
+            query = query.bind(profile_name);
+        }
+        if let Some(ca_id) = filter.ca_id {
+            query = query.bind(ca_id);
+        }
+        if let Some(search) = &filter.search {
+            // One bind, reused at three placeholders.
+            query = query.bind(format!("%{}%", search));
+        }
+        let query = query.bind(limit).bind(offset);
+
+        let rows = query.fetch_all(executor).await?;
+        rows.into_iter()
+            .map(CertificateRow::try_into_model)
+            .collect::<Result<Vec<_>, CoreError>>()
+    }
+
+    /// The estate's headline counts in ONE round trip: the `FILTER`ed
+    /// `COUNT(*)` aggregates (active, revoked, and active-and-expiring
+    /// before `expiring_before`) over the tenant's rows. Counts are never
+    /// `NULL` and never negative; the `BIGINT` values arrive as `i64` and
+    /// are converted typed.
+    pub async fn statistics(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        expiring_before: DateTime<Utc>,
+    ) -> Result<CertificateStatistics, CoreError> {
+        let (active, revoked, expiring_soon) = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT CAST(COUNT(*) FILTER (WHERE status = 'active') AS BIGINT), \
+             CAST(COUNT(*) FILTER (WHERE status = 'revoked') AS BIGINT), \
+             CAST(COUNT(*) FILTER (WHERE status = 'active' AND not_after < $1) AS BIGINT) \
+             FROM certificates WHERE tenant_id = $2",
+        )
+        .bind(expiring_before)
+        .bind(tenant_id)
+        .fetch_one(executor)
+        .await?;
+
+        let count = |value: i64| -> Result<u64, CoreError> {
+            u64::try_from(value)
+                .map_err(|_| CoreError::Config("negative certificate count".to_string()))
+        };
+        Ok(CertificateStatistics {
+            active: count(active)?,
+            revoked: count(revoked)?,
+            expiring_soon: count(expiring_soon)?,
+        })
     }
 
     /// Revoke a certificate: `status='active'` rows flip to `revoked` with

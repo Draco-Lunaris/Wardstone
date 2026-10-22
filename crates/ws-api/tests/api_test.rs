@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::Router;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -2029,4 +2029,247 @@ async fn profile_creation_refuses_the_star_dot_pattern() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The filtered listing and estate statistics (Plan 3 Task 1)
+// ---------------------------------------------------------------------------
+
+/// Create a profile named `name` permitting the `*.example.test` SAN
+/// wildcard, through the API; returns the profile id.
+async fn create_filter_profile(fixture: &Fixture, token: &str, name: &str) -> Uuid {
+    let res = post_json(
+        fixture,
+        "/api/v1/profiles",
+        Some(token),
+        json!({
+            "name": name,
+            "description": "the filtered-listing fixture profile",
+            "key_type": "ecdsa-p256",
+            "key_usages": ["digital_signature"],
+            "eku": ["server_auth"],
+            "lifetime_days": 30,
+            "san_patterns": ["*.example.test"]
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create profile {name}");
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    body["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+}
+
+/// A GET request's parsed JSON body (the response must be 200).
+async fn get_json(fixture: &Fixture, uri: &str, token: &str) -> Value {
+    let res = get_bearer(fixture, uri, token).await;
+    assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+    let raw = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&raw).unwrap()
+}
+
+/// The certificates list composes its filter parameters: `status`, `profile`
+/// (the profile NAME), `q` (subject | serial_hex | certificate SAN), and
+/// `ca` (the issuing CA id). A revoked certificate is matched by its
+/// profile, by a serial-hex search, and excluded by `status=active`; an
+/// unknown CA id matches nothing; an unparseable status is a 400.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn filtered_listing_matches_status_profile_search_and_ca() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    // Two profiles whose NAMES the profile filter keys on, one CA.
+    let web_server = create_filter_profile(&fx, &token, "web-server").await;
+    let web_server_ecdsa = create_filter_profile(&fx, &token, "web-server-ecdsa").await;
+    let res = post_json(
+        &fx,
+        "/api/v1/cas",
+        Some(&token),
+        json!({
+            "name": "filter-root-ca",
+            "subject": "Wardstone Filter Root",
+            "key_type": "ed25519",
+            "is_root": true
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create the filter CA");
+
+    // A: active, profile web-server, SAN a.example.test.
+    let (a_status, a_body) =
+        issue_csr(&fx, web_server, "a.example.test", &["a.example.test"]).await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_id = a_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let a_serial_hex = a_body["serial_hex"].as_str().unwrap().to_string();
+
+    // B: revoked, profile web-server-ecdsa, SAN b.example.test.
+    let (b_status, b_body) =
+        issue_csr(&fx, web_server_ecdsa, "b.example.test", &["b.example.test"]).await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_id = b_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let b_serial_hex = b_body["serial_hex"].as_str().unwrap().to_string();
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{b_id}/revoke"),
+        Some(&token),
+        json!({"reason": "filter fixture revoke"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke B");
+
+    // Every list query runs BEFORE cleanup (the self-cleaning contract).
+    let unfiltered = get_json(&fx, "/api/v1/certificates", &token).await;
+    let by_status = get_json(&fx, "/api/v1/certificates?status=active", &token).await;
+    let by_profile = get_json(&fx, "/api/v1/certificates?profile=web-server-ecdsa", &token).await;
+    let q_san = get_json(&fx, "/api/v1/certificates?q=a.example.test", &token).await;
+    // The serial-hex search needle: a PREFIX of B's hex — extended to the
+    // full hex only if the (random) short prefix also appears in A's.
+    let mut needle: String = b_serial_hex.chars().take(10).collect();
+    if a_serial_hex.contains(&needle) {
+        needle = b_serial_hex.clone();
+    }
+    let q_serial = get_json(&fx, &format!("/api/v1/certificates?q={needle}"), &token).await;
+    let by_other_ca = get_json(
+        &fx,
+        &format!("/api/v1/certificates?ca={}", Uuid::new_v4()),
+        &token,
+    )
+    .await;
+    let bad_status_res = get_bearer(&fx, "/api/v1/certificates?status=bogus", &token).await;
+    let bad_status = bad_status_res.status();
+    let raw = axum::body::to_bytes(bad_status_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let bad_status_body: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    fx.cleanup().await;
+
+    let ids = |list: &Value| -> Vec<Uuid> {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect()
+    };
+
+    assert_eq!(ids(&unfiltered), vec![a_id, b_id], "no filter lists both");
+    assert_eq!(
+        ids(&by_status),
+        vec![a_id],
+        "status=active lists only the active certificate"
+    );
+    assert_eq!(
+        ids(&by_profile),
+        vec![b_id],
+        "profile=web-server-ecdsa lists only B"
+    );
+    assert_eq!(ids(&q_san), vec![a_id], "the SAN search matches only A");
+    assert_eq!(
+        ids(&q_serial),
+        vec![b_id],
+        "the serial-hex search matches only B"
+    );
+    assert!(
+        ids(&by_other_ca).is_empty(),
+        "an unknown CA id matches nothing"
+    );
+    assert_eq!(
+        bad_status,
+        StatusCode::BAD_REQUEST,
+        "an unknown status is 400"
+    );
+    assert_eq!(
+        error_code(&bad_status_body),
+        "bad_request",
+        "the invalid-status code"
+    );
+}
+
+/// The estate statistics endpoint counts, in one response: active,
+/// revoked, and active-and-expiring-within-the-30-day horizon. Four
+/// certificates are issued and their `not_after` pinned by direct row
+/// update so the horizon is deterministic: A (+10d) and D (+5d) expire
+/// soon, B (+40d) does not, C is revoked.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn statistics_counts_active_revoked_expiring() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let token = admin_token(&fx);
+
+    // Issue four certificates through the API (the CSR path).
+    let mut cert_ids = Vec::new();
+    for cn in [
+        "a.wardstone.test",
+        "b.wardstone.test",
+        "c.wardstone.test",
+        "d.wardstone.test",
+    ] {
+        let (status, body) = issue_csr(&fx, profile_id, cn, &[cn]).await;
+        assert_eq!(status, StatusCode::OK, "issue {cn}: {body}");
+        cert_ids.push(
+            body["certificate_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+    }
+
+    // Pin the expiries: A +10d, B +40d, D +5d (C stays profile-expired and
+    // is revoked below — revoked rows sit outside the horizon either way).
+    let expiry_legs = [
+        (cert_ids[0], Duration::days(10)),
+        (cert_ids[1], Duration::days(40)),
+        (cert_ids[3], Duration::days(5)),
+    ];
+    for (id, leg) in expiry_legs {
+        sqlx::query("UPDATE certificates SET not_after = $2 WHERE id = $1")
+            .bind(id)
+            .bind(Utc::now() + leg)
+            .execute(&fx.pool)
+            .await
+            .expect("pin the certificate expiry");
+    }
+
+    // Revoke C.
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{}/revoke", cert_ids[2]),
+        Some(&token),
+        json!({"reason": "statistics fixture revoke"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke C");
+
+    // The statistics GET runs BEFORE cleanup.
+    let res = get_bearer(&fx, "/api/v1/certificates/statistics", &token).await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let stats: Value = serde_json::from_slice(&raw).unwrap_or(json!({}));
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK, "the statistics route answers");
+    assert_eq!(stats["active"], 3, "A, B, D are active");
+    assert_eq!(stats["revoked"], 1, "C is revoked");
+    assert_eq!(
+        stats["expiring_soon"], 2,
+        "A (+10d) and D (+5d) expire within the 30-day horizon"
+    );
 }

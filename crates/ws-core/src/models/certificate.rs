@@ -63,7 +63,6 @@ impl FromStr for CertStatus {
 }
 
 /// One row of `certificates`: an issued leaf certificate owned by a tenant.
-///
 /// `serial` is the certificate's integer serial — stored in the
 /// `serial bigint` column (the repository converts; a value beyond i64 is
 /// a typed error, never a wrapping cast) and carried here as `u128` to
@@ -116,6 +115,34 @@ pub struct CertificateModel {
     pub source: String,
     /// Row creation time (database `now()` default).
     pub created_at: DateTime<Utc>,
+}
+
+/// The composed filter of `CertificateRepo::list_filtered`. Every field
+/// optional; a `None` field contributes no WHERE clause.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CertificateFilter {
+    /// Match rows whose lifecycle status equals this (`active`/`revoked`).
+    pub status: Option<CertStatus>,
+    /// Match rows whose profile label equals this (the display form).
+    pub profile_name: Option<String>,
+    /// Match rows issued by this CA.
+    pub ca_id: Option<Uuid>,
+    /// Substring search across subject, serial hex, and DNS SANs.
+    pub search: Option<String>,
+}
+
+/// The estate statistics the dashboard tiles read:
+/// `GET /api/v1/certificates/statistics` (Plan 3 Task 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CertificateStatistics {
+    /// Certificates whose status is `active`.
+    pub active: u64,
+    /// Certificates whose status is `revoked`.
+    pub revoked: u64,
+    /// Active certificates whose `not_after` falls before the caller's
+    /// expiry horizon (the route pins now + 30 days).
+    pub expiring_soon: u64,
 }
 
 /// # Unit tests

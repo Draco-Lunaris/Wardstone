@@ -52,7 +52,9 @@ use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
 use ws_ca::serial::allocate_serial;
 use ws_core::error::CoreError;
 use ws_core::models::ca::CaModel;
-use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_core::models::certificate::{
+    CertStatus, CertificateFilter, CertificateModel, CertificateStatistics,
+};
 use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::models::rbac::{Actor, Capability, KeyUsagePurpose};
 use ws_core::profile_match::san_is_permitted;
@@ -64,7 +66,7 @@ use ws_core::repo::profile_repo::ProfileRepo;
 
 use crate::auth_middleware::AuthActor;
 use crate::error::ApiError;
-use crate::routes::{audit_entry, audit_entry_with_id, json_no_store, ListQuery};
+use crate::routes::{audit_entry, audit_entry_with_id, json_no_store};
 use crate::state::AppState;
 
 /// How many times the issuance attempts against a (possibly moved) profile
@@ -75,6 +77,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(issue_certificate).get(list_certificates))
         .route("/pull", post(issue_certificate_one_shot))
+        // Exact-match wins anyway, but the literal `/statistics` is pinned
+        // BEFORE `/{id}` so the router reads in the order the routes nest.
+        .route("/statistics", get(certificate_statistics))
         .route("/{id}", get(get_certificate))
         .route("/{id}/revoke", post(revoke_certificate))
 }
@@ -832,21 +837,87 @@ pub async fn pull_certificate(
     ))
 }
 
-/// `GET /api/v1/certificates` — one page, `read_certificates`.
+/// The `GET /api/v1/certificates` query: the shared paging fields plus the
+/// filter keys, all optional. `status` parses through `CertStatus`; `ca`
+/// must deserialize as a UUID.
+#[derive(Debug, Deserialize, Default)]
+pub struct CertificateListQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub status: Option<String>,
+    /// The profile NAME filter (the display label).
+    pub profile: Option<String>,
+    /// The issuing CA id filter.
+    #[serde(default)]
+    pub ca: Option<Uuid>,
+    /// Substring search across subject | serial_hex | certificate SANs.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+impl CertificateListQuery {
+    /// The defaults are the shared [`ListQuery`] ones: page 0, page size
+    /// 100 (clamped repo-side at 500 by `ws_core::repo::paging`).
+    pub fn page(&self) -> u32 {
+        self.page.unwrap_or(0)
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size.unwrap_or(100)
+    }
+}
+
+/// `GET /api/v1/certificates` — one page, `read_certificates`, through the
+/// composed [`CertificateFilter`] (a filter axis applies only when its
+/// query parameter is present). An unparseable `status` is a 400 — it never
+/// silently degenerates to "no filter".
 async fn list_certificates(
     auth: AuthActor,
     State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<CertificateListQuery>,
 ) -> Result<Json<Vec<CertificateResponse>>, ApiError> {
     auth.require(Capability::ReadCertificates)
         .map_err(ApiError::from)?;
+    let status = match query.status.as_deref() {
+        Some(raw) => Some(
+            raw.parse::<CertStatus>()
+                .map_err(|_| ApiError::bad_request("invalid status value"))?,
+        ),
+        None => None,
+    };
+    // The paging values are read BEFORE the filter consumes the query's
+    // fields (a partial move would borrow back the struct after it).
+    let (page, page_size) = (query.page(), query.page_size());
+    let filter = CertificateFilter {
+        status,
+        profile_name: query.profile,
+        ca_id: query.ca,
+        search: query.q,
+    };
     let certs = CertificateRepo::new()
-        .list_by_tenant(&state.pool, auth.tenant_id, query.page(), query.page_size())
+        .list_filtered(&state.pool, auth.tenant_id, &filter, page, page_size)
         .await?
         .iter()
         .map(CertificateResponse::from_model)
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(certs))
+}
+
+/// `GET /api/v1/certificates/statistics` — the estate's headline counts,
+/// `read_certificates`. The 30-day expiry horizon is pinned HERE (the repo
+/// method stays pure): "expiring soon" means an ACTIVE certificate whose
+/// `not_after` falls before now + 30 days.
+async fn certificate_statistics(
+    auth: AuthActor,
+    State(state): State<AppState>,
+) -> Result<Json<CertificateStatistics>, ApiError> {
+    auth.require(Capability::ReadCertificates)
+        .map_err(ApiError::from)?;
+    let expiring_before = Utc::now() + Duration::days(30);
+    let statistics = CertificateRepo::new()
+        .statistics(&state.pool, auth.tenant_id, expiring_before)
+        .await?;
+    Ok(Json(statistics))
 }
 
 /// `GET /api/v1/certificates/{id}` — one certificate, `read_certificates`.
