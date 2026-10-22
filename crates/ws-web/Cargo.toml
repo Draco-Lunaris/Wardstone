@@ -88,3 +88,12 @@ tower = { workspace = true }
 # Parsing the minted setup certificate in the tests (self-signedness,
 # SAN, DER fingerprint checks).
 x509-parser = { workspace = true }
+# Task 19's OIDC provider fixture (tests/common/oidc_provider.rs) signs
+# the loopback provider's id_token RS256 — the exact algorithm ws-auth's
+# `identity_from_response` verifies against the fixture JWKS. The
+# workspace pin (ws-auth's own signer/verifier, `rust_crypto` feature),
+# DEV-ONLY: no production binary gains the signing dependency through it.
+jsonwebtoken = { workspace = true }
+# The fixture keypair's modulus bytes → the JWK `n` (base64url).
+# (base64 itself is a regular dependency above; the URL-safe engine rides
+# the same crate.)
