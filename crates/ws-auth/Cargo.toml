@@ -28,3 +28,8 @@ zeroize = { workspace = true }
 thiserror = { workspace = true }
 # Claims carry UUIDs: user_id and the refresh-token session id (sid).
 uuid = { workspace = true, features = ["serde"] }
+# The shared access vocabulary (capabilities, roles, actor types) lives in
+# ws-core — the schema owner; a ws-core dependency on ws-auth instead
+# would be a Cargo cycle. Task 1 deferred this edge; re-exports it at the
+# crate root.
+ws-core = { path = "../ws-core" }

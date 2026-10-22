@@ -1,70 +1,17 @@
-//! The audit-log domain model (`audit_log` rows) and its actor types.
-
-use std::fmt;
-use std::str::FromStr;
+//! The audit-log domain model (`audit_log` rows).
+//!
+//! The actor type on every row is the shared access vocabulary's
+//! [`ActorType`], defined once in [`crate::models::rbac`] and re-exported
+//! here — publicly, because `ws-worker` and `ws-core`'s own audit repo
+//! name this path (`models::audit::ActorType`) — so an audit row's stored
+//! actor type and an actor's own type can never disagree.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
-/// Who performed an audited action, mirroring the `actor_type` text column
-/// of `audit_log`. The column stores [`ActorType::as_str`]; rows read back
-/// through [`ActorType::from_str`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActorType {
-    /// A human operator of the Wardstone web UI.
-    User,
-    /// An ACME client account.
-    AcmeAccount,
-    /// The Wardstone system itself (worker jobs, scheduler).
-    System,
-}
-
-impl ActorType {
-    /// The value stored in the `actor_type` column (`snake_case` variant
-    /// name).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ActorType::User => "user",
-            ActorType::AcmeAccount => "acme_account",
-            ActorType::System => "system",
-        }
-    }
-}
-
-impl fmt::Display for ActorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Error from parsing an unknown `actor_type` column value into an
-/// [`ActorType`] (via `FromStr`); carries the offending string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownActorType(pub String);
-
-impl fmt::Display for UnknownActorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown actor type: {:?}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownActorType {}
-
-impl FromStr for ActorType {
-    type Err = UnknownActorType;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "user" => Ok(ActorType::User),
-            "acme_account" => Ok(ActorType::AcmeAccount),
-            "system" => Ok(ActorType::System),
-            other => Err(UnknownActorType(other.to_string())),
-        }
-    }
-}
+pub use crate::models::rbac::ActorType;
 
 /// One row of `audit_log`: an append-only record of a security-relevant
 /// event, scoped to a tenant.
@@ -103,7 +50,8 @@ pub struct AuditEntry {
 /// # Unit tests
 #[cfg(test)]
 mod tests {
-    use super::{ActorType, UnknownActorType};
+    use super::ActorType;
+    use crate::models::rbac::UnknownActorType;
 
     #[test]
     fn actor_type_roundtrip() {

@@ -19,6 +19,15 @@ pub enum CoreError {
     /// A unique constraint was violated (e.g. inserting an existing name).
     #[error("duplicate resource")]
     Duplicate,
+    /// An actor attempted an action outside its capability set
+    /// ([`ws_core::models::rbac::Actor::require`]). The API layer maps
+    /// this to HTTP 403.
+    #[error("forbidden")]
+    Forbidden,
+    /// Cryptographic work failed (secret sealing/opening, os-entropy
+    /// exhaustion). Messages are static and never carry key material.
+    #[error("crypto error: {0}")]
+    Crypto(String),
     /// A configuration or environment problem detected at runtime.
     #[error("config error: {0}")]
     Config(String),
