@@ -14,6 +14,7 @@ pub mod cas;
 pub mod certificates;
 pub mod credentials;
 pub mod health;
+pub mod oidc;
 pub mod profiles;
 pub mod root_trust;
 pub mod tenants;
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/one-shot-tokens", credentials::one_shot_tokens_router())
         .nest("/tenants", tenants::router())
         .nest("/root-trust", root_trust::router())
+        .nest("/oidc", oidc::router())
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(health::metrics));
 
