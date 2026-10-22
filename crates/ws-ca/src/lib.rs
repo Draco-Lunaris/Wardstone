@@ -6,6 +6,7 @@ pub mod crl;
 pub mod error;
 pub mod issue;
 pub mod keystore;
+pub mod leafkey;
 pub mod ocsp;
 pub mod serial;
 

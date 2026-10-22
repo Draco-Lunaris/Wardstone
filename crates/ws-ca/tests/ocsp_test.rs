@@ -29,8 +29,11 @@ use chrono::{Duration, Utc};
 use sha1::{Digest, Sha1};
 use ws_ca::ca::{create_root, CaLifetime, CaSpec, CreatedCa, KeyType};
 use ws_ca::crl::CrlReason;
-use ws_ca::issue::{sign_leaf_with, IssuedLeaf, LeafSpec, SanEntry};
+use ws_ca::issue::{
+    sign_leaf_with, ExtKeyUsagePurpose, IssuedLeaf, KeyUsagePurpose, LeafSpec, SanEntry,
+};
 use ws_ca::keystore::KeyStore;
+use ws_ca::leafkey::LeafKeyType;
 use ws_ca::ocsp::{build_ocsp_response, OcspResponseSpec, OcspStatus};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::parse_x509_pem;
@@ -81,8 +84,10 @@ fn issue_leaf(root: &CreatedCa) -> IssuedLeaf {
         &mint_csr("leaf.example"),
         &LeafSpec {
             sans: vec![SanEntry::Dns("leaf.example".to_owned())],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            not_after: Some(Utc::now() + Duration::days(30)),
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: Duration::days(30),
             subject_cn: None,
             serial: LEAF_SERIAL,
         },

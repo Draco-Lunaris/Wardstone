@@ -59,8 +59,9 @@ use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use ws_ca::ca::{create_root, create_sub_ca, CaLifetime, CaSpec, KeyType};
-use ws_ca::issue::{sign_leaf_with, LeafSpec, SanEntry};
+use ws_ca::issue::{sign_leaf_with, ExtKeyUsagePurpose, KeyUsagePurpose, LeafSpec, SanEntry};
 use ws_ca::keystore::KeyStore;
+use ws_ca::leafkey::LeafKeyType;
 use ws_ca::serial::allocate_serial;
 use ws_core::db::connect;
 use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
@@ -528,8 +529,10 @@ async fn test_end_to_end_ca_forest() {
         &csr_pem,
         &LeafSpec {
             sans: vec![SanEntry::Dns(LEAF_SAN.to_owned())],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            not_after: Some(Utc::now() + Duration::days(30)),
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: Duration::days(30),
             subject_cn: None,
             serial,
         },
