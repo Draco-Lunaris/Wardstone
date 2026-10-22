@@ -23,9 +23,14 @@ import {
 } from "../lib/certs";
 import { selectExpiringSoon, statCards } from "../lib/stats";
 
-/** One estate page of active certificates to sieve client-side — far
- * past any real 30-day expiry burst. */
-const ACTIVE_DASHBOARD_PAGE = 100;
+/** The active-certificate page the sieve reads: 500 is the repo's clamp
+ * (crates/ws-core/src/repo/mod.rs `paging`). The certificates list
+ * orders by `not_after DESC` — furthest expiry FIRST — so the
+ * within-30-day rows sit at the ordering's bottom: a full page means
+ * more active certificates may exist beyond the sieve, and the list,
+ * then shown with an explicit "may be incomplete" warning, defers to the
+ * statistics tile above as the authoritative count. */
+const ACTIVE_DASHBOARD_PAGE = 500;
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -41,6 +46,9 @@ export default function Dashboard() {
 
   const [stats, setStats] = useState<CertificateStatistics | null>(null);
   const [expiring, setExpiring] = useState<Certificate[] | null>(null);
+  // True when the sieve's source page came back FULL — at the 500 clamp
+  // that means actives may exist beyond the window the sieve saw.
+  const [expiringPageFull, setExpiringPageFull] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
 
   useEffect(() => {
@@ -49,6 +57,7 @@ export default function Dashboard() {
     }
     let cancelled = false;
     setError(null);
+    setExpiringPageFull(false);
     const statistics = fetchCertificateStatistics();
     const active = fetchCertificates({ status: "active", pageSize: ACTIVE_DASHBOARD_PAGE });
     statistics
@@ -60,7 +69,10 @@ export default function Dashboard() {
       });
     active
       .then((rows) => {
-        if (!cancelled) setExpiring(selectExpiringSoon(rows));
+        if (!cancelled) {
+          setExpiring(selectExpiringSoon(rows));
+          setExpiringPageFull(rows.length >= ACTIVE_DASHBOARD_PAGE);
+        }
       })
       .catch((caught) => {
         if (!cancelled) setFirstError(caught, setError);
@@ -114,6 +126,13 @@ export default function Dashboard() {
       {error && (
         <p className="error-panel" role="alert">
           {error.message}
+        </p>
+      )}
+      {expiringPageFull && (
+        <p className="muted" role="note">
+          More than {ACTIVE_DASHBOARD_PAGE} active certificates exist, so this list reads only
+          the first page and may be incomplete — the "Expiring within 30 days" tile above is
+          the authoritative count.
         </p>
       )}
       {expiring === null && !error && <p className="muted">Loading…</p>}
