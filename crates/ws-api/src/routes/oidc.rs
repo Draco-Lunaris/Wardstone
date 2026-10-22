@@ -3,11 +3,15 @@
 //! "test" route the UI's test button drives.
 //!
 //! The login-side OIDC flow is public and lives in `auth.rs`
-//! (`/auth/oidc/*`); this module is purely the management surface. Every
-//! route on it is `manage_system`: provider configuration rewrites the
-//! tenant's login surface, which is system administration. The routes
-//! operate on the AUTHENTICATED actor's tenant (the configuration row's
-//! primary key is `tenant_id`) — never a path parameter.
+//! (`/auth/oidc/*`); this module is the management surface — every route
+//! on it EXCEPT the one-line status flag is `manage_system`: provider
+//! configuration rewrites the tenant's login surface, which is system
+//! administration. The management routes operate on the AUTHENTICATED
+//! actor's tenant (the configuration row's primary key is `tenant_id`)
+//! — never a path parameter. `GET /config/status` is the deliberate
+//! exception: PUBLIC, read-only, answering whether SSO is configured
+//! with no capability gate (the pre-auth login page's flag — see
+//! [`config_status`]).
 //!
 //! The `client_secret` never leaves the server: the read response carries
 //! `client_secret_set: bool` only, and the audit details carry
@@ -18,15 +22,18 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use ws_auth::oidc::{discover, OidcConfig};
 use ws_core::models::credential::OidcConfigModel;
 use ws_core::models::rbac::Capability;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::oidc_repo::OidcConfigRepo;
+use ws_core::repo::tenant_repo::TenantRepo;
 
 use crate::auth_middleware::AuthActor;
 use crate::error::ApiError;
+use crate::routes::auth::primary_tenant;
 use crate::routes::{audit_entry, json_no_store};
 use crate::state::AppState;
 
@@ -41,7 +48,42 @@ pub fn router() -> Router<AppState> {
             "/config",
             get(get_config).put(put_config).delete(delete_config),
         )
+        .route("/config/status", get(config_status))
         .route("/config/test", post(test_config))
+}
+
+/// `GET /api/v1/oidc/config/status` — PUBLIC: the login page's SSO flag.
+///
+/// Why it carries no capability gate and no `AuthActor` (a deliberate
+/// exception on an otherwise all-`manage_system` module): the flag is
+/// read BEFORE any session exists — ws-web's `/auth/ui/config` relay
+/// probes this route with NO browser credentials by design, so gating it
+/// behind `manage_system` would permanently 401 every pre-auth probe and
+/// hide the login page's "Sign in with SSO" button forever. Read-only
+/// (a bare repo GET) and secret-free: the answer carries `provider_type`
+/// ONLY when a configuration exists, and NEVER `client_id`,
+/// `redirect_uri`, `discovery_url`, or secret material — exactly the one
+/// question "is SSO configured, and under which provider label does the
+/// start route resolve `{provider}`". The tenant is resolved the same
+/// way the OTHER public login-side route resolves it —
+/// [`primary_tenant`] (the install's first-created tenant), the rule
+/// `GET /auth/oidc/{provider}/start` shares — so the flag the SSO button
+/// navigates with describes exactly the flow it starts, on the tenant
+/// the login form's sibling flow operates on.
+async fn config_status(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, ApiError> {
+    let tenant = primary_tenant(&TenantRepo::new(), &state.pool).await?;
+    match OidcConfigRepo::new().get(&state.pool, tenant.id).await? {
+        Some(row) => Ok(json_no_store(json!({
+            "configured": true,
+            "provider_type": row.provider_type,
+        }))),
+        None => Ok(json_no_store(json!({
+            "configured": false,
+            "provider_type": serde_json::Value::Null,
+        }))),
+    }
 }
 
 /// The provider configuration, as the UI reads it — never the secret.

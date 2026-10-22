@@ -175,12 +175,22 @@ async fn fixture() -> Fixture {
     sweep_tenant(&pool, OIDC_TENANT).await;
 
     let tenant_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
-        .bind(tenant_id)
-        .bind(OIDC_TENANT)
-        .execute(&pool)
-        .await
-        .expect("insert fixture tenant");
+    // The fixture tenant MUST resolve as the database-wide OLDEST: the
+    // PUBLIC login-side routes (login, OIDC start, the config status
+    // flag) pick the acting tenant with `primary_tenant` — `oldest` by
+    // `created_at`, never an actor — so a realistic, far-in-the-past
+    // `created_at` pins that resolution deterministically even on the
+    // shared database (a lingering tenant a crashed run left behind can
+    // never beat 1970).
+    sqlx::query(
+        "INSERT INTO tenants (id, name, created_at) \
+         VALUES ($1, $2, '1970-01-01T00:00:00Z'::timestamptz)",
+    )
+    .bind(tenant_id)
+    .bind(OIDC_TENANT)
+    .execute(&pool)
+    .await
+    .expect("insert fixture tenant");
 
     let admin_id = Uuid::new_v4();
     insert_user(&pool, tenant_id, admin_id).await;
@@ -461,6 +471,82 @@ async fn get_unconfigured_is_404() {
     assert_eq!(error_code(&body), "not_found");
 
     fx.cleanup().await;
+}
+
+/// The PUBLIC status flag: an UNAUTHENTICATED GET (no Authorization
+/// header, no capability) answers `{"configured": false,
+/// "provider_type": null}` when no provider row exists. The pre-auth
+/// login page's flag must never 401 — that is the whole point of it.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn status_is_public_and_false_when_unset() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/oidc/config/status")
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    let res = send(&fx, req).await;
+
+    assert_eq!(res.status(), StatusCode::OK, "public: no bearer, no gate");
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("header text")),
+        Some("no-store"),
+        "the status answer is no-store"
+    );
+    let body = json_body(res).await;
+    fx.cleanup().await;
+    assert_eq!(body, json!({ "configured": false, "provider_type": null }));
+}
+
+/// The PUBLIC status flag, CONFIGURED side: with a provider row in place
+/// (seeded by the ManageSystem PUT — the flag's READER is unauthenticated,
+/// its WRITER never is), the unauthenticated GET answers
+/// `{"configured": true, "provider_type": "keycloak"}` and leaks nothing
+/// else — no client_id, no redirect_uri, no discovery URL, no secret.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn status_is_public_and_true_with_provider_label_when_configured() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), config_body()).await;
+    assert_eq!(res.status(), StatusCode::OK, "the seed put must succeed");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/oidc/config/status")
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    let res = send(&fx, req).await;
+
+    assert_eq!(res.status(), StatusCode::OK, "public: no bearer, no gate");
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("header text")),
+        Some("no-store")
+    );
+    let body = json_body(res).await;
+    fx.cleanup().await;
+
+    assert_eq!(
+        body,
+        json!({ "configured": true, "provider_type": "keycloak" })
+    );
+    let text = serde_json::to_string(&body).expect("serialize the status body");
+    assert!(
+        !text.contains("ws_test_secret_material")
+            && !text.contains("wardstone")
+            && !text.contains("sso.wardstone.test")
+            && !text.contains("callback"),
+        "the status flag carries ONLY configured+provider_type: {text}"
+    );
 }
 
 /// A valid PUT round-trips through GET; `client_secret_set` is true and

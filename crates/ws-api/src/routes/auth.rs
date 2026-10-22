@@ -107,8 +107,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// setup flow made) — never "first by name", which is an accident of
 /// `list`'s display order, not an install fact. A fresh database with no
 /// tenant is a 404 — setup has not run. ONE helper so every call site
-/// shares the same resolution rule.
-async fn primary_tenant(
+/// shares the same resolution rule. `pub(crate)` because the OIDC
+/// config's PUBLIC status route (`routes/oidc.rs::config_status`) shares
+/// it — the SSO flag must describe the same tenant the SSO flow runs on.
+pub(crate) async fn primary_tenant(
     repo: &TenantRepo,
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<Tenant, ApiError> {
