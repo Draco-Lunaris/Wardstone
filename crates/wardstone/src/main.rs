@@ -388,6 +388,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
             fingerprint,
             hostname,
             &cfg.api_url,
+            ws_web::DEFAULT_SESSION_TTL,
         )
         .await?;
         return serve_ui(cfg, router, &cert_pem, &key).await;
@@ -466,6 +467,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         fingerprint,
         hostname,
         &cfg.api_url,
+        ws_web::DEFAULT_SESSION_TTL,
     )
     .await?;
     serve_ui(cfg, router, &cert_pem, &key_der).await

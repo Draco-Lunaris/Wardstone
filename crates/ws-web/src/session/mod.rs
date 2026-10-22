@@ -2,9 +2,19 @@
 //! session cookie's wire form, and reading the session id back out of an
 //! incoming request's headers.
 //!
-//! This task (11) ships ONLY the cookie helpers. Task 12 wires the
-//! session store around them (issue, revocation, the per-IP limiter keyed
-//! by the ConnectInfo this crate now serves).
+//! Task 11 shipped the cookie helpers. Task 12 wires the session store
+//! (`store`) and the `/auth/ui` relay routes (`relay`) around them: the
+//! JWT pair a browser session owns lives ONLY in ws-web's memory (entries
+//! die on restart — strictly tighter than any cookie-carries-token
+//! shape), the cookie's opaque id is minted at login, `Authorization` is
+//! injected on every proxied request, rotation runs through one locked
+//! ws-api refresh, and logout revokes server-side and clears.
+
+pub mod relay;
+pub mod store;
+
+pub use relay::{relay_router, RelayState};
+pub use store::{SessionEntry, SessionStore};
 
 use axum::http::{header, HeaderMap};
 use uuid::Uuid;
@@ -39,6 +49,14 @@ pub const CSRF_HEADER_VALUE: &str = "wardstone-ui";
 /// - `Path=/` — every part of the served SPA talks through the same proxy.
 pub fn build_session_cookie(session_id: &str) -> String {
     format!("{SESSION_COOKIE}={session_id}; HttpOnly; Secure; SameSite=Lax; Path=/")
+}
+
+/// Build the `Set-Cookie` VALUE for a logout: the same cookie with an
+/// empty value and `Max-Age=0` — the wire form that makes the browser drop
+/// it immediately, keeping the four flags so the deletion behaves exactly
+/// like the setting did.
+pub fn build_session_cookie_clear() -> String {
+    format!("{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Path=/")
 }
 
 /// Read the session id a request presents: the first
@@ -92,6 +110,11 @@ mod tests {
         assert_eq!(
             build_session_cookie(id),
             format!("{SESSION_COOKIE}={id}; HttpOnly; Secure; SameSite=Lax; Path=/")
+        );
+        // The logout form: empty value, Max-Age=0, same flags.
+        assert_eq!(
+            build_session_cookie_clear(),
+            format!("{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Path=/")
         );
     }
 

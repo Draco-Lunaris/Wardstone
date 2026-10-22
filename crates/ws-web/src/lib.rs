@@ -38,30 +38,73 @@ pub mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use axum::Extension;
 use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sqlx::PgPool;
 use ws_ca::error::CaError;
 
+use session::relay::relay_router;
+use session::store::SessionStore;
+
 pub use proxy::api_router;
 pub use setup::{run_setup, setup_router, tenant_exists, SetupFields, SetupState};
 
+/// The default server-side access-token lifetime ws-web bookkeeps (15
+/// minutes, matching ws-api's JWT access-token TTL): past this stamp the
+/// proxy rotates proactively through one locked refresh. The `wardstone`
+/// binary passes this value at [`web_router`]; env override is a Task 13
+/// concern. Tests pass `Duration::ZERO` (always rotate).
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
+
 /// The front-door router a fresh (`ui`-mode) process serves: the setup
 /// surface ONLY while the default tenant does not exist, plus the
-/// `/api/v1` proxy in every phase. The caller checks nothing — this
-/// function performs the `tenant_exists` check itself, so mounting (not
-/// refusal) is the unmount mechanism: with the tenant present there is no
-/// `/setup` route at all and a request to it is a plain 404.
+/// `/api/v1` proxy and the `/auth/ui` session relay in every phase. The
+/// caller checks nothing — this function performs the `tenant_exists`
+/// check itself, so mounting (not refusal) is the unmount mechanism: with
+/// the tenant present there is no `/setup` route at all and a request to
+/// it is a plain 404.
+///
+/// The session store is constructed here with `session_access_ttl` (the
+/// 15-minute [`DEFAULT_SESSION_TTL`] for the binary); tests that need a
+/// handle on the SAME store instance use [`web_router_with_store`].
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
     api_base_url: &str,
+    session_access_ttl: Duration,
 ) -> Result<Router, CaError> {
-    let mut app = api_router(api_base_url);
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl));
+    web_router_with_store(pool, keys_dir, fingerprint, hostname, api_base_url, store).await
+}
+
+/// [`web_router`] with the caller owning the `Arc<SessionStore>` instance:
+/// ws-web's relay routes and the proxy's Authorization injection MUST see
+/// the SAME store (one instance answers login-minting and request-time
+/// token reads) — this constructor is the pin that makes "same Arc"
+/// structural instead of a promise, and it is how the session_test suite
+/// inspects store contents alongside a live router.
+pub async fn web_router_with_store(
+    pool: PgPool,
+    keys_dir: PathBuf,
+    fingerprint: String,
+    hostname: String,
+    api_base_url: &str,
+    store: std::sync::Arc<SessionStore>,
+) -> Result<Router, CaError> {
+    // The ONE store instance rides BOTH routers: as the relay routes'
+    // state (mint/rotate/kill) and as an Extension on the proxy router
+    // (read-only injection). The `Option<Extension<_>>` extractor in the
+    // proxy handler keeps `api_router` usable standalone (no store: zero
+    // injection, the machine-token surface is untouched).
+    let api = api_router(api_base_url).layer(Extension(store.clone()));
+    let relay = relay_router(store, api_base_url);
+    let mut app = Router::new().merge(relay).merge(api);
     if !tenant_exists(&pool).await? {
         app = app.merge(setup_router(SetupState {
             pool,
@@ -72,10 +115,10 @@ pub async fn web_router(
     }
     // The SPA router rides LAST: `fallback_service` runs only when no
     // earlier route matched (the precedence the ui-serve suite pins), so
-    // the API proxy and the setup surface above are never masked. A Router
-    // is itself a fallback Service — `ui::ui_router()` carries its own
-    // route tree (`/`, `/assets/*`, the SPA catch-all) and its own
-    // routing.
+    // the API proxy, the relay, and the setup surface above are never
+    // masked. A Router is itself a fallback Service — `ui::ui_router()`
+    // carries its own route tree (`/`, `/assets/*`, the SPA catch-all) and
+    // its own routing.
     Ok(app.fallback_service(ui::ui_router()))
 }
 

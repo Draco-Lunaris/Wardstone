@@ -510,6 +510,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         "http://127.0.0.1:9", // intentionally nothing listens here
+        ws_web::DEFAULT_SESSION_TTL,
     )
     .await
     .expect("the front-door router builds while unconfigured");
@@ -547,6 +548,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         "http://127.0.0.1:9",
+        ws_web::DEFAULT_SESSION_TTL,
     )
     .await
     .expect("the front-door router builds after setup");
@@ -713,6 +715,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         "http://127.0.0.1:9", // intentionally nothing listens here
+        ws_web::DEFAULT_SESSION_TTL,
     )
     .await
     .expect("the front-door router builds after the refusal");

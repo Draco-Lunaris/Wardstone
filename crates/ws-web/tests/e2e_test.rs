@@ -551,6 +551,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         "http://127.0.0.1:9", // intentionally nothing listens here
+        ws_web::DEFAULT_SESSION_TTL,
     )
     .await
     .expect("the front-door router builds after setup");
