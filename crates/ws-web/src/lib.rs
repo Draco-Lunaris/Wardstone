@@ -62,6 +62,14 @@ pub use setup::{
 /// concern. Tests pass `Duration::ZERO` (always rotate).
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
 
+/// The default server-side idle-eviction window ws-web bookkeeps: an entry
+/// nobody has touched for six hours (`get`, a login insert, or a token
+/// rotation all touch) is dropped from the store the next time anything
+/// reads it. This is memory hygiene for forgotten browser tabs, not
+/// revocation: the ws-api refresh token a dropped entry carried stays valid
+/// under the stateless-JWT model. Env override is a Task 13 concern.
+pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
+
 /// The front-door router a fresh (`ui`-mode) process serves: the setup
 /// surface ONLY while the default tenant does not exist, plus the
 /// `/api/v1` proxy and the `/auth/ui` session relay in every phase. The
@@ -93,7 +101,7 @@ pub async fn web_router(
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
-    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl));
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
     web_router_with_store(
         pool,
         keys_dir,

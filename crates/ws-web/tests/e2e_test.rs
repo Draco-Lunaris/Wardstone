@@ -351,7 +351,10 @@ async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Rou
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
         api_base,
-        Arc::new(SessionStore::new(ws_web::DEFAULT_SESSION_TTL)),
+        Arc::new(SessionStore::new(
+            ws_web::DEFAULT_SESSION_TTL,
+            ws_web::DEFAULT_IDLE_EVICTION,
+        )),
         None,
     )
     .await

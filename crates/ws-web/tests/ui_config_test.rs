@@ -48,7 +48,10 @@ async fn spawn_stub(status: StatusCode, body: &'static str) -> String {
 /// other non-DB suites) and unpack the answer body as JSON.
 async fn config_answer(base: &str) -> (StatusCode, Value, Option<String>) {
     let router = relay_router(
-        Arc::new(SessionStore::new(Duration::from_secs(60))),
+        Arc::new(SessionStore::new(
+            Duration::from_secs(60),
+            ws_web::DEFAULT_IDLE_EVICTION,
+        )),
         base,
         None,
     );

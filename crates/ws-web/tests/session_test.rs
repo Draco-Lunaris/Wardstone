@@ -302,7 +302,7 @@ async fn env(ttl: Duration) -> TestEnv {
     ));
     let api_base = spawn_api(api_router.clone()).await;
 
-    let store = Arc::new(SessionStore::new(ttl));
+    let store = Arc::new(SessionStore::new(ttl, ws_web::DEFAULT_IDLE_EVICTION));
     let web = web_router_with_store(
         pool.clone(),
         keys_dir.clone(),

@@ -66,7 +66,10 @@ const PEER_B: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// the test's `rate_limit` choice.
 fn relay_router_for(rate_limit: Option<AuthRateLimit>) -> axum::Router {
     relay_router(
-        std::sync::Arc::new(SessionStore::new(std::time::Duration::from_secs(60))),
+        std::sync::Arc::new(SessionStore::new(
+            std::time::Duration::from_secs(60),
+            ws_web::DEFAULT_IDLE_EVICTION,
+        )),
         DEAD_API,
         rate_limit,
     )
@@ -78,7 +81,10 @@ fn relay_router_for(rate_limit: Option<AuthRateLimit>) -> axum::Router {
 /// store, the dead upstream, and the test's `rate_limit` choice.
 fn composed_router_for(rate_limit: Option<AuthRateLimit>) -> axum::Router {
     session_router_with_store(
-        std::sync::Arc::new(SessionStore::new(std::time::Duration::from_secs(60))),
+        std::sync::Arc::new(SessionStore::new(
+            std::time::Duration::from_secs(60),
+            ws_web::DEFAULT_IDLE_EVICTION,
+        )),
         DEAD_API,
         rate_limit,
     )
