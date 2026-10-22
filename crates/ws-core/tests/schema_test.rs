@@ -466,3 +466,449 @@ async fn role_capabilities_is_seeded() {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// ACME schema tests (migration 011). They run against this suite's existing
+// advisory key and own their tenant names exclusively; cleanup deletes their
+// rows (children first) before any assertion.
+// ---------------------------------------------------------------------------
+
+/// Every table migration 011 must have created, per the plan.
+const ACME_TABLES: [&str; 4] = [
+    "acme_accounts",
+    "acme_orders",
+    "acme_authorizations",
+    "acme_challenges",
+];
+
+/// The composite tenant-consistency foreign keys of migration 011 (006's
+/// idiom): constraint name -> the child column pair it keys. Each is
+/// DEFERRABLE INITIALLY DEFERRED, and each references its parent's
+/// `(id, tenant_id)` — which is why the parent tables carry their own
+/// `(id, tenant_id)` unique constraints.
+const ACME_COMPOSITE_FKS: [(&str, &str); 3] = [
+    (
+        "acme_orders_account_tenant_fk",
+        "FOREIGN KEY (account_id, tenant_id)",
+    ),
+    (
+        "acme_authorizations_account_tenant_fk",
+        "FOREIGN KEY (account_id, tenant_id)",
+    ),
+    (
+        "acme_challenges_authorization_tenant_fk",
+        "FOREIGN KEY (authorization_id, tenant_id)",
+    ),
+];
+
+/// Tenant names the ACME schema tests own; deleted before asserts (children
+/// first, then the tenants).
+const ACME_SCHEMA_TENANT: &str = "rt-schema-acme";
+const ACME_FK_TENANT_A: &str = "rt-schema-acme-fk-a";
+const ACME_FK_TENANT_B: &str = "rt-schema-acme-fk-b";
+
+/// Delete every row the ACME schema tests own, children before parents, by
+/// tenant name — the pre-run sweep AND the assert-first cleanup.
+async fn sweep_acme_schema_rows(pool: &PgPool, tenant_names: &[&str]) {
+    sqlx::query("DELETE FROM acme_challenges WHERE tenant_id IN (SELECT id FROM tenants WHERE name = ANY($1))")
+        .bind(tenant_names)
+        .execute(pool)
+        .await
+        .expect("sweep acme_challenges rows");
+    sqlx::query("DELETE FROM acme_authorizations WHERE tenant_id IN (SELECT id FROM tenants WHERE name = ANY($1))")
+        .bind(tenant_names)
+        .execute(pool)
+        .await
+        .expect("sweep acme_authorizations rows");
+    sqlx::query(
+        "DELETE FROM acme_orders WHERE tenant_id IN (SELECT id FROM tenants WHERE name = ANY($1))",
+    )
+    .bind(tenant_names)
+    .execute(pool)
+    .await
+    .expect("sweep acme_orders rows");
+    sqlx::query("DELETE FROM acme_accounts WHERE tenant_id IN (SELECT id FROM tenants WHERE name = ANY($1))")
+        .bind(tenant_names)
+        .execute(pool)
+        .await
+        .expect("sweep acme_accounts rows");
+    sqlx::query("DELETE FROM tenants WHERE name = ANY($1)")
+        .bind(tenant_names)
+        .execute(pool)
+        .await
+        .expect("sweep test tenants");
+}
+
+/// The Postgres error code of a query failure, when it is a database
+/// error at all (`None` for connection/decode failures).
+fn pg_error_code(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(|e| e.code().as_deref().map(str::to_string))
+}
+
+/// After `connect()`, every ACME table of migration 011 exists, and each of
+/// the three composite tenant-consistency foreign keys exists with its
+/// pinned name, keys on the pinned column pair, references its parent's
+/// composite `(id, tenant_id)` key, and is DEFERRABLE — the 006 idiom,
+/// which is what makes the cross-tenant test below able to defer the
+/// refusal to COMMIT.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_tables_and_composite_fks_exist() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    let mut existences = Vec::new();
+    for table in ACME_TABLES {
+        existences.push((table, table_exists(&pool, table).await));
+    }
+    let mut constraints = Vec::new();
+    for (name, _) in ACME_COMPOSITE_FKS {
+        let definition: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(c.oid, true) FROM pg_constraint c \
+             WHERE c.conrelid::regclass::text LIKE 'acme_%' \
+               AND c.conname = $1 AND c.contype = 'f'",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("query the composite FK constraint definitions");
+        constraints.push((name, definition));
+    }
+
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    for (table, exists) in &existences {
+        assert!(exists, "table {table} must exist after migration 011");
+    }
+    for (name, definition) in &constraints {
+        let definition = definition
+            .as_deref()
+            .unwrap_or_else(|| panic!("constraint {name} must exist after migration 011"));
+        assert!(
+            definition.contains("DEFERRABLE"),
+            "{name} must be DEFERRABLE INITIALLY DEFERRED, got: {definition}"
+        );
+        assert!(
+            definition.contains("REFERENCES"),
+            "{name} must reference its parent's (id, tenant_id), got: {definition}"
+        );
+    }
+    for (name, key_columns) in ACME_COMPOSITE_FKS {
+        let (_, definition) = constraints
+            .iter()
+            .find(|(constraint_name, _)| constraint_name == &name)
+            .expect("the constraint was fetched above");
+        let definition = definition
+            .as_deref()
+            .expect("the constraint must exist (asserted above)");
+        assert!(
+            definition.contains(key_columns),
+            "{name} must key on {key_columns:?}, got: {definition}"
+        );
+    }
+}
+
+/// Every `status` (and `challenge_type`) CHECK of migration 011 rejects an
+/// unknown value with a `check_violation` (23514) — the database backstop
+/// behind the `ws_core::models::acme` enums — while a valid row set (an
+/// account, an order, an authorization, both challenge flavors) goes
+/// through. Sweeps and cleans up its own tenant; asserts after cleanup.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_status_checks_reject_unknown_values() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_acme_schema_rows(&pool, &[ACME_SCHEMA_TENANT]).await;
+
+    let tenant: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (name) VALUES ($1) RETURNING id")
+            .bind(ACME_SCHEMA_TENANT)
+            .fetch_one(&pool)
+            .await
+            .expect("insert the check test tenant");
+    let account_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_accounts (tenant_id, jwk_thumbprint, jwk, status) \
+         VALUES ($1, 'schema-check-thumb', $2, 'valid') RETURNING id",
+    )
+    .bind(tenant)
+    .bind(serde_json::json!({ "kty": "EC", "crv": "P-256", "x": "a", "y": "b" }))
+    .fetch_one(&pool)
+    .await
+    .expect("insert the baseline valid account");
+    let _order_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_orders (tenant_id, account_id, status, profile_name, \
+         identifiers, expires_at, created_at) \
+         VALUES ($1, $2, 'pending', 'web-server', $3, now() + interval '30 days', now()) \
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(account_id)
+    .bind(serde_json::json!([{ "type": "dns", "value": "checks.example" }]))
+    .fetch_one(&pool)
+    .await
+    .expect("insert the baseline valid order");
+    let authz_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_authorizations (tenant_id, account_id, identifier, status, \
+         expires_at, created_at) \
+         VALUES ($1, $2, 'checks.example', 'pending', now() + interval '30 days', now()) \
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert the baseline valid authorization");
+
+    // The five rejections: an unknown value on each of the four `status`
+    // columns and on the `challenge_type` column. Each is its own statement
+    // so one rejection never poisons the others.
+    let bad_account = sqlx::query(
+        "INSERT INTO acme_accounts (tenant_id, jwk_thumbprint, jwk, status) \
+         VALUES ($1, 'schema-check-bad', $2, 'cancelled')",
+    )
+    .bind(tenant)
+    .bind(serde_json::json!({ "kty": "EC" }))
+    .execute(&pool)
+    .await;
+    let bad_order = sqlx::query(
+        "INSERT INTO acme_orders (tenant_id, account_id, status, profile_name, \
+         identifiers, expires_at, created_at) \
+         VALUES ($1, $2, 'quarantined', 'web-server', $3, now(), now())",
+    )
+    .bind(tenant)
+    .bind(account_id)
+    .bind(serde_json::json!([]))
+    .execute(&pool)
+    .await;
+    let bad_authorization = sqlx::query(
+        "INSERT INTO acme_authorizations (tenant_id, account_id, identifier, status, \
+         expires_at, created_at) \
+         VALUES ($1, $2, 'checks.example', 'quarantined', now(), now())",
+    )
+    .bind(tenant)
+    .bind(account_id)
+    .execute(&pool)
+    .await;
+    let bad_challenge_type = sqlx::query(
+        "INSERT INTO acme_challenges (tenant_id, authorization_id, challenge_type, \
+         token, status, created_at) VALUES ($1, $2, 'rsa', 't', 'pending', now())",
+    )
+    .bind(tenant)
+    .bind(authz_id)
+    .execute(&pool)
+    .await;
+    let bad_challenge_status = sqlx::query(
+        "INSERT INTO acme_challenges (tenant_id, authorization_id, challenge_type, \
+         token, status, created_at) VALUES ($1, $2, 'http-01', 't2', 'quarantined', now())",
+    )
+    .bind(tenant)
+    .bind(authz_id)
+    .execute(&pool)
+    .await;
+
+    sweep_acme_schema_rows(&pool, &[ACME_SCHEMA_TENANT]).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    // Cleanup happened above; the rejections stand on their own now.
+    for (label, result) in [
+        ("acme_accounts.status", bad_account),
+        ("acme_orders.status", bad_order),
+        ("acme_authorizations.status", bad_authorization),
+        ("acme_challenges.challenge_type", bad_challenge_type),
+        ("acme_challenges.status", bad_challenge_status),
+    ] {
+        match result {
+            Ok(_) => panic!("{label}: an unknown value must violate the CHECK constraint"),
+            Err(err) => assert_eq!(
+                pg_error_code(&err).as_deref(),
+                Some("23514"),
+                "{label}: expected check_violation (23514), got {err:?}"
+            ),
+        }
+    }
+}
+
+/// The composite tenant-consistency foreign keys DEFER their check to
+/// COMMIT: a cross-tenant child inserts per-statement cleanly but is
+/// refused at COMMIT with `foreign_key_violation` (23503) — for each of the
+/// three children — while a fully consistent chain (account, order,
+/// authorization, challenge, all one tenant, minted in ONE transaction in
+/// parent-before-child order) COMMITS. The 006-era precedent, replayed on
+/// the ACME chain. Sweeps and cleans up its own tenants; asserts after
+/// cleanup.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_composite_fk_refuses_cross_tenant_child_at_commit() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    let tenants = [ACME_FK_TENANT_A, ACME_FK_TENANT_B];
+    sweep_acme_schema_rows(&pool, &tenants).await;
+
+    let tenant_a: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (name) VALUES ($1) RETURNING id")
+            .bind(ACME_FK_TENANT_A)
+            .fetch_one(&pool)
+            .await
+            .expect("insert FK tenant A");
+    let tenant_b: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (name) VALUES ($1) RETURNING id")
+            .bind(ACME_FK_TENANT_B)
+            .fetch_one(&pool)
+            .await
+            .expect("insert FK tenant B");
+    let account_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_accounts (tenant_id, jwk_thumbprint, jwk, status) \
+         VALUES ($1, 'schema-fk-thumb', $2, 'valid') RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(serde_json::json!({ "kty": "EC", "crv": "P-256", "x": "a", "y": "b" }))
+    .fetch_one(&pool)
+    .await
+    .expect("insert the tenant-A account");
+    let authorization_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_authorizations (tenant_id, account_id, identifier, status, \
+         expires_at, created_at) \
+         VALUES ($1, $2, 'fks.example', 'pending', now() + interval '30 days', now()) \
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert the tenant-A authorization");
+
+    // Cross-tenant ORDER: tenant B's row naming tenant A's account. The
+    // deferred FK lets the statements through; COMMIT must refuse.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin the cross-tenant order transaction");
+    sqlx::query(
+        "INSERT INTO acme_orders (tenant_id, account_id, status, profile_name, \
+         identifiers, expires_at, created_at) \
+         VALUES ($1, $2, 'pending', 'web-server', $3, now() + interval '30 days', now())",
+    )
+    .bind(tenant_b)
+    .bind(account_id)
+    .bind(serde_json::json!([]))
+    .execute(&mut *tx)
+    .await
+    .expect("the deferred FK lets the statement through");
+    let order_refused = tx.commit().await;
+
+    // Cross-tenant AUTHORIZATION: the same, on acme_authorizations.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin the cross-tenant authorization transaction");
+    sqlx::query(
+        "INSERT INTO acme_authorizations (tenant_id, account_id, identifier, status, \
+         expires_at, created_at) \
+         VALUES ($1, $2, 'fks.example', 'pending', now() + interval '30 days', now())",
+    )
+    .bind(tenant_b)
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await
+    .expect("the deferred FK lets the statement through");
+    let authorization_refused = tx.commit().await;
+
+    // Cross-tenant CHALLENGE: a tenant-B row naming tenant A's
+    // authorization — the third composite chain link.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin the cross-tenant challenge transaction");
+    sqlx::query(
+        "INSERT INTO acme_challenges (tenant_id, authorization_id, challenge_type, \
+         token, status, created_at) VALUES ($1, $2, 'http-01', 't', 'pending', now())",
+    )
+    .bind(tenant_b)
+    .bind(authorization_id)
+    .execute(&mut *tx)
+    .await
+    .expect("the deferred FK lets the statement through");
+    let challenge_refused = tx.commit().await;
+
+    // The consistent chain: everything tenant A, minted in ONE transaction
+    // (account was already committed above; order, authorization, and
+    // challenge mint together), commits — and the deferral is what let the
+    // cross-tenant statements stand un-refuted until their COMMIT.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin the consistent-chain transaction");
+    let consistent_order: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_orders (tenant_id, account_id, status, profile_name, \
+         identifiers, expires_at, created_at) \
+         VALUES ($1, $2, 'pending', 'web-server', $3, now() + interval '30 days', now()) \
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(account_id)
+    .bind(serde_json::json!([{ "type": "dns", "value": "fks.example" }]))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert the consistent order");
+    let consistent_authz: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_authorizations (tenant_id, account_id, identifier, status, \
+         expires_at, created_at) \
+         VALUES ($1, $2, 'fks.example', 'pending', now() + interval '30 days', now()) \
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert the consistent authorization");
+    let consistent_challenge: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO acme_challenges (tenant_id, authorization_id, challenge_type, \
+         token, status, created_at) VALUES ($1, $2, 'dns-01', 't', 'pending', now()) \
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(consistent_authz)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert the consistent challenge");
+    tx.commit().await.expect("the consistent chain commits");
+
+    sweep_acme_schema_rows(&pool, &tenants).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let order_refused = order_refused.expect_err("a cross-tenant order must be refused at COMMIT");
+    let authorization_refused =
+        authorization_refused.expect_err("a cross-tenant authorization must be refused at COMMIT");
+    let challenge_refused =
+        challenge_refused.expect_err("a cross-tenant challenge must be refused at COMMIT");
+    assert_eq!(
+        pg_error_code(&order_refused).as_deref(),
+        Some("23503"),
+        "expected foreign_key_violation for the cross-tenant order, got {order_refused:?}"
+    );
+    assert_eq!(
+        pg_error_code(&authorization_refused).as_deref(),
+        Some("23503"),
+        "expected foreign_key_violation for the cross-tenant authorization, got {authorization_refused:?}"
+    );
+    assert_eq!(
+        pg_error_code(&challenge_refused).as_deref(),
+        Some("23503"),
+        "expected foreign_key_violation for the cross-tenant challenge, got {challenge_refused:?}"
+    );
+    assert!(
+        !consistent_order.is_nil() && !consistent_authz.is_nil() && !consistent_challenge.is_nil(),
+        "the consistent chain committed (its ids came back non-nil)"
+    );
+}

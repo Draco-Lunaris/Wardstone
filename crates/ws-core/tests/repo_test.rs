@@ -46,6 +46,10 @@ use tokio::sync::Mutex;
 
 use ws_core::db::connect;
 use ws_core::error::CoreError;
+use ws_core::models::acme::{
+    AcmeAccountModel, AcmeAccountStatus, AcmeAuthorizationModel, AcmeAuthorizationStatus,
+    AcmeChallengeModel, AcmeChallengeStatus, AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
+};
 use ws_core::models::audit::{ActorType, AuditEntry, AuthMethod};
 use ws_core::models::ca::{CaModel, KeyType};
 use ws_core::models::certificate::{CertStatus, CertificateFilter, CertificateModel};
@@ -56,6 +60,7 @@ use ws_core::models::ocsp::{OcspResponseModel, OcspStatus};
 use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::models::rbac::{Capability, Role};
 use ws_core::models::user::UserModel;
+use ws_core::repo::acme_repo::AcmeRepo;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
@@ -129,6 +134,23 @@ const ADVISORY_KEY_OCSP: i64 = 0x0057_4144_5354_0007;
 /// — then the CA, then the tenant).
 const OCSP_TENANT: &str = "rt-ocsp-tenant";
 const OCSP_CA_NAME: &str = "rt-ocsp-ca";
+
+/// Tenant name the ACME-repo tests own; deleted before asserts (challenges
+/// first, then authorizations, orders, accounts, certificates, CAs, tenant).
+/// The tests JOIN the suite's EXISTING base advisory key [`ADVISORY_KEY`]
+/// (marker 0x0003): the plan's advisory table mints keys for NEW suites
+/// only (0014 starts with ws-api's acme_test.rs in Task 5), and a joined
+/// test whose rows live under a tenant name nothing else touches only ever
+/// serializes against the key's other holders — it can never interleave
+/// rows with them.
+const ACME_TENANT: &str = "rt-acme-tenant";
+
+/// The CA name and certificate serial the ACME-repo tests own (unique per
+/// tenant; the certificate row backs the `certificate_id` the finalize
+/// path stamps into `acme_orders.certificate_id`, which is a real foreign
+/// key and must name an existing certificate).
+const ACME_CA_NAME: &str = "rt-acme-ca";
+const ACME_SERIAL: u128 = 0xacce_0001;
 
 /// In-process serialization, the same whole-body lock pattern as
 /// `db_test.rs`: the harness runs tests on separate threads. A tokio mutex
@@ -2637,5 +2659,484 @@ async fn plan1_repos_execute_against_a_transaction_and_the_pool() {
     assert!(
         listing[0].created_at >= listing[1].created_at,
         "created_at desc order"
+    );
+}
+// ---------------------------------------------------------------------------
+// ACME-repo tests (migration 011). They JOIN this suite's base advisory key
+// [`ADVISORY_KEY`] — see the `ACME_TENANT` constant's comment for the
+// reasoning — and own every `acme_*`, `certificates`, and `cas` row under
+// their tenant name exclusively.
+// ---------------------------------------------------------------------------
+
+/// Delete every row the ACME tests own, children before parents, by the
+/// suite-owned tenant name. Used for the pre-run sweep AND the assert-first
+/// cleanup — the same statement order both times, so a failing assert can
+/// never leave a row behind.
+async fn sweep_acme_rows(pool: &PgPool, tenant_name: &str) {
+    sqlx::query(
+        "DELETE FROM acme_challenges WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(tenant_name)
+    .execute(pool)
+    .await
+    .expect("sweep acme_challenges rows");
+    sqlx::query("DELETE FROM acme_authorizations WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind(tenant_name)
+        .execute(pool)
+        .await
+        .expect("sweep acme_authorizations rows");
+    sqlx::query(
+        "DELETE FROM acme_orders WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(tenant_name)
+    .execute(pool)
+    .await
+    .expect("sweep acme_orders rows");
+    sqlx::query(
+        "DELETE FROM acme_accounts WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(tenant_name)
+    .execute(pool)
+    .await
+    .expect("sweep acme_accounts rows");
+    sqlx::query(
+        "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(tenant_name)
+    .execute(pool)
+    .await
+    .expect("sweep certificates rows");
+    sqlx::query("DELETE FROM cas WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)")
+        .bind(tenant_name)
+        .execute(pool)
+        .await
+        .expect("sweep cas rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(tenant_name)
+        .execute(pool)
+        .await
+        .expect("sweep test tenant");
+}
+
+/// The CA row the ACME tests issue their certificate against (a placeholder
+/// PEM body, as across this suite).
+fn acme_ca_model(tenant_id: uuid::Uuid) -> CaModel {
+    CaModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id,
+        name: ACME_CA_NAME.to_string(),
+        subject: "CN=Wardstone Test ACME CA".to_string(),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: ts("2026-01-01T00:00:00Z"),
+        not_after: ts("2027-01-01T00:00:00Z"),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".to_string(),
+        key_file: "/var/lib/wardstone/keys/rt-acme-ca.pem".to_string(),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    }
+}
+
+/// The certificate row the finalize path's `certificate_id` stamp must name.
+fn acme_cert_model(tenant_id: uuid::Uuid, ca_id: uuid::Uuid) -> CertificateModel {
+    CertificateModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id,
+        ca_id,
+        profile_name: "default".to_string(),
+        profile_revision_id: None,
+        subject: "CN=acme-order.example".to_string(),
+        serial: ACME_SERIAL,
+        serial_hex: format!("{ACME_SERIAL:x}"),
+        san_dns: vec!["acme-order.example".to_string()],
+        san_ips: vec!["192.0.2.11".parse().expect("valid IPv4 fixture")],
+        key_type: "ed25519".to_string(),
+        not_before: ts("2026-01-01T00:00:00Z"),
+        not_after: ts("2026-12-01T00:00:00Z"),
+        cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".to_string(),
+        status: CertStatus::Active,
+        revoked_at: None,
+        revocation_reason: None,
+        revocation_detail: None,
+        source: "acme".to_string(),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    }
+}
+
+/// The full ACME-repo behavior set, one happy path at a time:
+///
+/// - `insert_account` / `get_account` / `get_account_by_id` roundtrip; a
+///   second account on the same thumbprint hits the per-tenant unique
+///   (`CoreError::Duplicate`); `update_account_status` flips the lifecycle.
+/// - `insert_order` / `get_order` roundtrip; `list_orders_by_account`
+///   paginates newest-first (`created_at DESC, id`); `update_order_status`
+///   promotes pending -> ready -> valid, stamping `certificate_id` (a real
+///   foreign key backed by the certificate row below).
+/// - `insert_authorization`; `valid_authorization_for` returns ONLY the
+///   newest account-level `valid` authorization (an order-scoped row and a
+///   newer `pending` row never shadow it) whose `expires_at` still lies
+///   past the injected `now` — and `None` once the clock passes the window.
+/// - `insert_challenge` / `get_challenge` roundtrip; `update_challenge_status`
+///   stamps both the success and the failure shapes (`validated_at`, and
+///   `error` only on the invalid path).
+///
+/// Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_repo_account_order_authorization_challenge_roundtrip() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    // Sweep debris from any previously crashed run of this suite; also
+    // proves the sweep itself can run with no tenant present.
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+
+    let tenants = TenantRepo::new();
+    let tenant = tenants
+        .insert(&pool, ACME_TENANT)
+        .await
+        .expect("insert test tenant for ACME rows");
+    let ca = acme_ca_model(tenant.id);
+    CaRepo::new()
+        .insert(&pool, &ca)
+        .await
+        .expect("insert test CA row");
+    let cert = acme_cert_model(tenant.id, ca.id);
+    CertificateRepo::new()
+        .insert(&pool, &cert)
+        .await
+        .expect("insert test certificate row");
+
+    let acme = AcmeRepo::new();
+    let account = AcmeAccountModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        jwk_thumbprint: "acme-repo-thumbprint".to_string(),
+        jwk: serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": "a", "y": "b"
+        }),
+        status: AcmeAccountStatus::Valid,
+        tos_agreed_at: Some(ts("2026-06-15T12:30:00Z")),
+        contact: Some("mailto:acme@example.com".to_string()),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    let inserted_account = acme.insert_account(&pool, &account).await;
+    let duplicate_account = acme
+        .insert_account(
+            &pool,
+            // Same (tenant_id, jwk_thumbprint), fresh id.
+            &AcmeAccountModel {
+                id: uuid::Uuid::new_v4(),
+                ..account.clone()
+            },
+        )
+        .await;
+    let fetched_account = acme
+        .get_account(&pool, tenant.id, "acme-repo-thumbprint")
+        .await;
+    let fetched_by_id = acme.get_account_by_id(&pool, tenant.id, account.id).await;
+    let status_flipped = acme
+        .update_account_status(&pool, tenant.id, account.id, AcmeAccountStatus::Pending)
+        .await;
+    let account_after_flip = acme
+        .get_account_by_id(&pool, tenant.id, account.id)
+        .await
+        .expect("get account after the status flip");
+
+    // Three orders on the account, newest first by created_at.
+    let make_order = |id: uuid::Uuid, created_at: DateTime<Utc>| AcmeOrderModel {
+        id,
+        tenant_id: tenant.id,
+        account_id: account.id,
+        status: AcmeOrderStatus::Pending,
+        profile_name: "web-server".to_string(),
+        identifiers: serde_json::json!([{ "type": "dns", "value": "example.com" }]),
+        csr_pem: None,
+        not_before: None,
+        not_after: None,
+        certificate_id: None,
+        error: None,
+        expires_at: ts("2026-09-15T00:00:00Z"),
+        created_at,
+    };
+    let order_new = make_order(uuid::Uuid::new_v4(), ts("2026-06-15T12:30:00Z"));
+    let order_mid = make_order(uuid::Uuid::new_v4(), ts("2026-06-14T12:30:00Z"));
+    let order_old = make_order(uuid::Uuid::new_v4(), ts("2026-06-13T12:30:00Z"));
+    for order in [&order_new, &order_mid, &order_old] {
+        acme.insert_order(&pool, order)
+            .await
+            .expect("insert order row");
+    }
+    let fetched_order = acme.get_order(&pool, tenant.id, order_new.id).await;
+    let order_page = acme
+        .list_orders_by_account(&pool, tenant.id, account.id, 0, 2)
+        .await;
+    let order_page_two = acme
+        .list_orders_by_account(&pool, tenant.id, account.id, 1, 2)
+        .await;
+
+    let ready_promoted = acme
+        .update_order_status(
+            &pool,
+            tenant.id,
+            order_new.id,
+            AcmeOrderStatus::Ready,
+            None,
+            None,
+        )
+        .await;
+    let order_ready = acme
+        .get_order(&pool, tenant.id, order_new.id)
+        .await
+        .expect("get order after the ready promotion")
+        .expect("row present after the ready promotion");
+    let finalized = acme
+        .update_order_status(
+            &pool,
+            tenant.id,
+            order_new.id,
+            AcmeOrderStatus::Valid,
+            Some(cert.id),
+            None,
+        )
+        .await;
+    let order_final = acme
+        .get_order(&pool, tenant.id, order_new.id)
+        .await
+        .expect("get order after the finalize stamp")
+        .expect("row present after the finalize stamp");
+
+    // Authorizations: two account-level `valid` rows on the same identifier
+    // (a reuse row and its older sibling), one newer `pending`, one
+    // order-scoped `valid` — the lookup may only ever surface the FIRST.
+    let make_authz = |id: uuid::Uuid,
+                      created_at: DateTime<Utc>,
+                      status: AcmeAuthorizationStatus,
+                      order_id: Option<uuid::Uuid>,
+                      identifier: &str| AcmeAuthorizationModel {
+        id,
+        tenant_id: tenant.id,
+        account_id: account.id,
+        identifier: identifier.to_string(),
+        status,
+        expires_at: ts("2026-09-15T00:00:00Z"),
+        reused_from: None,
+        order_id,
+        created_at,
+    };
+    let authz_reuse_new = make_authz(
+        uuid::Uuid::new_v4(),
+        ts("2026-06-15T12:00:00Z"),
+        AcmeAuthorizationStatus::Valid,
+        None,
+        "reused.example",
+    );
+    let authz_reuse_old = make_authz(
+        uuid::Uuid::new_v4(),
+        ts("2026-06-15T11:00:00Z"),
+        AcmeAuthorizationStatus::Valid,
+        None,
+        "reused.example",
+    );
+    let authz_pending = make_authz(
+        uuid::Uuid::new_v4(),
+        ts("2026-06-15T12:10:00Z"),
+        AcmeAuthorizationStatus::Pending,
+        None,
+        "reused.example",
+    );
+    let authz_order_scoped = make_authz(
+        uuid::Uuid::new_v4(),
+        ts("2026-06-15T12:20:00Z"),
+        AcmeAuthorizationStatus::Valid,
+        Some(order_new.id),
+        "reused.example",
+    );
+    for authz in [
+        &authz_reuse_new,
+        &authz_reuse_old,
+        &authz_pending,
+        &authz_order_scoped,
+    ] {
+        acme.insert_authorization(&pool, authz)
+            .await
+            .expect("insert authorization row");
+    }
+    let reused_now = acme
+        .valid_authorization_for(
+            &pool,
+            tenant.id,
+            account.id,
+            "reused.example",
+            ts("2026-06-15T12:15:00Z"),
+        )
+        .await;
+    let reused_after_window = acme
+        .valid_authorization_for(
+            &pool,
+            tenant.id,
+            account.id,
+            "reused.example",
+            ts("2026-10-01T00:00:00Z"),
+        )
+        .await;
+    let reused_wrong_identifier = acme
+        .valid_authorization_for(
+            &pool,
+            tenant.id,
+            account.id,
+            "other.example",
+            ts("2026-06-15T12:15:00Z"),
+        )
+        .await;
+
+    // Challenges: both flavors on the pending authorization; one decided
+    // valid, one invalid with a reason.
+    let make_challenge =
+        |id: uuid::Uuid, challenge_type: AcmeChallengeType, token: &str| AcmeChallengeModel {
+            id,
+            tenant_id: tenant.id,
+            authorization_id: authz_pending.id,
+            challenge_type,
+            token: token.to_string(),
+            status: AcmeChallengeStatus::Pending,
+            validated_at: None,
+            error: None,
+            created_at: ts("2026-06-15T12:30:00Z"),
+        };
+    let challenge_http = make_challenge(
+        uuid::Uuid::new_v4(),
+        AcmeChallengeType::Http01,
+        "token-http",
+    );
+    let challenge_dns = make_challenge(uuid::Uuid::new_v4(), AcmeChallengeType::Dns01, "token-dns");
+    acme.insert_challenge(&pool, &challenge_http)
+        .await
+        .expect("insert http-01 challenge row");
+    acme.insert_challenge(&pool, &challenge_dns)
+        .await
+        .expect("insert dns-01 challenge row");
+    let fetched_challenge = acme
+        .get_challenge(&pool, tenant.id, challenge_http.id)
+        .await;
+    let validated = acme
+        .update_challenge_status(
+            &pool,
+            tenant.id,
+            challenge_http.id,
+            AcmeChallengeStatus::Valid,
+            Some(ts("2026-06-15T12:35:00Z")),
+            None,
+        )
+        .await;
+    let challenge_after_validation = acme
+        .get_challenge(&pool, tenant.id, challenge_http.id)
+        .await
+        .expect("get challenge after the valid decision")
+        .expect("row present after the valid decision");
+    let failed = acme
+        .update_challenge_status(
+            &pool,
+            tenant.id,
+            challenge_dns.id,
+            AcmeChallengeStatus::Invalid,
+            Some(ts("2026-06-15T12:36:00Z")),
+            Some("DNS lookup failed"),
+        )
+        .await;
+    let challenge_after_failure = acme
+        .get_challenge(&pool, tenant.id, challenge_dns.id)
+        .await
+        .expect("get challenge after the invalid decision")
+        .expect("row present after the invalid decision");
+
+    // Cleanup BEFORE asserting: children first, then the tenant.
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    inserted_account.expect("insert ACME account");
+    assert!(
+        matches!(duplicate_account, Err(CoreError::Duplicate)),
+        "a second account on the same (tenant, thumbprint) must be a Duplicate: {duplicate_account:?}"
+    );
+    let fetched_account = fetched_account
+        .expect("get_account")
+        .expect("row present after insert");
+    assert_eq!(fetched_account, account);
+    let fetched_by_id = fetched_by_id
+        .expect("get_account_by_id")
+        .expect("row present after insert");
+    assert_eq!(fetched_by_id, account);
+    status_flipped.expect("update_account_status");
+    assert_eq!(
+        account_after_flip
+            .expect("row present after the flip")
+            .status,
+        AcmeAccountStatus::Pending
+    );
+
+    let fetched_order = fetched_order
+        .expect("get_order")
+        .expect("row present after insert");
+    assert_eq!(fetched_order, order_new);
+    let order_page = order_page.expect("list_orders_by_account page 0");
+    assert_eq!(
+        order_page.iter().map(|o| o.id).collect::<Vec<_>>(),
+        vec![order_new.id, order_mid.id],
+        "the page holds the two newest orders, created_at DESC"
+    );
+    let order_page_two = order_page_two.expect("list_orders_by_account page 1");
+    assert_eq!(
+        order_page_two.iter().map(|o| o.id).collect::<Vec<_>>(),
+        vec![order_old.id],
+        "page 1 holds the remaining order"
+    );
+
+    ready_promoted.expect("update_order_status to ready");
+    assert_eq!(order_ready.status, AcmeOrderStatus::Ready);
+    assert_eq!(order_ready.certificate_id, None);
+    assert_eq!(order_ready.error, None);
+    finalized.expect("update_order_status to valid");
+    assert_eq!(order_final.status, AcmeOrderStatus::Valid);
+    assert_eq!(order_final.certificate_id, Some(cert.id));
+
+    let reused_now = reused_now
+        .expect("valid_authorization_for inside the window")
+        .expect("the newest account-level valid authorization is present");
+    assert_eq!(reused_now.id, authz_reuse_new.id, "newest valid wins");
+    let reused_after_window = reused_after_window.expect("valid_authorization_for late");
+    assert!(
+        reused_after_window.is_none(),
+        "past the injected clock the row is out of the reuse window"
+    );
+    let reused_wrong_identifier =
+        reused_wrong_identifier.expect("valid_authorization_for other identifier");
+    assert!(
+        reused_wrong_identifier.is_none(),
+        "no row on a foreign identifier"
+    );
+
+    let fetched_challenge = fetched_challenge
+        .expect("get_challenge")
+        .expect("row present after insert");
+    assert_eq!(fetched_challenge, challenge_http);
+    validated.expect("update_challenge_status to valid");
+    assert_eq!(
+        challenge_after_validation.status,
+        AcmeChallengeStatus::Valid
+    );
+    assert_eq!(
+        challenge_after_validation.validated_at,
+        Some(ts("2026-06-15T12:35:00Z"))
+    );
+    assert_eq!(challenge_after_validation.error, None);
+    failed.expect("update_challenge_status to invalid");
+    assert_eq!(challenge_after_failure.status, AcmeChallengeStatus::Invalid);
+    assert_eq!(
+        challenge_after_failure.error,
+        Some("DNS lookup failed".to_string())
     );
 }
