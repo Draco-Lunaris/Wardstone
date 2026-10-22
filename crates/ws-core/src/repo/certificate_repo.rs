@@ -44,6 +44,7 @@ struct CertificateRow {
     status: String,
     revoked_at: Option<DateTime<Utc>>,
     revocation_reason: Option<String>,
+    revocation_detail: Option<String>,
     source: String,
     created_at: DateTime<Utc>,
 }
@@ -79,9 +80,9 @@ impl CertificateRepo {
             "INSERT INTO certificates (id, tenant_id, ca_id, profile_name, \
              profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at) \
+             revoked_at, revocation_reason, revocation_detail, source, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19)",
+             $17, $18, $19, $20)",
         )
         .bind(cert.id)
         .bind(cert.tenant_id)
@@ -100,6 +101,7 @@ impl CertificateRepo {
         .bind(cert.status.as_str())
         .bind(cert.revoked_at)
         .bind(cert.revocation_reason.as_deref())
+        .bind(cert.revocation_detail.as_deref())
         .bind(&cert.source)
         .bind(cert.created_at)
         .execute(executor)
@@ -117,7 +119,7 @@ impl CertificateRepo {
         let row: Option<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at FROM certificates WHERE id = $1",
+             revoked_at, revocation_reason, revocation_detail, source, created_at FROM certificates WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(executor)
@@ -144,7 +146,7 @@ impl CertificateRepo {
         let rows: Vec<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at \
+             revoked_at, revocation_reason, revocation_detail, source, created_at \
              FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC \
              LIMIT $2 OFFSET $3",
         )
@@ -176,7 +178,7 @@ impl CertificateRepo {
         let rows: Vec<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at \
+             revoked_at, revocation_reason, revocation_detail, source, created_at \
              FROM certificates WHERE tenant_id = $1 AND status = 'active' \
              AND not_after < $2 ORDER BY not_after ASC LIMIT $3 OFFSET $4",
         )
@@ -218,7 +220,7 @@ impl CertificateRepo {
         let mut sql = String::from(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at \
+             revoked_at, revocation_reason, revocation_detail, source, created_at \
              FROM certificates WHERE tenant_id = $1",
         );
         let mut next = 2usize; // the next placeholder's 1-based index
@@ -305,22 +307,29 @@ impl CertificateRepo {
     }
 
     /// Revoke a certificate: `status='active'` rows flip to `revoked` with
-    /// `revoked_at = now()` and the given reason. The `AND status='active'`
-    /// guard makes a double revoke structurally idempotent — a second call
-    /// updates zero rows and still returns `Ok(())`, leaving `revoked_at`
-    /// exactly where the first call set it.
+    /// `revoked_at = now()` and the given reason and detail. The
+    /// `AND status='active'` guard makes a double revoke structurally
+    /// idempotent — a second call updates zero rows and still returns
+    /// `Ok(())`, leaving `revoked_at` AND the FIRST call's reason/detail
+    /// pair exactly where the first call set them. `reason` is a stored
+    /// RFC 5280 name (`RevocationReason::as_str`, the spelling
+    /// ws-worker's `reason_from_str` parses); `detail` is the optional
+    /// free-form note stored verbatim alongside (migration 010).
     pub async fn revoke(
         &self,
         executor: impl PgExecutor<'_>,
         id: Uuid,
         reason: &str,
+        detail: Option<&str>,
     ) -> Result<(), CoreError> {
         sqlx::query(
             "UPDATE certificates SET status = 'revoked', revoked_at = now(), \
-             revocation_reason = $2 WHERE id = $1 AND status = 'active'",
+             revocation_reason = $2, revocation_detail = $3 \
+             WHERE id = $1 AND status = 'active'",
         )
         .bind(id)
         .bind(reason)
+        .bind(detail)
         .execute(executor)
         .await?;
         Ok(())
@@ -338,7 +347,7 @@ impl CertificateRepo {
         let rows: Vec<CertificateRow> = sqlx::query_as(
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
-             revoked_at, revocation_reason, source, created_at \
+             revoked_at, revocation_reason, revocation_detail, source, created_at \
              FROM certificates WHERE ca_id = $1 AND status = 'revoked' \
              AND revoked_at >= $2 ORDER BY revoked_at",
         )
@@ -387,6 +396,7 @@ impl CertificateRow {
             status,
             revoked_at: self.revoked_at,
             revocation_reason: self.revocation_reason,
+            revocation_detail: self.revocation_detail,
             source: self.source,
             created_at: self.created_at,
         })

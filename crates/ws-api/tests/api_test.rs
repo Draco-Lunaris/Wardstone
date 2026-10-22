@@ -1276,7 +1276,7 @@ async fn capability_table_refusal_matrix() {
         (
             "POST",
             format!("/api/v1/certificates/{}/revoke", Uuid::new_v4()),
-            Some(json!({"reason": "r"})),
+            Some(json!({"reason": "superseded"})),
             Capability::Issue,
         ),
         (
@@ -1943,7 +1943,7 @@ async fn revocation_is_idempotent_and_audited() {
         &fx,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&token),
-        json!({"reason": "key compromise"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1952,7 +1952,7 @@ async fn revocation_is_idempotent_and_audited() {
         &fx,
         &format!("/api/v1/certificates/{cert_id}/revoke"),
         Some(&token),
-        json!({"reason": "key compromise"}),
+        json!({"reason": "key_compromise"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK, "revoke is idempotent");
@@ -1962,7 +1962,194 @@ async fn revocation_is_idempotent_and_audited() {
     fx.cleanup().await;
 
     assert_eq!(revoked.len(), 1, "the second revoke writes no row");
-    assert_eq!(revoked[0].3["reason"], "key compromise");
+    assert_eq!(revoked[0].3["reason"], "key_compromise");
+}
+
+/// The stored revocation reason is the exact snake_case name
+/// ws-worker's `reason_from_str` maps into `CrlReason::KeyCompromise`
+/// (the CRL/OCSP contract: worker-side, an unknown stored spelling
+/// silently yields NO reason extension). The raw row is asserted, not
+/// the API DTO, so the test pins the DB contract itself.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn typed_reason_reaches_crl_contract() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "typed.wardstone.test",
+        &["typed.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "key_compromise", "detail": null}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Capture the raw row BEFORE cleanup, then sweep.
+    let stored: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT revocation_reason, revocation_detail FROM certificates WHERE id = $1",
+    )
+    .bind(cert_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("select the revocation pair");
+    fx.cleanup().await;
+
+    let (reason, detail) = stored.expect("the certificate row exists");
+    assert_eq!(
+        reason.as_deref(),
+        Some("key_compromise"),
+        "the stored reason is the exact name worker's reason_from_str parses"
+    );
+    assert_eq!(detail.as_deref(), None, "no detail was supplied");
+}
+
+/// The optional detail round-trips: stored verbatim on the first revoke,
+/// kept on a second (idempotent revoke keeps the FIRST reason/detail
+/// pair), and visible in the certificate GET response.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revocation_detail_roundtrip() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "detail.wardstone.test",
+        &["detail.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+    let first_detail = "under investigation since the 2026-10 incident";
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "certificate_hold", "detail": first_detail}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded", "detail": "a later revoke must not win"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "revoke is idempotent");
+
+    let stored: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT revocation_reason, revocation_detail FROM certificates WHERE id = $1",
+    )
+    .bind(cert_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("select the revocation pair");
+    let get_res = get_bearer(&fx, &format!("/api/v1/certificates/{cert_id}"), &token).await;
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let get_body: Value = serde_json::from_slice(&get_body).unwrap();
+    fx.cleanup().await;
+
+    let (reason, detail) = stored.expect("the certificate row exists");
+    assert_eq!(
+        reason.as_deref(),
+        Some("certificate_hold"),
+        "a second revoke keeps the FIRST reason"
+    );
+    assert_eq!(
+        detail.as_deref(),
+        Some(first_detail),
+        "a second revoke keeps the FIRST detail"
+    );
+    assert_eq!(get_body["revocation_reason"], "certificate_hold");
+    assert_eq!(get_body["revocation_detail"], first_detail);
+}
+
+/// An unknown reason name is a serde rejection mapped to 400
+/// `bad_request`, and a detail longer than 2000 characters is 400
+/// `bad_request` too; the certificate stays active.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revoke_rejects_unknown_reason_and_oversized_detail() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+    let (_, body) = issue_csr(
+        &fx,
+        profile_id,
+        "reject.wardstone.test",
+        &["reject.wardstone.test"],
+    )
+    .await;
+    let cert_id = body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "totally_not_a_reason"}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(error_code(&body), "bad_request");
+
+    let oversized = "x".repeat(2001);
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{cert_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded", "detail": oversized}),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(error_code(&body), "bad_request");
+
+    let get_res = get_bearer(&fx, &format!("/api/v1/certificates/{cert_id}"), &token).await;
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_res.into_body(), 4 << 20)
+        .await
+        .unwrap();
+    let get_body: Value = serde_json::from_slice(&get_bytes).unwrap();
+    fx.cleanup().await;
+    assert_eq!(get_body["status"], "active", "the rejects never revoked");
 }
 
 /// Health and metrics are public and cheap.
@@ -2126,7 +2313,7 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
         &fx,
         &format!("/api/v1/certificates/{b_id}/revoke"),
         Some(&token),
-        json!({"reason": "filter fixture revoke"}),
+        json!({"reason": "superseded"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK, "revoke B");
@@ -2251,7 +2438,7 @@ async fn statistics_counts_active_revoked_expiring() {
         &fx,
         &format!("/api/v1/certificates/{}/revoke", cert_ids[2]),
         Some(&token),
-        json!({"reason": "statistics fixture revoke"}),
+        json!({"reason": "cessation_of_operation"}),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK, "revoke C");

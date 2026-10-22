@@ -214,6 +214,7 @@ async fn insert_revoked_cert(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_string(),
         created_at: now,
     };
@@ -223,7 +224,7 @@ async fn insert_revoked_cert(
         .await
         .expect("insert the certificate row");
     certs
-        .revoke(pool, id, "key_compromise")
+        .revoke(pool, id, "key_compromise", None)
         .await
         .expect("revoke the certificate row");
     id
@@ -554,6 +555,7 @@ async fn insert_active_cert(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_string(),
         created_at: now,
     };

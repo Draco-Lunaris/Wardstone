@@ -560,6 +560,7 @@ async fn test_end_to_end_ca_forest() {
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_owned(),
         created_at: Utc::now(),
     };
@@ -582,7 +583,7 @@ async fn test_end_to_end_ca_forest() {
 
     // --- The revocation -----------------------------------------------
     certs
-        .revoke(&pool, cert_id, REVOCATION_REASON)
+        .revoke(&pool, cert_id, REVOCATION_REASON, None)
         .await
         .expect("revoke the certificate");
     tokio::time::sleep(AUDIT_GAP).await;

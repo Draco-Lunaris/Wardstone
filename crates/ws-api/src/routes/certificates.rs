@@ -36,6 +36,7 @@
 
 use std::net::IpAddr;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -53,7 +54,7 @@ use ws_ca::serial::allocate_serial;
 use ws_core::error::CoreError;
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::{
-    CertStatus, CertificateFilter, CertificateModel, CertificateStatistics,
+    CertStatus, CertificateFilter, CertificateModel, CertificateStatistics, RevocationReason,
 };
 use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::models::rbac::{Actor, Capability, KeyUsagePurpose};
@@ -628,6 +629,7 @@ fn certificate_model(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_string(),
         created_at: Utc::now(),
     }
@@ -958,6 +960,7 @@ pub struct CertificateResponse {
     pub status: String,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revocation_reason: Option<String>,
+    pub revocation_detail: Option<String>,
     pub source: String,
     pub created_at: DateTime<Utc>,
 }
@@ -984,6 +987,7 @@ impl CertificateResponse {
             status,
             revoked_at: cert.revoked_at,
             revocation_reason: cert.revocation_reason.clone(),
+            revocation_detail: cert.revocation_detail.clone(),
             source: cert.source.clone(),
             created_at: cert.created_at,
         })
@@ -993,16 +997,35 @@ impl CertificateResponse {
 /// `POST /api/v1/certificates/{id}/revoke` — idempotent; writes ONE
 /// `cert_revoked` audit row, in the same transaction as the revocation.
 /// Revoking an already-revoked certificate is a no-op (no second audit
-/// row), and revoking another tenant's certificate is a 404.
+/// row; the response echoes the FIRST revoke's stored pair), and
+/// revoking another tenant's certificate is a 404.
+///
+/// The reason is a TYPED [`RevocationReason`] — one of the nine RFC 5280
+/// names whose exact spellings ws-worker's CRL/OCSP builders parse into
+/// reason extensions. A missing or unknown name (a serde rejection on
+/// the body) is the client's error: 400 `bad_request`, never axum's
+/// default 422, whose body shape the SPA's error handling cannot read —
+/// as is a detail over 2000 characters.
 async fn revoke_certificate(
     auth: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(body): Json<RevokeBody>,
+    body: Result<Json<RevokeBody>, JsonRejection>,
 ) -> Result<Json<RevokeResponse>, ApiError> {
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        code: "bad_request",
+        message: rejection.body_text(),
+    })?;
     auth.require(Capability::Issue).map_err(ApiError::from)?;
-    if body.reason.trim().is_empty() {
-        return Err(ApiError::bad_request("a revocation reason is required"));
+
+    // The detail is optional free text, stored verbatim; a longer one is
+    // refused, never silently truncated.
+    if let Some(detail) = &body.detail {
+        if detail.chars().count() > 2000 {
+            return Err(ApiError::bad_request(
+                "the revocation detail must not exceed 2000 characters",
+            ));
+        }
     }
 
     let cert = CertificateRepo::new()
@@ -1017,12 +1040,20 @@ async fn revoke_certificate(
         return Ok(Json(RevokeResponse {
             id,
             status: cert.status.as_str().to_string(),
+            detail: cert.revocation_detail.clone(),
         }));
+    }
+
+    // The audit carries the typed reason NAME (the same string the worker
+    // parses) and the detail key only when one was supplied.
+    let mut details = serde_json::json!({ "reason": body.reason.as_str() });
+    if let Some(detail) = &body.detail {
+        details["detail"] = serde_json::json!(detail);
     }
 
     let mut tx = state.pool.begin().await?;
     CertificateRepo::new()
-        .revoke(&mut *tx, id, &body.reason)
+        .revoke(&mut *tx, id, body.reason.as_str(), body.detail.as_deref())
         .await?;
     AuditRepo::new()
         .record(
@@ -1032,7 +1063,7 @@ async fn revoke_certificate(
                 "cert_revoked",
                 "certificate",
                 &id.to_string(),
-                serde_json::json!({ "reason": body.reason }),
+                details,
             ),
         )
         .await?;
@@ -1041,20 +1072,36 @@ async fn revoke_certificate(
     Ok(Json(RevokeResponse {
         id,
         status: "revoked".to_string(),
+        detail: body.detail,
     }))
 }
 
-/// The revoke body.
+/// The revoke body: a typed reason (one of the nine RFC 5280 section
+/// 5.3.1 names — the exact strings ws-worker's `reason_from_str` maps
+/// into CRL/OCSP reason extensions) and an optional free-text detail
+/// (≤ 2000 characters, stored verbatim in `certificates.revocation_detail`).
+///
+/// This REPLACES the old free-text `reason: String` body (a breaking
+/// change to the Plan 2 API shape): a free-text reason had no CRL/OCSP
+/// mapping worker-side, so revoking with one silently dropped the
+/// published reason extension. The only consumers are this repo's
+/// UI/e2e, updated in the same change.
 #[derive(Debug, Deserialize)]
 pub struct RevokeBody {
-    pub reason: String,
+    pub reason: RevocationReason,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
-/// The revoke response.
+/// The revoke response: the certificate id, its status, and the stored
+/// revocation detail echoed — the request's detail on the first revoke,
+/// the FIRST revoke's stored value on an already-revoked no-op (the
+/// round-trip contract the UI shows).
 #[derive(Debug, Serialize)]
 pub struct RevokeResponse {
     pub id: Uuid,
     pub status: String,
+    pub detail: Option<String>,
 }
 
 /// `GET /api/v1/certificates/{id}/chain` — `read_certificates`. The trust

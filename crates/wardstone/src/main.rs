@@ -690,6 +690,7 @@ mod tests {
             status,
             revoked_at: None,
             revocation_reason: None,
+            revocation_detail: None,
             source: "manual".to_owned(),
             created_at: Utc::now() - Duration::minutes(minutes_ago),
         }

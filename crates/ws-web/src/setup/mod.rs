@@ -457,6 +457,7 @@ pub async fn run_setup(
         status: CertStatus::Active,
         revoked_at: None,
         revocation_reason: None,
+        revocation_detail: None,
         source: "manual".to_owned(),
         created_at: Utc::now(),
     };

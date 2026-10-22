@@ -62,6 +62,87 @@ impl FromStr for CertStatus {
     }
 }
 
+/// Why a certificate was revoked, mirroring the `revocation_reason` text
+/// column. The stored value is [`RevocationReason::as_str`] — exactly the
+/// nine RFC 5280 section 5.3.1 revocation names — and it is the contract
+/// ws-worker's CRL/OCSP builders parse back into `CrlReason` reason
+/// extensions: worker-side, ONLY these names publish an extension, so
+/// the API accepts exactly these and never a free-text reason (free text
+/// would be stored and then silently drop the published extension).
+/// `remove_from_crl` is deliberately NOT representable here either: a
+/// revocation is terminal in this plan (see the worker's own decoder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationReason {
+    Unspecified,
+    KeyCompromise,
+    CaCompromise,
+    AffiliationChanged,
+    Superseded,
+    CessationOfOperation,
+    CertificateHold,
+    PrivilegeWithdrawn,
+    AaCompromise,
+}
+
+impl RevocationReason {
+    /// The value stored in the `revocation_reason` column — the exact
+    /// name ws-worker's `reason_from_str` parses (serde's `snake_case`
+    /// names are identical, so the wire and column spellings never
+    /// diverge).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RevocationReason::Unspecified => "unspecified",
+            RevocationReason::KeyCompromise => "key_compromise",
+            RevocationReason::CaCompromise => "ca_compromise",
+            RevocationReason::AffiliationChanged => "affiliation_changed",
+            RevocationReason::Superseded => "superseded",
+            RevocationReason::CessationOfOperation => "cessation_of_operation",
+            RevocationReason::CertificateHold => "certificate_hold",
+            RevocationReason::PrivilegeWithdrawn => "privilege_withdrawn",
+            RevocationReason::AaCompromise => "aa_compromise",
+        }
+    }
+}
+
+impl fmt::Display for RevocationReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error from parsing an unknown `revocation_reason` column value into a
+/// [`RevocationReason`] (via `FromStr`); carries the offending string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationReasonParseError(pub String);
+
+impl fmt::Display for RevocationReasonParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown revocation reason: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for RevocationReasonParseError {}
+
+impl FromStr for RevocationReason {
+    type Err = RevocationReasonParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unspecified" => Ok(RevocationReason::Unspecified),
+            "key_compromise" => Ok(RevocationReason::KeyCompromise),
+            "ca_compromise" => Ok(RevocationReason::CaCompromise),
+            "affiliation_changed" => Ok(RevocationReason::AffiliationChanged),
+            "superseded" => Ok(RevocationReason::Superseded),
+            "cessation_of_operation" => Ok(RevocationReason::CessationOfOperation),
+            "certificate_hold" => Ok(RevocationReason::CertificateHold),
+            "privilege_withdrawn" => Ok(RevocationReason::PrivilegeWithdrawn),
+            "aa_compromise" => Ok(RevocationReason::AaCompromise),
+            other => Err(RevocationReasonParseError(other.to_string())),
+        }
+    }
+}
+
 /// One row of `certificates`: an issued leaf certificate owned by a tenant.
 /// `serial` is the certificate's integer serial — stored in the
 /// `serial bigint` column (the repository converts; a value beyond i64 is
@@ -111,6 +192,11 @@ pub struct CertificateModel {
     pub revoked_at: Option<DateTime<Utc>>,
     /// Why the certificate was revoked; `None` while active.
     pub revocation_reason: Option<String>,
+    /// Optional free-form revocation note (migration 010's
+    /// `revocation_detail text NULL`). Stored verbatim alongside the
+    /// reason; first-write-wins with the reason pair. `None` while
+    /// active, or when the revoke carried no detail.
+    pub revocation_detail: Option<String>,
     /// How the certificate entered the system (`manual` | `acme`).
     pub source: String,
     /// Row creation time (database `now()` default).
@@ -148,7 +234,7 @@ pub struct CertificateStatistics {
 /// # Unit tests
 #[cfg(test)]
 mod tests {
-    use super::{CertStatus, UnknownCertStatus};
+    use super::{CertStatus, RevocationReason, RevocationReasonParseError, UnknownCertStatus};
 
     #[test]
     fn cert_status_roundtrip() {
@@ -160,5 +246,44 @@ mod tests {
         );
         let err = "expired".parse::<CertStatus>().unwrap_err();
         assert_eq!(err, UnknownCertStatus("expired".to_string()));
+    }
+
+    /// `as_str` is the EXACT spelling ws-worker's `reason_from_str`
+    /// parses (the CRL/OCSP reason-extension contract), the serde
+    /// `snake_case` name is identical to it, and every serde spelling
+    /// parses back via `FromStr`.
+    #[test]
+    fn revocation_reason_contract() {
+        let expected = [
+            (RevocationReason::Unspecified, "unspecified"),
+            (RevocationReason::KeyCompromise, "key_compromise"),
+            (RevocationReason::CaCompromise, "ca_compromise"),
+            (RevocationReason::AffiliationChanged, "affiliation_changed"),
+            (RevocationReason::Superseded, "superseded"),
+            (
+                RevocationReason::CessationOfOperation,
+                "cessation_of_operation",
+            ),
+            (RevocationReason::CertificateHold, "certificate_hold"),
+            (RevocationReason::PrivilegeWithdrawn, "privilege_withdrawn"),
+            (RevocationReason::AaCompromise, "aa_compromise"),
+        ];
+        for (reason, stored) in expected {
+            assert_eq!(reason.as_str(), stored);
+            // serde serialization must equal the column spelling, so the
+            // wire and stored forms never diverge.
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::String(stored.to_string())
+            );
+            assert_eq!(stored.parse::<RevocationReason>().unwrap(), reason);
+        }
+        // `remove_from_crl` (RFC 5280 code 8) stays unparsable: a
+        // revocation is terminal, so a reinstatement reason is nonsense.
+        let err = "remove_from_crl".parse::<RevocationReason>().unwrap_err();
+        assert_eq!(
+            err,
+            RevocationReasonParseError("remove_from_crl".to_string())
+        );
     }
 }
