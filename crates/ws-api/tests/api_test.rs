@@ -3085,6 +3085,27 @@ async fn chain_walk_refuses_cross_tenant_parent() {
 /// that an issued leaf pins — are exactly this case), and an unknown or
 /// another tenant's profile id is a 404, indistinguishably. All captured
 /// response data is asserted after cleanup.
+/// A PATCH request with a JSON body and (optional) bearer header, shaped
+/// like [`put_json`].
+async fn patch_json(
+    fixture: &Fixture,
+    uri: &str,
+    token: Option<&str>,
+    body: Value,
+) -> TestResponse {
+    let mut builder = Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, bearer(token));
+    }
+    let req = builder
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build request");
+    send(fixture, req).await
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn profile_delete_refuses_when_referenced() {
@@ -3200,6 +3221,314 @@ async fn profile_delete_refuses_when_referenced() {
     );
 
     // Unknown and foreign ids are 404, indistinguishably.
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
+}
+
+// ---------------------------------------------------------------------------
+// The user PATCH route (role assignment and activation)
+// ---------------------------------------------------------------------------
+
+/// `PATCH /api/v1/users/{id}`: a role change, an activation flip, and
+/// both fields in one request — the response mirrors the fresh row, the
+/// `users` row follows, and each real change writes its audit row in the
+/// house order (the role row before the flag row).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_role_and_active_patch() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let user_id = Uuid::new_v4();
+    insert_user(&fx.pool, fx.tenant_id, user_id, "patchee", Role::Issuer).await;
+    let uri = format!("/api/v1/users/{user_id}");
+
+    // Role: issuer -> viewer.
+    let role_res = patch_json(&fx, &uri, Some(&token), json!({ "role": "viewer" })).await;
+    let role_status = role_res.status();
+    let role_raw = axum::body::to_bytes(role_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let role_body: Value = serde_json::from_slice(&role_raw).unwrap();
+    let after_role: (String, bool) =
+        sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the user row after the role patch");
+
+    // Deactivate, then reactivate: is_active flips each way.
+    let deact_status = patch_json(&fx, &uri, Some(&token), json!({ "is_active": false }))
+        .await
+        .status();
+    let after_deact: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read is_active after the deactivation");
+    let act_status = patch_json(&fx, &uri, Some(&token), json!({ "is_active": true }))
+        .await
+        .status();
+    let after_act: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read is_active after the reactivation");
+
+    // Both fields in ONE request: role first, then the flag.
+    let both_res = patch_json(
+        &fx,
+        &uri,
+        Some(&token),
+        json!({ "role": "issuer", "is_active": false }),
+    )
+    .await;
+    let both_status = both_res.status();
+    let after_both: (String, bool) =
+        sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the user row after the combined patch");
+
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(role_status, StatusCode::OK, "the role patch");
+    assert_eq!(role_body["role"], "viewer", "the response carries the role");
+    assert_eq!(
+        role_body["is_active"], true,
+        "an inactive field is untouched"
+    );
+    assert_eq!(after_role, ("viewer".to_string(), true), "the row role");
+
+    assert_eq!(deact_status, StatusCode::OK, "the deactivation");
+    assert!(!after_deact, "is_active flips to FALSE");
+    assert_eq!(act_status, StatusCode::OK, "the reactivation");
+    assert!(after_act, "is_active flips back to TRUE");
+
+    assert_eq!(both_status, StatusCode::OK, "the combined patch");
+    assert_eq!(after_both, ("issuer".to_string(), false));
+
+    // Exactly the five expected audit actions, in the request order with
+    // the combined request's role row BEFORE its flag row.
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "user_role_changed",
+            "user_deactivated",
+            "user_activated",
+            "user_role_changed",
+            "user_deactivated",
+        ],
+        "the patch audit rows in order: {audits:?}"
+    );
+    // The role rows carry from/to exactly; the flag rows are empty-detail.
+    assert_eq!(
+        audits[0].3,
+        json!({ "from": "issuer", "to": "viewer" }),
+        "the first role change's from/to"
+    );
+    assert_eq!(audits[1].3, json!({}), "user_deactivated");
+    assert_eq!(audits[2].3, json!({}), "user_activated");
+    assert_eq!(
+        audits[3].3,
+        json!({ "from": "viewer", "to": "issuer" }),
+        "the combined request's role change"
+    );
+    assert_eq!(audits[4].3, json!({}), "the combined request's deactivate");
+}
+
+/// The last-admin guard on a ROLE change: the fixture's single active
+/// admin demoting themselves is refused 409 with the exact message; the
+/// row keeps its role; no audit rows are written.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn last_admin_role_demotion_refused() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    // The fixture admin is the tenant's only active admin, and the
+    // acting actor on its own account: the tenant-wide count refuses
+    // regardless of who is acting.
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({ "role": "viewer" }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the demotion refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// The same last-admin guard on an ACTIVATION change: `is_active: false`
+/// onto the tenant's only active admin is refused the same way.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn last_admin_deactivation_refused() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({ "is_active": false }),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the deactivation refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// An empty PATCH body (`{}`) names no change at all: 400 with code
+/// `bad_request` and the fixed "nothing to update" message.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_patch_requires_payload() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let res = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the empty body");
+    assert_eq!(error_code(&body), "bad_request");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "nothing to update"
+    );
+}
+
+/// An unknown user id and another tenant's user id are both 404,
+/// indistinguishably (the PATCH body is otherwise valid).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn user_patch_unknown_and_foreign_ids_are_404() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let unknown_status = patch_json(
+        &fx,
+        &format!("/api/v1/users/{}", Uuid::new_v4()),
+        Some(&token),
+        json!({ "role": "viewer" }),
+    )
+    .await
+    .status();
+
+    // Another tenant's user, swept-then-seeded like the profile suite's
+    // foreign rows.
+    let foreign_name = "rt-api-foreign-user";
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user audit rows");
+    sqlx::query(
+        "DELETE FROM users WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-user tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-user tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_user = Uuid::new_v4();
+    insert_user(
+        &fx.pool,
+        foreign_tenant,
+        foreign_user,
+        "foreign-user",
+        Role::Viewer,
+    )
+    .await;
+    let foreign_status = patch_json(
+        &fx,
+        &format!("/api/v1/users/{foreign_user}"),
+        Some(&token),
+        json!({ "role": "admin" }),
+    )
+    .await
+    .status();
+
+    fx.cleanup().await;
+
     assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
     assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
 }

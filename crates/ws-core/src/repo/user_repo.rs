@@ -271,6 +271,27 @@ impl UserRepo {
         Ok(())
     }
 
+    /// Restore `is_active` — the re-activation path complementing
+    /// [`UserRepo::deactivate`]: rows never left, so one boolean flip
+    /// returns the user to the login path (an SSO/OAuth identity keeps its
+    /// provider linkage; re-activation has no special cases). A
+    /// nonexistent user updates zero rows; this stays a plain `Ok(())`,
+    /// mirroring [`UserRepo::deactivate`]'s house style — the ROUTE
+    /// decides 404 from its own resolve.
+    pub async fn set_active(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        active: bool,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(active)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// Replace the user's TOTP credential wholesale — the encrypted secret,
     /// its nonce, and the enforcement flag in ONE statement, so a TOTP
     /// change and its audit row (written by the caller on the same
