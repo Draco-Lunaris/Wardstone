@@ -73,6 +73,12 @@ const OID_SIG_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.
 /// sign a CRL with, written with NULL parameters.
 const OID_SIG_SHA256_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 
+/// ecdsa-with-SHA256 (RFC 5758 section 3.2): the signature algorithm
+/// ECDSA P-256 CA keys sign a CRL with, written with absent parameters
+/// (RFC 5758 forbids encoding the curve here — the SPKI already carries
+/// it).
+const OID_SIG_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+
 /// The CRL entry extension `reasonCode` (RFC 5280 section 5.3.1).
 const OID_EXT_REASON_CODE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.21");
 
@@ -299,9 +305,7 @@ fn algorithm_identifier(algorithm: &SignatureAlgorithm) -> Result<Vec<u8>, CaErr
     } else if algorithm == &PKCS_RSA_SHA256 {
         (OID_SIG_SHA256_RSA, true)
     } else if algorithm == &PKCS_ECDSA_P256_SHA256 {
-        return Err(CaError::UnsupportedKeyType(format!(
-            "ECDSA P-256 signing is not supported by this path yet ({algorithm:?})"
-        )));
+        (OID_SIG_ECDSA_SHA256, false)
     } else {
         return Err(CaError::UnsupportedKeyType(format!(
             "CRL signing is not supported for this CA key algorithm ({algorithm:?})"
