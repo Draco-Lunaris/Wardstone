@@ -69,8 +69,8 @@ use ws_ca::keystore::KeyStore;
 use ws_ca::KeyType;
 use ws_core::db::connect;
 use ws_core::models::acme::{
-    AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeModel, AcmeChallengeStatus,
-    AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
+    AcmeAccountStatus, AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeModel,
+    AcmeChallengeStatus, AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
 };
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::CertStatus;
@@ -1055,6 +1055,64 @@ async fn account_update_applies_contact_changes_with_an_audit_row() {
     let updates = audit_rows(&fx, "acme_account_updated").await;
     fx.cleanup().await;
     assert_eq!(updates.len(), 2, "two real changes, two audit rows");
+}
+
+/// The fix-wave I2 pin: ONE combined payload — `status: "deactivated"`
+/// WITH a `contact` update — deactivates the account and leaves the
+/// stored contact UNTOUCHED: the deactivation branch answers and returns,
+/// so the combined request can never fall through into the contact/ToS
+/// updater on a deactivated account (a deactivated account refuses every
+/// mutation).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_combined_deactivate_and_contact_request_deactivates_without_touching_the_contact() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let account = account_url(&thumb);
+    let nonce = fetch_nonce(&fx).await;
+    let jws = acme_common::sign_acme_request(
+        rsa2048(),
+        &Identity::Kid(account.clone()),
+        &nonce,
+        &account,
+        &json!({
+            "status": "deactivated",
+            "contact": ["mailto:sneaky@wardstone.test"],
+        }),
+    );
+    let combined = send(
+        &fx,
+        acme_post(&format!("/acme/{ACME_TENANT}/acct/{thumb}"), &jws),
+    )
+    .await;
+    let combined_status = combined.status();
+    let combined_body = body_json(combined).await;
+    let row = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the row")
+        .expect("exists");
+    let deactivations = audit_rows(&fx, "acme_account_deactivated").await;
+    fx.cleanup().await;
+
+    assert_eq!(combined_status, StatusCode::OK, "the deactivation answers");
+    assert_eq!(combined_body["status"], "deactivated");
+    assert_eq!(
+        combined_body["contact"],
+        json!([CONTACT]),
+        "the combined payload's contact member is NOT applied: the stored \
+         (original) contact stands"
+    );
+    assert_eq!(row.status, AcmeAccountStatus::Deactivated);
+    assert_eq!(
+        row.contact.as_deref(),
+        Some(CONTACT),
+        "the contact update inside the combined payload touched nothing"
+    );
+    assert_eq!(deactivations.len(), 1, "ONE deactivation audit row");
 }
 
 /// The deactivation cascade (spec settlement 9): `status: "deactivated"`

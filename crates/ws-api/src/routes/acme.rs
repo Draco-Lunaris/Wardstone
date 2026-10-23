@@ -207,6 +207,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/new-nonce", get(new_nonce))
         .route("/{tenant}/directory", get(directory))
         .route("/{tenant}/acct/{account}", post(account_url))
+        .route("/{tenant}/acct/{account}/orders", post(account_orders))
         .route("/{tenant}/new-order", post(new_order))
         .route("/{tenant}/orders/{order}", post(order_url))
         .route("/{tenant}/orders/{order}/finalize", post(finalize_order))
@@ -664,6 +665,24 @@ async fn account_url(
                 orders,
                 "acme account deactivated with its cascade"
             );
+            // Fix-wave I2: answer AND return. The branch must not fall
+            // through into the contact/ToS updater carrying the SAME
+            // request body — a deactivated account refuses every mutation
+            // (the gate above says so), so a combined deactivate+contact
+            // payload would otherwise apply the mutation to a
+            // deactivated account.
+            let deactivated = AcmeRepo::new()
+                .get_account_by_id(&state.pool, tenant.id, account.id)
+                .await?
+                .ok_or_else(|| {
+                    AcmeProblem::internal("the account vanished during its deactivation")
+                })?;
+            return Ok(account_response(
+                StatusCode::OK,
+                &base,
+                &tenant.name,
+                &deactivated,
+            ));
         }
         Some(other) => {
             return Err(AcmeProblem::malformed(format!(
@@ -694,6 +713,55 @@ async fn account_url(
         &tenant.name,
         &updated,
     ))
+}
+
+/// The bounded page the account-orders URL serves: the RFC 8555 §7.3.2
+/// allows truncation, and the shared repo clamp's own maximum is the
+/// cap (one page, newest first — a client pages by re-reading if it
+/// keeps more history than this).
+const ACCOUNT_ORDERS_PAGE: u32 = 500;
+
+/// `POST /acme/{tenant}/acct/{account}/orders` — RFC 8555 §7.3.2's
+/// account-orders URL, advertised on every account object: the account's
+/// order history as `{"orders": [absolute order URL, ...]}`, newest
+/// first, one bounded page. Kid-carried POST-as-GET, account-owned: the
+/// path's thumbprint MUST name the kid account itself (anything else is
+/// the usual one-404-no-oracle miss), the per-account limiter rides the
+/// same bucket as every other authenticated ACME POST
+/// ([`authenticate_kid_account`]), and a payload-carrying POST is
+/// refused — only POST-as-GET applies (a read needs no audit row).
+async fn account_orders(
+    State(state): State<AppState>,
+    Path((tenant_name, orders_account_thumb)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!(
+        "{base}/acme/{}/acct/{orders_account_thumb}/orders",
+        tenant.name
+    );
+    let raw = as_str(&raw)?;
+
+    let (account, payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    if !payload.is_null() {
+        return Err(AcmeProblem::malformed(
+            "the orders URL is read-only: POST-as-GET carries no payload",
+        ));
+    }
+    // Ownership: the path names the account the kid authenticated as.
+    if account.jwk_thumbprint != orders_account_thumb {
+        return Err(AcmeProblem::not_found("no such account"));
+    }
+    let orders = AcmeRepo::new()
+        .list_orders_by_account(&state.pool, tenant.id, account.id, 1, ACCOUNT_ORDERS_PAGE)
+        .await?;
+    let urls = orders
+        .iter()
+        .map(|order| order_object_url(&base, &tenant.name, order.id))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "orders": urls })).into_response())
 }
 
 /// `POST /acme/{tenant}/key-change` — the RFC 8555 §7.3.5 account-key
