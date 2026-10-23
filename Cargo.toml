@@ -91,6 +91,16 @@ totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 # pure-Rust rustls backend is pinned instead.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# Native DNS resolution for the ACME DNS-01 challenge (ws-api, Task 7):
+# the server resolves `_acme-challenge.<identifier>` TXT itself, and no
+# other DNS capability exists in the graph (std's `ToSocketAddrs` cannot
+# query TXT records). First-party TXT resolution through an injectable
+# route-layer seam — hickory knows nothing about ACME. Default features
+# (system-config + tokio) suffice; the DoH/TLS features stay OFF so the
+# aws-lc-rs-based `__tls` default never enters the graph (the same
+# constraint ws-web's rustls/ring pin records).
+hickory-resolver = { version = "0.25.2" }
+
 # HMAC-SHA1 signing backend for the TOTP code-computation regression test's
 # independent RFC 6238 check (dev-only in ws-auth; never used by production
 # code). 0.13 is the only live 0.x line in this timeline's index; it pairs

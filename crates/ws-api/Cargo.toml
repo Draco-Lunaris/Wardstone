@@ -61,6 +61,18 @@ ws-acme = { path = "../ws-acme" }
 # feature set matches ws-ca's pin exactly.
 rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 
+# HTTP-01 challenge fetches (Task 7): the server GETs
+# `http://<identifier>/.well-known/acme-challenge/<token>` itself — the
+# workspace pin (rustls-tls, default features off; the fetch is plain
+# HTTP anyway). The bounded client never trusts proxy environment
+# variables, and the fetcher sits behind an injectable seam in AppState.
+reqwest = { workspace = true }
+# Native TXT resolution for the DNS-01 challenge (Task 7): TXT lookups
+# have no std path, so the `TxtResolver` seam rides the workspace's
+# hickory-resolver pin (first-party DNS; hickory knows nothing about
+# ACME); tests inject a canned resolver instead.
+hickory-resolver = { workspace = true }
+
 [dev-dependencies]
 # The TOTP test computes RFC 6238 codes with the workspace's own totp-rs
 # pin (the same parameters ws-auth's mfa_totp module verifies with);

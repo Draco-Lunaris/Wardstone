@@ -31,4 +31,4 @@ pub mod state;
 /// plus the two names every consumer needs: the state and the router.
 pub use error::ApiError;
 pub use routes::router;
-pub use state::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, OidcStateStore};
+pub use state::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, OidcStateStore, VerificationDeps};

@@ -1,9 +1,14 @@
 //! Integration tests for the ACME (RFC 8555) route surface (Plan-4
-//! Tasks 5-6): directory, new-nonce, new-account (the ToS gate and
+//! Tasks 5-7): directory, new-nonce, new-account (the ToS gate and
 //! only-return-existing included), the account URL (POST-as-GET, update,
 //! deactivation with its cascade), the atomic account-key rollover, and
 //! the order machine — new-order (profile resolution, identifier
-//! validation, the REUSE window), order and authorization POST-as-GET.
+//! validation, the REUSE window), order and authorization POST-as-GET —
+//! plus Task 7's synchronous challenge verification (HTTP-01 fetched
+//! through a loopback stub over REAL reqwest at the canonical path,
+//! DNS-01 resolved through a canned TXT resolver): the server computes
+//! the expected answer from its own row and the account key, and no test
+//! can feed it one (Review Focus 1).
 //!
 //! These tests run against a live Postgres and are marked `#[ignore]`.
 //! Run them with:
@@ -35,9 +40,14 @@
 //! single-use, the `url` binding, alg-key pinning — is re-verified THROUGH
 //! the HTTP layer, not just in its own crate.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::ConnectInfo;
@@ -51,12 +61,13 @@ use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use ws_api::{AcmeConfig, ApiConfig, AppState, AuthRateLimit};
+use ws_api::routes::acme::{ChallengeFetch, TxtResolver};
+use ws_api::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, VerificationDeps};
 use ws_auth::jwt::JwtKeys;
 use ws_core::db::connect;
 use ws_core::models::acme::{
-    AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeStatus, AcmeChallengeType,
-    AcmeOrderModel, AcmeOrderStatus,
+    AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeModel, AcmeChallengeStatus,
+    AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
 };
 use ws_core::models::profile::ProfileModel;
 use ws_core::repo::acme_repo::AcmeRepo;
@@ -170,12 +181,15 @@ impl Fixture {
 }
 
 /// The fixture's config shape: the ACME `tos_url`, the new-account GCRA,
-/// and the `public_url` (None = the unconfigured degrade posture).
+/// and the `public_url` (None = the unconfigured degrade posture) — plus
+/// the challenge-verification seams a test may swap in (the stub fetcher
+/// and/or the canned TXT resolver) before the router wraps the state.
 #[derive(Default)]
 struct FixtureConfig<'a> {
     tos_url: Option<&'a str>,
     rate_limit: Option<AuthRateLimit>,
     public_url: Option<&'a str>,
+    verification: Option<VerificationDeps>,
 }
 
 /// Build the fixture: connect, take the advisory lock, sweep stale rows,
@@ -225,7 +239,13 @@ async fn fixture_with(config: FixtureConfig<'_>) -> Fixture {
         tos_url: config.tos_url.map(str::to_string),
     };
     api_config.auth_rate_limit = config.rate_limit;
-    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), api_config);
+    let mut state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), api_config);
+    // The challenge-verification seams a test swaps in BEFORE the router
+    // wraps the state (the router clones it — a later mutation would not
+    // reach it).
+    if let Some(verification) = config.verification {
+        state.verification = verification;
+    }
     let router = ws_api::router(state.clone());
 
     Fixture {
@@ -2621,4 +2641,1099 @@ async fn a_wildcard_identifier_renders_the_rfc_authorization_object() {
         stored, "*.wild.wardstone.test",
         "the row stores the order's verbatim identifier (the reuse key)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Challenge verification (Plan-4 Task 7): the loopback stub, the
+// injectable seams, and the synchronous verdict tests
+// ---------------------------------------------------------------------------
+
+/// The loopback HTTP-01 stub (the ws-auth oidc_test std-net pattern): one
+/// std thread, one text body served for every /.well-known/acme-challenge
+/// GET, served paths recorded for the server-side-fetch assertions. The
+/// body swaps behind a lock: the expected key authorization is only known
+/// after the challenge rows exist.
+struct ChallengeStub {
+    base: String,
+    served: Arc<StdMutex<Vec<String>>>,
+    body: Arc<RwLock<String>>,
+}
+
+fn spawn_challenge_stub(body: &str) -> ChallengeStub {
+    use std::io::{Read, Write};
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind the loopback challenge stub");
+    let port = listener.local_addr().expect("the stub port").port();
+    let served = Arc::new(StdMutex::new(Vec::new()));
+    let body = Arc::new(RwLock::new(body.to_owned()));
+    let served_thread = served.clone();
+    let body_thread = body.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let path = request
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .to_owned();
+            served_thread
+                .lock()
+                .expect("the stub served log")
+                .push(path);
+            let answer = body_thread.read().expect("the stub body").clone();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    ChallengeStub {
+        base: format!("http://127.0.0.1:{port}"),
+        served,
+        body,
+    }
+}
+
+impl ChallengeStub {
+    fn set_body(&self, body: String) {
+        *self.body.write().expect("the stub body") = body;
+    }
+}
+
+/// The test HTTP-01 fetcher: the route must build EXACTLY the canonical
+/// URL from the stored row (anything else refuses — the assertion of the
+/// server-side fetch), and the fetch itself is REAL reqwest against the
+/// loopback stub through the same bounded, proxyless client construction
+/// the production fetcher uses.
+struct StubFetcher {
+    client: reqwest::Client,
+    rewrites: Arc<RwLock<HashMap<String, String>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl StubFetcher {
+    fn new(rewrites: HashMap<String, String>) -> Self {
+        StubFetcher {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .no_proxy()
+                .build()
+                .expect("the stub-backed test client builds"),
+            rewrites: Arc::new(RwLock::new(rewrites)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set_rewrite(&self, from: String, to: String) {
+        self.rewrites
+            .write()
+            .expect("the rewrite table")
+            .insert(from, to);
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ChallengeFetch for StubFetcher {
+    fn fetch(&self, url: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mapped = self
+            .rewrites
+            .read()
+            .expect("the rewrite table")
+            .get(&url)
+            .cloned()
+            .ok_or_else(|| format!("unexpected fetch url: {url}"));
+        let client = self.client.clone();
+        Box::pin(async move {
+            let mapped = mapped?;
+            let response = client
+                .get(&mapped)
+                .send()
+                .await
+                .map_err(|err| format!("the HTTP request failed: {err}"))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| format!("the HTTP response body fetch failed: {err}"))?;
+            if !status.is_success() {
+                return Err(format!("the HTTP request returned status {status}"));
+            }
+            Ok(body)
+        })
+    }
+}
+
+/// A fetcher that holds the verification in flight until the test
+/// releases it (a oneshot channel, race-free): the rate-limit test races
+/// a second POST against the held request.
+struct GatedFetcher {
+    inner: Arc<dyn ChallengeFetch>,
+    calls: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+impl GatedFetcher {
+    /// The gated fetcher over `inner`, with the counter the test waits
+    /// on, and an EMPTY release slot the test fills with its oneshot
+    /// receiver.
+    fn new(inner: Arc<dyn ChallengeFetch>) -> Self {
+        GatedFetcher {
+            inner,
+            calls: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ChallengeFetch for GatedFetcher {
+    fn fetch(&self, url: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        // The count lands BEFORE the release await: observing it proves
+        // the attempt reached the outbound-fetch stage (i.e. it already
+        // passed the route's pacing gate).
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let inner = self.inner.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            let rx = release.lock().await.take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            inner.fetch(url).await
+        })
+    }
+}
+
+/// The canned TXT resolver: records keyed by the EXACT (trailing-dot FQ)
+/// name the route queries; an unlisted name answers the empty record set
+/// (the NXDOMAIN shape). Swappable behind a lock — the expected record
+/// value is only known after the rows exist.
+struct StaticTxtResolver {
+    records: Arc<RwLock<HashMap<String, Vec<String>>>>,
+}
+
+impl StaticTxtResolver {
+    fn new(records: HashMap<String, Vec<String>>) -> Self {
+        StaticTxtResolver {
+            records: Arc::new(RwLock::new(records)),
+        }
+    }
+
+    fn set_record(&self, name: String, values: Vec<String>) {
+        self.records
+            .write()
+            .expect("the record table")
+            .insert(name, values);
+    }
+}
+
+impl TxtResolver for StaticTxtResolver {
+    fn resolve_txt(
+        &self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send>> {
+        let records = self
+            .records
+            .read()
+            .expect("the record table")
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(records) })
+    }
+}
+
+/// The challenge tests' verification deps: explicit seams, never network.
+fn verification_deps(
+    fetcher: Arc<dyn ChallengeFetch>,
+    resolver: Arc<dyn TxtResolver>,
+) -> VerificationDeps {
+    VerificationDeps::with_seams(fetcher, resolver)
+}
+
+/// A kid-signed POST to a challenge URL: `json!({})` is the RFC 8555
+/// §7.5.1 trigger, `Value::Null` is RFC POST-as-GET.
+async fn post_chall(
+    fixture: &Fixture,
+    key: &KeyFixture,
+    challenge_id: Uuid,
+    payload: Value,
+) -> TestResponse {
+    let url = format!("{PUBLIC_URL}/acme/{ACME_TENANT}/chall/{challenge_id}");
+    let nonce = fetch_nonce(fixture).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Kid(account_url(&thumb_of(key))),
+        &nonce,
+        &url,
+        &payload,
+    );
+    send(
+        fixture,
+        acme_post(&format!("/acme/{ACME_TENANT}/chall/{challenge_id}"), &jws),
+    )
+    .await
+}
+
+/// The challenge tests' common prelude: account + profile + one order on
+/// one identifier; returns the order id, the authz id, and BOTH stored
+/// challenge rows (for a wildcard identifier the caller sees the dns-01
+/// row alone).
+async fn mint_order_with_challenges(
+    fixture: &Fixture,
+    key: &KeyFixture,
+    identifier: &str,
+) -> (Uuid, Uuid, Vec<AcmeChallengeModel>) {
+    let (_thumb, created) = create_account(fixture, key).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(fixture, "web-server").await;
+    let response = post_new_order(
+        fixture,
+        key,
+        json!({"identifiers": [{"type": "dns", "value": identifier}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let authz_rows = AcmeRepo::new()
+        .list_authorizations_by_order(&fixture.pool, fixture.tenant_id, order_id)
+        .await
+        .expect("the order's authorizations");
+    let challenge_rows = AcmeRepo::new()
+        .list_challenges_by_authorization(&fixture.pool, fixture.tenant_id, authz_rows[0].id)
+        .await
+        .expect("the challenge rows");
+    (order_id, authz_rows[0].id, challenge_rows)
+}
+
+/// The canonical HTTP-01 fetch URL the route must build, and the loopback
+/// URL the rewrite maps it to (same path, the stub's port).
+fn http01_urls(stub: &ChallengeStub, token: &str) -> (String, String) {
+    let path = format!("/.well-known/acme-challenge/{token}");
+    (
+        format!("http://host.wardstone.test{path}"),
+        format!("{}{path}", stub.base),
+    )
+}
+
+/// Review Focus 2, HTTP-01 happy path: the server fetches the canonical
+/// `/.well-known/acme-challenge/<token>` from ITS OWN connection, the
+/// response body EXACTLY equals the computed key authorization, and the
+/// settled state cascades (challenge valid → authz valid with the 30-day
+/// reuse window → order ready).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn http01_verifies_from_server_side_fetch() {
+    let _db = lock_db().await;
+    let stub = spawn_challenge_stub("placeholder");
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let resolver = Arc::new(StaticTxtResolver::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(fetcher.clone(), resolver.clone())),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+
+    // The stub serves the CORRECT key authorization — computed here the
+    // same way the server computes it (stored token + the account's own
+    // thumbprint; both sides land on the same value only in this test's
+    // capacity as the client that provisioned the answer).
+    let expected = ws_acme::key_authorization(&http_row.token, &thumb_of(rsa2048()));
+    stub.set_body(expected);
+    let (canonical, target) = http01_urls(&stub, &http_row.token);
+    fetcher.set_rewrite(canonical, target);
+
+    let response = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let served = stub.served.lock().expect("served").clone();
+    let row = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, http_row.id)
+        .await
+        .expect("read the challenge")
+        .expect("it exists");
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    let invalidations = audit_rows(&fx, "acme_order_invalidated").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["type"], "http-01");
+    assert_eq!(body["token"], json!(http_row.token));
+    assert_eq!(body["status"], "valid");
+    assert!(body["validated"].is_string());
+    assert!(
+        body.get("error").is_none(),
+        "a valid challenge carries no error member"
+    );
+    assert_eq!(row.status, AcmeChallengeStatus::Valid);
+    assert!(row.validated_at.is_some());
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Valid);
+    let fresh_days = (authz_row.expires_at - chrono::Utc::now()).num_days();
+    assert!(
+        (29..=30).contains(&fresh_days),
+        "the 30-day reuse window is stamped on the valid authz, got {fresh_days} days"
+    );
+    assert_eq!(
+        order_row.status,
+        AcmeOrderStatus::Ready,
+        "all-valid authorizations make the order ready"
+    );
+    assert!(
+        invalidations.is_empty(),
+        "no invalidation on the happy path"
+    );
+    assert_eq!(
+        served,
+        vec![format!("/.well-known/acme-challenge/{}", http_row.token)],
+        "the server-side fetch hit the canonical path, once"
+    );
+    assert_eq!(fetcher.calls(), 1);
+}
+
+/// The mismatch: a served body that is not the computed key authorization
+/// settles the challenge INVALID — and the terminal cascade runs (authz
+/// invalid → order invalid + the `acme_order_invalidated` audit row), so
+/// re-POSTing is refused (authz invalid is terminal per RFC).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn http01_wrong_body_invalidates_the_authorization_and_the_order() {
+    let _db = lock_db().await;
+    let stub = spawn_challenge_stub("not-the-answer");
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    let (canonical, target) = http01_urls(&stub, &http_row.token);
+    fetcher.set_rewrite(canonical, target);
+
+    let response = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    // Terminal: the re-POST is refused outright.
+    let repost = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let repost_status = repost.status();
+    let repost_problem = body_json(repost).await;
+
+    let row = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, http_row.id)
+        .await
+        .expect("read the challenge")
+        .expect("it exists");
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    let invalidations = audit_rows(&fx, "acme_order_invalidated").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "invalid");
+    assert!(
+        body["error"]["detail"]
+            .as_str()
+            .expect("the error detail")
+            .contains("does not match the expected value"),
+        "the fetch mismatch is the recorded failure, got {:?}",
+        body["error"]["detail"]
+    );
+    assert_eq!(row.status, AcmeChallengeStatus::Invalid);
+    assert!(row.error.is_some());
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Invalid);
+    assert_eq!(order_row.status, AcmeOrderStatus::Invalid);
+    assert!(
+        order_row.error.as_deref().is_some_and(|error| {
+            error.contains("host.wardstone.test") && error.contains("does not match")
+        }),
+        "the order error names the failed authorization, got {:?}",
+        order_row.error
+    );
+    assert_eq!(invalidations.len(), 1);
+    let (_, _, actor_id, target_id, details) = &invalidations[0];
+    assert_eq!(actor_id, &account_url(&thumb_of(rsa2048())));
+    assert_eq!(target_id, &order_id.to_string());
+    assert_eq!(details["identifier"], "host.wardstone.test");
+    assert!(details["order_url"].is_string());
+    assert_eq!(repost_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        repost_problem["type"],
+        "urn:ietf:params:acme:error:unauthorized"
+    );
+}
+
+/// The outbound fetch is the server's own: a connection-refused origin
+/// (the oidc_test bind-read-port-drop shape) fails the verification with
+/// the fetch error recorded — never a fallback to anything the client
+/// could influence.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn http01_fails_when_the_connection_is_refused() {
+    let _db = lock_db().await;
+    // Bind, read the port, drop: nothing listens there anymore.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the dead port");
+    let dead_port = listener.local_addr().expect("the dead port").port();
+    drop(listener);
+
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, _authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    fetcher.set_rewrite(
+        format!(
+            "http://host.wardstone.test/.well-known/acme-challenge/{}",
+            http_row.token
+        ),
+        format!(
+            "http://127.0.0.1:{dead_port}/.well-known/acme-challenge/{}",
+            http_row.token
+        ),
+    );
+
+    let response = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "invalid");
+    assert!(
+        body["error"]["detail"]
+            .as_str()
+            .expect("the error detail")
+            .contains("the HTTP request failed"),
+        "the fetch failure is the recorded error, got {:?}",
+        body["error"]["detail"]
+    );
+    assert_eq!(order_row.status, AcmeOrderStatus::Invalid);
+}
+
+/// DNS-01 happy path: the server itself resolves
+/// `_acme-challenge.<identifier>.`, and ANY record equal to the COMPUTED
+/// `base64url(SHA256(key authorization))` settles the challenge valid
+/// (cascading to the ready order). No HTTP fetch ever runs.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn dns01_verifies_the_computed_txt_record() {
+    let _db = lock_db().await;
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let resolver = Arc::new(StaticTxtResolver::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(fetcher.clone(), resolver.clone())),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let dns_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Dns01)
+        .expect("the dns-01 row")
+        .clone();
+
+    let expected = ws_acme::dns01_record_value(&ws_acme::key_authorization(
+        &dns_row.token,
+        &thumb_of(rsa2048()),
+    ));
+    resolver.set_record(
+        "_acme-challenge.host.wardstone.test.".to_owned(),
+        vec!["other-record-value".to_owned(), expected.clone()],
+    );
+
+    let response = post_chall(&fx, rsa2048(), dns_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let row = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, dns_row.id)
+        .await
+        .expect("read the challenge")
+        .expect("it exists");
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "valid");
+    assert_eq!(row.status, AcmeChallengeStatus::Valid);
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(order_row.status, AcmeOrderStatus::Ready);
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "DNS-01 verification never touches the HTTP layer"
+    );
+}
+
+/// The RFC 8555 wildcard rule end-to-end: a `*.` authorization mints its
+/// dns-01 challenge ALONE (http-01 cannot prove a wildcard), and the TXT
+/// lookup name is the identifier WITHOUT the prefix.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn dns01_a_wildcard_authorization_mints_dns01_only_and_verifies() {
+    let _db = lock_db().await;
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let resolver = Arc::new(StaticTxtResolver::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(fetcher.clone(), resolver.clone())),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "*.wild.wardstone.test").await;
+    assert_eq!(
+        challenges.len(),
+        1,
+        "a wildcard authorization carries no http-01 challenge"
+    );
+    let dns_row = challenges[0].clone();
+
+    let expected = ws_acme::dns01_record_value(&ws_acme::key_authorization(
+        &dns_row.token,
+        &thumb_of(rsa2048()),
+    ));
+    resolver.set_record(
+        "_acme-challenge.wild.wardstone.test.".to_owned(),
+        vec![expected],
+    );
+
+    let response = post_chall(&fx, rsa2048(), dns_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "valid");
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(order_row.status, AcmeOrderStatus::Ready);
+}
+
+/// The DNS-01 negative: no record matches (the empty record set — the
+/// NXDOMAIN shape a not-yet-propagated deployment produces), so the
+/// challenge goes invalid and the terminal cascade runs.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn dns01_fails_when_no_record_matches() {
+    let _db = lock_db().await;
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            Arc::new(StubFetcher::new(HashMap::new())),
+            // NO records at all.
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let dns_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Dns01)
+        .expect("the dns-01 row")
+        .clone();
+
+    let response = post_chall(&fx, rsa2048(), dns_row.id, json!({})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "invalid");
+    assert!(
+        body["error"]["detail"]
+            .as_str()
+            .expect("the error detail")
+            .contains("_acme-challenge.host.wardstone.test."),
+        "the resolver name is the recorded failure, got {:?}",
+        body["error"]["detail"]
+    );
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Invalid);
+    assert_eq!(order_row.status, AcmeOrderStatus::Invalid);
+}
+
+/// Review Focus 1: a client CANNOT POST an answer anywhere. The payload
+/// carries the CORRECT dns-01 record value as a suggested response field,
+/// yet the resolver has no record — the verification still uses the
+/// server-computed value against the DNS layer, and the challenge goes
+/// invalid regardless of the body (§7.5.1: response-object members are
+/// ignored wholesale).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn dns01_rejects_client_suggested_payload() {
+    let _db = lock_db().await;
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            Arc::new(StubFetcher::new(HashMap::new())),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let dns_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Dns01)
+        .expect("the dns-01 row")
+        .clone();
+
+    // The suggested answer is exactly the value a compliant client would
+    // provision: if the route read ANY of it, this POST could not fail.
+    let suggested_record = ws_acme::dns01_record_value(&ws_acme::key_authorization(
+        &dns_row.token,
+        &thumb_of(rsa2048()),
+    ));
+    let response = post_chall(
+        &fx,
+        rsa2048(),
+        dns_row.id,
+        json!({ "keyAuthorization": suggested_record }),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["status"], "invalid",
+        "the suggested answer is not an input: the stale resolver fails it"
+    );
+    assert!(
+        body["error"]["detail"]
+            .as_str()
+            .expect("the error detail")
+            .contains("no TXT record"),
+        "the DNS layer's truth is the verdict, got {:?}",
+        body["error"]["detail"]
+    );
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Invalid);
+    assert_eq!(order_row.status, AcmeOrderStatus::Invalid);
+}
+
+/// Settlement D5's pacing: while one verification is in flight (held by
+/// the gate), a second POST on the SAME authorization is the 400
+/// `rateLimited` problem — and touches nothing (the held verification
+/// completes from a single fetch; no second outbound attempt ever runs).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_second_rapid_verification_attempt_is_rate_limited() {
+    let _db = lock_db().await;
+    let stub = spawn_challenge_stub("placeholder");
+    let stub_fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let gated = Arc::new(GatedFetcher::new(stub_fetcher.clone()));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    *gated.release.lock().await = Some(release_rx);
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            gated.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (_order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    stub.set_body(ws_acme::key_authorization(
+        &http_row.token,
+        &thumb_of(rsa2048()),
+    ));
+    let (canonical, target) = http01_urls(&stub, &http_row.token);
+    stub_fetcher.set_rewrite(canonical, target);
+
+    // The first verification, held in flight: spawn the request (the
+    // router clones fine — oneshot takes it by value) and wait until it
+    // is inside the fetch.
+    let first_nonce = fetch_nonce(&fx).await;
+    let first_jws = acme_common::sign_acme_request(
+        rsa2048(),
+        &Identity::Kid(account_url(&thumb_of(rsa2048()))),
+        &first_nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/chall/{}", http_row.id),
+        &json!({}),
+    );
+    let first_request = acme_post(
+        &format!("/acme/{ACME_TENANT}/chall/{}", http_row.id),
+        &first_jws,
+    );
+    let router = fx.router.clone();
+    let first_task =
+        tokio::spawn(async move { router.oneshot(first_request).await.expect("the router") });
+    let mut waited = 0;
+    while gated.calls() == 0 {
+        assert!(
+            waited < 200,
+            "the first verification never reached the fetch"
+        );
+        waited += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The racing second POST on the same authorization: paced out.
+    let second = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let second_status = second.status();
+    let second_problem = body_json(second).await;
+
+    // Release; the held verification completes from its single fetch.
+    let _ = release_tx.send(());
+    let first = first_task.await.expect("the held task joins");
+    let first_status = first.status();
+    let first_body = body_json(first).await;
+
+    let row = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, http_row.id)
+        .await
+        .expect("read the challenge")
+        .expect("it exists");
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(second_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        second_problem["type"],
+        "urn:ietf:params:acme:error:rateLimited"
+    );
+    assert_eq!(first_status, StatusCode::OK, "the held attempt completes");
+    assert_eq!(first_body["status"], "valid");
+    assert_eq!(
+        row.status,
+        AcmeChallengeStatus::Valid,
+        "the pacing refusal touched nothing: the one attempt settled valid"
+    );
+    assert_eq!(authz_row.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(
+        stub_fetcher.calls(),
+        1,
+        "no second outbound attempt was ever made"
+    );
+}
+
+/// POST-as-GET on the challenge URL (the empty payload) is a plain read:
+/// the object answers as it stands, nothing verifies, nothing mutates.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn challenge_post_as_get_returns_the_object_without_verifying() {
+    let _db = lock_db().await;
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (_order_id, _authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+
+    let response = post_chall(&fx, rsa2048(), http_row.id, Value::Null).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "pending");
+    assert!(body.get("validated").is_none());
+    assert!(body.get("error").is_none());
+    assert_eq!(fetcher.calls(), 0, "POST-as-GET never verifies anything");
+}
+
+/// The expiry self-transition (the Task-6 carrying obligation): a PENDING
+/// authorization past its 7-day window transitions ITSELF where the
+/// surface touches it — a POST-as-GET read renders `expired`, a trigger
+/// POST refuses `unauthorized` with the expiry in the detail, and its
+/// order invalidates under the audit row — all without touching the
+/// challenge rows (there is no `expired` problem URN in the §6.7
+/// registry; the refusal type carries the state in the detail).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn an_expired_authorization_transitions_itself_and_refuses_the_chall_post() {
+    let _db = lock_db().await;
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    sqlx::query(
+        "UPDATE acme_authorizations SET expires_at = now() - interval '1 hour' \
+                 WHERE id = $1",
+    )
+    .bind(authz_id)
+    .execute(&fx.pool)
+    .await
+    .expect("age the authz past its window");
+
+    // The read leg: POST-as-GET transitions the row and renders it.
+    let read = post_chall(&fx, rsa2048(), http_row.id, Value::Null).await;
+    let read_status = read.status();
+    let read_body = body_json(read).await;
+
+    // The trigger leg: a verification on the expired authz is refused.
+    let trigger = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let trigger_status = trigger.status();
+    let trigger_problem = body_json(trigger).await;
+
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let challenge_row = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, http_row.id)
+        .await
+        .expect("read the challenge")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    let invalidations = audit_rows(&fx, "acme_order_invalidated").await;
+    fx.cleanup().await;
+
+    assert_eq!(read_status, StatusCode::OK);
+    assert!(
+        read_body["status"].is_string(),
+        "the challenge object answers as it stands"
+    );
+    assert_eq!(trigger_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        trigger_problem["type"],
+        "urn:ietf:params:acme:error:unauthorized"
+    );
+    assert!(
+        trigger_problem["detail"]
+            .as_str()
+            .expect("the refusal detail")
+            .contains("expired"),
+        "the expiry is named in the refusal, got {:?}",
+        trigger_problem["detail"]
+    );
+    assert_eq!(
+        authz_row.status,
+        AcmeAuthorizationStatus::Expired,
+        "the authz transitioned itself past the window"
+    );
+    assert_eq!(
+        challenge_row.status,
+        AcmeChallengeStatus::Pending,
+        "the challenge rows are untouched: no verification ran"
+    );
+    assert_eq!(order_row.status, AcmeOrderStatus::Invalid);
+    assert!(
+        order_row
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("expired")),
+        "the order error names the expiry, got {:?}",
+        order_row.error
+    );
+    assert_eq!(invalidations.len(), 1);
+}
+
+/// The account-scoped shape carries over to challenges: a foreign
+/// account's kid finds nothing (one 404, no oracle), and so does an
+/// unknown id and a non-uuid path.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_foreign_or_missing_challenge_is_not_found() {
+    let _db = lock_db().await;
+    let stub = spawn_challenge_stub("placeholder");
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (_order_id, _authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    let (canonical, target) = http01_urls(&stub, &http_row.token);
+    fetcher.set_rewrite(canonical, target);
+
+    // A different account's kid: the challenge of account A's authz is
+    // invisible.
+    let (_, created_b) = create_account(&fx, p256()).await;
+    assert_eq!(created_b.status(), StatusCode::CREATED);
+    let foreign = post_chall(&fx, p256(), http_row.id, json!({})).await;
+    let foreign_status = foreign.status();
+    let foreign_problem = body_json(foreign).await;
+
+    let missing = post_chall(&fx, rsa2048(), Uuid::new_v4(), json!({})).await;
+    let missing_status = missing.status();
+    let missing_body = body_json(missing).await;
+
+    // A non-uuid path segment.
+    let nonce = fetch_nonce(&fx).await;
+    let bad_jws = acme_common::sign_acme_request(
+        rsa2048(),
+        &Identity::Kid(account_url(&thumb_of(rsa2048()))),
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/chall/not-a-uuid"),
+        &json!({}),
+    );
+    let bad = send(
+        &fx,
+        acme_post(&format!("/acme/{ACME_TENANT}/chall/not-a-uuid"), &bad_jws),
+    )
+    .await;
+    let bad_status = bad.status();
+
+    fx.cleanup().await;
+
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        foreign_problem["type"], "urn:ietf:params:acme:error:malformed",
+        "one 404 problem document, no existence oracle"
+    );
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(bad_status, StatusCode::NOT_FOUND);
 }

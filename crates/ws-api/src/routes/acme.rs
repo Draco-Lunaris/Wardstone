@@ -2,7 +2,13 @@
 //! endpoint, the account lifecycle (new-account incl. only-return-existing
 //! and the ToS gate, account update, deactivation with its cascade, the
 //! atomic account-key rollover), and the order machine — new-order,
-//! order polling (POST-as-GET), and authorization objects.
+//! order polling (POST-as-GET), authorization objects — plus Task 7's
+//! SYNCHRONOUS challenge verification: for every challenge POST the
+//! server COMPUTES the expected answer (the stored token dotted with the
+//! authenticating account's own RFC 7638 thumbprint) and checks it
+//! against its own outbound HTTP fetch (HTTP-01) or DNS TXT resolution
+//! (DNS-01) — a client-supplied answer is never an input (the RFC's
+//! response fields are ignored wholesale).
 //!
 //! This is JWS-machine traffic, mounted OUTSIDE `/api/v1` at `/acme`
 //! (Plan-1-pinned URL shape): no bearer/session extractor ever touches it —
@@ -52,6 +58,8 @@
 //! payload), never unauthenticated GETs.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
@@ -106,6 +114,11 @@ const URN_ACCOUNT_DOES_NOT_EXIST: &str = "urn:ietf:params:acme:error:accountDoes
 /// headers.)
 const URN_REJECTED_IDENTIFIER: &str = "urn:ietf:params:acme:error:rejectedIdentifier";
 
+/// The problem URN for an attempt paced out by the per-authorization
+/// backoff (RFC 8555 §6.7's `rateLimited`; the pacing window lives in
+/// [`crate::state::CHALLENGE_ATTEMPT_BACKOFF`]).
+const URN_RATE_LIMITED: &str = "urn:ietf:params:acme:error:rateLimited";
+
 /// The order machine's clock pins (settlement D5): an order lives 7 days,
 /// and each freshly minted PENDING authorization shares that retry window.
 /// The 30-day figure of the reuse window is NOT minted here — it is the
@@ -114,6 +127,11 @@ const URN_REJECTED_IDENTIFIER: &str = "urn:ietf:params:acme:error:rejectedIdenti
 /// now` on `valid` account-level rows.
 const ORDER_EXPIRY_DAYS: i64 = 7;
 const PENDING_AUTHZ_EXPIRY_DAYS: i64 = 7;
+
+/// A VALID authorization's NEW expiry, stamped by the challenge
+/// verification when it settles the identifier: the 30-day REUSE WINDOW
+/// the order constants' doc defers to this task.
+const REUSE_WINDOW_DAYS: i64 = 30;
 
 /// The default certificate profile of the Wardstone `profile` extension
 /// member (the plan's pin): an order that offers no profile asks for the
@@ -168,6 +186,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/{tenant}/new-order", post(new_order))
         .route("/{tenant}/orders/{order}", post(order_url))
         .route("/{tenant}/authz/{authz}", post(authz_url))
+        .route("/{tenant}/chall/{challenge}", post(challenge_url))
         .route("/{tenant}/key-change", post(key_change))
         .merge(new_account)
         // Every /acme response — including the governor's 429s and every
@@ -1034,7 +1053,7 @@ async fn new_order(
         AcmeRepo::new()
             .insert_authorization(&mut *tx, &authorization)
             .await?;
-        mint_challenge_pair(&mut tx, tenant.id, authorization.id, now).await?;
+        mint_challenge_pair(&mut tx, tenant.id, authorization.id, identifier, now).await?;
         authorization_urls.push(authz_object_url(&base, &tenant.name, authorization.id));
         minted.push(identifier.clone());
     }
@@ -1104,7 +1123,25 @@ async fn order_url(
         .await?
         .filter(|order| order.account_id == account.id)
         .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
-    let authorizations = order_authorization_urls(&state, &tenant, &base, &order).await?;
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
+    let authorizations =
+        order_authorization_urls(&state, &tenant, &base, &account_url_str, &order).await?;
+    // The poll may have driven a PAST-EXPIRY pending authorization to its
+    // expired self-transition (Task 7's wiring), which invalidates an
+    // order-scoped one's order; re-read the row so the object speaks
+    // as-of-now.
+    let order = AcmeRepo::new()
+        .get_order(&state.pool, tenant.id, order_id)
+        .await?
+        .filter(|order| order.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
+    let authorizations = match order.status {
+        AcmeOrderStatus::Pending | AcmeOrderStatus::Ready => authorizations,
+        _ => None,
+    };
     Ok(order_response(
         StatusCode::OK,
         &base,
@@ -1131,6 +1168,7 @@ async fn order_authorization_urls(
     state: &AppState,
     tenant: &Tenant,
     base: &str,
+    account_url: &str,
     order: &AcmeOrderModel,
 ) -> Result<Option<Vec<String>>, AcmeProblem> {
     if !matches!(
@@ -1150,6 +1188,13 @@ async fn order_authorization_urls(
             .iter()
             .find(|authorization| &authorization.identifier == identifier)
         {
+            // Task 7's poll-time wiring: a PENDING row past its 7-day
+            // window transitions itself expired here (an order-scoped one
+            // invalidates the order in the same transaction —
+            // see expire_authorization_if_past).
+            let existing =
+                expire_authorization_if_past(state, tenant, base, account_url, existing.clone())
+                    .await?;
             urls.push(authz_object_url(base, &tenant.name, existing.id));
             continue;
         }
@@ -1157,7 +1202,11 @@ async fn order_authorization_urls(
             .valid_authorization_for(&state.pool, tenant.id, order.account_id, identifier, now)
             .await?
         {
-            Some(reused) => urls.push(authz_object_url(base, &tenant.name, reused.id)),
+            Some(reused) => {
+                let reused =
+                    expire_authorization_if_past(state, tenant, base, account_url, reused).await?;
+                urls.push(authz_object_url(base, &tenant.name, reused.id));
+            }
             None => tracing::warn!(
                 order = %order.id,
                 identifier = %identifier,
@@ -1209,11 +1258,21 @@ async fn authz_url(
     let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
     let authz_id =
         Uuid::parse_str(&authz_id).map_err(|_| AcmeProblem::not_found("no such authorization"))?;
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
     let authorization = AcmeRepo::new()
         .get_authorization(&state.pool, tenant.id, authz_id)
         .await?
         .filter(|authorization| authorization.account_id == account.id)
         .ok_or_else(|| AcmeProblem::not_found("no such authorization"))?;
+    // Task 7's poll-time wiring: a PENDING row past its 7-day window
+    // transitions itself expired right here (the object then speaks the
+    // RFC's deadline state).
+    let authorization =
+        expire_authorization_if_past(&state, &tenant, &base, &account_url_str, authorization)
+            .await?;
     let challenges = AcmeRepo::new()
         .list_challenges_by_authorization(&state.pool, tenant.id, authorization.id)
         .await?;
@@ -1226,17 +1285,657 @@ async fn authz_url(
     .into_response())
 }
 
-/// Mint the BOTH-flavor challenge pair of a freshly minted authorization
-/// (the plan's Task-6 pin: http-01 AND dns-01 per authorization — the
-/// client picks by requesting validation on one; Task 7's verification
-/// and Task 5's deactivation cascade both key on these rows).
+// ---------------------------------------------------------------------------
+// Challenge verification (Plan 4 Task 7): the server-side seams, the
+// synchronous verdict, and the settlement transitions
+// ---------------------------------------------------------------------------
+
+use hickory_resolver::TokioResolver;
+
+/// The HTTP-01 fetch seam (the server-side fetch of RFC 8555 §8.3): the
+/// route builds the CANONICAL fetch URL from the stored row (identifier +
+/// token) and hands it here; `Ok` carries the body for the exact-match
+/// comparison, `Err` the flattened failure text the challenge error
+/// records. Dyn-compatible over hand-boxed futures — no async-trait pin
+/// is added for this (the house adds no pin it does not use).
+pub trait ChallengeFetch: Send + Sync {
+    fn fetch(&self, url: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+}
+
+/// The DNS-01 resolver seam (RFC 8555 §8.4): resolve the given (fully
+/// qualified) name's TXT records; `Ok` carries the record strings — an
+/// empty `Ok` IS the truth when no records exist (the NXDOMAIN shape) —
+/// and `Err` the flattened failure text.
+pub trait TxtResolver: Send + Sync {
+    fn resolve_txt(
+        &self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send>>;
+}
+
+/// The production HTTP-01 fetcher: a reqwest client bounded to 10s TOTAL
+/// per request, direct connections only — `no_proxy`, because the
+/// environment's proxy variables are never trusted (the fetch must
+/// originate from THIS server against the identifier's own origin; the
+/// `Host` header rides from the URL, never a header the route reads).
+pub struct Http01Fetcher {
+    client: reqwest::Client,
+}
+
+impl Http01Fetcher {
+    /// Build the bounded client (the whole-request budget: inside
+    /// ws-web's 60s proxy timeout, well ahead of it).
+    pub fn bounded() -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .no_proxy()
+            .build()?;
+        Ok(Http01Fetcher { client })
+    }
+}
+
+impl ChallengeFetch for Http01Fetcher {
+    fn fetch(&self, url: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|err| format!("the HTTP request to {url} failed: {err}"))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| format!("the HTTP response body fetch failed: {err}"))?;
+            if !status.is_success() {
+                return Err(format!("the HTTP request returned status {status}"));
+            }
+            Ok(body)
+        })
+    }
+}
+
+/// The production DNS-01 resolver: hickory over the system DNS
+/// configuration (`/etc/resolv.conf` — the operator's own resolver, the
+/// homelab reality the wildcard path serves).
+pub struct TxtResolverHandle {
+    resolver: TokioResolver,
+}
+
+impl TxtResolverHandle {
+    /// Build over the system configuration; a failure carries the flat
+    /// text the state layer logs before degrading closed.
+    pub fn from_system_conf() -> Result<Self, String> {
+        let resolver = TokioResolver::builder_tokio()
+            .map_err(|err| format!("the system DNS configuration is unreadable: {err}"))?
+            .build();
+        Ok(TxtResolverHandle { resolver })
+    }
+}
+
+impl TxtResolver for TxtResolverHandle {
+    fn resolve_txt(
+        &self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send>> {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let lookup = resolver
+                .txt_lookup(&name)
+                .await
+                .map_err(|err| format!("the TXT lookup for {name} failed: {err}"))?;
+            Ok(lookup
+                .iter()
+                .map(|txt| {
+                    // TXT records may split the value across
+                    // character-strings; the RFC's value is the
+                    // concatenation.
+                    let bytes: Vec<u8> = txt
+                        .txt_data()
+                        .iter()
+                        .flat_map(|segment| segment.iter())
+                        .copied()
+                        .collect();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                })
+                .collect())
+        })
+    }
+}
+
+/// The closed degradation (see
+/// [`crate::state::VerificationDeps::production`]): every request fails
+/// with the construction failure's text.
+pub struct FailingFetcher(pub String);
+
+impl ChallengeFetch for FailingFetcher {
+    fn fetch(&self, _url: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let detail = self.0.clone();
+        Box::pin(async move { Err(detail) })
+    }
+}
+
+/// The closed DNS-01 degradation (see
+/// [`crate::state::VerificationDeps::production`]).
+pub struct FailingTxtResolver(pub String);
+
+impl TxtResolver for FailingTxtResolver {
+    fn resolve_txt(
+        &self,
+        _name: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send>> {
+        let detail = self.0.clone();
+        Box::pin(async move { Err(detail) })
+    }
+}
+
+/// The trigger payload of RFC 8555 §7.5.1: an (usually empty) JSON
+/// object. The challenges of this document define NO response fields, so
+/// the object is accepted and every member is IGNORED — deliberately not
+/// a single member is deserialized. That is how a client cannot even
+/// PRESENT a suggested answer on this route (`keyAuthorization` and
+/// friends go nowhere): the expected value is computed server-side.
+#[derive(Debug, Deserialize)]
+struct ChallengePayload {}
+
+/// `POST /acme/{tenant}/chall/{challenge}` — the RFC 8555 §7.5.1
+/// challenge surface, kid-carried and account-scoped (the owning
+/// authorization's account must match the kid; a foreign or missing
+/// challenge is the usual one-404-no-oracle miss). The empty payload is
+/// RFC POST-as-GET: a plain read of the challenge object. An object
+/// payload triggers the SYNCHRONOUS verification (settlement D4): the
+/// route computes the expected answer from the STORED token and the
+/// authenticating account's own RFC 7638 thumbprint, fetches/resolves
+/// server-side (HTTP-01: GET `http://<identifier>/.well-known/
+/// acme-challenge/<token>` with the bounded, proxyless client; DNS-01:
+/// TXT on `_acme-challenge.<identifier>`), then transitions the
+/// challenge, authorization, and order in ONE transaction and responds
+/// the challenge object as of that moment.
+///
+/// Lifecycle (settlement D6): unlimited re-POSTs while the authorization
+/// is pending, paced by the per-authorization backoff (a refusal inside
+/// the window touches nothing); a decided challenge answers its standing
+/// object without re-verifying; an authorization past its 7-day pending
+/// window transitions itself `expired` first, and further POSTs refuse
+/// `unauthorized` — the §6.7 registry's closest type (there is no
+/// `expired` URN; the expiry rides the detail).
+///
+/// The anti-goal stands by construction: §7.5.1's response fields are
+/// ignored wholesale, and nothing on this route can ingest a
+/// client-suggested answer — [`dns01` verification] compares the
+/// DNS layer the server resolved and the `http-01` fetch the server
+/// made.
+async fn challenge_url(
+    State(state): State<AppState>,
+    Path((tenant_name, challenge_id)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/chall/{challenge_id}", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    let challenge_id =
+        Uuid::parse_str(&challenge_id).map_err(|_| AcmeProblem::not_found("no such challenge"))?;
+    let challenge = AcmeRepo::new()
+        .get_challenge(&state.pool, tenant.id, challenge_id)
+        .await?
+        .ok_or_else(|| AcmeProblem::not_found("no such challenge"))?;
+    let authorization = AcmeRepo::new()
+        .get_authorization(&state.pool, tenant.id, challenge.authorization_id)
+        .await?
+        .filter(|authorization| authorization.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such challenge"))?;
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
+    let authorization =
+        expire_authorization_if_past(&state, &tenant, &base, &account_url_str, authorization)
+            .await?;
+
+    // POST-as-GET: a plain read, no verification.
+    if payload.is_null() {
+        return Ok(challenge_response(
+            StatusCode::OK,
+            &base,
+            &tenant.name,
+            &challenge,
+        ));
+    }
+    // The §7.5.1 trigger: everything the client sent beyond the JWS
+    // envelope is a response-object member the RFC says to ignore — the
+    // object is parsed for shape, the members are not.
+    let _trigger: ChallengePayload = serde_json::from_value(payload)
+        .map_err(|_| AcmeProblem::malformed("the challenge payload is not a JSON object"))?;
+
+    // The authorization's lifecycle gates the trigger.
+    match authorization.status {
+        AcmeAuthorizationStatus::Pending | AcmeAuthorizationStatus::Valid => {}
+        AcmeAuthorizationStatus::Expired => {
+            return Err(AcmeProblem::unauthorized("the authorization has expired"));
+        }
+        AcmeAuthorizationStatus::Invalid => {
+            return Err(AcmeProblem::unauthorized("the authorization is invalid"));
+        }
+        AcmeAuthorizationStatus::Deactivated => {
+            return Err(AcmeProblem::unauthorized(
+                "the authorization is deactivated",
+            ));
+        }
+    }
+    // A decided challenge answers its standing object — a valid challenge
+    // never re-validates, an invalid one is terminal with its
+    // authorization (whose gate already refused).
+    if matches!(
+        challenge.status,
+        AcmeChallengeStatus::Valid | AcmeChallengeStatus::Invalid
+    ) {
+        return Ok(challenge_response(
+            StatusCode::OK,
+            &base,
+            &tenant.name,
+            &challenge,
+        ));
+    }
+    // Settlement D5's pacing: the next attempt on this authorization is
+    // one window after the last; a refusal inside the window touches
+    // nothing (no processing mark, no fetch, no row write).
+    if !state.verification.try_record_attempt(authorization.id) {
+        return Err(AcmeProblem {
+            status: StatusCode::BAD_REQUEST,
+            type_urn: URN_RATE_LIMITED,
+            detail: "another verification attempt on this authorization is inside its \
+                     pacing window; retry shortly"
+                .to_owned(),
+            tos_link: None,
+            location: None,
+        });
+    }
+
+    // In-flight bookkeeping: `processing` until the verdict — a request
+    // that dies mid-verification leaves the row `processing`, which
+    // re-enters like a retry (§8.2's client-retry semantics).
+    AcmeRepo::new()
+        .update_challenge_status(
+            &state.pool,
+            tenant.id,
+            challenge.id,
+            AcmeChallengeStatus::Processing,
+            None,
+            None,
+        )
+        .await?;
+
+    // The server-side verdict. The expected answer is COMPUTED here from
+    // the STORED token and the AUTHENTICATING account's own thumbprint —
+    // the key that signed this very request — and checked against the
+    // origin the server itself reaches.
+    let expected = ws_acme::key_authorization(&challenge.token, &account.jwk_thumbprint);
+    let verdict = match challenge.challenge_type {
+        AcmeChallengeType::Http01 => {
+            // An http-01 row never exists for a wildcard identifier
+            // (mint_challenge_pair mints DNS-01 alone there); the guard
+            // is defense-in-depth against stray rows.
+            if authorization.identifier.starts_with("*.") {
+                Err("HTTP-01 cannot prove a wildcard identifier".to_owned())
+            } else {
+                let url = format!(
+                    "http://{}/.well-known/acme-challenge/{}",
+                    authorization.identifier, challenge.token
+                );
+                match state.verification.http_fetcher.fetch(url).await {
+                    Ok(body) if body == expected => Ok(()),
+                    Ok(_) => Err(format!(
+                        "the key authorization served at /.well-known/acme-challenge/{} \
+                         does not match the expected value",
+                        challenge.token
+                    )),
+                    Err(detail) => Err(detail),
+                }
+            }
+        }
+        AcmeChallengeType::Dns01 => {
+            // RFC 8555's wildcard rule: the TXT name uses the identifier
+            // WITHOUT the `*.` prefix (the authorization row stores it
+            // verbatim).
+            let domain = authorization
+                .identifier
+                .strip_prefix("*.")
+                .unwrap_or(&authorization.identifier);
+            let name = format!("_acme-challenge.{domain}.");
+            // §8.4: the record the server looks for is
+            // base64url(SHA256(key authorization)) — computed here from
+            // the same expected key authorization the http-01
+            // exact-match uses.
+            let record_value = ws_acme::dns01_record_value(&expected);
+            match state
+                .verification
+                .txt_resolver
+                .resolve_txt(name.clone())
+                .await
+            {
+                Ok(records) if records.iter().any(|record| record == &record_value) => Ok(()),
+                Ok(_) => Err(format!(
+                    "no TXT record for {name} matches the expected value"
+                )),
+                Err(detail) => Err(detail),
+            }
+        }
+    };
+
+    let settled = settle_challenge(
+        &state,
+        &tenant,
+        &base,
+        &account_url_str,
+        &challenge,
+        &authorization,
+        verdict,
+    )
+    .await?;
+    Ok(challenge_response(
+        StatusCode::OK,
+        &base,
+        &tenant.name,
+        &settled,
+    ))
+}
+
+/// The challenge object (RFC 8555 §8's data shape): type, url, token,
+/// status — with `validated` (RFC 3339) once decided and, on a failure,
+/// the `error` problem document (the registry's generic `serverInternal`
+/// URN; the stored flat text is the detail).
+fn challenge_object(base: &str, tenant_name: &str, challenge: &AcmeChallengeModel) -> Value {
+    let mut object = json!({
+        "type": challenge.challenge_type.as_str(),
+        "url": format!("{base}/acme/{tenant_name}/chall/{}", challenge.id),
+        "token": challenge.token,
+        "status": challenge.status.as_str(),
+    });
+    if let Some(validated) = challenge.validated_at {
+        object["validated"] = json!(validated.to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
+    if let Some(error) = &challenge.error {
+        object["error"] = json!({
+            "type": "urn:ietf:params:acme:error:serverInternal",
+            "detail": error,
+        });
+    }
+    object
+}
+
+/// A challenge-object response (§7.5.1 answers the POST with the updated
+/// challenge object; no Location header — the URL is already in hand).
+fn challenge_response(
+    status: StatusCode,
+    base: &str,
+    tenant_name: &str,
+    challenge: &AcmeChallengeModel,
+) -> Response {
+    (status, Json(challenge_object(base, tenant_name, challenge))).into_response()
+}
+
+/// Task 7's poll-time obligation (the Task-6 review's carrying item): a
+/// PENDING authorization past its 7-day window transitions ITSELF to
+/// `expired` wherever the surface touches it — a POST-as-GET read, a
+/// challenge trigger, an order poll — instead of the silent omission the
+/// old poll documented. RFC 8555 §7.1.6: an order goes invalid when one
+/// of its authorizations enters a final state other than valid, so an
+/// order-scoped expired row invalidates its order under the
+/// `acme_order_invalidated` audit row, in ONE transaction.
+async fn expire_authorization_if_past(
+    state: &AppState,
+    tenant: &Tenant,
+    base: &str,
+    account_url: &str,
+    mut authorization: AcmeAuthorizationModel,
+) -> Result<AcmeAuthorizationModel, AcmeProblem> {
+    if authorization.status != AcmeAuthorizationStatus::Pending
+        || authorization.expires_at > Utc::now()
+    {
+        return Ok(authorization);
+    }
+    let mut tx = state.pool.begin().await?;
+    AcmeRepo::new()
+        .update_authorization_status(
+            &mut *tx,
+            tenant.id,
+            authorization.id,
+            AcmeAuthorizationStatus::Expired,
+            None,
+        )
+        .await?;
+    if let Some(order_id) = authorization.order_id {
+        invalidate_order(
+            &mut tx,
+            tenant,
+            base,
+            order_id,
+            &authorization,
+            "the authorization expired",
+            account_url,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::warn!(
+        authorization = %authorization.id,
+        "an expired pending authorization transitioned itself at poll/POST time"
+    );
+    authorization.status = AcmeAuthorizationStatus::Expired;
+    Ok(authorization)
+}
+
+/// The RFC 8555 §7.1.6 companion: an authorization that entered a final
+/// non-valid state invalidates its order — when that order is not itself
+/// `valid` (a regressed order would contradict the state machine) — with
+/// the reason as the flattened `error`, under the `acme_order_invalidated`
+/// audit row. Runs INSIDE the caller's transaction.
+async fn invalidate_order(
+    tx: &mut sqlx::PgConnection,
+    tenant: &Tenant,
+    base: &str,
+    order_id: Uuid,
+    authorization: &AcmeAuthorizationModel,
+    reason: &str,
+    account_url: &str,
+) -> Result<(), AcmeProblem> {
+    let order = AcmeRepo::new()
+        .get_order(&mut *tx, tenant.id, order_id)
+        .await?
+        .ok_or_else(|| AcmeProblem::internal("an authorization's order vanished"))?;
+    if order.status == AcmeOrderStatus::Valid {
+        // A valid order cannot regress: its authorizations were all
+        // settled `valid` long before any row could fall out from under
+        // it.
+        return Ok(());
+    }
+    let error = format!(
+        "the authorization for {} failed: {reason}",
+        authorization.identifier
+    );
+    AcmeRepo::new()
+        .update_order_status(
+            &mut *tx,
+            tenant.id,
+            order_id,
+            AcmeOrderStatus::Invalid,
+            None,
+            Some(&error),
+        )
+        .await?;
+    let actor = acme_actor(tenant.id, account_url.to_owned());
+    AuditRepo::new()
+        .record(
+            &mut *tx,
+            &audit_entry(
+                &actor,
+                "acme_order_invalidated",
+                "acme_order",
+                &order.id.to_string(),
+                json!({
+                    "order_url": order_object_url(base, &tenant.name, order.id),
+                    "authorization": authorization.id.to_string(),
+                    "identifier": authorization.identifier,
+                    "error": error,
+                }),
+            ),
+        )
+        .await?;
+    tracing::info!(
+        order = %order.id,
+        "acme order invalidated by an authorization's final state"
+    );
+    Ok(())
+}
+
+/// The ready companion: when the LAST of an order's authorizations
+/// settles `valid`, the order is `ready` (RFC 8555 §7.1.6) —
+/// transitioned only from `pending` (a ready order stays ready;
+/// a processing/valid one is past this step; an invalid one never
+/// re-readies). Runs INSIDE the caller's transaction.
+async fn ready_order_when_all_authorizations_valid(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+    order_id: Uuid,
+) -> Result<(), AcmeProblem> {
+    let order = AcmeRepo::new()
+        .get_order(&mut *tx, tenant_id, order_id)
+        .await?
+        .ok_or_else(|| AcmeProblem::internal("an authorization's order vanished"))?;
+    if order.status != AcmeOrderStatus::Pending {
+        return Ok(());
+    }
+    let authorizations = AcmeRepo::new()
+        .list_authorizations_by_order(&mut *tx, tenant_id, order_id)
+        .await?;
+    if authorizations
+        .iter()
+        .all(|a| a.status == AcmeAuthorizationStatus::Valid)
+    {
+        AcmeRepo::new()
+            .update_order_status(
+                &mut *tx,
+                tenant_id,
+                order_id,
+                AcmeOrderStatus::Ready,
+                None,
+                None,
+            )
+            .await?;
+        tracing::info!(order = %order_id, "all authorizations valid: the acme order is ready");
+    }
+    Ok(())
+}
+
+/// The verdict transaction: the challenge's decision, the owning
+/// authorization's transition (a `valid` stamps the 30-day REUSE WINDOW
+/// as the fresh `expires_at`; an `invalid` is final), and the
+/// order-scoped companions (ready / invalid + audit) commit in ONE
+/// transaction. The route renders the row as of this moment — the refetch
+/// follows the commit.
+async fn settle_challenge(
+    state: &AppState,
+    tenant: &Tenant,
+    base: &str,
+    account_url: &str,
+    challenge: &AcmeChallengeModel,
+    authorization: &AcmeAuthorizationModel,
+    verdict: Result<(), String>,
+) -> Result<AcmeChallengeModel, AcmeProblem> {
+    let now = Utc::now();
+    let mut tx = state.pool.begin().await?;
+    match verdict {
+        Ok(()) => {
+            AcmeRepo::new()
+                .update_challenge_status(
+                    &mut *tx,
+                    tenant.id,
+                    challenge.id,
+                    AcmeChallengeStatus::Valid,
+                    Some(now),
+                    None,
+                )
+                .await?;
+            AcmeRepo::new()
+                .update_authorization_status(
+                    &mut *tx,
+                    tenant.id,
+                    authorization.id,
+                    AcmeAuthorizationStatus::Valid,
+                    Some(now + chrono::Duration::days(REUSE_WINDOW_DAYS)),
+                )
+                .await?;
+            if let Some(order_id) = authorization.order_id {
+                ready_order_when_all_authorizations_valid(&mut tx, tenant.id, order_id).await?;
+            }
+        }
+        Err(detail) => {
+            AcmeRepo::new()
+                .update_challenge_status(
+                    &mut *tx,
+                    tenant.id,
+                    challenge.id,
+                    AcmeChallengeStatus::Invalid,
+                    Some(now),
+                    Some(&detail),
+                )
+                .await?;
+            AcmeRepo::new()
+                .update_authorization_status(
+                    &mut *tx,
+                    tenant.id,
+                    authorization.id,
+                    AcmeAuthorizationStatus::Invalid,
+                    None,
+                )
+                .await?;
+            if let Some(order_id) = authorization.order_id {
+                invalidate_order(
+                    &mut tx,
+                    tenant,
+                    base,
+                    order_id,
+                    authorization,
+                    &detail,
+                    account_url,
+                )
+                .await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    tracing::info!(challenge = %challenge.id, "acme challenge settled");
+    AcmeRepo::new()
+        .get_challenge(&state.pool, tenant.id, challenge.id)
+        .await?
+        .ok_or_else(|| AcmeProblem::internal("the challenge vanished during its settlement"))
+}
+
+/// Mint the challenges of a freshly minted authorization (the plan's
+/// Task-6 pin: BOTH flavors per PLAIN identifier — http-01 AND dns-01,
+/// the client picks by requesting validation on one). The RFC 8555
+/// wildcard rule (Task 7): http-01 cannot prove a wildcard identifier, so
+/// a `*.`-prefixed authorization mints its DNS-01 challenge ALONE — an
+/// http-01 row never exists for a wildcard.
 async fn mint_challenge_pair(
     executor: &mut sqlx::PgConnection,
     tenant_id: Uuid,
     authorization_id: Uuid,
+    identifier: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AcmeProblem> {
-    for challenge_type in [AcmeChallengeType::Http01, AcmeChallengeType::Dns01] {
+    let flavors: &[AcmeChallengeType] = if identifier.starts_with("*.") {
+        &[AcmeChallengeType::Dns01]
+    } else {
+        &[AcmeChallengeType::Http01, AcmeChallengeType::Dns01]
+    };
+    for challenge_type in flavors {
+        let challenge_type = *challenge_type;
         let challenge = AcmeChallengeModel {
             id: Uuid::new_v4(),
             tenant_id,
@@ -1254,7 +1953,6 @@ async fn mint_challenge_pair(
     }
     Ok(())
 }
-
 /// A challenge token: 32 OS-random bytes, unpadded base64url — the
 /// `ws_acme::NonceStore::mint` idiom verbatim (a dead OS entropy source
 /// is unrecoverable, so minting fails loudly rather than fabricating a

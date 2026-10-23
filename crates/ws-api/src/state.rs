@@ -11,6 +11,11 @@ use sqlx::PgPool;
 use ws_acme::NonceStore;
 use ws_auth::jwt::JwtKeys;
 
+use crate::routes::acme::{
+    ChallengeFetch, FailingFetcher, FailingTxtResolver, Http01Fetcher, TxtResolver,
+    TxtResolverHandle,
+};
+
 /// The name of the TOTP/OIDC secret-encryption key file inside the keys
 /// directory (`ws_core::crypto::SecretBox`'s envelope key, created at
 /// setup under the keys volume).
@@ -218,6 +223,103 @@ impl OidcStateStore {
     }
 }
 
+/// The pacing window between server-side verification attempts on one
+/// authorization (settlement D5, the plan's Task-7 pin): a challenge POST
+/// may run a verification per authorization per window; attempts inside
+/// the window answer the `rateLimited` problem document without touching
+/// the row. The counter lives in MEMORY ([`VerificationDeps`]): a restart
+/// lifts the backoff — the accepted v1 shape, because the backoff paces a
+/// retrying client, it is not a security boundary.
+pub const CHALLENGE_ATTEMPT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The challenge-verification seams (Plan 4 Task 7): the server-side
+/// fetcher for HTTP-01, the TXT resolver for DNS-01, and the per-
+/// authorization attempt pacing. Clonable: the fetcher/resolver fields
+/// are `Arc` handles and the pacing map rides its own `Arc`, so every
+/// clone shares one live set of seams and one pacing map.
+#[derive(Clone)]
+pub struct VerificationDeps {
+    /// HTTP-01: GET the canonical fetch URL; the body is the exact-match
+    /// input (`Ok`) or the failure detail (`Err`) the challenge error
+    /// records.
+    pub http_fetcher: Arc<dyn ChallengeFetch>,
+    /// DNS-01: resolve the `_acme-challenge.<identifier>.` TXT name; the
+    /// returned record strings are the any-match input.
+    pub txt_resolver: Arc<dyn TxtResolver>,
+    /// `authorization id -> the instant the NEXT attempt is allowed`;
+    /// entries past their instant are stale and dropped opportunistically.
+    attempts: Arc<Mutex<HashMap<uuid::Uuid, Instant>>>,
+}
+
+impl VerificationDeps {
+    /// The production seams: the bounded reqwest fetcher (10s total per
+    /// request, direct connections only — proxy environment variables are
+    /// never trusted) and the hickory resolver over the system DNS
+    /// configuration. A seam that cannot construct (an unreadable
+    /// resolv.conf, a client build failure) degrades CLOSED — every
+    /// verification attempt it serves fails, never a fake success.
+    pub fn production() -> Self {
+        let http_fetcher: Arc<dyn ChallengeFetch> = match Http01Fetcher::bounded() {
+            Ok(fetcher) => Arc::new(fetcher),
+            Err(err) => {
+                tracing::error!(error = %err, "the HTTP-01 fetcher failed to construct");
+                Arc::new(FailingFetcher(format!(
+                    "the HTTP-01 fetcher is unavailable: {err}"
+                )))
+            }
+        };
+        let txt_resolver: Arc<dyn TxtResolver> = match TxtResolverHandle::from_system_conf() {
+            Ok(resolver) => Arc::new(resolver),
+            Err(err) => {
+                tracing::error!(error = %err, "the DNS-01 resolver failed to construct");
+                Arc::new(FailingTxtResolver(format!(
+                    "the DNS-01 resolver is unavailable: {err}"
+                )))
+            }
+        };
+        Self::with_seams(http_fetcher, txt_resolver)
+    }
+
+    /// The injection constructor (tests and future alternate
+    /// deployments): caller-supplied seam objects over an empty pacing
+    /// map.
+    pub fn with_seams(
+        http_fetcher: Arc<dyn ChallengeFetch>,
+        txt_resolver: Arc<dyn TxtResolver>,
+    ) -> Self {
+        VerificationDeps {
+            http_fetcher,
+            txt_resolver,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The pacing gate: `true` when the attempt is allowed, spending the
+    /// allowance atomically under one lock hold (the next attempt on this
+    /// authorization inside [`CHALLENGE_ATTEMPT_BACKOFF`] is refused). A
+    /// poisoned lock fails OPEN — only a panic while the lock was held
+    /// poisons it, and pacing is not a security boundary — while
+    /// opportunistic GC drops the stale entries the check walks over.
+    pub fn try_record_attempt(&self, authorization_id: uuid::Uuid) -> bool {
+        let Ok(mut attempts) = self.attempts.lock() else {
+            tracing::warn!(
+                "the challenge-attempt pacing map is poisoned; the attempt runs un-paced"
+            );
+            return true;
+        };
+        let now = Instant::now();
+        if attempts
+            .get(&authorization_id)
+            .is_some_and(|next| *next > now)
+        {
+            return false;
+        }
+        attempts.retain(|_, next| *next > now);
+        attempts.insert(authorization_id, now + CHALLENGE_ATTEMPT_BACKOFF);
+        true
+    }
+}
+
 /// The application state of the REST surface. Clonable (the pool and the
 /// shared handles are cheap `Arc`/connection copies).
 #[derive(Clone)]
@@ -237,6 +339,11 @@ pub struct AppState {
     /// ACME request spends one through `verify_jws` — single-use,
     /// in-memory (a restart simply re-nonces).
     pub nonces: Arc<NonceStore>,
+    /// The challenge-verification seams (Plan 4 Task 7): the server-side
+    /// HTTP-01 fetcher, the DNS-01 TXT resolver, and the per-authorization
+    /// attempt pacing — the routes compute every expected answer from
+    /// these; client-supplied data is never a verification input.
+    pub verification: VerificationDeps,
 }
 
 impl AppState {
@@ -250,6 +357,7 @@ impl AppState {
             access_log: Arc::new(AccessLog::default()),
             oidc_states: Arc::new(OidcStateStore::default()),
             nonces: Arc::new(NonceStore::new()),
+            verification: VerificationDeps::production(),
         }
     }
 
