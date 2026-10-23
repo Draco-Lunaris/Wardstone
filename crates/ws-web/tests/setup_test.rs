@@ -621,6 +621,20 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         cert.subject(),
         "the certificate is self-signed"
     );
+    // The setup certificate's consumer is the operator's BROWSER: browsers
+    // do not support Ed25519 TLS certificates (curl/openssl do — the gap
+    // surfaced as ERR_SSL_PROTOCOL_ERROR in real deployment), so the mint
+    // must stay on a browser-universal algorithm (ECDSA P-256).
+    assert_eq!(
+        cert.signature_algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.4.3.2",
+        "the setup cert's signature is ecdsa-with-SHA256, not Ed25519 (1.3.101.112)"
+    );
+    assert_eq!(
+        cert.public_key().algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.2.1",
+        "the setup cert's public key is ECDSA (id-ecPublicKey), not Ed25519 (1.3.101.100) or RSA"
+    );
     let san = cert
         .subject_alternative_name()
         .expect("the extensions parse")

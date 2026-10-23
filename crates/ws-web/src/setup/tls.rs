@@ -40,12 +40,13 @@ pub const PLACEHOLDER_SAN: &str = "wardstone-setup.local";
 pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, String), CaError> {
     keystore.ensure_master_key()?;
 
-    // An Ed25519 leaf key: the setup certificate is strictly temporary
-    // (it is replaced by the CA-issued leaf at the end of setup, and
-    // lives only long enough for the operator to complete the form), so
-    // instant key generation is worth more than an algorithm choice the
-    // operator never sees or pins.
-    let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::Ed25519)?;
+    // An ECDSA P-256 leaf key. The setup certificate is strictly temporary
+    // (replaced by the CA-issued leaf at the end of setup, living only long
+    // enough for the operator to complete the form) — but its consumer is
+    // the operator's BROWSER, and browsers do not support Ed25519 TLS
+    // certificates (curl/openssl do, which hid the gap from server-side
+    // probes). P-256 keeps instant generation AND universal browser support.
+    let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
     let private_key_der = Zeroizing::new(private_key_der);
 
     let mut params = rcgen::CertificateParams::default();
