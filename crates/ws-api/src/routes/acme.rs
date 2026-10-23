@@ -2093,13 +2093,26 @@ async fn authz_url(
     let challenges = AcmeRepo::new()
         .list_challenges_by_authorization(&state.pool, tenant.id, authorization.id)
         .await?;
-    Ok(Json(authz_object(
+    let mut response = (Json(authz_object(
         &base,
         &tenant.name,
         &authorization,
         &challenges,
-    ))
-    .into_response())
+    )),)
+        .into_response();
+    // RFC 8555 §7.5: an order-scoped authorization points back to its
+    // order with a Link header rel="up". Account-level rows (the Task-11
+    // promotion's reuse pool) have no single originating order and omit
+    // the member.
+    if let Some(order_id) = authorization.order_id {
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "<{}>; rel=\"up\"",
+            order_object_url(&base, &tenant.name, order_id)
+        )) {
+            response.headers_mut().insert(header::LINK, value);
+        }
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -2501,7 +2514,17 @@ fn challenge_response(
     tenant_name: &str,
     challenge: &AcmeChallengeModel,
 ) -> Response {
-    (status, Json(challenge_object(base, tenant_name, challenge))).into_response()
+    let mut response =
+        (status, Json(challenge_object(base, tenant_name, challenge))).into_response();
+    // RFC 8555 §7.5: a challenge object points back to its authorization
+    // with a Link header rel="up".
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "<{}>; rel=\"up\"",
+        authz_object_url(base, tenant_name, challenge.authorization_id)
+    )) {
+        response.headers_mut().insert(header::LINK, value);
+    }
+    response
 }
 
 /// Task 7's poll-time obligation (the Task-6 review's carrying item): a
@@ -2949,6 +2972,16 @@ fn order_response(
         .into_response();
     if let Ok(value) = HeaderValue::from_str(&location) {
         response.headers_mut().insert(header::LOCATION, value);
+    }
+    // RFC 8555 §7.4: the order's response carries the authorizations as
+    // Link headers rel="up" as well as the member — real clients (certbot
+    // 4.0.0 found it live) require the headers.
+    if let Some(urls) = authorizations {
+        for auth in urls {
+            if let Ok(value) = HeaderValue::from_str(&format!("<{auth}>; rel=\"up\"")) {
+                response.headers_mut().append(header::LINK, value);
+            }
+        }
     }
     response
 }
