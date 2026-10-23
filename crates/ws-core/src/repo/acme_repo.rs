@@ -236,10 +236,13 @@ impl AcmeRepo {
     /// `created_at` included). A repeat of an existing
     /// `(tenant_id, jwk_thumbprint)` is a typed [`CoreError::Duplicate`]
     /// — the routes map it to `new-account`'s return-the-existing-account
-    /// flow. One insert-time foreign key (`account_id, tenant_id` ->
-    /// `acme_accounts (id, tenant_id)`, deferred) pins the row to its
-    /// account's tenant; children may only be minted in the SAME
-    /// transaction as this row, or after it commits.
+    /// flow. The row's FKs are the plain ones: `id` is its own primary
+    /// key and `tenant_id` a single-column reference — NO composite
+    /// foreign key and no other constraint touches this row (that
+    /// pattern belongs to the child tables — orders, authorizations and
+    /// their challenges — whose rows pin their parents tenant-consistently
+    /// with their own composite FKs); this row is the FK TARGET its
+    /// children reference through `(id, tenant_id)`.
     pub async fn insert_account(
         &self,
         executor: impl PgExecutor<'_>,
@@ -651,6 +654,10 @@ impl AcmeRepo {
     /// the routes find those per identifier through
     /// [`Self::valid_authorization_for`], since Task 2's design keeps a
     /// reused row's `order_id` NULL — no order owns the row it reused.
+    /// The fix wave's promotion widens that by one class: a row this
+    /// order MINTED that its settlement then PROMOTED to account-level
+    /// also has `order_id NULL` and is also found per identifier (and an
+    /// all-reused fix-wave order never owned any row at all).
     pub async fn list_authorizations_by_order(
         &self,
         executor: impl PgExecutor<'_>,

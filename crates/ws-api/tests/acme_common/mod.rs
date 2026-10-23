@@ -185,7 +185,7 @@ pub fn sign_with_header(key: &KeyFixture, header: &Value, payload: &Value) -> St
     format!("{protected}.{payload_segment}.{signature}")
 }
 
-/// A signed-elsewhere JWS rendered as RFC 8555 §7.3.6's flattened JSON
+/// A signed-elsewhere JWS rendered as RFC 8555 §7.3.5's flattened JSON
 /// serialization — the `{"protected","payload","signature"}` object the
 /// OUTER key-change JWS carries as its payload.
 pub fn inner_jws_object(compact: &str) -> Value {

@@ -123,9 +123,12 @@ pub async fn web_router(
 /// structural instead of a promise, and it is how the session_test suite
 /// inspects store contents alongside a live router.
 ///
-/// `rate_limit` threads to BOTH auth surfaces — [`relay_router`]'s
-/// `/auth/ui` GCRA nest and the proxy's `/api/v1/auth` limiter scope (see
-/// [`web_router`] and [`session_router_with_store`]).
+/// `rate_limit` threads to auth surfaces AND the ACME enrollment edge —
+/// [`relay_router`]'s `/auth/ui` GCRA nest, the proxy's `/api/v1/auth`
+/// limiter scope, and the proxy's `/acme` ENROLLMENT route
+/// (`POST /acme/{tenant}/new-account`, the one unauthenticated ACME
+/// mutator — see [`proxy::acme_router`]; see [`web_router`] and
+/// [`session_router_with_store`]).
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
