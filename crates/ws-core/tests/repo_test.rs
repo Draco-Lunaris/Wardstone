@@ -3318,6 +3318,136 @@ async fn acme_repo_authorization_listings_serve_the_order_machine() {
     assert!(foreign_authz_challenges.is_empty(), "no rows, none found");
 }
 
+/// `update_authorization_status` serves Task 7's settlement transitions:
+/// stamping `valid` WITH the reuse window's fresh expiry (the 30-day
+/// account-level lifetime — `expires_at` overwritten when some, untouched
+/// when `None`), stamping `invalid` without touching the expiry, and the
+/// poll-time `expired` self-transition. A missing id updates zero rows and
+/// stays `Ok` (existence is the route's check). Reads back happen after
+/// the sweep, per the house cleanup-first shape.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_repo_authorization_status_transitions_serve_the_settlement() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    let tenant = TenantRepo::new()
+        .insert(&pool, ACME_TENANT)
+        .await
+        .expect("insert test tenant");
+
+    let acme = AcmeRepo::new();
+    let account = AcmeAccountModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        jwk_thumbprint: "acme-transitions-thumbprint".to_string(),
+        jwk: serde_json::json!({ "kty": "EC", "crv": "P-256", "x": "a", "y": "b" }),
+        status: AcmeAccountStatus::Valid,
+        tos_agreed_at: None,
+        contact: None,
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    acme.insert_account(&pool, &account)
+        .await
+        .expect("insert account row");
+    let pending = AcmeAuthorizationModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        account_id: account.id,
+        identifier: "settle.example.test".to_string(),
+        status: AcmeAuthorizationStatus::Pending,
+        expires_at: ts("2026-06-22T12:30:00Z"),
+        reused_from: None,
+        order_id: None,
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    acme.insert_authorization(&pool, &pending)
+        .await
+        .expect("insert authorization row");
+
+    // valid, stamped together with the fresh 30-day reuse expiry.
+    let fresh_expiry = ts("2026-07-15T12:30:00Z");
+    acme.update_authorization_status(
+        &pool,
+        tenant.id,
+        pending.id,
+        AcmeAuthorizationStatus::Valid,
+        Some(fresh_expiry),
+    )
+    .await
+    .expect("stamp valid");
+    let after_valid = acme
+        .get_authorization(&pool, tenant.id, pending.id)
+        .await
+        .expect("read back the valid stamp")
+        .expect("row present");
+    // invalid, with `None` expiry: the stored (fresh) expiry survives.
+    acme.update_authorization_status(
+        &pool,
+        tenant.id,
+        pending.id,
+        AcmeAuthorizationStatus::Invalid,
+        None,
+    )
+    .await
+    .expect("stamp invalid");
+    let after_invalid = acme
+        .get_authorization(&pool, tenant.id, pending.id)
+        .await
+        .expect("read back the invalid stamp")
+        .expect("row present");
+    // expired: the poll-time self-transition of a pending row found past
+    // its expiry — same method, no expiry overwrite.
+    acme.update_authorization_status(
+        &pool,
+        tenant.id,
+        pending.id,
+        AcmeAuthorizationStatus::Expired,
+        None,
+    )
+    .await
+    .expect("stamp expired");
+    let after_expired = acme
+        .get_authorization(&pool, tenant.id, pending.id)
+        .await
+        .expect("read back the expired stamp")
+        .expect("row present");
+    let missing = acme
+        .update_authorization_status(
+            &pool,
+            tenant.id,
+            uuid::Uuid::new_v4(),
+            AcmeAuthorizationStatus::Valid,
+            Some(fresh_expiry),
+        )
+        .await;
+
+    // Cleanup BEFORE asserting.
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(after_valid.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(
+        after_valid.expires_at, fresh_expiry,
+        "the expiry was stamped"
+    );
+    assert_eq!(after_invalid.status, AcmeAuthorizationStatus::Invalid);
+    assert_eq!(
+        after_invalid.expires_at, fresh_expiry,
+        "`None` leaves the stored expiry untouched"
+    );
+    assert_eq!(after_expired.status, AcmeAuthorizationStatus::Expired);
+    assert_eq!(
+        missing.expect("a missing id is not an error"),
+        (),
+        "a missing authorization updates nothing and stays Ok"
+    );
+}
+
 /// `get_by_name` resolves a profile within ITS tenant only: a DIFFERENT
 /// tenant's profile with the same name never surfaces through a foreign
 /// tenant id (the lookup is tenant-scoped), and a name the tenant holds

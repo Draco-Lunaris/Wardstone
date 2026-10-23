@@ -617,6 +617,36 @@ impl AcmeRepo {
         Ok(())
     }
 
+    /// Set an authorization's lifecycle status (Task 7's settlement
+    /// transitions): the challenge route stamps `valid` (with the REUSE
+    /// WINDOW's fresh `expires_at` — the 30-day account-level lifetime) or
+    /// `invalid`, and the poll/POST paths stamp a pending row they found
+    /// PAST its expiry as `expired`. `expires_at: Some` overwrites the
+    /// stored expiry together with the status (set-what-you-pass);
+    /// `None` leaves it untouched. A missing authorization updates zero
+    /// rows and stays `Ok` — existence is the caller's ownership check.
+    pub async fn update_authorization_status(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+        status: AcmeAuthorizationStatus,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE acme_authorizations SET status = $3, \
+             expires_at = COALESCE($4, expires_at) \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(status.as_str())
+        .bind(expires_at)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
     /// Insert a challenge row exactly as given (every field, `created_at`
     /// included). BOTH flavors (http-01 and dns-01) are minted per
     /// authorization; the client picks by requesting validation on one.
