@@ -439,6 +439,11 @@ fn test_crl_from_ecdsa_root_verifies() {
         "1.2.840.10045.4.3.2",
         "the CRL signature algorithm follows the ECDSA CA key"
     );
+    assert!(
+        crl.signature_algorithm.parameters.is_none(),
+        "the ECDSA AlgorithmIdentifier must carry ABSENT parameters (RFC 5758 \
+         forbids the NULL encoding)"
+    );
     let (_, ca_pem_block) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
     let ca_cert = ca_pem_block.parse_x509().unwrap();
     crl.verify_signature(ca_cert.public_key())

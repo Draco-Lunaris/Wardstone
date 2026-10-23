@@ -121,7 +121,7 @@ mod tests {
     /// value written by anything but the round-trip must fail loudly.)
     #[test]
     fn key_type_parses_only_its_exact_name() {
-        for near_miss in ["ecdsa", "ECDSA_P256", "p256", "EcdsaP256"] {
+        for near_miss in ["ecdsa", "ecdsa_p_256", "ECDSA_P256", "p256", "EcdsaP256"] {
             assert!(
                 near_miss.parse::<KeyType>().is_err(),
                 "{near_miss:?} must not parse as a KeyType"

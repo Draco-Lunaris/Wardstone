@@ -297,8 +297,9 @@ pub fn build_crl(ca_cert_pem: &str, ca_key_der: &[u8], spec: &CrlSpec) -> Result
 /// The CRL's `AlgorithmIdentifier` (RFC 5280 section 5.1), dispatched from
 /// the signing key: Ed25519 keys sign with id-Ed25519 and absent
 /// parameters (RFC 8410), RSA keys with sha256WithRSAEncryption and NULL
-/// parameters. Anything else is a typed rejection naming the algorithm
-/// only.
+/// parameters (RFC 4055), and ECDSA P-256 keys with ecdsa-with-SHA256 and
+/// absent parameters (RFC 5758). Anything else is a typed rejection naming
+/// the algorithm only.
 fn algorithm_identifier(algorithm: &SignatureAlgorithm) -> Result<Vec<u8>, CaError> {
     let (oid, null_params) = if algorithm == &PKCS_ED25519 {
         (OID_SIG_ED25519, false)

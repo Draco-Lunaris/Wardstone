@@ -3,7 +3,8 @@
 //!
 //! [`create_root`] mints a self-signed trust anchor; [`create_sub_ca`]
 //! mints an intermediate signed by an existing parent CA. Both generate a
-//! fresh private key for the new CA (Ed25519, RSA-2048, or RSA-3072 per
+//! fresh private key for the new CA (ECDSA P-256, Ed25519, RSA-2048, or
+//! RSA-3072 per
 //! [`KeyType`]), build the certificate per the pinned Wardstone CA
 //! profile, store the private key in the [`KeyStore`] envelope format
 //! under a fresh UUID, and return the PEM certificate plus the PKCS#8 DER
@@ -404,7 +405,8 @@ fn ymd(dt: &chrono::DateTime<Utc>) -> (i32, u8, u8) {
 
 /// Generate a fresh private key for `key_type`, PKCS#8-serialized.
 ///
-/// Ed25519 keys are generated inside rcgen (ring). RSA keys are generated
+/// Ed25519 and ECDSA P-256 keys are generated inside rcgen (ring). RSA
+/// keys are generated
 /// with the pure-Rust `rsa` crate — rcgen's default ring backend can
 /// parse and sign RSA but cannot generate it — exported as PKCS#8 DER and
 /// imported back into rcgen, which detects the algorithm from the DER.

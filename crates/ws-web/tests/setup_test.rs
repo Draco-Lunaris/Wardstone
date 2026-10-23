@@ -357,6 +357,17 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
             .await
             .expect("query the setup audit entries");
 
+    // Captured BEFORE cleanup like the audit actions: the ca-created row's
+    // JSON details carry the key type the bootstrap recorded.
+    let ca_created_details: Option<(String,)> = sqlx::query_as(
+        "SELECT details::text FROM audit_log WHERE tenant_id = $1 \
+             AND action = 'ca_created'",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("query the ca_created audit row");
+
     // The leaf's issuer chain and DER: parsed while the keys directory
     // still exists (cleanup removes it just below).
     let leaf_pem: String = match certs.first() {
@@ -474,6 +485,16 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert!(
         audit_actions.iter().any(|action| action == "ca_created"),
         "setup audits the root CA creation"
+    );
+    // The bootstrap audit row records the SAME key type the row does — the
+    // operator's observability of "what key is my root" must never depend
+    // on reading the cas row alone.
+    let (ca_created_details,) = ca_created_details.expect("the ca_created audit row exists");
+    let ca_created: Value =
+        serde_json::from_str(&ca_created_details).expect("the ca_created audit details are JSON");
+    assert_eq!(
+        ca_created["key_type"], "ecdsa_p256",
+        "the bootstrap audit row records the ECDSA P-256 root key type"
     );
     assert!(
         audit_actions.iter().any(|action| action == "user_created"),

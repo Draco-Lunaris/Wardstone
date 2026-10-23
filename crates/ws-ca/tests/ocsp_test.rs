@@ -959,6 +959,18 @@ fn test_ocsp_response_from_ecdsa_root_verifies() {
         "the response must name ecdsa-with-SHA256 in its signature algorithm"
     );
 
+    // The parameter octets must be ABSENT (RFC 5758 §3.2): the NULL-encoded
+    // variant of the same identifier — the OID immediately followed by the
+    // `05 00` NULL TLV — must not appear anywhere in the response.
+    let ecdsa_null_params_der: [u8; 12] = [
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02, 0x05, 0x00,
+    ];
+    assert_eq!(
+        count_occurrences(&response, &ecdsa_null_params_der),
+        0,
+        "the ecdsa-with-SHA256 AlgorithmIdentifier must not carry NULL parameters"
+    );
+
     if let Some(text) = openssl_ocsp("ecdsa-root", &root.cert_pem, &leaf.cert_pem, &response) {
         assert!(
             text.contains("good"),
