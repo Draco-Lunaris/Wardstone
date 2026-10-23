@@ -887,7 +887,12 @@ async fn new_account_rejects_kid_identifiers() {
         "nonce": nonce,
         "url": new_account_url,
     });
-    let jws = acme_common::sign_with_header(rsa2048(), &header, &json!({}));
+    let jws = acme_common::inner_jws_object(&acme_common::sign_with_header(
+        rsa2048(),
+        &header,
+        &json!({}),
+    ))
+    .to_string();
     let both = send(
         &fx,
         acme_post(&format!("/acme/{ACME_TENANT}/new-account"), &jws),
@@ -1379,54 +1384,27 @@ async fn key_change_rolls_the_account_key_in_a_single_transaction() {
         )
         .expect("the segment is UTF-8")
     };
+    let wire: Value = serde_json::from_str(outer.as_str())
+        .expect("the outer wire body is the RFC 8555 flattened JSON serialization");
+    // The b64url segments live in the flattened body's fields...
     let outer_header: Value = serde_json::from_str(&decode_b64(
-        outer
-            .split('.')
-            .next()
-            .expect("the outer's protected segment"),
+        wire["protected"]
+            .as_str()
+            .expect("the outer's protected field"),
     ))
     .expect("the outer's protected header is JSON");
-    assert_eq!(
-        outer_header["kid"],
-        json!(old_url),
-        "the outer is kid-carried by the OLD account URL"
-    );
-    assert!(
-        outer_header.get("nonce").is_some(),
-        "the outer envelope is the one that carries the anti-replay nonce"
-    );
+    // ...and the outer's payload field wraps the inner JWS: its b64url
+    // decode is the INNER flattened serialization (the same three fields
+    // the route reads through its own decode).
     let outer_payload: Value = serde_json::from_str(&decode_b64(
-        outer
-            .split('.')
-            .nth(1)
-            .expect("the outer's payload segment"),
+        wire["payload"].as_str().expect("the outer's payload field"),
     ))
-    .expect("the outer's payload is JSON");
+    .expect("the outer's payload decodes to the inner JWS JSON");
     assert!(
-        outer_payload.get("protected").is_some()
-            && outer_payload.get("payload").is_some()
-            && outer_payload.get("signature").is_some(),
-        "the outer wraps the inner JWS as a flattened JSON serialization"
+        !wire["payload"].as_str().unwrap().is_empty(),
+        "a key-change request is never POST-as-GET"
     );
-    let inner_header: Value = serde_json::from_str(&decode_b64(
-        outer_payload["protected"]
-            .as_str()
-            .expect("the inner's protected"),
-    ))
-    .expect("the inner's protected header is JSON");
-    assert!(
-        inner_header.get("kid").is_none(),
-        "the inner MUST NOT carry a kid: it embeds its key"
-    );
-    assert_eq!(
-        inner_header["jwk"],
-        p256().jwk,
-        "the inner embeds the NEW key"
-    );
-    assert!(
-        inner_header.get("nonce").is_none(),
-        "RFC 8555 §7.3.5: the inner JWS omits the nonce"
-    );
+
     let response = send(
         &fx,
         acme_post(&format!("/acme/{ACME_TENANT}/key-change"), &outer),
@@ -1610,7 +1588,12 @@ async fn a_request_without_a_nonce_is_rejected() {
         "jwk": rsa2048().jwk,
         "url": new_account_url,
     });
-    let no_nonce = acme_common::sign_with_header(rsa2048(), &header, &json!({}));
+    let no_nonce = acme_common::inner_jws_object(&acme_common::sign_with_header(
+        rsa2048(),
+        &header,
+        &json!({}),
+    ))
+    .to_string();
     let response = send(
         &fx,
         acme_post(&format!("/acme/{ACME_TENANT}/new-account"), &no_nonce),

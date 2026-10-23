@@ -150,9 +150,24 @@ pub enum Identity {
     Bare,
 }
 
-/// Build a client-side ACME request: a compact JWS whose protected header
-/// carries the alg, the identity members, the `nonce`, and the `url` the
-/// request binds to. A `Value::Null` payload produces the empty
+/// Missing-nonce case).
+pub fn sign_with_header(key: &KeyFixture, header: &Value, payload: &Value) -> String {
+    let protected = B64URL.encode(header.to_string());
+    let payload_segment = match payload {
+        Value::Null => String::new(),
+        p => B64URL.encode(p.to_string()),
+    };
+    let signing_input = format!("{protected}.{payload_segment}");
+    let signature =
+        jsonwebtoken::crypto::sign(signing_input.as_bytes(), &key.encoding_key, key.alg)
+            .expect("fixture signature computes under the fixture key");
+    format!("{protected}.{payload_segment}.{signature}")
+}
+
+/// Sign a client request as RFC 8555 §6.2 puts it ON THE WIRE: the JWS
+/// flattened JSON serialization (`{"protected","payload","signature"}` —
+/// the JOSE floor verifies the compact form that these same three b64url
+/// segments re-express). A `Value::Null` payload stays the empty
 /// (POST-as-GET) payload segment, mirroring the wire form.
 pub fn sign_acme_request(
     key: &KeyFixture,
@@ -167,23 +182,18 @@ pub fn sign_acme_request(
         Identity::Jwk => header["jwk"] = key.jwk.clone(),
         Identity::Bare => {}
     }
-    sign_with_header(key, &header, payload)
+    let compact = sign_with_header(key, &header, payload);
+    serde_json::to_string(&inner_jws_object(&compact))
+        .expect("the flattened envelope always serializes")
 }
 
-/// Sign under a fully hand-built header (the jwk+kid trap and the
-/// missing-nonce case).
-pub fn sign_with_header(key: &KeyFixture, header: &Value, payload: &Value) -> String {
-    let protected = B64URL.encode(header.to_string());
-    let payload_segment = match payload {
-        Value::Null => String::new(),
-        p => B64URL.encode(p.to_string()),
-    };
-    let signing_input = format!("{protected}.{payload_segment}");
-    let signature =
-        jsonwebtoken::crypto::sign(signing_input.as_bytes(), &key.encoding_key, key.alg)
-            .expect("fixture signature computes under the fixture key");
-    format!("{protected}.{payload_segment}.{signature}")
-}
+/// Build a client-side ACME request AS a compact JWS: a low-level builder
+/// whose protected header carries the alg, the identity members, the
+/// `nonce`, and the `url` the request binds to. A `Value::Null` payload
+/// produces the empty (POST-as-GET) payload segment, mirroring the wire
+/// form. NOTE: compact is the INTERNAL shape (the JOSE floor verifies it;
+/// RFC 8555 puts the flattened JSON serialization on the wire — wrap with
+/// `inner_jws_object` + serialize for on-wire bodies).
 
 /// A signed-elsewhere JWS rendered as RFC 8555 §7.3.5's flattened JSON
 /// serialization — the `{"protected","payload","signature"}` object the
@@ -202,16 +212,16 @@ pub fn inner_jws_object(compact: &str) -> Value {
 /// non-canonical trailing bits and fail the BASE64 decode — a `malformed`
 /// refusal — instead of the signature verdict the trap is about.)
 pub fn tamper_signature(token: &str) -> String {
-    let parts: Vec<&str> = token.split('.').collect();
-    let signature = parts[2];
+    let envelope: serde_json::Value = serde_json::from_str(token)
+        .expect("the token is the RFC 8555 flattened JSON serialization");
+    let signature = envelope["signature"]
+        .as_str()
+        .expect("the flattened envelope carries a signature field");
     let mut chars = signature.chars();
-    let first = chars.next().expect("a signature segment is non-empty");
+    let first = chars.next().expect("a signature field is non-empty");
     let replacement = if first == 'A' { 'B' } else { 'A' };
-    format!(
-        "{}.{}.{}{}",
-        parts[0],
-        parts[1],
-        replacement,
-        chars.as_str()
-    )
+    let tampered_signature = format!("{}{}", replacement, chars.as_str());
+    let mut envelope = envelope;
+    envelope["signature"] = serde_json::Value::String(tampered_signature);
+    serde_json::to_string(&envelope).expect("the tampered envelope serializes")
 }

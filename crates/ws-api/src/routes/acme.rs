@@ -371,7 +371,7 @@ async fn new_account(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/new-account", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let jws = ws_acme::verify_jws(
         raw,
@@ -545,7 +545,7 @@ async fn account_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/acct/{account_thumb}", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     // Pre-resolve the kid synchronously (the verifier's resolver is a sync
     // closure): peek the UNVERIFIED protected header, parse the kid URL —
@@ -741,7 +741,7 @@ async fn account_orders(
         "{base}/acme/{}/acct/{orders_account_thumb}/orders",
         tenant.name
     );
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -795,7 +795,7 @@ async fn key_change(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/key-change", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     // Pre-resolve the outer's kid (the OLD account URL) synchronously, the
     // same way the account route does: peek the UNVERIFIED protected
@@ -1079,7 +1079,7 @@ async fn new_order(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/new-order", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1275,7 +1275,7 @@ async fn order_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
     let order_id =
@@ -1493,7 +1493,7 @@ async fn finalize_order(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}/finalize", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1759,7 +1759,7 @@ async fn download_certificate(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}/certificate", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, _payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1867,7 +1867,7 @@ async fn revoke_cert(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/revoke-cert", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     // The cert-key PoP decline (settlement D7) fires BEFORE the
     // JWS-verifying prelude: an embedded jwk names no account, so the
@@ -2070,7 +2070,7 @@ async fn authz_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/authz/{authz_id}", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
     let authz_id =
@@ -2291,7 +2291,7 @@ async fn challenge_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/chall/{challenge_id}", tenant.name);
-    let raw = as_str(&raw)?;
+    let raw = &flattened_to_compact(&as_str(&raw)?)?;
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -3393,10 +3393,43 @@ fn json_string_member<'a>(
         .ok_or_else(|| AcmeProblem::malformed(format!("{name} must be a base64url string")))
 }
 
-/// The request body as text (the JWS compact serialization).
+/// The request body as text (the JWS flattened JSON serialization).
 fn as_str(bytes: &Bytes) -> Result<&str, AcmeProblem> {
     std::str::from_utf8(bytes)
         .map_err(|_| AcmeProblem::malformed("the request body is not UTF-8 JWS text"))
+}
+
+/// RFC 8555 §6.2: every request body on the wire is the JWS FLATTENED JSON
+/// serialization — `{"protected": <b64url>, "payload": <b64url>, "signature":
+/// <b64url>}` (the payload field empty for POST-as-GET). The JOSE floor
+/// verifies the compact serialization, whose signing input is the same exact
+/// three segments re-expressed: `{protected}.{payload}.{signature}`. Real
+/// clients (certbot 4.0.0 found it live) send flattened; converting at this
+/// one boundary keeps the floor untouched. The same conversion already
+/// happens inside `key_change` for the RFC §7.3.5 inner envelope.
+fn flattened_to_compact(raw: &str) -> Result<String, AcmeProblem> {
+    let members: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+        AcmeProblem::malformed(
+            "the JWS body is not the flattened JSON serialization \
+             (three string fields: protected, payload, signature)",
+        )
+    })?;
+    let strings = match (
+        members.get("protected"),
+        members.get("payload"),
+        members.get("signature"),
+    ) {
+        (Some(Value::String(p)), Some(Value::String(pl)), Some(Value::String(s))) => {
+            (p.clone(), pl.as_str().to_owned(), s.clone())
+        }
+        _ => {
+            return Err(AcmeProblem::malformed(
+                "the JWS body is not the flattened JSON serialization \
+                 (three string fields: protected, payload, signature)",
+            ))
+        }
+    };
+    Ok(format!("{}.{}.{}", strings.0, strings.1, strings.2))
 }
 
 /// The UNVERIFIED protected header's identity members, for the routes' kid

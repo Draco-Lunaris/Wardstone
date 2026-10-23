@@ -250,11 +250,13 @@ enum Identity {
     Jwk,
 }
 
-/// Build a client-side ACME request: a compact JWS whose protected header
-/// carries the alg, the identity member, the `nonce` (one fresh nonce per
-/// request, fetched from the server beforehand — the RFC 8555 §6.5
-/// discipline), and the `url` the request binds itself to. A `Value::Null`
-/// payload produces the empty POST-as-GET payload segment.
+/// Sign a client request as RFC 8555 §6.2 puts it ON THE WIRE: the JWS
+/// flattened JSON serialization (`{"protected","payload","signature"}` —
+/// the JOSE floor verifies the compact form these b64url segments
+/// re-express). A `Value::Null` payload stays the empty POST-as-GET
+/// payload segment. The wire must be flattened: compact bodies are
+/// refused (certbot 4.0.0 found the compact-only wire shape live before
+/// the fix).
 fn sign_acme_request(
     key: &KeyFixture,
     identity: &Identity,
@@ -277,7 +279,13 @@ fn sign_acme_request(
     let signature =
         jsonwebtoken::crypto::sign(signing_input.as_bytes(), &key.encoding_key, key.alg)
             .expect("fixture signature computes under the fixture key");
-    format!("{protected}.{payload_segment}.{signature}")
+    let compact = format!("{protected}.{payload_segment}.{signature}");
+    let mut parts = compact.split('.');
+    let protected_seg = parts.next().expect("compact has a protected");
+    let payload_seg = parts.next().expect("compact has a payload");
+    let signature_seg = parts.next().expect("compact has a signature");
+    json!({ "protected": protected_seg, "payload": payload_seg, "signature": signature_seg })
+        .to_string()
 }
 
 /// The DER bytes of one PEM body (PEMs the tests mint, download, and

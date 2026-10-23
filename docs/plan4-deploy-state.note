@@ -1,0 +1,2 @@
+Plan 4 deploy: task 1/4 done — Dockerfile + .dockerignore + GHCR workflow written, committed 68b30c3 on main. Push blocked pending `gh auth refresh -s workflow` (user action). LXC standing up now.
+Deploy UX gap (from the real-deploy test 2026-10-23): a fresh deploy browsed at / serves the operator LOGIN page while the wizard lives at /setup — no pointer exists for a pre-setup operator. Follow-up: the SPA login page (or the / handler pre-tenant) should probe setup-pending and redirect to /setup. Recorded from the CT-242 real deployment.
