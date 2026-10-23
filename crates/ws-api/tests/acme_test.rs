@@ -3737,3 +3737,99 @@ async fn a_foreign_or_missing_challenge_is_not_found() {
     assert_eq!(missing_body["type"], "urn:ietf:params:acme:error:malformed");
     assert_eq!(bad_status, StatusCode::NOT_FOUND);
 }
+
+/// T6-M5, the two-account reuse-isolation leg: a DIFFERENT account's
+/// `valid` authorization on the same identifier is NOT reusable — the
+/// reuse window is per (account, identifier) — so this account's order
+/// MINTS a fresh pending authorization (`reused_authorization_count` 0,
+/// `minted_authorization_count` 1 in the audit row) while the other
+/// account's row stays untouched. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_does_not_reuse_another_accounts_authorization() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    // Account B holds the valid account-level reuse row on the identifier.
+    let (thumb_b, created_b) = create_account(&fx, p256()).await;
+    assert_eq!(created_b.status(), StatusCode::CREATED);
+    let account_b = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb_b)
+        .await
+        .expect("read account B")
+        .expect("it exists");
+    let foreign_valid = AcmeAuthorizationModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account_b.id,
+        identifier: "site.wardstone.test".to_owned(),
+        status: AcmeAuthorizationStatus::Valid,
+        expires_at: chrono::Utc::now() + chrono::Duration::days(29),
+        reused_from: None,
+        order_id: None,
+        created_at: chrono::Utc::now() - chrono::Duration::days(1),
+    };
+    AcmeRepo::new()
+        .insert_authorization(&fx.pool, &foreign_valid)
+        .await
+        .expect("seed account B's valid authorization");
+
+    // Account A orders the SAME identifier.
+    let (thumb_a, created_a) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created_a.status(), StatusCode::CREATED);
+    let account_a = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb_a)
+        .await
+        .expect("read account A")
+        .expect("it exists");
+    seed_profile(&fx, "web-server").await;
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "site.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let body = body_json(response).await;
+
+    let authz_rows = AcmeRepo::new()
+        .list_authorizations_by_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order's authorizations");
+    let created_audit = audit_rows(&fx, "acme_order_created").await;
+    let authzs_after = authz_count(&fx).await;
+    let foreign_after = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, foreign_valid.id)
+        .await
+        .expect("read account B's row")
+        .expect("it survives");
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(authz_rows.len(), 1, "a fresh order-scoped authz was minted");
+    assert_eq!(
+        authz_rows[0].account_id, account_a.id,
+        "the fresh row belongs to ACCOUNT A"
+    );
+    assert_eq!(authz_rows[0].status, AcmeAuthorizationStatus::Pending);
+    assert_eq!(
+        body["authorizations"],
+        json!([authz_url(authz_rows[0].id)]),
+        "the order points at the NEW authz URL, never account B's"
+    );
+    assert_eq!(created_audit.len(), 1);
+    assert_eq!(created_audit[0].4["reused_authorization_count"], 0);
+    assert_eq!(created_audit[0].4["minted_authorization_count"], 1);
+    assert_eq!(
+        authzs_after, 2,
+        "one row per account: nothing was reused across accounts"
+    );
+    assert_eq!(
+        foreign_after.status,
+        AcmeAuthorizationStatus::Valid,
+        "account B's row is untouched"
+    );
+    assert!(foreign_after.order_id.is_none());
+}
