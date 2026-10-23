@@ -1,6 +1,6 @@
 //! The application state of the REST surface: the pool, the JWT key pair,
-//! the deployment config, the bounded access log, and the OIDC csrf-state
-//! store.
+//! the deployment config (including the ACME URL base), the bounded access
+//! log, the OIDC csrf-state store, and the ACME nonce ledger.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
+use ws_acme::NonceStore;
 use ws_auth::jwt::JwtKeys;
 
 /// The name of the TOTP/OIDC secret-encryption key file inside the keys
@@ -43,17 +44,58 @@ pub struct ApiConfig {
     /// in-process `oneshot` request; the Task 13 binary always configures
     /// it.
     pub auth_rate_limit: Option<AuthRateLimit>,
+    /// The ACME (RFC 8555) surface config: the public URL base and the
+    /// optional ToS URL — see [`AcmeConfig`].
+    pub acme: AcmeConfig,
 }
 
 impl ApiConfig {
     /// Build the config with the setup values and no rate limit (the test
-    /// default); the binary sets `auth_rate_limit` explicitly.
+    /// default); the binary sets `auth_rate_limit` explicitly. The ACME
+    /// config starts UNCONFIGURED (an empty `public_url`): the ACME routes
+    /// answer the problem document `serverInternal` under that config
+    /// until the binary (or a test) carries a real value — see
+    /// [`routes::acme`](crate::routes::acme).
     pub fn new(domain: String, keys_dir: PathBuf) -> Self {
         ApiConfig {
             domain,
             keys_dir,
             admin_cidrs: Vec::new(),
             auth_rate_limit: None,
+            acme: AcmeConfig::unconfigured(),
+        }
+    }
+}
+
+/// The ACME (RFC 8555) deployment configuration: the absolute URL base
+/// every ACME URL is built from (`WARDSTONE_PUBLIC_URL`, the settlement's
+/// anti-Host-trust rule — the `Host` header is NEVER consulted) and the
+/// optional terms-of-service URL (`WARDSTONE_ACME_TOS_URL`).
+#[derive(Clone, Debug)]
+pub struct AcmeConfig {
+    /// The public base URL (`https://ca.example.test`): directory links,
+    /// kid account URLs, and every `Location` header are built from it.
+    /// An EMPTY value means "not configured": the ACME routes keep
+    /// serving, but every one that would build an absolute URL answers
+    /// the problem document `serverInternal` (the binary warns loudly at
+    /// boot — the deployment choice: a misconfigured ACME env degrades the
+    /// ACME surface alone, never the process).
+    pub public_url: String,
+    /// The terms-of-service document URL. `None` means the instance
+    /// publishes no ToS: directories carry no `Link
+    /// rel="terms-of-service"` header and new accounts are `valid`
+    /// immediately. `Some` turns `termsOfServiceAgreed` into an enforced
+    /// gate (the account is minted `pending` until the client agrees).
+    pub tos_url: Option<String>,
+}
+
+impl AcmeConfig {
+    /// The unconfigured default (the test/blank-env shape): an empty
+    /// public URL and no ToS.
+    pub fn unconfigured() -> Self {
+        AcmeConfig {
+            public_url: String::new(),
+            tos_url: None,
         }
     }
 }
@@ -190,6 +232,11 @@ pub struct AppState {
     pub access_log: Arc<AccessLog>,
     /// The OIDC csrf-state store (Task 3's R8 contract).
     pub oidc_states: Arc<OidcStateStore>,
+    /// The ACME anti-replay nonce ledger (Plan 4 Task 4's store): every
+    /// `/acme` response mints a fresh `Replay-Nonce` from it and every
+    /// ACME request spends one through `verify_jws` — single-use,
+    /// in-memory (a restart simply re-nonces).
+    pub nonces: Arc<NonceStore>,
 }
 
 impl AppState {
@@ -202,6 +249,7 @@ impl AppState {
             config,
             access_log: Arc::new(AccessLog::default()),
             oidc_states: Arc::new(OidcStateStore::default()),
+            nonces: Arc::new(NonceStore::new()),
         }
     }
 

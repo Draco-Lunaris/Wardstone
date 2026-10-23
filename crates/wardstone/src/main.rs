@@ -108,6 +108,21 @@ struct BootConfig {
     /// values validated) regardless of the switch. `None` in api mode (no
     /// web router exists to mount it on).
     web_rate_limit: Option<ws_api::AuthRateLimit>,
+    /// The absolute URL base every ACME (RFC 8555) URL is built from
+    /// (`WARDSTONE_PUBLIC_URL`, `api` only; e.g. `https://ca.home.test`).
+    /// The ui mode constructs no ACME URLs and ignores it. OPTIONAL (the
+    /// deployment choice): unset or blank leaves the process booting, but
+    /// the ACME routes that would build an absolute URL answer the problem
+    /// document `serverInternal` and the boot logs a loud warning — a
+    /// misconfigured ACME env degrades the ACME surface alone, never the
+    /// whole CA.
+    public_url: Option<String>,
+    /// The terms-of-service document URL (`WARDSTONE_ACME_TOS_URL`, `api`
+    /// only, optional). Set, the directory answers with `Link:
+    /// <tos>;rel="terms-of-service"` and `new-account` mints `pending`
+    /// accounts until the client agrees; unset, there is no ToS flow at
+    /// all (spec settlement 9).
+    acme_tos_url: Option<String>,
 }
 
 /// Variables whose absence is fatal, with their roles — listed together
@@ -228,7 +243,11 @@ the api's auth routes, and the ui's /auth/ui login routes; defaults \
          \x20 WARDSTONE_AUTH_RATE_LIMIT_DISABLED\n\
          \x20                            `true` disables the api's auth \
 rate limiter (api; for UI-fronted deployments — the ui's own /auth/ui \
-limiter stays on)\n"
+limiter stays on)\n\
+         \x20 WARDSTONE_PUBLIC_URL        the absolute base URL for the ACME \
+surface (api; unset degrades the ACME routes to serverInternal problems)\n\
+         \x20 WARDSTONE_ACME_TOS_URL     the terms-of-service URL the ACME \
+directory links (api; optional — unset means no ToS flow)\n"
     )
 }
 
@@ -297,6 +316,11 @@ fn config_from(
         bind,
         auth_rate_limit,
         web_rate_limit,
+        // The ACME envs (api mode consumes them; ui ignores the fields):
+        // both are OPTIONAL — blank is already filtered to None by the
+        // lookup contract.
+        public_url: lookup("WARDSTONE_PUBLIC_URL"),
+        acme_tos_url: lookup("WARDSTONE_ACME_TOS_URL"),
     })
 }
 
@@ -598,6 +622,22 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
         // per-client limit on `/auth/ui/*` itself. ws-api's layer skips
         // when `None`.
         auth_rate_limit: cfg.auth_rate_limit,
+        // The ACME surface config: the URL base (unset → the ACME routes
+        // degrade to `serverInternal` problems; the choice is LOUD here)
+        // and the optional ToS URL.
+        acme: {
+            if cfg.public_url.is_none() {
+                tracing::warn!(
+                    "WARDSTONE_PUBLIC_URL is not set: the ACME directory cannot build \
+                     absolute URLs and every ACME route that needs one will answer \
+                     urn:ietf:params:acme:error:serverInternal until it is configured"
+                );
+            }
+            ws_api::AcmeConfig {
+                public_url: cfg.public_url.clone().unwrap_or_default(),
+                tos_url: cfg.acme_tos_url.clone(),
+            }
+        },
     };
     let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
 
@@ -974,6 +1014,46 @@ mod tests {
     fn api_mode_has_no_web_rate_limit() {
         let cfg = config_from(BootMode::Api, table(&MINIMAL)).expect("the minimal table parses");
         assert!(cfg.web_rate_limit.is_none(), "no web router in api mode");
+    }
+
+    /// The ACME env contract: `WARDSTONE_PUBLIC_URL` is OPTIONAL (blank or
+    /// unset is the degrade-to-`serverInternal` posture, never a boot
+    /// failure) and `WARDSTONE_ACME_TOS_URL` is optional and independent —
+    /// a ToS URL without a public URL would be inert, since nothing can
+    /// build absolute URLs without the base.
+    #[test]
+    fn acme_envs_are_optional_and_pass_through() {
+        let bare = config_from(BootMode::Api, table(&MINIMAL)).expect("bare table parses");
+        assert!(
+            bare.public_url.is_none(),
+            "no WARDSTONE_PUBLIC_URL → unset (the warn-and-degrade posture)"
+        );
+        assert!(bare.acme_tos_url.is_none(), "no ToS URL configured");
+
+        let full = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_PUBLIC_URL", "https://ca.home.test"),
+            ("WARDSTONE_ACME_TOS_URL", "https://ca.home.test/terms"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&full)).expect("the full table parses");
+        assert_eq!(cfg.public_url.as_deref(), Some("https://ca.home.test"));
+        assert_eq!(
+            cfg.acme_tos_url.as_deref(),
+            Some("https://ca.home.test/terms")
+        );
+
+        let blank = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_PUBLIC_URL", "   "),
+            ("WARDSTONE_ACME_TOS_URL", ""),
+        ];
+        let cfg = config_from(BootMode::Api, table(&blank)).expect("blank values parse");
+        assert!(
+            cfg.public_url.is_none() && cfg.acme_tos_url.is_none(),
+            "blank ACME env values count as unset (the lookup contract)"
+        );
     }
 
     /// The tenant name the boot lookup and the setup flow agree on: the

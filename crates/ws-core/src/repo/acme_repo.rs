@@ -289,6 +289,123 @@ impl AcmeRepo {
         Ok(())
     }
 
+    /// Overwrite an account's contact (the account-update route; RFC 8555
+    /// section 7.3.2). `None` clears the contact (an empty RFC `contact`
+    /// array). A missing account updates zero rows and stays `Ok`.
+    pub async fn set_account_contact(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+        contact: Option<&str>,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE acme_accounts SET contact = $3 WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .bind(contact)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
+    /// Stamp the ToS agreement (`tos_agreed_at`) — the ToS flow's
+    /// promotion companion (`update_account_status` to `valid` carries the
+    /// status change). Repeated writes are last-write-wins, so a client
+    /// that re-agrees re-stamps the instant.
+    pub async fn set_account_tos_agreed(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+        tos_agreed_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE acme_accounts SET tos_agreed_at = $3 WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .bind(tos_agreed_at)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
+    /// The account-key rollover (RFC 8555 section 7.3.6): overwrite the
+    /// account row's key material with the NEW account key. THE ROW ID IS
+    /// DELIBERATELY KEPT: orders and authorizations reference
+    /// `acme_accounts.id`, so the atomic single-statement swap keeps every
+    /// issued-certificate linkage intact, while the OLD thumbprint — the
+    /// old kid's URL — stops resolving (the identity IS the key).
+    /// A `Duplicate` here means the tenant already holds another account
+    /// on the NEW key — the route maps it to a `malformed` problem
+    /// document.
+    pub async fn swap_account_key(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+        jwk: &JsonValue,
+        jwk_thumbprint: &str,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE acme_accounts SET jwk = $3, jwk_thumbprint = $4 \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(jwk)
+        .bind(jwk_thumbprint)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// The deactivation cascade (spec settlement 9): a deactivated
+    /// account's PENDING authorizations become `deactivated` and its OPEN
+    /// (pending / ready / processing) orders become `invalid` with the
+    /// given error text. Already-decided authorizations and issued
+    /// certificates are untouched; the two returned counts are
+    /// `(authorizations invalidated, orders invalidated)` for the routes'
+    /// audit details. Repeated calls are no-ops (nothing left pending).
+    ///
+    /// Takes `&mut PgConnection` (a `&mut *tx` at the call sites) instead
+    /// of the per-statement `impl PgExecutor`: the cascade runs TWO
+    /// statements inside one transaction, and an `impl PgExecutor` param
+    /// is consumed by the first `execute`.
+    pub async fn deactivation_cascade(
+        &self,
+        executor: &mut sqlx::PgConnection,
+        tenant_id: Uuid,
+        account_id: Uuid,
+        order_error: &str,
+    ) -> Result<(u64, u64), CoreError> {
+        let authorizations = sqlx::query(
+            "UPDATE acme_authorizations SET status = $3 \
+             WHERE tenant_id = $1 AND account_id = $2 AND status = $4",
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(AcmeAuthorizationStatus::Deactivated.as_str())
+        .bind(AcmeAuthorizationStatus::Pending.as_str())
+        .execute(&mut *executor)
+        .await?
+        .rows_affected();
+        let orders = sqlx::query(
+            "UPDATE acme_orders SET status = $3, error = $5 \
+             WHERE tenant_id = $1 AND account_id = $2 \
+               AND status IN ($4, $6, $7)",
+        )
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(AcmeOrderStatus::Invalid.as_str())
+        .bind(AcmeOrderStatus::Pending.as_str())
+        .bind(order_error)
+        .bind(AcmeOrderStatus::Ready.as_str())
+        .bind(AcmeOrderStatus::Processing.as_str())
+        .execute(&mut *executor)
+        .await?
+        .rows_affected();
+        Ok((authorizations, orders))
+    }
+
     /// Insert an order row exactly as given (every field, `created_at`
     /// included). The composite foreign key
     /// `acme_orders_account_tenant_fk` is DEFERRABLE INITIALLY DEFERRED:

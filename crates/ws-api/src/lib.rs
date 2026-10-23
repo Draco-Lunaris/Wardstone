@@ -3,8 +3,8 @@
 //!
 //! - `state` — [`AppState`]: the pool, the JWT key pair, the deployment
 //!   config (setup hostname/SAN, the keys dir, the rate limits, the admin
-//!   CIDRs collected at setup), the bounded access log, and the OIDC
-//!   csrf-state store.
+//!   CIDRs collected at setup, the ACME URL base), the bounded access
+//!   log, the OIDC csrf-state store, and the ACME nonce ledger.
 //! - `error` — [`ApiError`]: one enum, one JSON body shape
 //!   (`{"error": {"code", "message"}}`), and the two conversion tables
 //!   (`CoreError` and `AuthError`) every handler's `?` flows through.
@@ -31,4 +31,4 @@ pub mod state;
 /// plus the two names every consumer needs: the state and the router.
 pub use error::ApiError;
 pub use routes::router;
-pub use state::{ApiConfig, AppState, AuthRateLimit, OidcStateStore};
+pub use state::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, OidcStateStore};
