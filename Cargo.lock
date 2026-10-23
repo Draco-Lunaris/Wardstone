@@ -3366,6 +3366,7 @@ dependencies = [
  "ws-ca",
  "ws-core",
  "ws-web",
+ "zeroize",
 ]
 
 [[package]]
