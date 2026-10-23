@@ -413,6 +413,9 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
         KeyType::Ed25519 => Ok(KeyPair::generate_for(&PKCS_ED25519)?),
         KeyType::Rsa2048 => Ok(generate_rsa(2048)?.0),
         KeyType::Rsa3072 => Ok(generate_rsa(3072)?.0),
+        KeyType::EcdsaP256 => Err(CaError::UnsupportedKeyType(
+            "ECDSA P-256 CA keys are not generated yet".to_owned(),
+        )),
     }
 }
 

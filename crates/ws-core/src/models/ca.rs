@@ -19,6 +19,10 @@ pub enum KeyType {
     Rsa2048,
     /// 3072-bit RSA key.
     Rsa3072,
+    /// ECDSA over the NIST P-256 curve — the browser-universal default:
+    /// every mainstream browser verifies an ECDSA chain once the root is
+    /// imported (Chromium-family cannot verify Ed25519 chains).
+    EcdsaP256,
 }
 
 impl KeyType {
@@ -28,6 +32,7 @@ impl KeyType {
             KeyType::Ed25519 => "ed25519",
             KeyType::Rsa2048 => "rsa2048",
             KeyType::Rsa3072 => "rsa3072",
+            KeyType::EcdsaP256 => "ecdsa_p256",
         }
     }
 }
@@ -59,6 +64,7 @@ impl FromStr for KeyType {
             "ed25519" => Ok(KeyType::Ed25519),
             "rsa2048" => Ok(KeyType::Rsa2048),
             "rsa3072" => Ok(KeyType::Rsa3072),
+            "ecdsa_p256" => Ok(KeyType::EcdsaP256),
             other => Err(UnknownKeyType(other.to_string())),
         }
     }
@@ -103,8 +109,40 @@ mod tests {
         assert_eq!(KeyType::Ed25519.as_str(), "ed25519");
         assert_eq!(KeyType::Rsa2048.as_str(), "rsa2048");
         assert_eq!(KeyType::Rsa3072.as_str(), "rsa3072");
+        assert_eq!(KeyType::EcdsaP256.as_str(), "ecdsa_p256");
         assert_eq!("rsa3072".parse::<KeyType>().unwrap(), KeyType::Rsa3072);
+        assert_eq!("ecdsa_p256".parse::<KeyType>().unwrap(), KeyType::EcdsaP256);
         let err = "bogus".parse::<KeyType>().unwrap_err();
         assert_eq!(err, UnknownKeyType("bogus".to_string()));
+    }
+
+    /// Only the exact serde string parses: near-misses do not silently
+    /// become another key type. (Review-focus pin — a `key_type` column
+    /// value written by anything but the round-trip must fail loudly.)
+    #[test]
+    fn key_type_parses_only_its_exact_name() {
+        for near_miss in ["ecdsa", "ECDSA_P256", "p256", "EcdsaP256"] {
+            assert!(
+                near_miss.parse::<KeyType>().is_err(),
+                "{near_miss:?} must not parse as a KeyType"
+            );
+        }
+    }
+
+    /// The serde name (snake_case derive) and the column value are one
+    /// string by house rule: `as_str()` equals what serde serializes.
+    #[test]
+    fn key_type_serde_name_matches_the_column_value() {
+        for (key_type, expected) in [
+            (KeyType::Ed25519, "ed25519"),
+            (KeyType::Rsa2048, "rsa2048"),
+            (KeyType::Rsa3072, "rsa3072"),
+            (KeyType::EcdsaP256, "ecdsa_p256"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(key_type).unwrap(),
+                serde_json::json!(expected)
+            );
+        }
     }
 }

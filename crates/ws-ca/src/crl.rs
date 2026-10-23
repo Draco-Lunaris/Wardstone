@@ -55,7 +55,9 @@ use der::asn1::{
     AnyRef, BitString, GeneralizedTime, Null, ObjectIdentifier, OctetString, Uint, UtcTime,
 };
 use der::{Encode, Tag, TagNumber};
-use rcgen::{KeyPair, SignatureAlgorithm, SigningKey, PKCS_ED25519, PKCS_RSA_SHA256};
+use rcgen::{
+    KeyPair, SignatureAlgorithm, SigningKey, PKCS_ECDSA_P256_SHA256, PKCS_ED25519, PKCS_RSA_SHA256,
+};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::pem::parse_x509_pem;
@@ -296,6 +298,10 @@ fn algorithm_identifier(algorithm: &SignatureAlgorithm) -> Result<Vec<u8>, CaErr
         (OID_SIG_ED25519, false)
     } else if algorithm == &PKCS_RSA_SHA256 {
         (OID_SIG_SHA256_RSA, true)
+    } else if algorithm == &PKCS_ECDSA_P256_SHA256 {
+        return Err(CaError::UnsupportedKeyType(format!(
+            "ECDSA P-256 signing is not supported by this path yet ({algorithm:?})"
+        )));
     } else {
         return Err(CaError::UnsupportedKeyType(format!(
             "CRL signing is not supported for this CA key algorithm ({algorithm:?})"
