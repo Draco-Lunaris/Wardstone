@@ -24,6 +24,7 @@ const NAV: Array<[string, string, string | null]> = [
   ["CAs", "/cas", "read_cas"],
   ["Tokens", "/tokens", "read_service_identities"],
   ["Audit", "/audit", "read_audit"],
+  ["ACME", "/acme", "read_acme"],
   ["Admin", "/admin", null],
 ];
 

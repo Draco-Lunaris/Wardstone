@@ -27,6 +27,11 @@ export default function CertificateDetail() {
   const { id } = useParams<{ id: string }>();
   const auth = useAuthState();
   const canRevoke = hasCapability(auth.me?.capabilities, "issue");
+  // An ACME-issued certificate carries its ACME order's id on the server
+  // (`acme_orders.certificate_id`) — with `read_acme` the detail links
+  // back to it (the ACME page resolves the order from the certificate's
+  // id); a viewer without the capability never sees a link that would 403.
+  const canReadAcme = hasCapability(auth.me?.capabilities, "read_acme");
 
   const [cert, setCert] = useState<Certificate | null>(null);
   const [loading, setLoading] = useState(true);
@@ -179,6 +184,11 @@ export default function CertificateDetail() {
             <button type="button" onClick={downloadChain} disabled={downloadingChain}>
               {downloadingChain ? "Preparing…" : "Download chain (PEM)"}
             </button>
+            {cert.source === "acme" && canReadAcme && (
+              <Link className="button-link" to={`/acme?certificate=${cert.id}`}>
+                View ACME order
+              </Link>
+            )}
             {canRevoke && (
               <button type="button" className="danger" onClick={() => setRevoking(true)}>
                 Revoke…
