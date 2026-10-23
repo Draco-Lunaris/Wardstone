@@ -3994,3 +3994,116 @@ async fn a_trigger_cannot_regress_a_valid_authorization() {
         "only the http-01 settle ever fetched: the sibling trigger ran no verifier"
     );
 }
+
+/// A new-account POST from a SPECIFIC peer IP: the per-account limiter
+/// test needs the GCRA (per-IP) and the account limiter (per-account) in
+/// one fixture, so the two account creations ride distinct peers.
+async fn create_account_as_peer(fixture: &Fixture, key: &KeyFixture, ip: Ipv4Addr) -> TestResponse {
+    let nonce = fetch_nonce(fixture).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Jwk,
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/new-account"),
+        &json!({"termsOfServiceAgreed": true, "contact": [CONTACT]}),
+    );
+    send(
+        fixture,
+        with_peer(
+            acme_post(&format!("/acme/{ACME_TENANT}/new-account"), &jws),
+            ip,
+            44444,
+        ),
+    )
+    .await
+}
+
+/// Fix round 1 (F3), settlement D8: authenticated ACME is rate-limited
+/// PER ACCOUNT — the same AuthRateLimit the public auth routes carry (no
+/// new env); only new-account stays per-IP GCRA, because no account exists
+/// to key on. Burst 1 with a 60s refill: account A's SECOND POST — any
+/// route, POST-as-GET included — is the 429 rateLimited problem, while
+/// account B keeps its own bucket. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn authenticated_acme_routes_are_rate_limited_per_account() {
+    let _db = lock_db().await;
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        rate_limit: Some(AuthRateLimit {
+            per_millis: 60_000,
+            burst: 1,
+        }),
+        ..FixtureConfig::default()
+    })
+    .await;
+
+    let created_a = create_account_as_peer(&fx, rsa2048(), Ipv4Addr::new(127, 0, 0, 1)).await;
+    assert_eq!(
+        created_a.status(),
+        StatusCode::CREATED,
+        "account A enrols through its own GCRA bucket"
+    );
+    let created_b = create_account_as_peer(&fx, p256(), Ipv4Addr::new(127, 0, 0, 2)).await;
+    assert_eq!(
+        created_b.status(),
+        StatusCode::CREATED,
+        "account B enrols through ITS OWN GCRA bucket"
+    );
+    seed_profile(&fx, "web-server").await;
+
+    // Account A's first POST: through (the bucket starts full).
+    let first = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "a.wardstone.test"}]}),
+    )
+    .await;
+    let first_status = first.status();
+    let order_id = Uuid::parse_str(&location_order_id(&first)).expect("the Location's id");
+
+    // Account A's second POST: the 429 rateLimited problem.
+    let second = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "b.wardstone.test"}]}),
+    )
+    .await;
+    let second_status = second.status();
+    let second_problem = body_json(second).await;
+
+    // POST-as-GET rides the same bucket: still refused.
+    let read = kid_post_as_get(
+        &fx,
+        rsa2048(),
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}"),
+    )
+    .await;
+    let read_status = read.status();
+
+    // Account B keeps its own bucket.
+    let b_order = post_new_order(
+        &fx,
+        p256(),
+        json!({"identifiers": [{"type": "dns", "value": "c.wardstone.test"}]}),
+    )
+    .await;
+    let b_status = b_order.status();
+
+    let orders_after = order_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        second_problem["type"],
+        "urn:ietf:params:acme:error:rateLimited"
+    );
+    assert_eq!(
+        read_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "POST-as-GET rides the same account bucket"
+    );
+    assert_eq!(b_status, StatusCode::CREATED, "the buckets are per-account");
+    assert_eq!(orders_after, 2, "the refusals minted nothing");
+}

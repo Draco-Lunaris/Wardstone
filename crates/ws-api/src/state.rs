@@ -320,6 +320,62 @@ impl VerificationDeps {
     }
 }
 
+/// The per-account ACME rate limiter (settlement D8, fix round 1):
+/// authenticated ACME runs one refill curve per account — the SAME
+/// [`AuthRateLimit`] values the public auth routes carry (no new env);
+/// `None` disables it (in-process tests). tower_governor's middleware
+/// keying was ruled out: the account identity only exists AFTER the JWS
+/// verifies inside the handler, past any middleware layer — so this is a
+/// hand-rolled token bucket with the same refill semantics (one credit
+/// per `per_millis`, `burst` held at most), checked exactly where the
+/// account resolves. In-memory by the same accepted consequence class as
+/// the challenge pacing map: a restart refills every bucket, and the
+/// limiter is not a security boundary.
+#[derive(Clone)]
+pub struct AcmeAccountLimiter {
+    config: Option<AuthRateLimit>,
+    buckets: Arc<Mutex<HashMap<uuid::Uuid, (f64, Instant)>>>,
+}
+
+impl AcmeAccountLimiter {
+    /// Build over the shared auth-route limit config (or None).
+    pub fn new(config: Option<AuthRateLimit>) -> Self {
+        AcmeAccountLimiter {
+            config,
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Check-and-consume one credit for `account_id`: elapsed credits
+    /// refill since the bucket's last touch (capped at the burst), one
+    /// credit is spent, `false` answers when the bucket is empty. A
+    /// poisoned lock fails OPEN (only a panic inside the lock poisons
+    /// it, and the limiter is not a security boundary).
+    pub fn try_consume(&self, account_id: uuid::Uuid) -> bool {
+        let Some(config) = self.config else {
+            return true;
+        };
+        let Ok(mut buckets) = self.buckets.lock() else {
+            tracing::warn!("the ACME account-limiter map is poisoned; the request runs un-limited");
+            return true;
+        };
+        let now = Instant::now();
+        let (tokens, last) = buckets
+            .get(&account_id)
+            .copied()
+            .unwrap_or((config.burst as f64, now));
+        let elapsed_millis = now.saturating_duration_since(last).as_millis() as f64;
+        let refilled =
+            (tokens + elapsed_millis / config.per_millis as f64).min(config.burst as f64);
+        if refilled < 1.0 {
+            buckets.insert(account_id, (refilled, now));
+            return false;
+        }
+        buckets.insert(account_id, (refilled - 1.0, now));
+        true
+    }
+}
+
 /// The application state of the REST surface. Clonable (the pool and the
 /// shared handles are cheap `Arc`/connection copies).
 #[derive(Clone)]
@@ -344,12 +400,18 @@ pub struct AppState {
     /// attempt pacing — the routes compute every expected answer from
     /// these; client-supplied data is never a verification input.
     pub verification: VerificationDeps,
+    /// The per-account ACME rate limiter (settlement D8): keyed buckets
+    /// over the same AuthRateLimit values the public auth routes carry;
+    /// spends one credit per authenticated ACME POST where the account
+    /// resolves.
+    pub acme_accounts: AcmeAccountLimiter,
 }
 
 impl AppState {
     /// Build the state from the pool, the JWT key pair, and the config;
     /// the mutable-by-product stores start empty.
     pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
+        let acme_accounts = AcmeAccountLimiter::new(config.auth_rate_limit);
         AppState {
             pool,
             jwt,
@@ -358,6 +420,7 @@ impl AppState {
             oidc_states: Arc::new(OidcStateStore::default()),
             nonces: Arc::new(NonceStore::new()),
             verification: VerificationDeps::production(),
+            acme_accounts,
         }
     }
 

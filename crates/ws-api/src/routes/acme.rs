@@ -563,6 +563,10 @@ async fn account_url(
         .await?
         .ok_or(AcmeError::NoSuchAccount)
         .map_err(AcmeProblem::from)?;
+    // Settlement D8's per-account pacing: the account update (and its
+    // POST-as-GET read) rides the same bucket as every other
+    // authenticated ACME POST (see [`check_account_rate_limit`]).
+    check_account_rate_limit(&state, &account)?;
 
     // The empty payload is RFC 8555's POST-as-GET: a plain read.
     if jws.payload.is_null() {
@@ -805,6 +809,8 @@ async fn key_change(
             "the account for this key is deactivated",
         ));
     }
+    // Settlement D8's per-account pacing (see [`check_account_rate_limit`]).
+    check_account_rate_limit(&state, &account)?;
 
     let new_thumb = ws_acme::thumbprint(&inner.key).map_err(AcmeProblem::from)?;
     let new_url = format!("{base}/acme/{}/acct/{new_thumb}", tenant.name);
@@ -908,14 +914,45 @@ async fn authenticate_kid_account(
         .await?
         .ok_or(AcmeError::NoSuchAccount)
         .map_err(AcmeProblem::from)?;
-    let detail = match account.status {
-        AcmeAccountStatus::Valid => return Ok((account, jws.payload)),
+    let status_problem = match account.status {
+        AcmeAccountStatus::Valid => None,
         AcmeAccountStatus::Pending => {
-            "the account is not yet valid (agree to the terms of service)"
+            Some("the account is not yet valid (agree to the terms of service)")
         }
-        AcmeAccountStatus::Deactivated => "the account is deactivated",
+        AcmeAccountStatus::Deactivated => Some("the account is deactivated"),
     };
-    Err(AcmeProblem::unauthorized(detail))
+    if let Some(detail) = status_problem {
+        return Err(AcmeProblem::unauthorized(detail));
+    }
+    // Settlement D8's per-account pacing (see [`check_account_rate_limit`]).
+    check_account_rate_limit(state, &account)?;
+    Ok((account, jws.payload))
+}
+
+/// Settlement D8's per-account gate (fix round 1): one credit of the
+/// account's ACME bucket per authenticated POST — new-order, the
+/// POST-as-GET reads, every challenge trigger (and Task 8's finalize and
+/// revoke-cert) ride the SAME bucket, spent here where the account
+/// resolves, BEFORE any handler logic. The same `AuthRateLimit` the
+/// public auth routes carry drives it (no new env); new-account stays
+/// per-IP GCRA (no account exists to key on yet — the middleware form
+/// cannot key on an identity that only exists after the JWS verifies).
+/// A refusal is the RFC's rate-limited problem at 429.
+fn check_account_rate_limit(
+    state: &AppState,
+    account: &AcmeAccountModel,
+) -> Result<(), AcmeProblem> {
+    if state.acme_accounts.try_consume(account.id) {
+        Ok(())
+    } else {
+        Err(AcmeProblem {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            type_urn: URN_RATE_LIMITED,
+            detail: "the account has exceeded its ACME rate limit; retry later".to_owned(),
+            tos_link: None,
+            location: None,
+        })
+    }
 }
 
 /// `POST /acme/{tenant}/new-order` — the RFC 8555 §7.4 order machine's
