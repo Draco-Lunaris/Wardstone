@@ -185,6 +185,19 @@ CA (its root certificate in the client's trust store, or leaf pinning), or
 the directory fetch fails TLS verification before any ACME exchange
 starts.
 
+The root is an **ECDSA P-256 key by default** (setups from 2026-10-23
+onward), which every mainstream browser — Chrome, Chromium, Brave, Edge,
+Firefox, Safari — verifies once the root is imported. **An Ed25519 root
+cannot be trusted by Chromium-family browsers at all**: with the root
+imported they fail the chain with `net::ERR_CERT_INVALID` and offer no
+bypass (verified live). Setups created before the ECDSA default minted an
+Ed25519 root; such an install recovers either by wiping and re-running
+setup (fresh volumes, new root, re-import the new root everywhere
+including every ACME client's trust store) or, where a wipe is
+impossible, by minting an RSA-2048 CA (`POST /api/v1/cas`,
+`key_type=rsa2048`) and re-issuing the front door's `web-server` leaf
+from it.
+
 **Open enrollment and rate limiting.** Any ACME client that can reach the
 front door may enroll: new-account is authorized by the requester's own
 JWS key, and issuance stays bounded by server-computed http-01/dns-01
