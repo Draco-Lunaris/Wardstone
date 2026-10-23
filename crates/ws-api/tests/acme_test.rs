@@ -1387,7 +1387,7 @@ async fn key_change_rolls_the_account_key_in_a_single_transaction() {
     let wire: Value = serde_json::from_str(outer.as_str())
         .expect("the outer wire body is the RFC 8555 flattened JSON serialization");
     // The b64url segments live in the flattened body's fields...
-    let outer_header: Value = serde_json::from_str(&decode_b64(
+    let _outer_header: Value = serde_json::from_str(&decode_b64(
         wire["protected"]
             .as_str()
             .expect("the outer's protected field"),
@@ -1396,7 +1396,7 @@ async fn key_change_rolls_the_account_key_in_a_single_transaction() {
     // ...and the outer's payload field wraps the inner JWS: its b64url
     // decode is the INNER flattened serialization (the same three fields
     // the route reads through its own decode).
-    let outer_payload: Value = serde_json::from_str(&decode_b64(
+    let _outer_payload: Value = serde_json::from_str(&decode_b64(
         wire["payload"].as_str().expect("the outer's payload field"),
     ))
     .expect("the outer's payload decodes to the inner JWS JSON");

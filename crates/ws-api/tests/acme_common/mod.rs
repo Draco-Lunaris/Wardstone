@@ -150,7 +150,13 @@ pub enum Identity {
     Bare,
 }
 
-/// Missing-nonce case).
+/// Build a client-side ACME request AS a compact JWS: a low-level builder
+/// whose protected header carries the alg, the identity members, the
+/// `nonce`, and the `url` the request binds to. A `Value::Null` payload
+/// produces the empty (POST-as-GET) payload segment, mirroring the wire
+/// form. NOTE: compact is the INTERNAL shape (the JOSE floor verifies it;
+/// RFC 8555 puts the flattened JSON serialization on the wire — wrap with
+/// `inner_jws_object` + serialize for on-wire bodies).
 pub fn sign_with_header(key: &KeyFixture, header: &Value, payload: &Value) -> String {
     let protected = B64URL.encode(header.to_string());
     let payload_segment = match payload {
@@ -186,14 +192,6 @@ pub fn sign_acme_request(
     serde_json::to_string(&inner_jws_object(&compact))
         .expect("the flattened envelope always serializes")
 }
-
-/// Build a client-side ACME request AS a compact JWS: a low-level builder
-/// whose protected header carries the alg, the identity members, the
-/// `nonce`, and the `url` the request binds to. A `Value::Null` payload
-/// produces the empty (POST-as-GET) payload segment, mirroring the wire
-/// form. NOTE: compact is the INTERNAL shape (the JOSE floor verifies it;
-/// RFC 8555 puts the flattened JSON serialization on the wire — wrap with
-/// `inner_jws_object` + serialize for on-wire bodies).
 
 /// A signed-elsewhere JWS rendered as RFC 8555 §7.3.5's flattened JSON
 /// serialization — the `{"protected","payload","signature"}` object the
