@@ -1224,9 +1224,13 @@ async fn order_url(
 
 /// The order's `authorizations` URLs, identifier order, re-derived from
 /// the rows at POLL time: an order-scoped row (minted FOR this order —
-/// any status) first, else the account-level REUSED row the order was
-/// pointed at when created (found through the same reuse-window lookup
-/// the creation ran). `None` = the member is not carried for this order
+/// any status) first, else the account-level row the identifier resolves
+/// to through the same reuse-window lookup the creation ran — the REUSED
+/// row the order was pointed at when created, or (fix round 1) the row
+/// that ORDER'S OWN settlement promoted to account-level, so an issuing
+/// order that is still pending or ready keeps rendering its
+/// authorization after the promotion. `None` = the member is not carried
+/// for this order
 /// status (processing/valid/invalid — the RFC allows omitting the
 /// authorizations of an order past `pending`; a valid order speaks
 /// through `certificate`, an invalid one through `error`).
@@ -2532,6 +2536,21 @@ async fn settle_challenge(
                     Some(now + chrono::Duration::days(REUSE_WINDOW_DAYS)),
                 )
                 .await?;
+            // The D5 promotion (the Task-11 e2e's fix round): the renewal
+            // criterion needs an ORGANICALLY settled row to be reusable by
+            // the account's NEXT order, and the reuse lookup serves
+            // account-level rows only — so a row minted order-scoped for
+            // THIS order is promoted (`order_id` NULL) in the SAME
+            // transaction as the `valid` stamp. Its 30-day window is the
+            // stamp above; the poll path re-finds the promoted row through
+            // the reuse-window lookup (the Task-6 pattern), so the issuing
+            // order keeps rendering its authorization while it lives. A
+            // reused row is already account-level and takes no arm here.
+            if authorization.order_id.is_some() {
+                AcmeRepo::new()
+                    .promote_authorization_to_account_level(&mut *tx, tenant.id, authorization.id)
+                    .await?;
+            }
             if let Some(order_id) = authorization.order_id {
                 ready_order_when_all_authorizations_valid(&mut tx, tenant.id, order_id).await?;
             }

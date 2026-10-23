@@ -753,6 +753,34 @@ impl AcmeRepo {
         Ok(())
     }
 
+    /// Promote an order-scoped authorization to ACCOUNT-LEVEL
+    /// (`order_id` NULL — the Task-2 row shape `valid_authorization_for`
+    /// reuses): settlement D5's renewal criterion requires an ORGANICALLY
+    /// settled row to be reusable by the account's NEXT order, and the
+    /// lookup serves account-level rows only. Settlement (Task 7) runs
+    /// this in the SAME transaction as the `valid` stamp, so a crash
+    /// never leaves a half state — either both land or neither. A missing
+    /// authorization updates zero rows and stays `Ok`; the caller guards
+    /// the call to rows it JUST settled `valid` while they were
+    /// order-scoped (an already account-level row must be left alone —
+    /// there is no `order_id` to clear).
+    pub async fn promote_authorization_to_account_level(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE acme_authorizations SET order_id = NULL \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
     /// Insert a challenge row exactly as given (every field, `created_at`
     /// included). BOTH flavors (http-01 and dns-01) are minted per
     /// authorization; the client picks by requesting validation on one.
