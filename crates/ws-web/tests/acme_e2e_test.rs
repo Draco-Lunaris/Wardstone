@@ -1598,13 +1598,27 @@ async fn second_order_reuses_authorizations() {
 
     // order 1 issues all the way: enrollment, profile + CA seeding, the
     // HTTP-01 settlement (whose transaction promotes the row), finalize.
-    let (order_id, _root_pem) = issue_certificate(&mut env, "host.wardstone-e2e.test").await;
+    let (order_id, root_pem) = issue_certificate(&mut env, "host.wardstone-e2e.test").await;
     let key = KeyFixture::rsa2048();
 
-    // -- the second order through the front door. No account-level row is
+    // -- the second order through the front door. NO account-level row is
     //    seeded: the one it must reuse is the one order 1's own settlement
     //    promoted.
     let (second_order_id, second_body) = new_order(&env, key, "host.wardstone-e2e.test").await;
+
+    // -- D5's renewal criterion as a RUN, not a pinned state: the ready
+    //    renewal order finalizes with NO further challenge work and its
+    //    certificate downloads.
+    let (finalize_status, finalize_body) = finalize(
+        &env,
+        key,
+        second_order_id,
+        "host.wardstone-e2e.test",
+        &["host.wardstone-e2e.test"],
+    )
+    .await;
+    let (download_status, download_type, download_body) =
+        download_certificate(&env, key, second_order_id).await;
 
     // -- DB captures, then the cleanup, THEN the assertions.
     let identifier_rows: Vec<(Uuid,)> = sqlx::query_as(
@@ -1639,6 +1653,23 @@ async fn second_order_reuses_authorizations() {
         .await
         .expect("read order one")
         .expect("it exists");
+    let order_one_certificate_id = order_one_row
+        .certificate_id
+        .expect("the first order issued its certificate");
+    let second_order_row = AcmeRepo::new()
+        .get_order(&env.pool, env.tenant_id, second_order_id)
+        .await
+        .expect("read the renewal order")
+        .expect("it exists");
+    let second_certificate_id = second_order_row
+        .certificate_id
+        .expect("the renewal order issued its certificate");
+    let second_cert_row = CertificateRepo::new()
+        .get(&env.pool, second_certificate_id)
+        .await
+        .expect("read the renewal certificate")
+        .expect("it exists");
+    let issued_audits = audit_rows(&env, "cert_issued").await;
     let created_audits = audit_rows(&env, "acme_order_created").await;
     env.cleanup().await;
 
@@ -1653,8 +1684,9 @@ async fn second_order_reuses_authorizations() {
         "the SECOND order reuses the row the FIRST settlement promoted"
     );
     assert_eq!(
-        second_body["status"], "pending",
-        "the second order is a fresh pending order on the reused credential"
+        second_body["status"], "ready",
+        "the renewal order is ready BY CREATION: its every identifier \
+         reused an already-valid authorization"
     );
     assert_ne!(second_order_id, order_id);
     assert!(
@@ -1670,6 +1702,46 @@ async fn second_order_reuses_authorizations() {
         order_one_row.status,
         AcmeOrderStatus::Valid,
         "the first order's issued state is untouched"
+    );
+    // the D5 run: the ready renewal finalizes with no further challenge
+    // work and its certificate downloads.
+    assert_eq!(second_order_row.status, AcmeOrderStatus::Valid);
+    assert_eq!(
+        finalize_status,
+        StatusCode::OK,
+        "the renewal finalizes: {finalize_body}"
+    );
+    assert_eq!(finalize_body["status"], "valid");
+    assert_eq!(
+        finalize_body["certificate"],
+        json!(format!(
+            "{PUBLIC_URL}/acme/{E2E_TENANT}/orders/{second_order_id}/certificate"
+        ))
+    );
+    assert_eq!(
+        download_status,
+        StatusCode::OK,
+        "the renewal's certificate URL serves: {download_body}"
+    );
+    assert_eq!(
+        download_type.as_deref(),
+        Some("application/pem-certificate-chain")
+    );
+    let leaf_at = download_body
+        .find(&second_cert_row.cert_pem)
+        .expect("the renewal's leaf PEM in the download body");
+    let root_at = download_body
+        .find(&root_pem)
+        .expect("the root PEM in the download body");
+    assert!(leaf_at < root_at, "the chain body is leaf-first");
+    assert_eq!(second_cert_row.source, "acme");
+    assert_eq!(second_cert_row.status, CertStatus::Active);
+    assert_eq!(issued_audits.len(), 2, "both issuances audited");
+    let audit_targets: Vec<&str> = issued_audits.iter().map(|row| row.3.as_str()).collect();
+    assert!(
+        audit_targets.contains(&order_one_certificate_id.to_string().as_str())
+            && audit_targets.contains(&second_certificate_id.to_string().as_str()),
+        "both certificates carry their cert_issued audit rows"
     );
     assert_eq!(created_audits.len(), 2, "both orders audited");
     assert_eq!(created_audits[1].4["reused_authorization_count"], 1);

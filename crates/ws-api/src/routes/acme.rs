@@ -1064,7 +1064,7 @@ async fn new_order(
     }
 
     let now = Utc::now();
-    let order = AcmeOrderModel {
+    let mut order = AcmeOrderModel {
         id: Uuid::new_v4(),
         tenant_id: tenant.id,
         account_id: account.id,
@@ -1127,6 +1127,29 @@ async fn new_order(
         mint_challenge_pair(&mut tx, tenant.id, authorization.id, identifier, now).await?;
         authorization_urls.push(authz_object_url(&base, &tenant.name, authorization.id));
         minted.push(identifier.clone());
+    }
+    // C1 (fix wave): an order whose EVERY identifier reused an
+    // already-valid authorization is ready BY CONSTRUCTION of the lookup
+    // (every row it points at is `status = 'valid' AND expires_at > now`
+    // exactly). No settlement can ever fire for those rows — a valid
+    // authorization refuses its trigger without re-verifying (Task 7's F1
+    // fix) — so without this stamp an all-reused (renewal) order would sit
+    // pending until its 7-day expiry and automated renewal could never
+    // reach finalize (finalize answers 403 orderNotReady unless `ready`).
+    // A MIXED order (at least one freshly minted pending authorization)
+    // stays pending and reaches ready via settlement exactly as before.
+    if minted.is_empty() {
+        AcmeRepo::new()
+            .update_order_status(
+                &mut *tx,
+                tenant.id,
+                order.id,
+                AcmeOrderStatus::Ready,
+                None,
+                None,
+            )
+            .await?;
+        order.status = AcmeOrderStatus::Ready;
     }
     let account_url_str = format!(
         "{base}/acme/{}/acct/{}",
@@ -1198,7 +1221,7 @@ async fn order_url(
         "{base}/acme/{}/acct/{}",
         tenant.name, account.jwk_thumbprint
     );
-    let authorizations =
+    let resolved =
         order_authorization_urls(&state, &tenant, &base, &account_url_str, &order).await?;
     // The poll may have driven a PAST-EXPIRY pending authorization to its
     // expired self-transition (Task 7's wiring), which invalidates an
@@ -1209,8 +1232,42 @@ async fn order_url(
         .await?
         .filter(|order| order.account_id == account.id)
         .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
+    // The C1 readiness fallback (fix wave, the reviewer's
+    // defense-in-depth): a STILL-pending order whose every identifier
+    // resolved to a `valid` authorization reaches `ready` right here,
+    // mirrors of the expired-self-transition pattern — order-object
+    // readers stay consistent with the state the rows already speak. This
+    // normally backstops pre-fix orders the creation stamp never saw; a
+    // mixed order (any minted pending row) never qualifies. A concurrent
+    // settlement cannot race this into a wrong state: the rows here are
+    // VALID, and a valid authorization refuses its trigger without
+    // re-verifying.
+    let order = if order.status == AcmeOrderStatus::Pending && resolved.all_valid {
+        let mut tx = state.pool.begin().await?;
+        AcmeRepo::new()
+            .update_order_status(
+                &mut *tx,
+                tenant.id,
+                order.id,
+                AcmeOrderStatus::Ready,
+                None,
+                None,
+            )
+            .await?;
+        tx.commit().await?;
+        tracing::info!(
+            order = %order.id,
+            "a pending order whose authorizations are all valid is ready"
+        );
+        AcmeOrderModel {
+            status: AcmeOrderStatus::Ready,
+            ..order
+        }
+    } else {
+        order
+    };
     let authorizations = match order.status {
-        AcmeOrderStatus::Pending | AcmeOrderStatus::Ready => authorizations,
+        AcmeOrderStatus::Pending | AcmeOrderStatus::Ready => resolved.urls,
         _ => None,
     };
     Ok(order_response(
@@ -1220,6 +1277,19 @@ async fn order_url(
         &order,
         authorizations.as_deref(),
     ))
+}
+
+/// The poll-time resolution of an order's `authorizations` array plus the
+/// readiness signal the fix-wave defense-in-depth consumes.
+struct ResolvedAuthorizations {
+    /// The absolute authorization URLs, identifier order — `None` = the
+    /// member is not carried for this order status.
+    urls: Option<Vec<String>>,
+    /// TRUE when every identifier resolved to a `valid` authorization
+    /// (computed only while the member is carried). The readiness
+    /// fallback at the poll drives a still-pending order with all-valid
+    /// rows to `ready`.
+    all_valid: bool,
 }
 
 /// The order's `authorizations` URLs, identifier order, re-derived from
@@ -1238,19 +1308,24 @@ async fn order_url(
 /// A reused row that has since dropped out of the window (expired without
 /// the order having been invalidated — no machinery does that until Task
 /// 7) is OMITTED with a warn, never a 500: the array may only shorten for
-/// an order that is about to be invalidated anyway.
+/// an order that is about to be invalidated anyway — and it makes
+/// `all_valid` false, so a short array can never drive the readiness
+/// fallback.
 async fn order_authorization_urls(
     state: &AppState,
     tenant: &Tenant,
     base: &str,
     account_url: &str,
     order: &AcmeOrderModel,
-) -> Result<Option<Vec<String>>, AcmeProblem> {
+) -> Result<ResolvedAuthorizations, AcmeProblem> {
     if !matches!(
         order.status,
         AcmeOrderStatus::Pending | AcmeOrderStatus::Ready
     ) {
-        return Ok(None);
+        return Ok(ResolvedAuthorizations {
+            urls: None,
+            all_valid: false,
+        });
     }
     let identifiers = identifiers_of(&order.identifiers)?;
     let order_scoped = AcmeRepo::new()
@@ -1258,6 +1333,7 @@ async fn order_authorization_urls(
         .await?;
     let now = Utc::now();
     let mut urls = Vec::with_capacity(identifiers.len());
+    let mut all_valid = true;
     for identifier in &identifiers {
         if let Some(existing) = order_scoped
             .iter()
@@ -1270,6 +1346,12 @@ async fn order_authorization_urls(
             let existing =
                 expire_authorization_if_past(state, tenant, base, account_url, existing.clone())
                     .await?;
+            if existing.status != AcmeAuthorizationStatus::Valid {
+                // A pending order-scoped row: reaches valid via
+                // settlement, or expires/invalidates. Mixed orders (any
+                // minted identifier) keep their settlement path.
+                all_valid = false;
+            }
             urls.push(authz_object_url(base, &tenant.name, existing.id));
             continue;
         }
@@ -1280,17 +1362,26 @@ async fn order_authorization_urls(
             Some(reused) => {
                 let reused =
                     expire_authorization_if_past(state, tenant, base, account_url, reused).await?;
+                if reused.status != AcmeAuthorizationStatus::Valid {
+                    all_valid = false;
+                }
                 urls.push(authz_object_url(base, &tenant.name, reused.id));
             }
-            None => tracing::warn!(
-                order = %order.id,
-                identifier = %identifier,
-                "an order's reused authorization left the reuse window; \
-                 the authorizations array omits it until the order is invalidated"
-            ),
+            None => {
+                all_valid = false;
+                tracing::warn!(
+                    order = %order.id,
+                    identifier = %identifier,
+                    "an order's reused authorization left the reuse window; \
+                     the authorizations array omits it until the order is invalidated"
+                );
+            }
         }
     }
-    Ok(Some(urls))
+    Ok(ResolvedAuthorizations {
+        urls: Some(urls),
+        all_valid,
+    })
 }
 
 // ---------------------------------------------------------------------------
