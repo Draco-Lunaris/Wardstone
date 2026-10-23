@@ -34,6 +34,9 @@ ws-api = { path = "../ws-api" }
 ws-web = { path = "../ws-web" }
 # The CA engine: the keystore (setup slot, per-certificate key envelopes).
 ws-ca = { path = "../ws-ca" }
+# The keystore loaders return zeroizing key bytes; named so
+# `resolve_serving_leaf`'s loader signature can spell the type out.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # Model ids and the created_at clock for the serving-leaf selection tests
