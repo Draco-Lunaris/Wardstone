@@ -8,7 +8,13 @@
 //! authenticating account's own RFC 7638 thumbprint) and checks it
 //! against its own outbound HTTP fetch (HTTP-01) or DNS TXT resolution
 //! (DNS-01) — a client-supplied answer is never an input (the RFC's
-//! response fields are ignored wholesale).
+//! response fields are ignored wholesale). Task 8 closes the issuance
+//! loop: finalize (RFC 8555 §7.4) delegates to the SAME issuance
+//! machinery as the manual path (`issue_certificate_core`, the account
+//! actor carrying exactly `issue`), the order's certificate URL serves
+//! the leaf + chain via POST-as-GET (§7.4.2), and revoke-cert (§7.6) is
+//! account-key JWS only — the certificate-key proof-of-possession
+//! variant is declined per settlement D7 (`cert_key_pop_declined`).
 //!
 //! This is JWS-machine traffic, mounted OUTSIDE `/api/v1` at `/acme`
 //! (Plan-1-pinned URL shape): no bearer/session extractor ever touches it —
@@ -57,7 +63,7 @@
 //! authorization reads are POST-as-GET only (the RFC's POST-with-empty-
 //! payload), never unauthenticated GETs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -69,7 +75,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
@@ -80,21 +86,26 @@ use tower_governor::key_extractor::PeerIpKeyExtractor;
 use tower_governor::GovernorLayer;
 use uuid::Uuid;
 use ws_acme::{AcmeError, NonceStore};
+use ws_ca::issue::{validate_csr, CsrInfo, SanEntry};
 use ws_core::error::CoreError;
 use ws_core::models::acme::{
     AcmeAccountModel, AcmeAccountStatus, AcmeAuthorizationModel, AcmeAuthorizationStatus,
     AcmeChallengeModel, AcmeChallengeStatus, AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
 };
-use ws_core::models::rbac::{Actor, ActorType, AuthMethod};
+use ws_core::models::certificate::{CertStatus, CertificateModel, RevocationReason};
+use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Capability};
 use ws_core::models::tenant::Tenant;
 use ws_core::repo::acme_repo::AcmeRepo;
 use ws_core::repo::audit_repo::AuditRepo;
+use ws_core::repo::ca_repo::CaRepo;
+use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::profile_repo::ProfileRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
 
 use crate::error::ApiError;
 use crate::routes::audit_entry;
 use crate::routes::auth::primary_tenant;
+use crate::routes::certificates::{issue_certificate_core, IssueCertificateBody};
 use crate::state::AppState;
 
 /// The problem URN for the ToS gate — in the ACME error registry, though
@@ -116,8 +127,19 @@ const URN_REJECTED_IDENTIFIER: &str = "urn:ietf:params:acme:error:rejectedIdenti
 
 /// The problem URN for an attempt paced out by the per-authorization
 /// backoff (RFC 8555 §6.7's `rateLimited`; the pacing window lives in
-/// [`crate::state::CHALLENGE_ATTEMPT_BACKOFF`]).
+/// [`crate::state::CHALLENGE_ATTEMPT_BACKOFF`]) and for a request the
+/// per-account limiter (settlement D8) refuses.
 const URN_RATE_LIMITED: &str = "urn:ietf:params:acme:error:rateLimited";
+
+/// The problem URN for a finalize CSR the server cannot use against its
+/// order (RFC 8555 §7.4's `badCSR`): PKCS#10 input that does not parse,
+/// or a CSR whose requested identifiers differ from the order's.
+const URN_BAD_CSR: &str = "urn:ietf:params:acme:error:badCSR";
+
+/// The problem URN for a finalize (or certificate download) on an order
+/// whose state does not admit it (RFC 8555 §7.4's `orderNotReady`) —
+/// answered 403, per the RFC's own status pin for the finalize case.
+const URN_ORDER_NOT_READY: &str = "urn:ietf:params:acme:error:orderNotReady";
 
 /// The order machine's clock pins (settlement D5): an order lives 7 days,
 /// and each freshly minted PENDING authorization shares that retry window.
@@ -185,6 +207,12 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/{tenant}/acct/{account}", post(account_url))
         .route("/{tenant}/new-order", post(new_order))
         .route("/{tenant}/orders/{order}", post(order_url))
+        .route("/{tenant}/orders/{order}/finalize", post(finalize_order))
+        .route(
+            "/{tenant}/orders/{order}/certificate",
+            post(download_certificate),
+        )
+        .route("/{tenant}/revoke-cert", post(revoke_cert))
         .route("/{tenant}/authz/{authz}", post(authz_url))
         .route("/{tenant}/chall/{challenge}", post(challenge_url))
         .route("/{tenant}/key-change", post(key_change))
@@ -931,13 +959,14 @@ async fn authenticate_kid_account(
 
 /// Settlement D8's per-account gate (fix round 1): one credit of the
 /// account's ACME bucket per authenticated POST — new-order, the
-/// POST-as-GET reads, every challenge trigger (and Task 8's finalize and
-/// revoke-cert) ride the SAME bucket, spent here where the account
-/// resolves, BEFORE any handler logic. The same `AuthRateLimit` the
-/// public auth routes carry drives it (no new env); new-account stays
-/// per-IP GCRA (no account exists to key on yet — the middleware form
-/// cannot key on an identity that only exists after the JWS verifies).
-/// A refusal is the RFC's rate-limited problem at 429.
+/// POST-as-GET reads (the order poll AND Task 8's certificate download),
+/// every challenge trigger, the account update and key change, and
+/// Task 8's finalize and revoke-cert ride the SAME bucket, spent here
+/// where the account resolves, BEFORE any handler logic. The same
+/// `AuthRateLimit` the public auth routes carry drives it (no new env);
+/// new-account stays per-IP GCRA (no account exists to key on yet — the
+/// middleware form cannot key on an identity that only exists after the
+/// JWS verifies). A refusal is the RFC's rate-limited problem at 429.
 fn check_account_rate_limit(
     state: &AppState,
     account: &AcmeAccountModel,
@@ -1253,6 +1282,589 @@ async fn order_authorization_urls(
         }
     }
     Ok(Some(urls))
+}
+
+// ---------------------------------------------------------------------------
+// Finalize, certificate download, and revocation (Plan 4 Task 8): the
+// issuance loop closes. Finalize delegates to the SAME issuance machinery
+// as the manual path (`issue_certificate_core`) with the AcmeAccount
+// actor carrying exactly the `issue` capability; the certificate URL
+// serves the leaf + chain; revoke-cert is account-key JWS only (the
+// cert-key proof-of-possession variant is declined per settlement D7).
+// ---------------------------------------------------------------------------
+
+/// `POST /acme/{tenant}/orders/{id}/finalize` — RFC 8555 §7.4's
+/// finalization, kid-carried by a `valid` account, an order `ready`
+/// required. The payload carries the CSR as the base64url-encoded DER
+/// (`csr`); the route validates it (`ws_ca::validate_csr`), checks the
+/// §7.4 CSR-vs-order identifier gate, and delegates to the SAME issuance
+/// machinery the manual `POST /api/v1/certificates` path runs —
+/// [`issue_certificate_core`] with
+/// `IssueCertificateBody { profile_id: <the order's stored profile name
+/// resolved by tenant>, subject_cn: <the CSR's CN, else the order's
+/// primary identifier>, sans: <the order's identifiers VERBATIM>,
+/// csr_pem: Some }`. The `sans` carry the raw `*.` wildcard strings —
+/// exactly the shape the manual CSR path submits wildcards in: the
+/// profile's SAN patterns match the stripped form (`san_is_permitted`),
+/// and rcgen writes the wildcard dNSName. The server-key-generation path
+/// is NOT an ACME surface: a payload without a usable CSR is refused
+/// before any delegation (never routed to [`Capability::GenerateLeafKey`]
+/// — `issue_certificate_core` only reaches it when `csr_pem.is_none()`).
+///
+/// State transitions: RFC 8555 §7.4 answers finalize-not-ready with 403
+/// `orderNotReady`; on success this server issues SYNCHRONOUSLY inside
+/// the request, so the `processing` mark is never persisted and the 200
+/// response is the final `valid` order object carrying the `certificate`
+/// member. The CSR, the issued certificate's id, and the `valid` status
+/// commit together (the write-side contract).
+async fn finalize_order(
+    State(state): State<AppState>,
+    Path((tenant_name, order_id)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/orders/{order_id}/finalize", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    let order_uuid =
+        Uuid::parse_str(&order_id).map_err(|_| AcmeProblem::not_found("no such order"))?;
+    let order = AcmeRepo::new()
+        .get_order(&state.pool, tenant.id, order_uuid)
+        .await?
+        .filter(|order| order.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
+
+    // §7.4: "A request to finalize an order will result in error if the
+    // order is in the 'pending' or 'processing' state" — 403 with the
+    // orderNotReady problem (the RFC's own status pin). A `valid` order
+    // carries its certificate already; an `invalid` one is final.
+    if order.status != AcmeOrderStatus::Ready {
+        return Err(AcmeProblem {
+            status: StatusCode::FORBIDDEN,
+            type_urn: URN_ORDER_NOT_READY,
+            detail: format!(
+                "the order is {} and cannot be finalized; POST-as-GET it for its current state",
+                order.status.as_str()
+            ),
+            tos_link: None,
+            location: None,
+        });
+    }
+
+    // The CSR member: RFC 8555 §7.4 — "the base64url-encoded version of
+    // the DER format". A finalize POST-as-GET (the null payload) names
+    // nothing to issue; the `csr` member is required and is a string.
+    let csr_der = if payload.is_null() {
+        return Err(AcmeProblem::malformed(
+            "a finalize request requires a csr member (POST-as-GET does not apply)",
+        ));
+    } else {
+        match payload.get("csr").and_then(Value::as_str) {
+            Some(csr) => URL_SAFE_NO_PAD.decode(csr.as_bytes()).map_err(|_| {
+                AcmeProblem::malformed("the finalize payload's csr member is not valid base64url")
+            })?,
+            None => {
+                return Err(AcmeProblem::malformed(
+                    "the finalize payload must carry the CSR as a base64url string in csr",
+                ));
+            }
+        }
+    };
+
+    // The ws-ca parsers consume PEM; the wire carried headerless DER. A
+    // CSR that does not parse as PKCS#10 is the §7.4 `badCSR` problem.
+    let csr_pem = pem_encode(&csr_der, "CERTIFICATE REQUEST");
+    let csr = validate_csr(&csr_pem).map_err(|err| AcmeProblem {
+        status: StatusCode::BAD_REQUEST,
+        type_urn: URN_BAD_CSR,
+        detail: format!("the finalize CSR does not parse as a PKCS#10 request: {err}"),
+        tos_link: None,
+        location: None,
+    })?;
+
+    let identifiers = identifiers_of(&order.identifiers)?;
+
+    // The RFC 8555 §7.4 gate the shared issuance core does NOT run (it
+    // validates the request names against the profile, never the CSR
+    // against the order): the CSR "MUST indicate the exact same set of
+    // requested identifiers as the initial newOrder request". After a
+    // badCSR the order STAYS `ready` (the RFC's SHOULD) — nothing has
+    // been written yet.
+    if !csr_identifiers_match(&csr, &identifiers) {
+        return Err(AcmeProblem {
+            status: StatusCode::BAD_REQUEST,
+            type_urn: URN_BAD_CSR,
+            detail: "the CSR's requested identifiers do not match the order's identifiers"
+                .to_owned(),
+            tos_link: None,
+            location: None,
+        });
+    }
+
+    // The order's stored profile name resolves through the Task-6 by-name
+    // lookup, tenant-scoped — exactly what new-order validated. A profile
+    // deleted between order creation and finalize is server-side damage
+    // (new-order refused it while it existed): 500.
+    let profile = ProfileRepo::new()
+        .get_by_name(&state.pool, tenant.id, &order.profile_name)
+        .await?
+        .ok_or_else(|| {
+            AcmeProblem::internal(format!(
+                "the order's profile {:?} no longer exists",
+                order.profile_name
+            ))
+        })?;
+
+    // The subject CN: the CSR's own common name, else the order's primary
+    // identifier. The profile's SAN policy (and the CN's) is enforced
+    // INSIDE the shared issuance core on exactly the names the manual
+    // path validates — [`validate_names`] — so a name outside the
+    // profile's patterns yields the SAME message semantics the manual
+    // path returns (a 400 problem whose detail is the policy message).
+    let subject_cn = csr
+        .subject_cn
+        .clone()
+        .unwrap_or_else(|| identifiers[0].clone());
+    let body = IssueCertificateBody {
+        profile_id: profile.id,
+        subject_cn,
+        sans: identifiers.clone(),
+        csr_pem: Some(csr_pem.clone()),
+    };
+
+    // The delegation: the account actor carries EXACTLY the `issue`
+    // capability (the Plan-4 settlement); [`issue_certificate_core`]
+    // checks it internally for the CSR-bearing path and runs the
+    // capability-checked profile/revision read, the name validation, the
+    // CA choice, and the ONE transaction (CAS, serial, signing,
+    // certificate insert, `cert_issued` audit) — with its built-in
+    // bounded retry against a moved profile revision.
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
+    let actor = acme_issuing_actor(tenant.id, account_url_str);
+    let issued =
+        issue_certificate_core(&state, &actor, &body, Uuid::new_v4(), Uuid::new_v4(), None)
+            .await
+            .map_err(AcmeProblem::from)?;
+
+    // The final stamp, ONE transaction: the CSR the request carried, the
+    // issued certificate's id, and the `valid` status. A request that
+    // fails before here (badCSR, policy refusal, server error) writes
+    // nothing — the order stays `ready` for the client's retry, which is
+    // also why the RFC's `processing` mark never needs a persistent row.
+    let mut tx = state.pool.begin().await?;
+    AcmeRepo::new()
+        .set_order_csr(&mut *tx, tenant.id, order.id, &csr_pem)
+        .await?;
+    AcmeRepo::new()
+        .update_order_status(
+            &mut *tx,
+            tenant.id,
+            order.id,
+            AcmeOrderStatus::Valid,
+            Some(issued.certificate_id),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    tracing::info!(
+        order = %order.id,
+        certificate = %issued.certificate_id,
+        "acme order finalized: certificate issued"
+    );
+
+    let finalized = AcmeRepo::new()
+        .get_order(&state.pool, tenant.id, order.id)
+        .await?
+        .ok_or_else(|| AcmeProblem::internal("the order vanished during its finalize"))?;
+    Ok(order_response(
+        StatusCode::OK,
+        &base,
+        &tenant.name,
+        &finalized,
+        None,
+    ))
+}
+
+/// The finalize CSR-vs-order gate (RFC 8555 §7.4): the CSR "MUST indicate
+/// the exact same set of requested identifiers as the initial newOrder
+/// request", each DNS identifier riding the requested subject's
+/// commonName OR the subjectAltName extension. The comparison runs on
+/// the WILDCARD-STRIPPED, case-folded forms (an order's `*.example.com`
+/// is matched by a CSR SAN of `*.example.com` — the wildcard prefix is
+/// not compared, matching the stripped-form semantics the profile's SAN
+/// patterns apply to the issued names). Both directions are exact: every
+/// order identifier must be carried by the CSR (SANs or CN), every CSR
+/// SAN must be an order identifier, and the CSR's own CN (when present)
+/// must be one as well — it becomes the issued subject. A CSR SAN of a
+/// kind the dns-only order cannot express (IP, email) is a mismatch.
+fn csr_identifiers_match(csr: &CsrInfo, identifiers: &[String]) -> bool {
+    let normalize = |name: &str| name.strip_prefix("*.").unwrap_or(name).to_lowercase();
+    if csr
+        .sans
+        .iter()
+        .any(|entry| !matches!(entry, SanEntry::Dns(_)))
+    {
+        return false;
+    }
+    let csr_names: HashSet<String> = csr
+        .sans
+        .iter()
+        .filter_map(|entry| match entry {
+            SanEntry::Dns(name) => Some(normalize(name)),
+            _ => None,
+        })
+        .collect();
+    let cn = csr.subject_cn.as_deref().map(normalize);
+    let order_names: HashSet<String> = identifiers.iter().map(|id| normalize(id)).collect();
+    // Every CSR SAN is an order identifier...
+    csr_names.iter().all(|name| order_names.contains(name))
+        // ...the CN (when present) is one too...
+        && match cn.as_deref() {
+            Some(cn) => order_names.contains(cn),
+            None => true,
+        }
+        // ...and every order identifier rides the CSR's SANs or CN.
+        && identifiers
+            .iter()
+            .map(|id| normalize(id))
+            .all(|id| csr_names.contains(&id) || cn.as_deref() == Some(id.as_str()))
+}
+
+/// Wrap DER bytes into a PEM body: the RFC 8555 finalize/revocation
+/// members are headerless base64url DER, while the ws-ca parsers consume
+/// PEM. The 64-character line wrapping is PEM's RFC 1421 form (the
+/// base64 body is pure ASCII, so the byte chunks are whole characters).
+fn pem_encode(der: &[u8], label: &str) -> String {
+    let body = STANDARD.encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for chunk in body.into_bytes().chunks(64) {
+        pem.push_str(&String::from_utf8_lossy(chunk));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+/// The DER bytes of one PEM body: everything between the label lines,
+/// whitespace stripped, base64 (STANDARD alphabet) decoded. Unreadable
+/// stored PEM is data-level damage (a 500), never a per-request refusal.
+fn pem_to_der(pem: &str, label: &str) -> Result<Vec<u8>, AcmeProblem> {
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect();
+    STANDARD
+        .decode(body.as_bytes())
+        .map_err(|_| AcmeProblem::internal(format!("a stored {label} PEM body is corrupt")))
+}
+
+/// `POST /acme/{tenant}/orders/{id}/certificate` — the RFC 8555 §7.4.2
+/// certificate download, kid-carried POST-as-GET (the same shape the
+/// order and authorization reads share), account-scoped: a foreign order
+/// is indistinguishable from a missing one. The plan pinned the URL
+/// shape `GET /.../certificate`; the surface's JWS-floor posture (order
+/// and authorization reads are POST-as-GET only, never unauthenticated
+/// GETs) and §7.4.2's own rule — certificate URLs are fetched like every
+/// other resource, with POST-as-GET — make the kid-carried POST the
+/// serving method. The URL and the body follow the pin exactly: 200 with
+/// `application/pem-certificate-chain`, the text body the LEAF
+/// certificate first, then the issuing chain up to the root
+/// ([`CaRepo::chain_to_root`] — the manual `/certificates/{id}/chain`
+/// route's idiom). Order `valid` required: pending/ready/processing
+/// answer the 403 `orderNotReady` problem; an `invalid` order answers
+/// 403 with the RFC's most generic type and its RECORDED ERROR as the
+/// detail (§7.4.2 registers no download failure shape; the order's own
+/// error text is the authoritative part — the same rendering the order
+/// object's `error` member uses).
+async fn download_certificate(
+    State(state): State<AppState>,
+    Path((tenant_name, order_id)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/orders/{order_id}/certificate", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, _payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    let order_uuid =
+        Uuid::parse_str(&order_id).map_err(|_| AcmeProblem::not_found("no such order"))?;
+    let order = AcmeRepo::new()
+        .get_order(&state.pool, tenant.id, order_uuid)
+        .await?
+        .filter(|order| order.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
+    match (&order.status, &order.error) {
+        (AcmeOrderStatus::Valid, _) => {}
+        (AcmeOrderStatus::Invalid, error) => {
+            return Err(AcmeProblem {
+                status: StatusCode::FORBIDDEN,
+                type_urn: "urn:ietf:params:acme:error:serverInternal",
+                detail: error
+                    .clone()
+                    .unwrap_or_else(|| "the order is invalid".to_owned()),
+                tos_link: None,
+                location: None,
+            });
+        }
+        _ => {
+            return Err(AcmeProblem {
+                status: StatusCode::FORBIDDEN,
+                type_urn: URN_ORDER_NOT_READY,
+                detail: format!(
+                    "the order is {} and carries no certificate yet; POST-as-GET it for \
+                     its current state",
+                    order.status.as_str()
+                ),
+                tos_link: None,
+                location: None,
+            });
+        }
+    }
+    let certificate_id = order
+        .certificate_id
+        .ok_or_else(|| AcmeProblem::internal("a valid order's certificate row is missing"))?;
+    let cert = CertificateRepo::new()
+        .get(&state.pool, certificate_id)
+        .await?
+        .filter(|cert| cert.tenant_id == tenant.id)
+        .ok_or_else(|| AcmeProblem::internal("a valid order's certificate row is missing"))?;
+    let chain = {
+        // One pooled connection serves the multi-statement walk (the
+        // repos' executor convention; the walk re-checks the tenant per
+        // hop).
+        let mut conn = state.pool.acquire().await?;
+        CaRepo::new()
+            .chain_to_root(&mut conn, tenant.id, cert.ca_id)
+            .await?
+    };
+    let mut body = cert.cert_pem.clone();
+    body.extend(chain.iter().map(|ca| ca.cert_pem.as_str()));
+    Ok((
+        [(header::CONTENT_TYPE, "application/pem-certificate-chain")],
+        body,
+    )
+        .into_response())
+}
+
+/// The revoke-cert request payload (RFC 8555 §7.6): the certificate as
+/// the base64url-encoded DER, and the optional reason — kept RAW so an
+/// unknown value can fall back to `unspecified` instead of failing the
+/// whole payload parse (see [`acme_revocation_reason`]).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeCertPayload {
+    /// The certificate to revoke — RFC 8555 §7.6's base64url-encoded DER
+    /// ("headerless... different from PEM").
+    certificate: String,
+    /// The optional reason value, parsed by [`acme_revocation_reason`].
+    #[serde(default)]
+    reason: Option<Value>,
+}
+
+/// `POST /acme/{tenant}/revoke-cert` — RFC 8555 §7.6's revocation,
+/// kid-carried by a `valid` account. The certificate member is the
+/// base64url-encoded DER; the route resolves the certificate by matching
+/// the presented DER against the certificate rows the ACCOUNT'S OWN
+/// orders point at (the D7 authorization settlement: an account may
+/// revoke only what IT issued via orders — unknown, another account's,
+/// or another tenant's certificate all earn the ONE 401 `unauthorized`
+/// problem, no existence oracle). The typed revoke runs through the SAME
+/// machinery as the manual route (`CertificateRepo::revoke` writing the
+/// reason name ws-worker's builders parse, one `cert_revoked` audit row
+/// in the same transaction). Idempotency mirrors the manual route: an
+/// already-revoked certificate answers problem-free 200 without a second
+/// revoke or audit row (the RFC's `alreadyRevoked` problem is
+/// deliberately not minted — the manual path's idempotent shape is the
+/// pinned mirror).
+///
+/// Settlement D7: revocation by CERTIFICATE-key proof of possession is
+/// DECLINED — an embedded-jwk JWS (no account kid) is refused before any
+/// state read with the 400 `unauthorized` problem naming
+/// `cert_key_pop_declined` (RFC 8555 §7.6 permits the cert-key variant;
+/// the Plan-1 spec's settlement declines it for v1).
+async fn revoke_cert(
+    State(state): State<AppState>,
+    Path(tenant_name): Path<String>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/revoke-cert", tenant.name);
+    let raw = as_str(&raw)?;
+
+    // The cert-key PoP decline (settlement D7) fires BEFORE the
+    // JWS-verifying prelude: an embedded jwk names no account, so the
+    // decline is cheaper than any account resolution.
+    let peeked = peek_header(raw)?;
+    if peeked.jwk.is_some() {
+        return Err(AcmeProblem {
+            status: StatusCode::BAD_REQUEST,
+            type_urn: "urn:ietf:params:acme:error:unauthorized",
+            detail: "revocation by certificate-key proof of possession is declined \
+                     (cert_key_pop_declined); sign the revocation request with the \
+                     issuing account's key as the kid"
+                .to_owned(),
+            tos_link: None,
+            location: None,
+        });
+    }
+
+    let (account, payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    if payload.is_null() {
+        return Err(AcmeProblem::malformed(
+            "a revoke-cert request requires a certificate member (POST-as-GET does not apply)",
+        ));
+    }
+    let body: RevokeCertPayload = serde_json::from_value(payload).map_err(|_| {
+        AcmeProblem::malformed("the revoke-cert payload is not a valid request object")
+    })?;
+    let reason = acme_revocation_reason(&body.reason)?;
+    let presented = URL_SAFE_NO_PAD
+        .decode(body.certificate.as_bytes())
+        .map_err(|_| {
+            AcmeProblem::malformed(
+                "the revoke-cert payload's certificate member is not valid base64url DER",
+            )
+        })?;
+
+    // Ownership: match the presented DER against the certificates the
+    // account's own orders issued (paged; a page whose rows carry no
+    // certificate id simply skips). The DER comparison is byte-exact —
+    // the wire certificate must BE the stored certificate, not merely
+    // serialize to the same PEM.
+    let mut owned: Option<CertificateModel> = None;
+    let mut page = 0u32;
+    while owned.is_none() {
+        let orders = AcmeRepo::new()
+            .list_orders_by_account(&state.pool, tenant.id, account.id, page, 100)
+            .await?;
+        if orders.is_empty() {
+            break;
+        }
+        for order in orders {
+            let Some(cert_id) = order.certificate_id else {
+                continue;
+            };
+            let cert = CertificateRepo::new().get(&state.pool, cert_id).await?;
+            if let Some(cert) = cert {
+                if pem_to_der(&cert.cert_pem, "CERTIFICATE")? == presented {
+                    owned = Some(cert);
+                    break;
+                }
+            }
+        }
+        page += 1;
+    }
+    let Some(cert) = owned else {
+        return Err(AcmeProblem::unauthorized(
+            "the certificate is not one this account issued through an order",
+        ));
+    };
+
+    // The manual route's idempotency shape, mirrored: an already-revoked
+    // certificate changes nothing and writes no second audit row.
+    if cert.status == CertStatus::Revoked {
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
+    let mut tx = state.pool.begin().await?;
+    CertificateRepo::new()
+        .revoke(&mut *tx, cert.id, reason.as_str(), None)
+        .await?;
+    AuditRepo::new()
+        .record(
+            &mut *tx,
+            &audit_entry(
+                &acme_actor(tenant.id, account_url_str),
+                "cert_revoked",
+                "certificate",
+                &cert.id.to_string(),
+                json!({ "reason": reason.as_str(), "via": "acme" }),
+            ),
+        )
+        .await?;
+    tx.commit().await?;
+    tracing::info!(certificate = %cert.id, "acme account revoked a certificate");
+    // §7.6 success: 200 with an empty body (the Replay-Nonce rides the
+    // middleware).
+    Ok(StatusCode::OK.into_response())
+}
+
+/// The `reason` member mapping (RFC 8555 §7.6 → the Plan-3 typed
+/// [`RevocationReason`] by NAME — the exact spellings `CertificateRepo::revoke`
+/// stores and ws-worker's CRL/OCSP builders parse):
+///
+/// - absent → `unspecified` (the stored name; a reasonless revocation
+///   is indistinguishable from an explicit one in v1 — the enum has no
+///   absent option);
+/// - the RFC's enumerated integers map by name: 0 unspecified, 1
+///   keyCompromise, 2 caCompromise, 3 affiliationChanged, 4 superseded,
+///   5 cessationOfOperation, 6 certificateHold, 8 privilegeWithdrawn,
+///   9 aaCompromise;
+/// - 7 and 10 — BOTH render `removeFromCrl` in RFC 8555's table (the
+///   RFC carries the code twice) — are REFUSED with the `malformed`
+///   problem naming it: a Wardstone revocation is terminal, there is no
+///   reinstatement machinery to revoke-then-reinstate, and the worker
+///   deliberately maps no `remove_from_crl` reason extension
+///   (`ws_worker::jobs::reason_from_str`);
+/// - any OTHER value (a non-integer member, a negative or >10 integer)
+///   falls back to `unspecified`: an unknown reason is not a refusal —
+///   the revocation proceeds without a typed reason beyond the
+///   unspecified default (the brief's `unspecified` fallback; the RFC's
+///   `badRevocationReason` was reserved for the KNOWN-but-unsupported
+///   remove-from-CRL case, which this surface answers `malformed`
+///   instead per the task settlement).
+fn acme_revocation_reason(reason: &Option<Value>) -> Result<RevocationReason, AcmeProblem> {
+    match reason.as_ref().and_then(Value::as_u64) {
+        None | Some(0) => Ok(RevocationReason::Unspecified),
+        Some(1) => Ok(RevocationReason::KeyCompromise),
+        Some(2) => Ok(RevocationReason::CaCompromise),
+        Some(3) => Ok(RevocationReason::AffiliationChanged),
+        Some(4) => Ok(RevocationReason::Superseded),
+        Some(5) => Ok(RevocationReason::CessationOfOperation),
+        Some(6) => Ok(RevocationReason::CertificateHold),
+        Some(8) => Ok(RevocationReason::PrivilegeWithdrawn),
+        Some(9) => Ok(RevocationReason::AaCompromise),
+        Some(7 | 10) => Err(AcmeProblem::malformed(
+            "the remove-from-CRL revocation reason is not supported: revocations are \
+             terminal in Wardstone",
+        )),
+        Some(_) => Ok(RevocationReason::Unspecified),
+    }
+}
+
+/// The ACME account actor for the finalize delegation: the pinned actor
+/// shape (the ACCOUNT acts on the surface) but carrying EXACTLY the
+/// `issue` capability — the CSR-bearing issuance path's requirement that
+/// [`issue_certificate_core`] checks internally (the Plan-4 settlement:
+/// the ACME account never carries `generate_leaf_key`; a finalize
+/// without a CSR never reaches that path). The account URL is the actor
+/// id, so the `cert_issued` audit row the core writes attributes the
+/// issuance to the account (`actor_type` `acme_account`).
+fn acme_issuing_actor(tenant_id: Uuid, account_url: String) -> Actor {
+    Actor {
+        actor_type: ActorType::AcmeAccount,
+        actor_id: account_url,
+        auth_method: AuthMethod::AcmeAccount,
+        capabilities: vec![Capability::Issue],
+        session_id: None,
+        tenant_id,
+        minted_by: None,
+    }
 }
 
 /// The dns value strings stored on an order's (validated, verbatim)
@@ -2358,6 +2970,34 @@ impl From<AcmeError> for AcmeProblem {
 impl From<CoreError> for AcmeProblem {
     fn from(err: CoreError) -> Self {
         AcmeProblem::internal(format!("the acme route failed: {err}"))
+    }
+}
+
+/// The REST error vocabulary of the shared issuance core
+/// ([`crate::routes::certificates::issue_certificate_core`], which the
+/// finalize route delegates to) maps onto the same registry the ACME
+/// surface answers with — the error never reaches the wire in its `/api`
+/// body shape. The profile-policy refusal keeps its message: the 400
+/// `malformed` problem's detail IS the `not_permitted_by_profile`
+/// message the manual path returns (the generic form, since the ACME
+/// account carries no `read_profiles`).
+impl From<ApiError> for AcmeProblem {
+    fn from(err: ApiError) -> Self {
+        match err {
+            ApiError::BadRequest { message, .. } => AcmeProblem::malformed(message),
+            ApiError::Unauthorized(m) | ApiError::UnauthorizedMfa(m) | ApiError::Forbidden(m) => {
+                AcmeProblem::unauthorized(m)
+            }
+            ApiError::NotFound(m) => AcmeProblem::not_found(m),
+            ApiError::Conflict(m) | ApiError::Internal(m) => AcmeProblem::internal(m),
+            ApiError::RateLimited(_) => AcmeProblem {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                type_urn: URN_RATE_LIMITED,
+                detail: "the account has exceeded its ACME rate limit; retry later".to_owned(),
+                tos_link: None,
+                location: None,
+            },
+        }
     }
 }
 

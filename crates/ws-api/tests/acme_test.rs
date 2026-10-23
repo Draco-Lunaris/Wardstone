@@ -52,7 +52,7 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body};
 use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
@@ -64,13 +64,20 @@ use uuid::Uuid;
 use ws_api::routes::acme::{ChallengeFetch, TxtResolver};
 use ws_api::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, VerificationDeps};
 use ws_auth::jwt::JwtKeys;
+use ws_ca::ca::{create_root, CaLifetime, CaSpec};
+use ws_ca::keystore::KeyStore;
+use ws_ca::KeyType;
 use ws_core::db::connect;
 use ws_core::models::acme::{
     AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeModel, AcmeChallengeStatus,
     AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
 };
-use ws_core::models::profile::ProfileModel;
+use ws_core::models::ca::CaModel;
+use ws_core::models::certificate::CertStatus;
+use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
 use ws_core::repo::acme_repo::AcmeRepo;
+use ws_core::repo::ca_repo::CaRepo;
+use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::profile_repo::ProfileRepo;
 
 use acme_common::{ed25519, p256, rsa2048, Identity, KeyFixture};
@@ -155,14 +162,18 @@ impl Fixture {
     /// release the advisory lock. Runs BEFORE the assertions, so a failing
     /// assert can never leave rows behind (the self-cleaning contract).
     /// ACME children first (challenges → authorizations → orders →
-    /// accounts), then the audit log, then the tenant.
+    /// accounts), then Task 8's issuance children (certificates, serials),
+    /// then the audit log, profiles, CAs, and the tenant.
     async fn cleanup(&mut self) {
         for table in [
             "DELETE FROM acme_challenges WHERE tenant_id = $1",
             "DELETE FROM acme_authorizations WHERE tenant_id = $1",
             "DELETE FROM acme_orders WHERE tenant_id = $1",
             "DELETE FROM acme_accounts WHERE tenant_id = $1",
+            "DELETE FROM certificates WHERE tenant_id = $1",
+            "DELETE FROM used_serials WHERE tenant_id = $1",
             "DELETE FROM profiles WHERE tenant_id = $1",
+            "DELETE FROM cas WHERE tenant_id = $1",
             "DELETE FROM audit_log WHERE tenant_id = $1",
             "DELETE FROM tenants WHERE id = $1",
         ] {
@@ -267,7 +278,8 @@ async fn fixture() -> Fixture {
 }
 
 /// Delete every row a previous run may have left under `name` (children
-/// first, then the tenant).
+/// first, then the tenant — Task 8's issuance children included,
+/// certificates before the CAs their rows reference).
 async fn sweep_tenant(pool: &PgPool, name: &str) {
     for table in [
         "DELETE FROM acme_challenges WHERE tenant_id IN \
@@ -278,7 +290,13 @@ async fn sweep_tenant(pool: &PgPool, name: &str) {
          (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM acme_accounts WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM certificates WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM used_serials WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM profiles WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM cas WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM audit_log WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
@@ -4106,4 +4124,898 @@ async fn authenticated_acme_routes_are_rate_limited_per_account() {
     );
     assert_eq!(b_status, StatusCode::CREATED, "the buckets are per-account");
     assert_eq!(orders_after, 2, "the refusals minted nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Finalize, certificate download, and revocation (Plan 4 Task 8): the
+// issuance loop closes on the ACME surface
+// ---------------------------------------------------------------------------
+
+/// The CSR-minting idiom of api_test's helper, restated locally: a valid
+/// ECDSA P-256 CSR (self-signed) for `cn` with DNS SANs `names`. The
+/// issuing profile under these tests pins `ecdsa-p256`, satisfying the
+/// signing leg's exact-algorithm rule.
+fn mint_csr(cn: &str, names: &[&str]) -> String {
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256,
+    };
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    params.subject_alt_names = names
+        .iter()
+        .map(|n| SanType::DnsName((*n).try_into().unwrap()))
+        .collect();
+    let csr = params.serialize_request(&key_pair).unwrap();
+    csr.pem().unwrap()
+}
+
+/// The DER bytes of one PEM body (the PEMs the tests mint, download, and
+/// revoke against).
+fn pem_to_der(pem: &str) -> Vec<u8> {
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect();
+    STANDARD
+        .decode(body.as_bytes())
+        .expect("the PEM body decodes as base64")
+}
+
+/// The RFC 8555 `csr`/`certificate` member: base64url of `pem`'s DER form.
+fn member_b64url(pem: &str) -> String {
+    URL_SAFE_NO_PAD.encode(pem_to_der(pem))
+}
+
+/// A FULL issuing profile under the fixture tenant: "web-server" with
+/// revision 1 as its CURRENT revision (`current_revision_id` forward-
+/// referenced inside one transaction, the deferred FK blessing), pinned
+/// `ecdsa-p256`, and the wardstone.test allow-list. The plain
+/// [`seed_profile`] rows carry no revision — fine for new-order, but
+/// finalize's issuance needs one.
+async fn seed_issuing_profile(fixture: &Fixture, name: &str) {
+    let profile_id = Uuid::new_v4();
+    let revision_id = Uuid::new_v4();
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin the profile seed transaction");
+    ProfileRepo::new()
+        .insert_profile(
+            &mut *tx,
+            &ProfileModel {
+                id: profile_id,
+                tenant_id: fixture.tenant_id,
+                name: name.to_owned(),
+                description: None,
+                current_revision_id: Some(revision_id),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("seed the profile row");
+    ProfileRepo::new()
+        .insert_revision(
+            &mut *tx,
+            &ProfileRevisionModel {
+                id: revision_id,
+                profile_id,
+                revision: 1,
+                name: "init".to_owned(),
+                key_type: "ecdsa-p256".to_owned(),
+                key_usages: vec!["digital_signature".to_owned()],
+                eku: vec!["server_auth".to_owned()],
+                lifetime_days: 30,
+                san_patterns: vec!["wardstone.test".to_owned(), "*.wardstone.test".to_owned()],
+                is_legacy: false,
+                created_at: chrono::Utc::now(),
+                actor_id: "tests:acme".to_owned(),
+            },
+        )
+        .await
+        .expect("seed the revision row");
+    tx.commit().await.expect("commit the profile seed");
+}
+
+/// A REAL root CA for the fixture tenant: the key minted into the fixture
+/// keystore through `ws_ca::ca::create_root` (the issuance signing leg
+/// loads it back) plus the `cas` row `choose_ca` needs. Returns the root
+/// certificate PEM — the chain tail the download body must carry.
+async fn seed_root_ca(fixture: &Fixture) -> String {
+    let mut keystore = KeyStore::open(&fixture.keys_dir).expect("open the fixture keystore");
+    let created = create_root(
+        &CaSpec {
+            name: "acme-test-root".to_owned(),
+            subject: "Wardstone ACME Test Root".to_owned(),
+            key_type: KeyType::Ed25519,
+            lifetime: CaLifetime::Root,
+        },
+        &mut keystore,
+    )
+    .expect("create the root CA");
+    CaRepo::new()
+        .insert(
+            &fixture.pool,
+            &CaModel {
+                id: created.key_pair_id,
+                tenant_id: fixture.tenant_id,
+                name: "acme-test-root".to_owned(),
+                subject: "CN=Wardstone ACME Test Root".to_owned(),
+                is_root: true,
+                parent_id: None,
+                key_type: KeyType::Ed25519,
+                not_before: chrono::Utc::now(),
+                not_after: chrono::Utc::now() + chrono::Duration::days(3650),
+                cert_pem: created.cert_pem.clone(),
+                key_file: "tests/acme-test-root".to_owned(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("insert the CA row");
+    created.cert_pem
+}
+
+/// The Task-8 issuance prelude, up to a usable order machine: account +
+/// issuing profile + root CA, all ONCE per fixture. Returns the root CA's
+/// PEM (for the download-body chain assertion).
+async fn setup_issuance(fixture: &Fixture, key: &KeyFixture) -> String {
+    let (_thumb, created) = create_account(fixture, key).await;
+    assert_eq!(created.status(), StatusCode::CREATED, "the account enrols");
+    seed_issuing_profile(fixture, "web-server").await;
+    seed_root_ca(fixture).await
+}
+
+/// One order on `identifier`, driven to `ready` by seeding the outcome
+/// Task 7's verification produces: every order-scoped authorization
+/// stamped `valid` (with the 30-day reuse window) and the order `ready`.
+/// The finalize tests are about the ISSUANCE loop; the challenge path
+/// that legitimately reaches these states has its own suite.
+async fn mint_ready_order(fixture: &Fixture, key: &KeyFixture, identifier: &str) -> Uuid {
+    let response = post_new_order(
+        fixture,
+        key,
+        json!({"identifiers": [{"type": "dns", "value": identifier}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED, "the order mints");
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let authz_rows = AcmeRepo::new()
+        .list_authorizations_by_order(&fixture.pool, fixture.tenant_id, order_id)
+        .await
+        .expect("the order's authorizations");
+    for authz in &authz_rows {
+        AcmeRepo::new()
+            .update_authorization_status(
+                &fixture.pool,
+                fixture.tenant_id,
+                authz.id,
+                AcmeAuthorizationStatus::Valid,
+                Some(chrono::Utc::now() + chrono::Duration::days(30)),
+            )
+            .await
+            .expect("stamp the authorization valid");
+    }
+    AcmeRepo::new()
+        .update_order_status(
+            &fixture.pool,
+            fixture.tenant_id,
+            order_id,
+            AcmeOrderStatus::Ready,
+            None,
+            None,
+        )
+        .await
+        .expect("stamp the order ready");
+    order_id
+}
+
+/// A kid-signed finalize POST with the caller's payload.
+async fn post_finalize(
+    fixture: &Fixture,
+    key: &KeyFixture,
+    order_id: Uuid,
+    payload: Value,
+) -> TestResponse {
+    let nonce = fetch_nonce(fixture).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Kid(account_url(&thumb_of(key))),
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}/finalize"),
+        &payload,
+    );
+    send(
+        fixture,
+        acme_post(
+            &format!("/acme/{ACME_TENANT}/orders/{order_id}/finalize"),
+            &jws,
+        ),
+    )
+    .await
+}
+
+/// A kid-signed revoke-cert POST with the caller's payload.
+async fn post_revoke(fixture: &Fixture, key: &KeyFixture, payload: Value) -> TestResponse {
+    let nonce = fetch_nonce(fixture).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Kid(account_url(&thumb_of(key))),
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/revoke-cert"),
+        &payload,
+    );
+    send(
+        fixture,
+        acme_post(&format!("/acme/{ACME_TENANT}/revoke-cert"), &jws),
+    )
+    .await
+}
+
+/// Finalize an order with a self-minted CSR carrying exactly `identifier`
+/// (CN and SAN), returning the `(status, body)` pair.
+async fn finalize_with_csr(
+    fixture: &Fixture,
+    key: &KeyFixture,
+    order_id: Uuid,
+    identifier: &str,
+) -> (StatusCode, Value) {
+    let csr = mint_csr(identifier, &[identifier]);
+    let response = post_finalize(fixture, key, order_id, json!({"csr": member_b64url(&csr)})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    (status, body)
+}
+
+/// Review Focus 1-4 (the issuance loop): a `ready` order finalizes into a
+/// `valid` one carrying the `certificate` member; the CSR is recorded on
+/// the order row; the certificate row is the `acme` SOURCE with the
+/// issued names; ONE `cert_issued` audit row attributes the issuance to
+/// the ACME account; and the certificate URL serves `application/
+/// pem-certificate-chain` with the leaf FIRST and the root CA after it.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn finalize_happy_path_issues_and_the_certificate_url_serves_the_chain() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    let root_pem = setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "finalize.wardstone.test").await;
+
+    let (status, body) = finalize_with_csr(&fx, key, order_id, "finalize.wardstone.test").await;
+
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order row");
+    let certificate_id = order_row.as_ref().and_then(|order| order.certificate_id);
+    let cert_row = match certificate_id {
+        Some(id) => CertificateRepo::new()
+            .get(&fx.pool, id)
+            .await
+            .expect("read the certificate row"),
+        None => None,
+    };
+    let audits = audit_rows(&fx, "cert_issued").await;
+    let download = kid_post_as_get(
+        &fx,
+        key,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}/certificate"),
+    )
+    .await;
+    let download_status = download.status();
+    let download_type = download
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|value| value.to_str().expect("ascii").to_owned());
+    let download_body = body_text(download).await;
+    fx.cleanup().await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "finalize accepts a ready order: {body}"
+    );
+    assert_eq!(body["status"], "valid");
+    assert_eq!(
+        body["certificate"],
+        format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}/certificate")
+    );
+    let order_row = order_row.expect("the order row exists");
+    assert_eq!(order_row.status, AcmeOrderStatus::Valid);
+    assert!(order_row.csr_pem.is_some(), "the accepted CSR is recorded");
+    let certificate_id = certificate_id.expect("the order carries its certificate id");
+    let cert_row = cert_row.expect("the certificate row exists");
+    assert_eq!(
+        cert_row.source, "acme",
+        "an ACME-issued certificate is the acme source"
+    );
+    assert_eq!(cert_row.status, CertStatus::Active);
+    assert_eq!(cert_row.subject, "CN=finalize.wardstone.test");
+    assert_eq!(cert_row.san_dns, vec!["finalize.wardstone.test".to_owned()]);
+    assert_eq!(audits.len(), 1, "ONE cert_issued audit row");
+    assert_eq!(
+        audits[0].0, "acme_account",
+        "the audit actor is the account"
+    );
+    assert_eq!(audits[0].1, "acme_account");
+    assert_eq!(
+        audits[0].3,
+        certificate_id.to_string(),
+        "the audit targets the certificate"
+    );
+    assert_eq!(download_status, StatusCode::OK, "the download serves");
+    assert_eq!(
+        download_type.as_deref(),
+        Some("application/pem-certificate-chain")
+    );
+    let leaf_at = download_body
+        .find(&cert_row.cert_pem)
+        .expect("the leaf PEM in the download body");
+    let root_at = download_body
+        .find(&root_pem)
+        .expect("the root PEM in the download body");
+    assert!(
+        leaf_at < root_at,
+        "the chain body is leaf-first: leaf, then the CA chain"
+    );
+}
+
+/// Review Focus 4: a SAN outside the profile's patterns never issues —
+/// the problem document carries the SAME message the manual path returns
+/// (`not_permitted_by_profile`'s generic form, because the ACME account
+/// holds no `read_profiles`), and the order STAYS `ready` for the
+/// client's retry (a failed finalize writes nothing).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_finalize_respects_profile_san_policy() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "outside.example.net").await;
+
+    let (status, body) = finalize_with_csr(&fx, key, order_id, "outside.example.net").await;
+
+    let poll = kid_post_as_get(&fx, key, &order_url(order_id)).await;
+    let poll_body = body_json(poll).await;
+    let audits = audit_rows(&fx, "cert_issued").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(
+        body["detail"], "not permitted by policy",
+        "the SAME message semantics the manual path returns"
+    );
+    assert_eq!(
+        poll_body["status"], "ready",
+        "a refused finalize leaves the order ready"
+    );
+    assert!(audits.is_empty(), "nothing was issued");
+}
+
+/// RFC 8555 §7.4's `badCSR` gate: a CSR whose identifiers differ from the
+/// order's is refused and the order stays `ready`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn finalize_refuses_a_csr_whose_identifiers_differ_from_the_order() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "good.wardstone.test").await;
+
+    // "elsewhere.wardstone.test" is PERMITTED by the profile's patterns —
+    // the refusal is the order-consistency gate, not policy.
+    let csr = mint_csr("elsewhere.wardstone.test", &["elsewhere.wardstone.test"]);
+    let response = post_finalize(&fx, key, order_id, json!({"csr": member_b64url(&csr)})).await;
+    let status = response.status();
+    let body = body_json(response).await;
+
+    let poll = kid_post_as_get(&fx, key, &order_url(order_id)).await;
+    let poll_body = body_json(poll).await;
+    let audits = audit_rows(&fx, "cert_issued").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:badCSR");
+    assert_eq!(
+        poll_body["status"], "ready",
+        "a badCSR leaves the order ready"
+    );
+    assert!(audits.is_empty(), "nothing was issued");
+}
+
+/// RFC 8555 §7.4: finalize on an order that is not `ready` answers the
+/// 403 `orderNotReady` problem (a pending order's authorizations are not
+/// settled yet).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn finalize_on_a_non_ready_order_answers_order_not_ready() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    // mint_ready_order is NOT called: the order stays pending.
+    let response = post_new_order(
+        &fx,
+        key,
+        json!({"identifiers": [{"type": "dns", "value": "pending.wardstone.test"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+
+    let (status, body) = finalize_with_csr(&fx, key, order_id, "pending.wardstone.test").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:orderNotReady");
+}
+
+/// The finalize request's CSR handling: a POST-as-GET, a payload without
+/// a `csr` member, a non-base64url member, and a base64url value that is
+/// not a PKCS#10 request are each refused (the last as `badCSR`), and
+/// none of them writes anything.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn finalize_refuses_malformed_and_unparsable_csrs() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "csr-shape.wardstone.test").await;
+
+    let no_csr = post_finalize(&fx, key, order_id, json!({})).await;
+    let no_csr_status = no_csr.status();
+    let no_csr_body = body_json(no_csr).await;
+    let not_b64 = post_finalize(&fx, key, order_id, json!({"csr": "!!!not-b64url"})).await;
+    let not_b64_status = not_b64.status();
+    let not_b64_body = body_json(not_b64).await;
+    let not_pkcs10 = post_finalize(
+        &fx,
+        key,
+        order_id,
+        json!({"csr": URL_SAFE_NO_PAD.encode(b"definitely not a CSR")}),
+    )
+    .await;
+    let not_pkcs10_status = not_pkcs10.status();
+    let not_pkcs10_body = body_json(not_pkcs10).await;
+
+    let poll = kid_post_as_get(&fx, key, &order_url(order_id)).await;
+    let poll_body = body_json(poll).await;
+    fx.cleanup().await;
+
+    assert_eq!(no_csr_status, StatusCode::BAD_REQUEST);
+    assert_eq!(no_csr_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(not_b64_status, StatusCode::BAD_REQUEST);
+    assert_eq!(not_b64_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(not_pkcs10_status, StatusCode::BAD_REQUEST);
+    assert_eq!(not_pkcs10_body["type"], "urn:ietf:params:acme:error:badCSR");
+    assert_eq!(poll_body["status"], "ready", "nothing changed the order");
+}
+
+/// The certificate URL serves only a `valid` order: a pending order
+/// answers 403 `orderNotReady`, an invalid one answers 403 carrying the
+/// order's RECORDED error as the problem detail.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn an_order_without_a_certificate_refuses_the_download() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let response = post_new_order(
+        &fx,
+        key,
+        json!({"identifiers": [{"type": "dns", "value": "no-cert.wardstone.test"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let certificate_url = format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}/certificate");
+
+    let pending = kid_post_as_get(&fx, key, &certificate_url).await;
+    let pending_status = pending.status();
+    let pending_body = body_json(pending).await;
+
+    AcmeRepo::new()
+        .update_order_status(
+            &fx.pool,
+            fx.tenant_id,
+            order_id,
+            AcmeOrderStatus::Invalid,
+            None,
+            Some("the authorization for no-cert.wardstone.test failed: the fetch did not match"),
+        )
+        .await
+        .expect("invalidate the order");
+    let invalid = kid_post_as_get(&fx, key, &certificate_url).await;
+    let invalid_status = invalid.status();
+    let invalid_body = body_json(invalid).await;
+    fx.cleanup().await;
+
+    assert_eq!(pending_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        pending_body["type"],
+        "urn:ietf:params:acme:error:orderNotReady"
+    );
+    assert_eq!(invalid_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        invalid_body["type"],
+        "urn:ietf:params:acme:error:serverInternal"
+    );
+    assert!(
+        invalid_body["detail"]
+            .as_str()
+            .expect("a detail string")
+            .contains("no-cert.wardstone.test failed"),
+        "the recorded error is the detail: {}",
+        invalid_body["detail"]
+    );
+}
+
+/// The revocation happy path: the issuing account's kid-keyed JWS with
+/// the leaf's base64url DER revokes through the SAME machinery as the
+/// manual route (typed reason stored; ONE `cert_revoked` audit row), a
+/// second revocation of the same certificate is a problem-free idempotent
+/// no-op, and the first revoke's stored reason stands.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revoke_by_account_key_revokes_the_issued_certificate() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "revoke-me.wardstone.test").await;
+    let (finalize_status, finalize_body) =
+        finalize_with_csr(&fx, key, order_id, "revoke-me.wardstone.test").await;
+    assert_eq!(finalize_status, StatusCode::OK, "finalize: {finalize_body}");
+    let certificate_id = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order row")
+        .expect("the order exists")
+        .certificate_id
+        .expect("the certificate id");
+
+    let member = {
+        let cert_row = CertificateRepo::new()
+            .get(&fx.pool, certificate_id)
+            .await
+            .expect("read the certificate row")
+            .expect("the certificate exists");
+        member_b64url(&cert_row.cert_pem)
+    };
+    let revoke = post_revoke(&fx, key, json!({"certificate": member, "reason": 1})).await;
+    let revoke_status = revoke.status();
+    let revoke_body = body_text(revoke).await;
+    let after = CertificateRepo::new()
+        .get(&fx.pool, certificate_id)
+        .await
+        .expect("read the certificate row after revoke")
+        .expect("the certificate exists");
+    let again = post_revoke(&fx, key, json!({"certificate": member, "reason": 4})).await;
+    let again_status = again.status();
+    let after_again = CertificateRepo::new()
+        .get(&fx.pool, certificate_id)
+        .await
+        .expect("read the certificate row after the repeat")
+        .expect("the certificate exists");
+    let audits = audit_rows(&fx, "cert_revoked").await;
+    fx.cleanup().await;
+
+    assert_eq!(revoke_status, StatusCode::OK, "the revocation succeeds");
+    assert_eq!(revoke_body, "", "the 200 body is empty (RFC 8555 §7.6)");
+    assert_eq!(after.status, CertStatus::Revoked);
+    assert_eq!(after.revocation_reason.as_deref(), Some("key_compromise"));
+    assert_eq!(again_status, StatusCode::OK, "the repeat is idempotent");
+    assert_eq!(
+        after_again.revocation_reason.as_deref(),
+        Some("key_compromise"),
+        "the FIRST revoke's reason stands after the idempotent repeat"
+    );
+    assert_eq!(audits.len(), 1, "ONE cert_revoked audit row");
+    assert_eq!(audits[0].0, "acme_account");
+    assert_eq!(audits[0].3, certificate_id.to_string());
+    assert_eq!(audits[0].4["reason"], "key_compromise");
+}
+
+/// The ACME reason integers map onto the typed enum 1:1 by name: 4 →
+/// `superseded`, 8 → `privilege_withdrawn` (the RFC 8555 table's 8, which
+/// the RFC 5280 register spells differently — this surface follows RFC
+/// 8555), and an ABSENT reason → `unspecified`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_revocation_reasons_map_onto_the_typed_enum() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+
+    let mut revoked: Vec<(Option<String>, Option<String>)> = Vec::new();
+    for (identifier, reason) in [
+        ("r-superseded.wardstone.test", Some::<Value>(json!(4))),
+        ("r-privilege.wardstone.test", Some(json!(8))),
+        ("r-none.wardstone.test", None),
+    ] {
+        let order_id = mint_ready_order(&fx, key, identifier).await;
+        let (status, body) = finalize_with_csr(&fx, key, order_id, identifier).await;
+        assert_eq!(status, StatusCode::OK, "finalize {identifier}: {body}");
+        let certificate_id = AcmeRepo::new()
+            .get_order(&fx.pool, fx.tenant_id, order_id)
+            .await
+            .expect("read the order row")
+            .expect("the order exists")
+            .certificate_id
+            .expect("the certificate id");
+        let member = {
+            let cert_row = CertificateRepo::new()
+                .get(&fx.pool, certificate_id)
+                .await
+                .expect("read the certificate row")
+                .expect("the certificate exists");
+            member_b64url(&cert_row.cert_pem)
+        };
+        let mut payload = json!({"certificate": member});
+        if let Some(reason) = reason {
+            payload["reason"] = reason;
+        }
+        let revoke = post_revoke(&fx, key, payload).await;
+        let revoke_status = revoke.status();
+        let stored = CertificateRepo::new()
+            .get(&fx.pool, certificate_id)
+            .await
+            .expect("read the certificate row")
+            .expect("the certificate exists")
+            .revocation_reason;
+        revoked.push((Some(revoke_status.to_string()), stored));
+        let _ = certificate_id; // captured through `revoked` below
+    }
+    fx.cleanup().await;
+
+    assert_eq!(revoked[0].0.as_deref(), Some("200 OK"));
+    assert_eq!(revoked[0].1.as_deref(), Some("superseded"));
+    assert_eq!(revoked[1].1.as_deref(), Some("privilege_withdrawn"));
+    assert_eq!(revoked[2].1.as_deref(), Some("unspecified"));
+}
+
+/// The remove-from-CRL reason (RFC 8555's integers 7 AND 10) is refused
+/// with the `malformed` problem naming it: a Wardstone revocation is
+/// terminal and no CRL/OCSP builder maps a `remove_from_crl` reason
+/// extension. An unknown reason VALUE falls back to `unspecified` and
+/// proceeds (here: to the ownership refusal, the certificate being
+/// unknown).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_remove_from_crl_reason_is_refused() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let member = URL_SAFE_NO_PAD.encode(b"whatever bytes; the refusal precedes resolution");
+
+    let seven = post_revoke(&fx, key, json!({"certificate": member, "reason": 7})).await;
+    let seven_status = seven.status();
+    let seven_body = body_json(seven).await;
+    let ten = post_revoke(&fx, key, json!({"certificate": member, "reason": 10})).await;
+    let ten_status = ten.status();
+    let ten_body = body_json(ten).await;
+    let unknown = post_revoke(&fx, key, json!({"certificate": member, "reason": 99})).await;
+    let unknown_status = unknown.status();
+    let unknown_body = body_json(unknown).await;
+    let non_integer = post_revoke(
+        &fx,
+        key,
+        json!({"certificate": member, "reason": "keyCompromise"}),
+    )
+    .await;
+    let non_integer_status = non_integer.status();
+    fx.cleanup().await;
+
+    assert_eq!(seven_status, StatusCode::BAD_REQUEST);
+    assert_eq!(seven_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert!(
+        seven_body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("remove-from-CRL"),
+        "the refusal names the reason: {}",
+        seven_body["detail"]
+    );
+    assert_eq!(ten_status, StatusCode::BAD_REQUEST);
+    assert_eq!(ten_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(
+        unknown_status,
+        StatusCode::UNAUTHORIZED,
+        "an unknown reason value falls back to unspecified and proceeds"
+    );
+    assert_eq!(
+        unknown_body["type"],
+        "urn:ietf:params:acme:error:unauthorized"
+    );
+    assert_eq!(
+        non_integer_status,
+        StatusCode::UNAUTHORIZED,
+        "a non-integer reason member is leniently unspecified, never a 400"
+    );
+}
+
+/// The D7 authorization settlement: a certificate another account issued
+/// (or an unknown one) earns the ONE 401 `unauthorized` problem — no
+/// existence oracle.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn revoke_refuses_certificates_outside_the_account() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key_a = rsa2048();
+    let ca_pem = setup_issuance(&fx, key_a).await;
+    let order_id = mint_ready_order(&fx, key_a, "revoke-a.wardstone.test").await;
+    let (status, body) = finalize_with_csr(&fx, key_a, order_id, "revoke-a.wardstone.test").await;
+    assert_eq!(status, StatusCode::OK, "A finalizes: {body}");
+    let certificate_id = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order row")
+        .expect("the order exists")
+        .certificate_id
+        .expect("the certificate id");
+    let member = {
+        let cert_row = CertificateRepo::new()
+            .get(&fx.pool, certificate_id)
+            .await
+            .expect("read the certificate row")
+            .expect("the certificate exists");
+        member_b64url(&cert_row.cert_pem)
+    };
+
+    let key_b = p256();
+    let (_thumb_b, created_b) = create_account(&fx, key_b).await;
+    assert_eq!(created_b.status(), StatusCode::CREATED);
+    let foreign = post_revoke(&fx, key_b, json!({"certificate": member, "reason": 1})).await;
+    let foreign_status = foreign.status();
+    let foreign_body = body_json(foreign).await;
+    let unknown = post_revoke(
+        &fx,
+        key_b,
+        json!({"certificate": URL_SAFE_NO_PAD.encode(b"unknown certificate bytes"), "reason": 1}),
+    )
+    .await;
+    let unknown_status = unknown.status();
+    let unknown_body = body_json(unknown).await;
+
+    let cert_after = CertificateRepo::new()
+        .get(&fx.pool, certificate_id)
+        .await
+        .expect("read the certificate row")
+        .expect("the certificate exists");
+    fx.cleanup().await;
+
+    let _ = ca_pem; // chain context only
+    assert_eq!(foreign_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        foreign_body["type"], "urn:ietf:params:acme:error:unauthorized",
+        "another account's certificate is indistinguishable from an unknown one"
+    );
+    assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unknown_body["type"],
+        "urn:ietf:params:acme:error:unauthorized"
+    );
+    assert_eq!(
+        cert_after.status,
+        CertStatus::Active,
+        "the refusals touch nothing"
+    );
+}
+
+/// Settlement D7: a certificate-key proof-of-possession JWS (embedded
+/// jwk, no account kid) is DECLINED for revocation — the 400
+/// `unauthorized` problem names `cert_key_pop_declined`, and the
+/// certificate stays as it was.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_certificate_key_jws_cannot_revoke() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    setup_issuance(&fx, key).await;
+    let order_id = mint_ready_order(&fx, key, "pop-declined.wardstone.test").await;
+    let (status, body) = finalize_with_csr(&fx, key, order_id, "pop-declined.wardstone.test").await;
+    assert_eq!(status, StatusCode::OK, "finalize: {body}");
+    let certificate_id = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order row")
+        .expect("the order exists")
+        .certificate_id
+        .expect("the certificate id");
+    let member = {
+        let cert_row = CertificateRepo::new()
+            .get(&fx.pool, certificate_id)
+            .await
+            .expect("read the certificate row")
+            .expect("the certificate exists");
+        member_b64url(&cert_row.cert_pem)
+    };
+
+    // A FRESH key signs the revocation with its key EMBEDDED (the RFC
+    // 8555 §6.2/§7.6 cert-key shape); it holds no account kid.
+    let pop_key = ed25519();
+    let nonce = fetch_nonce(&fx).await;
+    let jws = acme_common::sign_acme_request(
+        pop_key,
+        &Identity::Jwk,
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/revoke-cert"),
+        &json!({"certificate": member, "reason": 1}),
+    );
+    let pop = send(
+        &fx,
+        acme_post(&format!("/acme/{ACME_TENANT}/revoke-cert"), &jws),
+    )
+    .await;
+    let pop_status = pop.status();
+    let pop_body = body_json(pop).await;
+    let cert_after = CertificateRepo::new()
+        .get(&fx.pool, certificate_id)
+        .await
+        .expect("read the certificate row")
+        .expect("the certificate exists");
+    fx.cleanup().await;
+
+    assert_eq!(pop_status, StatusCode::BAD_REQUEST);
+    assert_eq!(pop_body["type"], "urn:ietf:params:acme:error:unauthorized");
+    assert!(
+        pop_body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("cert_key_pop_declined"),
+        "the decline names the settlement: {}",
+        pop_body["detail"]
+    );
+    assert_eq!(cert_after.status, CertStatus::Active, "nothing was revoked");
+}
+
+/// Review Focus 3's carried half (deferred from Task 5): a kid that does
+/// not name an account URL of THIS tenant never resolves — the 404
+/// `accountDoesNotExist` lookup failure, never a cross-tenant account.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_kid_from_another_tenant_fails_the_lookup() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let key = rsa2048();
+    let (_thumb, created) = create_account(&fx, key).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let other_tenant_kid = format!("{PUBLIC_URL}/acme/other-tenant/acct/{}", thumb_of(key));
+    let nonce = fetch_nonce(&fx).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Kid(other_tenant_kid),
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/new-order"),
+        &json!({"identifiers": [{"type": "dns", "value": "x.wardstone.test"}]}),
+    );
+    let response = send(
+        &fx,
+        acme_post(&format!("/acme/{ACME_TENANT}/new-order"), &jws),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body["type"], "urn:ietf:params:acme:error:accountDoesNotExist",
+        "a foreign-tenant kid is a lookup failure, never a cross-tenant account"
+    );
 }

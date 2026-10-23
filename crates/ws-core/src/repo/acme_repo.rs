@@ -754,4 +754,28 @@ impl AcmeRepo {
         .await?;
         Ok(())
     }
+
+    /// Record the CSR the finalize request carried on the order row (Plan 4
+    /// Task 8): the `acme_orders.csr_pem` column stays NULL until the
+    /// order's CSR is accepted, then holds the PEM the issuer signed. The
+    /// caller runs this inside the SAME transaction as the `valid` status
+    /// stamp (the finalize route's write-side contract: the CSR, the
+    /// issued-certificate pointer, and the final status commit together or
+    /// not at all). A missing id updates zero rows and stays `Ok` —
+    /// existence is the caller's ownership check.
+    pub async fn set_order_csr(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+        csr_pem: &str,
+    ) -> Result<(), CoreError> {
+        sqlx::query("UPDATE acme_orders SET csr_pem = $3 WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .bind(csr_pem)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
 }
