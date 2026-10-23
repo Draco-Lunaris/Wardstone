@@ -7,6 +7,7 @@
 //! with `InvalidKeyFormat` — so the private key cannot double as the
 //! verification key and the two-file layout is required.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -40,6 +41,12 @@ const SIGNING_KEY_FILE: &str = "jwt-signing-key.pem";
 /// The Ed25519 **public** key PEM inside the keys directory. jsonwebtoken's
 /// decoder accepts only the public form, so the pair is stored separately.
 const VERIFY_KEY_FILE: &str = "jwt-verify-key.pem";
+
+/// Advisory lock against concurrent first-boot key generation, next to the
+/// key pair on the shared keys volume (`JwtKeys::load_or_create` holds it
+/// across the whole read-or-generate window, unix only).
+#[cfg(unix)]
+const KEY_LOCK_FILE: &str = "jwt-keys.lock";
 
 /// Standard claims of a Wardstone access token.
 ///
@@ -142,7 +149,21 @@ impl JwtKeys {
     /// volume must be able to produce the pair here: when `dir` does not
     /// exist it is created (mode 0700), and when both key files are absent a
     /// new Ed25519 pair is written into it. When both files are present they
-    /// are returned untouched, so every boot signs with the same key.
+    /// are proven to form one usable pair first (see
+    /// [`assert_pair_usable`]), so every boot signs with the same key and a
+    /// corrupted pair never silently pretends to authenticate.
+    ///
+    /// Concurrency is part of the deployment shape: the compose bundle's
+    /// `ui` and `api` processes boot simultaneously and share the keys
+    /// volume, so on unix every call holds an exclusive advisory lock on a
+    /// sibling lockfile across the whole read-or-generate window. A taker
+    /// that arrives mid-generation waits out the winner's complete two-file
+    /// write instead of generating its own divergent pair over it — the
+    /// collision that once left the deployed volume with a signing and a
+    /// verification key from two different pairs (every then-issued token
+    /// failed its own validation on first use). The lock is advisory:
+    /// closing the file releases it, so a crashed holder cannot wedge the
+    /// next boot.
     ///
     /// Exactly one of the two files present is a torn state (e.g. a restore
     /// that only carried the signing key). It is surfaced as a typed
@@ -164,19 +185,30 @@ impl JwtKeys {
             force_mode(dir, 0o700)?;
         }
 
+        // Held for the remainder of the call; dropping the file releases
+        // the lock before any result is built.
+        #[cfg(unix)]
+        let _creation_lock = lock_keys_dir(dir)?;
+
         let signing_key_pem = read_key_file(&dir.join(SIGNING_KEY_FILE))?;
         let verification_key_pem = read_key_file(&dir.join(VERIFY_KEY_FILE))?;
 
         match (signing_key_pem, verification_key_pem) {
-            (Some(signing_key_pem), Some(verification_key_pem)) => Ok(Self {
-                signing_key_pem,
-                verification_key_pem,
-                ttl_secs: DEFAULT_ACCESS_TTL_SECS,
-            }),
+            (Some(signing_key_pem), Some(verification_key_pem)) => {
+                assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
+                Ok(Self {
+                    signing_key_pem,
+                    verification_key_pem,
+                    ttl_secs: DEFAULT_ACCESS_TTL_SECS,
+                })
+            }
             (None, None) => {
                 let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
                 write_key_file(&dir.join(SIGNING_KEY_FILE), &signing_key_pem, 0o600)?;
                 write_key_file(&dir.join(VERIFY_KEY_FILE), &verification_key_pem, 0o644)?;
+                // Prove what was written forms the working pair — defense in
+                // depth against a future write-path defect, at probe cost.
+                assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
                 Ok(Self {
                     signing_key_pem,
                     verification_key_pem,
@@ -192,6 +224,105 @@ impl JwtKeys {
             ))),
         }
     }
+}
+
+/// Advisory cross-process serialization for [`JwtKeys::load_or_create`]
+/// (unix only): an exclusive, blocking file lock on `jwt-keys.lock` beside
+/// the key pair. A file lock is tied to the open file description, so each
+/// caller opens its own handle: concurrent callers block until the holder
+/// closes its file, and a crashed holder's handle closes with it — no
+/// stale-lock state can accumulate. The lockfile holds no bytes and is
+/// never removed; deleting it would break mutual exclusion for a caller
+/// holding a handle on the deleted inode.
+#[cfg(unix)]
+fn lock_keys_dir(dir: &Path) -> Result<fs::File, AuthError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let lock_path = dir.join(KEY_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| {
+            AuthError::Config(format!(
+                "cannot open the JWT keys lock file {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+    force_mode(&lock_path, 0o600)?;
+    file.lock().map_err(|e| {
+        AuthError::Config(format!(
+            "cannot acquire the exclusive JWT keys lock on {}: {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Prove the on-disk (or freshly generated) two-file pair is **usable**: a
+/// probe token signed with the signing PEM must decode under the
+/// verification PEM. This is deliberately the same `jsonwebtoken` path the
+/// runtime itself pays (`issue_access_token` → `validate_access_token`), so
+/// the check certifies exactly the property the service depends on rather
+/// than a structural stand-in for it.
+///
+/// The case it exists for: both files present, each individually intact,
+/// but written by two different `load_or_create` callers — a concurrent
+/// virgin-volume boot race on a shared keys volume. The mixed pair loads
+/// without error, makes every freshly minted token fail its own
+/// verification on first use, and turns the login flow into: issued → 401
+/// on the identity fetch, forever. It is refused as a configuration error
+/// carrying the recovery hint, mirroring the torn-state arm above; the
+/// operators re-key deliberately per the documented procedure.
+fn assert_pair_usable(
+    signing_pem: &str,
+    verification_pem: &str,
+    dir: &Path,
+) -> Result<(), AuthError> {
+    let hint = format!("remove both from {} to re-key", dir.display());
+
+    let encoding = EncodingKey::from_ed_pem(signing_pem.as_bytes()).map_err(|e| {
+        AuthError::Config(format!(
+            "the JWT signing key {} in {} does not parse as Ed25519 \
+             PKCS#8 private key material ({e}); remove both to re-key",
+            SIGNING_KEY_FILE,
+            dir.display()
+        ))
+    })?;
+    let decoding = DecodingKey::from_ed_pem(verification_pem.as_bytes()).map_err(|e| {
+        AuthError::Config(format!(
+            "the JWT verification key {} in {} does not parse as Ed25519 \
+             public key material ({e}); remove both to re-key",
+            VERIFY_KEY_FILE,
+            dir.display()
+        ))
+    })?;
+
+    let mut validation = Validation::new(TOKEN_ALGORITHM);
+    validation.validate_exp = false;
+    validation.required_spec_claims = HashSet::new();
+    let probe_claims = serde_json::json!({ "pair-probe": true });
+    let probe_token =
+        encode(&Header::new(TOKEN_ALGORITHM), &probe_claims, &encoding).map_err(|e| {
+            AuthError::Config(format!(
+                "the JWT signing key {} in {} cannot sign a probe token ({e}); \
+             remove both to re-key",
+                SIGNING_KEY_FILE,
+                dir.display()
+            ))
+        })?;
+    if let Err(e) = decode::<serde_json::Value>(&probe_token, &decoding, &validation) {
+        return Err(AuthError::Config(format!(
+            "the JWT key pair in {} is mixed or invalid: a probe signed with \
+             '{}' does not verify under '{}' ({e}); {hint}",
+            dir.display(),
+            SIGNING_KEY_FILE,
+            VERIFY_KEY_FILE
+        )));
+    }
+    Ok(())
 }
 
 /// Sign the given claims as a compact EdDSA JWT.

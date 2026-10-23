@@ -154,3 +154,86 @@ fn a_token_signed_with_the_loaded_keys_validates() {
     let decoded = validate_access_token(&token, &loaded).unwrap();
     assert_eq!(decoded.username, "carol");
 }
+
+#[test]
+fn a_mixed_key_pair_fails_the_load_loudly() {
+    // Two real, independent pairs: the signing file from A, the
+    // verification file from B — the exact shape a concurrent virgin-volume
+    // boot race on a shared keys volume left on the deployed 2026-10-23
+    // system (each file whole, the pair useless). The load must refuse it,
+    // not silently sign tokens nothing can verify.
+    let dir_a = temp_keys_dir("mixed-a");
+    let pair_a = JwtKeys::load_or_create(&dir_a).unwrap();
+    let dir_b = temp_keys_dir("mixed-b");
+    let pair_b = JwtKeys::load_or_create(&dir_b).unwrap();
+
+    let dir = temp_keys_dir("mixed-pair");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(SIGNING_KEY_FILE), &pair_a.signing_key_pem).unwrap();
+    fs::write(dir.join(VERIFY_KEY_FILE), &pair_b.verification_key_pem).unwrap();
+
+    let err = JwtKeys::load_or_create(&dir)
+        .expect_err("a mixed key pair must be refused, not loaded as authentic");
+
+    assert!(
+        matches!(err, AuthError::Config(ref msg) if msg.contains("remove both")),
+        "a mixed pair must fail as a configuration error carrying the \
+         remove-both re-key hint, got {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn racing_creators_serialize_into_one_consistent_pair() {
+    // Eight takers released into load_or_create on one virgin directory —
+    // the concurrent first boot of the ui and api processes on the shared
+    // keys volume. Every taker must succeed, hold the SAME pair, and the
+    // pair on disk must validate: the losers wait out the winner's complete
+    // two-file write instead of colliding with it.
+    use std::sync::{Arc, Barrier};
+
+    const RACERS: usize = 8;
+    let dir = temp_keys_dir("racing-creators");
+    let barrier = Arc::new(Barrier::new(RACERS));
+
+    let handles: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                JwtKeys::load_or_create(&dir)
+            })
+        })
+        .collect();
+    let results: Vec<Result<JwtKeys, _>> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("a racing creator panicked"))
+        .collect();
+
+    for (i, result) in results.iter().enumerate() {
+        assert!(result.is_ok(), "racing creator {i} failed: {result:?}");
+    }
+    let first = results
+        .first()
+        .expect("at least one racer")
+        .as_ref()
+        .unwrap();
+    for (i, result) in results.iter().enumerate() {
+        let keys = result.as_ref().unwrap();
+        assert_eq!(
+            keys.signing_key_pem, first.signing_key_pem,
+            "racing creator {i} holds a different signing key than creator 0"
+        );
+        assert_eq!(
+            keys.verification_key_pem, first.verification_key_pem,
+            "racing creator {i} holds a different verification key than creator 0"
+        );
+    }
+
+    // The disk pair the winners left behind must itself load cleanly —
+    // a mixed two-file residue would fail the loader's own pair check.
+    let disk = JwtKeys::load_or_create(&dir).unwrap();
+    assert_eq!(disk.signing_key_pem, first.signing_key_pem);
+    assert_eq!(disk.verification_key_pem, first.verification_key_pem);
+}
