@@ -1,7 +1,8 @@
 //! The ACME (RFC 8555) route surface: the directory, the new-nonce
 //! endpoint, the account lifecycle (new-account incl. only-return-existing
-//! and the ToS gate, account update, deactivation with its cascade, and
-//! the atomic account-key rollover).
+//! and the ToS gate, account update, deactivation with its cascade, the
+//! atomic account-key rollover), and the order machine — new-order,
+//! order polling (POST-as-GET), and authorization objects.
 //!
 //! This is JWS-machine traffic, mounted OUTSIDE `/api/v1` at `/acme`
 //! (Plan-1-pinned URL shape): no bearer/session extractor ever touches it —
@@ -26,11 +27,29 @@
 //! configured `public_url` — the `Host` header is NEVER consulted (the
 //! spec's anti-goal stands; settlement 7).
 //!
+//! The order machine (Task 6): `new-order` is a kid-carried POST whose
+//! account must be `valid`; the order row, its freshly minted pending
+//! authorizations (plus BOTH challenge flavors per authorization — the
+//! client picks http-01 or dns-01), and the audit row commit in ONE
+//! transaction with the deferred composite foreign keys' blessing. An
+//! identifier whose account already holds a `valid` authorization inside
+//! the REUSE WINDOW ([`AcmeRepo::valid_authorization_for`]: newest valid
+//! account-level row, `expires_at > now`) is REUSED: the order's
+//! `authorizations` array points at the EXISTING authorization URL and
+//! Task 2's row design keeps that row's `order_id` NULL — an expired or
+//! absent one mints a fresh pending authorization. The two-time shape
+//! this task pins (Task 7 continues it): a PENDING authorization lives
+//! the order's 7-day retry window; a VALID one gains its 30-day reuse
+//! lifetime only when validation settles it (Task 7 stamps the new
+//! `expires_at` there).
+//!
 //! Problem documents: `{"type": "urn:ietf:params:acme:error:<slug>",
 //! "detail", "status"}` with `Content-Type: application/problem+json`
 //! ([`AcmeProblem`]). Payload handling beyond the JWS floor is deliberately
 //! RFC-shaped and lenient about unknown members (external account binding
-//! is accepted-and-ignored per the spec's non-goal).
+//! is accepted-and-ignored per the spec's non-goal); order and
+//! authorization reads are POST-as-GET only (the RFC's POST-with-empty-
+//! payload), never unauthenticated GETs.
 
 use std::collections::HashMap;
 
@@ -44,6 +63,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -53,11 +73,15 @@ use tower_governor::GovernorLayer;
 use uuid::Uuid;
 use ws_acme::{AcmeError, NonceStore};
 use ws_core::error::CoreError;
-use ws_core::models::acme::{AcmeAccountModel, AcmeAccountStatus};
+use ws_core::models::acme::{
+    AcmeAccountModel, AcmeAccountStatus, AcmeAuthorizationModel, AcmeAuthorizationStatus,
+    AcmeChallengeModel, AcmeChallengeStatus, AcmeChallengeType, AcmeOrderModel, AcmeOrderStatus,
+};
 use ws_core::models::rbac::{Actor, ActorType, AuthMethod};
 use ws_core::models::tenant::Tenant;
 use ws_core::repo::acme_repo::AcmeRepo;
 use ws_core::repo::audit_repo::AuditRepo;
+use ws_core::repo::profile_repo::ProfileRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
 
 use crate::error::ApiError;
@@ -73,6 +97,28 @@ const URN_USER_ACTION_REQUIRED: &str = "urn:ietf:params:acme:error:userActionReq
 /// The problem URN for the `onlyReturnExisting` miss (RFC 8555 §7.3.3),
 /// named here for the same reason as the ToS gate above.
 const URN_ACCOUNT_DOES_NOT_EXIST: &str = "urn:ietf:params:acme:error:accountDoesNotExist";
+
+/// The problem URN for an identifier the server refuses (RFC 8555 §8's
+/// well-known registry entry): an identifier whose TYPE is not offered.
+/// (The RFC also suggests naming the rejected identifier on a
+/// `Link rel="up"` header; the plan's Task-6 pin keeps it to the detail
+/// message naming the type — the identifier never enters the response
+/// headers.)
+const URN_REJECTED_IDENTIFIER: &str = "urn:ietf:params:acme:error:rejectedIdentifier";
+
+/// The order machine's clock pins (settlement D5): an order lives 7 days,
+/// and each freshly minted PENDING authorization shares that retry window.
+/// The 30-day figure of the reuse window is NOT minted here — it is the
+/// `expires_at` a VALID authorization gains when Task 7's verification
+/// settles its identifier; the reuse lookup only checks `expires_at >
+/// now` on `valid` account-level rows.
+const ORDER_EXPIRY_DAYS: i64 = 7;
+const PENDING_AUTHZ_EXPIRY_DAYS: i64 = 7;
+
+/// The default certificate profile of the Wardstone `profile` extension
+/// member (the plan's pin): an order that offers no profile asks for the
+/// setup-minted `web-server` profile.
+const DEFAULT_ORDER_PROFILE: &str = "web-server";
 
 /// The `Replay-Nonce` response header (RFC 8555 §6.5): every `/acme`
 /// response — success and failure alike — carries a fresh one.
@@ -119,6 +165,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/new-nonce", get(new_nonce))
         .route("/{tenant}/directory", get(directory))
         .route("/{tenant}/acct/{account}", post(account_url))
+        .route("/{tenant}/new-order", post(new_order))
+        .route("/{tenant}/orders/{order}", post(order_url))
+        .route("/{tenant}/authz/{authz}", post(authz_url))
         .route("/{tenant}/key-change", post(key_change))
         .merge(new_account)
         // Every /acme response — including the governor's 429s and every
@@ -226,6 +275,36 @@ struct AccountPayload {
     /// it.
     #[allow(dead_code)]
     external_account_binding: Option<Value>,
+}
+
+/// The new-order request payload (RFC 8555 §7.4) plus the Wardstone
+/// extension. RFC 8555 has NO profile member (profile selection is the
+/// ARI/drafts ground); the plan still pins orders to carry one, so the
+/// extension lives on the payload as `profile` (a string naming a profile
+/// of THIS tenant, defaulting to [`DEFAULT_ORDER_PROFILE`]) — the same
+/// member name the profiles draft put in `newOrder`. The plan/brief text
+/// spelled the member `profile_name`; BOTH spellings are accepted on
+/// input (`profile` preferred, `profile_name` the fallback; sending both
+/// with different values is `malformed`), and the order OBJECT carries
+/// the single `profile` member.
+///
+/// `identifiers` is kept as the RAW `Value` (the model stores it verbatim
+/// as the order's authority for what it asked for) and validated as a
+/// whole; `notBefore`/`notAfter` are RFC 3339 strings per the spec.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewOrderPayload {
+    identifiers: Value,
+    /// The Wardstone profile extension member (see the struct doc).
+    profile: Option<String>,
+    /// The plan-text spelling of the same extension member (see the
+    /// struct doc), accepted under BOTH spellings this repo's documents
+    /// have used: `profileName` (this payload's camelCase members) and
+    /// the plan text's verbatim `profile_name`. Secondary to `profile`.
+    #[serde(alias = "profile_name")]
+    profile_name: Option<String>,
+    not_before: Option<String>,
+    not_after: Option<String>,
 }
 
 /// `POST /acme/{tenant}/new-account` — the RFC 8555 §7.3 enrollment:
@@ -753,6 +832,571 @@ async fn key_change(
     ))
 }
 
+/// The kid-account prelude the order-machine routes share (new-order and
+/// the two POST-as-GET reads): peek the UNVERIFIED protected header,
+/// eagerly fetch the candidate account's key into the resolver cache (the
+/// account route's idiom verbatim), verify the JWS (which spends the
+/// nonce), refuse an embedded jwk, parse the kid against the CONFIGURED
+/// tenant prefix, load the account, and gate it `valid` (pending accounts
+/// have yet to agree to the ToS; deactivated accounts refuse every
+/// action). A kid that is not a tenant-local account URL, or whose
+/// lookup misses, is the 404 `accountDoesNotExist` lookup failure — never
+/// a cross-tenant read.
+///
+/// Returns the account and the (possibly null) verified payload: the read
+/// routes treat a null payload as RFC POST-as-GET; new-order refuses it
+/// (a creation endpoint has no GET).
+async fn authenticate_kid_account(
+    state: &AppState,
+    tenant: &Tenant,
+    base: &str,
+    request_url: &str,
+    raw: &str,
+) -> Result<(AcmeAccountModel, Value), AcmeProblem> {
+    let peeked = peek_header(raw)?;
+    let mut kid_keys: HashMap<String, Value> = HashMap::new();
+    if let Some(kid) = peeked.kid.filter(|_| peeked.jwk.is_none()) {
+        if let Some(thumbprint) = kid_thumbprint(&kid, base, &tenant.name) {
+            if let Some(account) = AcmeRepo::new()
+                .get_account(&state.pool, tenant.id, &thumbprint)
+                .await?
+            {
+                kid_keys.insert(kid, account.jwk);
+            }
+        }
+    }
+    let jws = ws_acme::verify_jws(
+        raw,
+        &|kid: &str| Ok(kid_keys.get(kid).cloned()),
+        &|n| state.nonces.consume(n),
+        request_url,
+    )
+    .map_err(AcmeProblem::from)?;
+    if jws.header.jwk.is_some() {
+        return Err(AcmeProblem::malformed(
+            "an order-machine request must authenticate with its account kid, \
+             not an embedded jwk",
+        ));
+    }
+    let kid = jws.header.kid.as_deref().ok_or_else(|| {
+        AcmeProblem::malformed("an order-machine request must name its account URL as a kid")
+    })?;
+    let thumbprint = kid_thumbprint(kid, base, &tenant.name).ok_or_else(|| {
+        AcmeProblem::malformed("the kid does not name an account URL of this tenant")
+    })?;
+    let account = AcmeRepo::new()
+        .get_account(&state.pool, tenant.id, &thumbprint)
+        .await?
+        .ok_or(AcmeError::NoSuchAccount)
+        .map_err(AcmeProblem::from)?;
+    let detail = match account.status {
+        AcmeAccountStatus::Valid => return Ok((account, jws.payload)),
+        AcmeAccountStatus::Pending => {
+            "the account is not yet valid (agree to the terms of service)"
+        }
+        AcmeAccountStatus::Deactivated => "the account is deactivated",
+    };
+    Err(AcmeProblem::unauthorized(detail))
+}
+
+/// `POST /acme/{tenant}/new-order` — the RFC 8555 §7.4 order machine's
+/// front door, kid-carried by a `valid` account. The identifiers are
+/// dns-only in v1 (a foreign type is the RFC's `rejectedIdentifier`,
+/// naming the type in its detail). The profile must exist in the tenant —
+/// a missing one is a 400 `malformed` problem naming it (the plan's Task-6
+/// pin). The order row, each freshly minted pending authorization (the
+/// 7-day retry window) with its BOTH-flavor challenge pair (http-01 +
+/// dns-01: the client picks), and the audit row commit in ONE transaction
+/// under the deferred composite foreign keys. An identifier the account
+/// already holds a `valid` authorization for inside the REUSE WINDOW is
+/// REUSED: the order's `authorizations` array points at the EXISTING
+/// authorization URL and Task 2's reused row keeps its `order_id` NULL —
+/// an expired or absent one mints a fresh pending authorization. Success
+/// answers 201 with the order's `Location` and the pending order object.
+async fn new_order(
+    State(state): State<AppState>,
+    Path(tenant_name): Path<String>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/new-order", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, payload) =
+        authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+
+    // A POST-as-GET (the empty payload) names no order to read: new-order
+    // is a CREATION endpoint, and the RFC gives it no GET.
+    if payload.is_null() {
+        return Err(AcmeProblem::malformed(
+            "a new-order request requires an identifiers payload \
+             (POST-as-GET does not apply)",
+        ));
+    }
+    let body: NewOrderPayload = serde_json::from_value(payload).map_err(|_| {
+        AcmeProblem::malformed("the new-order payload is not a valid request object")
+    })?;
+    let identifiers = dns_identifiers(&body.identifiers)?;
+
+    // The Wardstone extension: `profile` (with the plan-text spelling
+    // `profile_name` accepted underneath it; both present and disagreeing
+    // is `malformed` — the request would otherwise silently order under
+    // whichever one wins). The profile must be the tenant's.
+    let profile_name = match (body.profile.as_deref(), body.profile_name.as_deref()) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(AcmeProblem::malformed(
+                "the profile and profile_name members carry different profiles; \
+                 send exactly one",
+            ));
+        }
+        (Some(a), _) => a,
+        (None, Some(b)) => b,
+        (None, None) => DEFAULT_ORDER_PROFILE,
+    };
+    ProfileRepo::new()
+        .get_by_name(&state.pool, tenant.id, profile_name)
+        .await?
+        .ok_or_else(|| {
+            AcmeProblem::malformed(format!(
+                "the profile {profile_name:?} does not exist in this tenant"
+            ))
+        })?;
+
+    let not_before = rfc3339_member(&body.not_before, "notBefore")?;
+    let not_after = rfc3339_member(&body.not_after, "notAfter")?;
+    if let (Some(before), Some(after)) = (not_before, not_after) {
+        if after < before {
+            return Err(AcmeProblem::malformed(
+                "the notAfter member precedes notBefore",
+            ));
+        }
+    }
+
+    let now = Utc::now();
+    let order = AcmeOrderModel {
+        id: Uuid::new_v4(),
+        tenant_id: tenant.id,
+        account_id: account.id,
+        status: AcmeOrderStatus::Pending,
+        profile_name: profile_name.to_owned(),
+        identifiers: body.identifiers.clone(),
+        csr_pem: None,
+        not_before,
+        not_after,
+        certificate_id: None,
+        error: None,
+        // The 7-day window: the finalization deadline AND the fresh
+        // authorizations' pending retry window (see the constants).
+        expires_at: now + chrono::Duration::days(ORDER_EXPIRY_DAYS),
+        created_at: now,
+    };
+
+    // ONE transaction: the order, each minted authorization (with its
+    // challenge pair), and the audit row. The deferred composite foreign
+    // keys (migration 011) bless any statement order. The reuse lookup
+    // reads through this transaction's snapshot, so a concurrent order
+    // settling the same identifier reuses or mints — never both.
+    let mut tx = state.pool.begin().await?;
+    AcmeRepo::new().insert_order(&mut *tx, &order).await?;
+    let mut authorization_urls = Vec::with_capacity(identifiers.len());
+    let mut reused = Vec::with_capacity(identifiers.len());
+    let mut minted = Vec::with_capacity(identifiers.len());
+    for identifier in &identifiers {
+        // The reuse window: the newest VALID account-level authorization
+        // whose expiry is still in the future at `now`. A hit is reused
+        // VERBATIM — the row keeps its own expiry and `order_id: NULL`.
+        if let Some(existing) = AcmeRepo::new()
+            .valid_authorization_for(&mut *tx, tenant.id, account.id, identifier, now)
+            .await?
+        {
+            authorization_urls.push(authz_object_url(&base, &tenant.name, existing.id));
+            reused.push(identifier.clone());
+            continue;
+        }
+        let authorization = AcmeAuthorizationModel {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.id,
+            account_id: account.id,
+            identifier: identifier.clone(),
+            status: AcmeAuthorizationStatus::Pending,
+            expires_at: now + chrono::Duration::days(PENDING_AUTHZ_EXPIRY_DAYS),
+            reused_from: None,
+            order_id: Some(order.id),
+            created_at: now,
+        };
+        AcmeRepo::new()
+            .insert_authorization(&mut *tx, &authorization)
+            .await?;
+        mint_challenge_pair(&mut tx, tenant.id, authorization.id, now).await?;
+        authorization_urls.push(authz_object_url(&base, &tenant.name, authorization.id));
+        minted.push(identifier.clone());
+    }
+    let account_url_str = format!(
+        "{base}/acme/{}/acct/{}",
+        tenant.name, account.jwk_thumbprint
+    );
+    let actor = acme_actor(tenant.id, account_url_str);
+    AuditRepo::new()
+        .record(
+            &mut *tx,
+            &audit_entry(
+                &actor,
+                "acme_order_created",
+                "acme_order",
+                &order.id.to_string(),
+                json!({
+                    "order_url": order_object_url(&base, &tenant.name, order.id),
+                    "profile": profile_name,
+                    "identifiers": identifiers,
+                    "reused_authorization_count": reused.len(),
+                    "minted_authorization_count": minted.len(),
+                }),
+            ),
+        )
+        .await?;
+    tx.commit().await?;
+    tracing::info!(
+        order = %order.id,
+        reused = reused.len(),
+        minted = minted.len(),
+        "acme order created"
+    );
+
+    Ok(order_response(
+        StatusCode::CREATED,
+        &base,
+        &tenant.name,
+        &order,
+        Some(&authorization_urls),
+    ))
+}
+
+/// `POST /acme/{tenant}/orders/{order}` — the order object's POST-as-GET
+/// (RFC 8555 §7.4): kid-carried and account-scoped (a foreign order is
+/// indistinguishable from a missing one — one 404 problem document, no
+/// existence oracle). The body carries the object per status: always
+/// `status`/`expires`/`identifiers`/`profile`/`finalize`, the
+/// `authorizations` array while the order is pending or ready (re-derived
+/// from the rows at poll time), the `certificate` URL once valid, and an
+/// `error` problem document once invalid.
+async fn order_url(
+    State(state): State<AppState>,
+    Path((tenant_name, order_id)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/orders/{order_id}", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    let order_id =
+        Uuid::parse_str(&order_id).map_err(|_| AcmeProblem::not_found("no such order"))?;
+    let order = AcmeRepo::new()
+        .get_order(&state.pool, tenant.id, order_id)
+        .await?
+        .filter(|order| order.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such order"))?;
+    let authorizations = order_authorization_urls(&state, &tenant, &base, &order).await?;
+    Ok(order_response(
+        StatusCode::OK,
+        &base,
+        &tenant.name,
+        &order,
+        authorizations.as_deref(),
+    ))
+}
+
+/// The order's `authorizations` URLs, identifier order, re-derived from
+/// the rows at POLL time: an order-scoped row (minted FOR this order —
+/// any status) first, else the account-level REUSED row the order was
+/// pointed at when created (found through the same reuse-window lookup
+/// the creation ran). `None` = the member is not carried for this order
+/// status (processing/valid/invalid — the RFC allows omitting the
+/// authorizations of an order past `pending`; a valid order speaks
+/// through `certificate`, an invalid one through `error`).
+///
+/// A reused row that has since dropped out of the window (expired without
+/// the order having been invalidated — no machinery does that until Task
+/// 7) is OMITTED with a warn, never a 500: the array may only shorten for
+/// an order that is about to be invalidated anyway.
+async fn order_authorization_urls(
+    state: &AppState,
+    tenant: &Tenant,
+    base: &str,
+    order: &AcmeOrderModel,
+) -> Result<Option<Vec<String>>, AcmeProblem> {
+    if !matches!(
+        order.status,
+        AcmeOrderStatus::Pending | AcmeOrderStatus::Ready
+    ) {
+        return Ok(None);
+    }
+    let identifiers = identifiers_of(&order.identifiers)?;
+    let order_scoped = AcmeRepo::new()
+        .list_authorizations_by_order(&state.pool, tenant.id, order.id)
+        .await?;
+    let now = Utc::now();
+    let mut urls = Vec::with_capacity(identifiers.len());
+    for identifier in &identifiers {
+        if let Some(existing) = order_scoped
+            .iter()
+            .find(|authorization| &authorization.identifier == identifier)
+        {
+            urls.push(authz_object_url(base, &tenant.name, existing.id));
+            continue;
+        }
+        match AcmeRepo::new()
+            .valid_authorization_for(&state.pool, tenant.id, order.account_id, identifier, now)
+            .await?
+        {
+            Some(reused) => urls.push(authz_object_url(base, &tenant.name, reused.id)),
+            None => tracing::warn!(
+                order = %order.id,
+                identifier = %identifier,
+                "an order's reused authorization left the reuse window; \
+                 the authorizations array omits it until the order is invalidated"
+            ),
+        }
+    }
+    Ok(Some(urls))
+}
+
+/// The dns value strings stored on an order's (validated, verbatim)
+/// `identifiers` jsonb. An unreadable row is internal damage, not a
+/// per-request condition.
+fn identifiers_of(stored: &Value) -> Result<Vec<String>, AcmeProblem> {
+    stored
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .ok_or_else(|| AcmeProblem::internal("a stored order's identifiers are unreadable"))
+}
+
+/// `POST /acme/{tenant}/authz/{authz}` — the authorization object's
+/// POST-as-GET (RFC 8555 §7.5.1): kid-carried, account-scoped (the same
+/// 404 shape as the order read), rendering the stored status, the
+/// identifier (a `*.`-prefixed wildcard row renders WITHOUT the prefix
+/// and with `wildcard: true` — the RFC's authorization-object form; the
+/// row stores the order's verbatim identifier), the expiry, and BOTH
+/// challenge flavors with their absolute `chall` URLs.
+async fn authz_url(
+    State(state): State<AppState>,
+    Path((tenant_name, authz_id)): Path<(String, String)>,
+    raw: Bytes,
+) -> Result<Response, AcmeProblem> {
+    let tenant = resolve_tenant(&state, &tenant_name).await?;
+    let base = public_base(&state)?;
+    let expected_url = format!("{base}/acme/{}/authz/{authz_id}", tenant.name);
+    let raw = as_str(&raw)?;
+
+    let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
+    let authz_id =
+        Uuid::parse_str(&authz_id).map_err(|_| AcmeProblem::not_found("no such authorization"))?;
+    let authorization = AcmeRepo::new()
+        .get_authorization(&state.pool, tenant.id, authz_id)
+        .await?
+        .filter(|authorization| authorization.account_id == account.id)
+        .ok_or_else(|| AcmeProblem::not_found("no such authorization"))?;
+    let challenges = AcmeRepo::new()
+        .list_challenges_by_authorization(&state.pool, tenant.id, authorization.id)
+        .await?;
+    Ok(Json(authz_object(
+        &base,
+        &tenant.name,
+        &authorization,
+        &challenges,
+    ))
+    .into_response())
+}
+
+/// Mint the BOTH-flavor challenge pair of a freshly minted authorization
+/// (the plan's Task-6 pin: http-01 AND dns-01 per authorization — the
+/// client picks by requesting validation on one; Task 7's verification
+/// and Task 5's deactivation cascade both key on these rows).
+async fn mint_challenge_pair(
+    executor: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+    authorization_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), AcmeProblem> {
+    for challenge_type in [AcmeChallengeType::Http01, AcmeChallengeType::Dns01] {
+        let challenge = AcmeChallengeModel {
+            id: Uuid::new_v4(),
+            tenant_id,
+            authorization_id,
+            challenge_type,
+            token: mint_challenge_token(),
+            status: AcmeChallengeStatus::Pending,
+            validated_at: None,
+            error: None,
+            created_at: now,
+        };
+        AcmeRepo::new()
+            .insert_challenge(&mut *executor, &challenge)
+            .await?;
+    }
+    Ok(())
+}
+
+/// A challenge token: 32 OS-random bytes, unpadded base64url — the
+/// `ws_acme::NonceStore::mint` idiom verbatim (a dead OS entropy source
+/// is unrecoverable, so minting fails loudly rather than fabricating a
+/// token).
+fn mint_challenge_token() -> String {
+    use rand::{rngs::SysRng, TryRng};
+    let mut raw = [0u8; 32];
+    if let Err(e) = SysRng.try_fill_bytes(&mut raw) {
+        panic!("OS entropy source failed while minting an ACME challenge token: {e}");
+    }
+    URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// The identifiers array's dns VALUE strings, in the order offered, under
+/// v1's light validator. The type gate: `dns` only — any other type is
+/// the RFC registry's `rejectedIdentifier` with the offending TYPE named
+/// in the detail (the plan's pin; the identifier value itself never
+/// enters the response — the RFC's `Link rel="up"` rendering of the
+/// rejected identifier would leak it into headers it does not need to be
+/// in). DNS shape: non-empty, no leading dot, optional `*.` wildcard
+/// prefix (the RFC 8555 wildcard-authority form Task 10's e2e
+/// exercises), no whitespace or slash. A repeated value is `malformed`.
+fn dns_identifiers(identifiers: &Value) -> Result<Vec<String>, AcmeProblem> {
+    let entries = identifiers
+        .as_array()
+        .ok_or_else(|| AcmeProblem::malformed("the identifiers member must be an array"))?;
+    if entries.is_empty() {
+        return Err(AcmeProblem::malformed(
+            "the identifiers member must carry at least one identifier",
+        ));
+    }
+    let mut values = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object().ok_or_else(|| {
+            AcmeProblem::malformed("each identifier must be an object with type and value")
+        })?;
+        let identifier_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcmeProblem::malformed("each identifier must carry a type string"))?;
+        if identifier_type != "dns" {
+            return Err(AcmeProblem {
+                status: StatusCode::BAD_REQUEST,
+                type_urn: URN_REJECTED_IDENTIFIER,
+                detail: format!(
+                    "the identifier type {identifier_type:?} is not supported; only \"dns\" is"
+                ),
+                tos_link: None,
+                location: None,
+            });
+        }
+        let value = object
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcmeProblem::malformed("each dns identifier must carry a value"))?;
+        validate_dns_value(value)?;
+        if values.contains(&value.to_owned()) {
+            return Err(AcmeProblem::malformed(format!(
+                "the identifiers member repeats {value:?}"
+            )));
+        }
+        values.push(value.to_owned());
+    }
+    Ok(values)
+}
+
+/// The light dns-value validator (see [`dns_identifiers`]): no full
+/// hostname spec, just the shape lines that keep a value speakable as a
+/// challenge target and a reuse key.
+fn validate_dns_value(value: &str) -> Result<(), AcmeProblem> {
+    let refused = |why: &str| {
+        AcmeProblem::malformed(format!(
+            "the dns identifier {value:?} is not a valid DNS name: {why}"
+        ))
+    };
+    if value.is_empty() {
+        return Err(refused("it is empty"));
+    }
+    if value.starts_with('.') {
+        return Err(refused("it has a leading dot"));
+    }
+    let domain = match value.strip_prefix("*.") {
+        // The wildcard-authority form: the prefix must name a domain.
+        Some(domain) => {
+            if domain.is_empty() || domain.starts_with('.') {
+                return Err(refused("the wildcard prefix names no domain"));
+            }
+            domain
+        }
+        // A plain name: nothing is stripped.
+        None => value,
+    };
+    if value.contains(char::is_whitespace) || domain.contains('/') {
+        return Err(refused("it carries whitespace or a slash"));
+    }
+    Ok(())
+}
+
+/// Parse an optional RFC 3339 payload member (`notBefore`/`notAfter`).
+fn rfc3339_member(
+    member: &Option<String>,
+    name: &str,
+) -> Result<Option<DateTime<Utc>>, AcmeProblem> {
+    member
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(DateTime::<Utc>::from)
+                .map_err(|_| {
+                    AcmeProblem::malformed(format!(
+                        "the {name} member is not an RFC 3339 timestamp"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+/// The absolute URL of an order object (the `Location` handle).
+fn order_object_url(base: &str, tenant_name: &str, order_id: Uuid) -> String {
+    format!("{base}/acme/{tenant_name}/orders/{order_id}")
+}
+
+/// The absolute URL of an authorization object.
+fn authz_object_url(base: &str, tenant_name: &str, authorization_id: Uuid) -> String {
+    format!("{base}/acme/{tenant_name}/authz/{authorization_id}")
+}
+
+/// An order-object response: `status` (201 on creation with its
+/// `Location`, 200 on POST-as-GET — same body, different shape on top).
+fn order_response(
+    status: StatusCode,
+    base: &str,
+    tenant_name: &str,
+    order: &AcmeOrderModel,
+    authorizations: Option<&[String]>,
+) -> Response {
+    let location = order_object_url(base, tenant_name, order.id);
+    let mut response = (
+        status,
+        Json(order_object(base, tenant_name, order, authorizations)),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
+}
+
 /// The contact + ToS-agreement half of both account flows (new-account's
 /// idempotency branch and the account URL): `contact` handling is
 /// RFC 8555 §7.3.2-shaped — absent touches nothing, `[]` clears (an empty
@@ -897,6 +1541,20 @@ impl AcmeProblem {
         }
     }
 
+    /// A resource that does not exist — or that exists but belongs to
+    /// another account (one 404 problem document, no existence oracle).
+    /// The registry's `malformed` slug at a 404 status, the shape the
+    /// unknown-tenant reply already establishes.
+    fn not_found(detail: impl Into<String>) -> Self {
+        AcmeProblem {
+            status: StatusCode::NOT_FOUND,
+            type_urn: "urn:ietf:params:acme:error:malformed",
+            detail: detail.into(),
+            tos_link: None,
+            location: None,
+        }
+    }
+
     /// The ONE 404 problem document the wrong (or missing) tenant path
     /// earns — indistinguishable whether the segment named another tenant
     /// or no tenant exists at all (setup not run), and never a
@@ -1030,6 +1688,88 @@ fn account_object(base: &str, tenant_name: &str, account: &AcmeAccountModel) -> 
             .unwrap_or_default(),
         "orders": format!("{base}/acme/{tenant_name}/acct/{}/orders", account.jwk_thumbprint),
     })
+}
+
+/// The RFC 8555 §7.4 order object. `profile` is the Wardstone extension
+/// member (see [`NewOrderPayload`]); `notBefore`/`notAfter` ride only
+/// when the client asked; `authorizations` is carried only while the
+/// order is pending or ready; `certificate` (Task 8's serving route) only
+/// on a valid order that has one; `error` renders the stored failure text
+/// as a problem document (the stored text carries no registry category,
+/// so the wire type is the generic `serverInternal` URN and the detail
+/// message is the authoritative part).
+fn order_object(
+    base: &str,
+    tenant_name: &str,
+    order: &AcmeOrderModel,
+    authorizations: Option<&[String]>,
+) -> Value {
+    let mut object = json!({
+        "status": order.status.as_str(),
+        "expires": order.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "identifiers": &order.identifiers,
+        "profile": order.profile_name,
+        "finalize": format!("{base}/acme/{tenant_name}/orders/{}/finalize", order.id),
+    });
+    if let Some(not_before) = order.not_before {
+        object["notBefore"] = json!(not_before.to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
+    if let Some(not_after) = order.not_after {
+        object["notAfter"] = json!(not_after.to_rfc3339_opts(SecondsFormat::Secs, true));
+    }
+    if let Some(urls) = authorizations {
+        object["authorizations"] = json!(urls);
+    }
+    if order.status == AcmeOrderStatus::Valid && order.certificate_id.is_some() {
+        object["certificate"] = json!(format!(
+            "{base}/acme/{tenant_name}/orders/{}/certificate",
+            order.id
+        ));
+    }
+    if let Some(error) = &order.error {
+        object["error"] = json!({
+            "type": "urn:ietf:params:acme:error:serverInternal",
+            "detail": error,
+        });
+    }
+    object
+}
+
+/// The RFC 8555 §7.5.1 authorization object: status, identifier, expiry,
+/// and the BOTH-flavor challenges with their absolute `chall` URLs (Task
+/// 7's verification route). A `*.`-prefixed stored identifier renders
+/// without the prefix and with `wildcard: true` (see [`authz_url`]).
+fn authz_object(
+    base: &str,
+    tenant_name: &str,
+    authorization: &AcmeAuthorizationModel,
+    challenges: &[AcmeChallengeModel],
+) -> Value {
+    let wildcard = authorization.identifier.starts_with("*.");
+    let identifier = authorization
+        .identifier
+        .strip_prefix("*.")
+        .unwrap_or(&authorization.identifier);
+    let mut object = json!({
+        "status": authorization.status.as_str(),
+        "identifier": { "type": "dns", "value": identifier },
+        "expires": authorization.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "challenges": challenges
+            .iter()
+            .map(|challenge| {
+                json!({
+                    "type": challenge.challenge_type.as_str(),
+                    "url": format!("{base}/acme/{tenant_name}/chall/{}", challenge.id),
+                    "token": challenge.token,
+                    "status": challenge.status.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    if wildcard {
+        object["wildcard"] = json!(true);
+    }
+    object
 }
 
 /// An account-object response with its `Location` header (the full

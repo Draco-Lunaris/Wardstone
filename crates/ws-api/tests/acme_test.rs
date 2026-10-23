@@ -1,7 +1,9 @@
 //! Integration tests for the ACME (RFC 8555) route surface (Plan-4
-//! Task 5): directory, new-nonce, new-account (the ToS gate and
+//! Tasks 5-6): directory, new-nonce, new-account (the ToS gate and
 //! only-return-existing included), the account URL (POST-as-GET, update,
-//! deactivation with its cascade), and the atomic account-key rollover.
+//! deactivation with its cascade), the atomic account-key rollover, and
+//! the order machine — new-order (profile resolution, identifier
+//! validation, the REUSE window), order and authorization POST-as-GET.
 //!
 //! These tests run against a live Postgres and are marked `#[ignore]`.
 //! Run them with:
@@ -53,9 +55,12 @@ use ws_api::{AcmeConfig, ApiConfig, AppState, AuthRateLimit};
 use ws_auth::jwt::JwtKeys;
 use ws_core::db::connect;
 use ws_core::models::acme::{
-    AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeOrderModel, AcmeOrderStatus,
+    AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeStatus, AcmeChallengeType,
+    AcmeOrderModel, AcmeOrderStatus,
 };
+use ws_core::models::profile::ProfileModel;
 use ws_core::repo::acme_repo::AcmeRepo;
+use ws_core::repo::profile_repo::ProfileRepo;
 
 use acme_common::{ed25519, p256, rsa2048, Identity, KeyFixture};
 
@@ -146,6 +151,7 @@ impl Fixture {
             "DELETE FROM acme_authorizations WHERE tenant_id = $1",
             "DELETE FROM acme_orders WHERE tenant_id = $1",
             "DELETE FROM acme_accounts WHERE tenant_id = $1",
+            "DELETE FROM profiles WHERE tenant_id = $1",
             "DELETE FROM audit_log WHERE tenant_id = $1",
             "DELETE FROM tenants WHERE id = $1",
         ] {
@@ -251,6 +257,8 @@ async fn sweep_tenant(pool: &PgPool, name: &str) {
         "DELETE FROM acme_orders WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM acme_accounts WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM profiles WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM audit_log WHERE tenant_id IN \
          (SELECT id FROM tenants WHERE name = $1)",
@@ -1716,4 +1724,901 @@ async fn sign_without_agreement(fixture: &Fixture, key: &KeyFixture) -> TestResp
         acme_post(&format!("/acme/{ACME_TENANT}/new-account"), &jws),
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// The order machine (Plan-4 Task 6): new-order, reuse window,
+// order/authz POST-as-GET
+// ---------------------------------------------------------------------------
+
+/// A profile fixture row under the fixture tenant (setup's built-ins are
+/// named profiles; the ACME order surface resolves the order's `profile`
+/// member against them by name).
+fn profile_row(tenant_id: Uuid, name: &str) -> ProfileModel {
+    ProfileModel {
+        id: Uuid::new_v4(),
+        tenant_id,
+        name: name.to_owned(),
+        description: None,
+        current_revision_id: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// Seed a named profile under the fixture tenant, through the Task-2 repo.
+async fn seed_profile(fixture: &Fixture, name: &str) {
+    ProfileRepo::new()
+        .insert_profile(&fixture.pool, &profile_row(fixture.tenant_id, name))
+        .await
+        .expect("seed the profile row");
+}
+
+/// The absolute order-object URL.
+fn order_url(order_id: Uuid) -> String {
+    format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}")
+}
+
+/// The absolute authorization-object URL.
+fn authz_url(authz_id: Uuid) -> String {
+    format!("{PUBLIC_URL}/acme/{ACME_TENANT}/authz/{authz_id}")
+}
+
+/// A kid-signed POST-as-GET to ANY order-machine resource URL (the
+/// account URL as the kid, the empty payload).
+async fn kid_post_as_get(fixture: &Fixture, key: &KeyFixture, url: &str) -> TestResponse {
+    let nonce = fetch_nonce(fixture).await;
+    let account = account_url(&thumb_of(key));
+    let jws =
+        acme_common::sign_acme_request(key, &Identity::Kid(account), &nonce, url, &Value::Null);
+    let path = url
+        .strip_prefix(PUBLIC_URL)
+        .expect("a fixture-built absolute URL");
+    send(fixture, acme_post(path, &jws)).await
+}
+
+/// A kid-signed new-order POST with the caller's payload object.
+async fn post_new_order(fixture: &Fixture, key: &KeyFixture, payload: Value) -> TestResponse {
+    let nonce = fetch_nonce(fixture).await;
+    let jws = acme_common::sign_acme_request(
+        key,
+        &Identity::Kid(account_url(&thumb_of(key))),
+        &nonce,
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/new-order"),
+        &payload,
+    );
+    send(
+        fixture,
+        acme_post(&format!("/acme/{ACME_TENANT}/new-order"), &jws),
+    )
+    .await
+}
+
+/// The id tail of the `Location` a created order carries (the order
+/// object itself carries no id member — the Location IS the handle).
+fn location_order_id(response: &TestResponse) -> String {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .expect("a Location on the created order")
+        .to_str()
+        .expect("ascii")
+        .rsplit('/')
+        .next()
+        .expect("a uuid tail")
+        .to_owned()
+}
+
+/// How many orders live under the fixture tenant (the refused-request
+/// leg's "nothing was created" check).
+async fn order_count(fixture: &Fixture) -> i64 {
+    sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM acme_orders WHERE tenant_id = $1")
+        .bind(fixture.tenant_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the orders")
+        .0
+}
+
+/// How many authorizations live under the fixture tenant.
+async fn authz_count(fixture: &Fixture) -> i64 {
+    sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM acme_authorizations WHERE tenant_id = $1")
+        .bind(fixture.tenant_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the authorizations")
+        .0
+}
+
+/// The happy new-order: 201 with the order `Location`, a pending order
+/// object carrying the default `web-server` profile and the finalize URL,
+/// ONE freshly minted pending authorization on the 7-day retry window
+/// with its BOTH-flavor challenge pair (http-01 + dns-01, distinct
+/// OS-random tokens), and the `acme_order_created` audit row in the
+/// pinned AcmeAccount actor shape.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_mints_a_pending_order_with_an_authorization_url() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let account = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the account")
+        .expect("it exists");
+    seed_profile(&fx, "web-server").await;
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "host.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let order_object = body_json(response).await;
+
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order row")
+        .expect("it was minted");
+    let authz_rows = AcmeRepo::new()
+        .list_authorizations_by_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order's authorizations");
+    let challenge_rows = AcmeRepo::new()
+        .list_challenges_by_authorization(&fx.pool, fx.tenant_id, authz_rows[0].id)
+        .await
+        .expect("read the authz's challenges");
+    let created_audit = audit_rows(&fx, "acme_order_created").await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(order_object["status"], "pending");
+    assert_eq!(order_object["profile"], "web-server");
+    assert_eq!(
+        order_object["identifiers"],
+        json!([{"type": "dns", "value": "host.wardstone.test"}])
+    );
+    assert_eq!(
+        order_object["finalize"],
+        json!(format!(
+            "{PUBLIC_URL}/acme/{ACME_TENANT}/orders/{order_id}/finalize"
+        ))
+    );
+    assert_eq!(
+        order_object["authorizations"],
+        json!([authz_url(authz_rows[0].id)]),
+        "the 201 body lists the order's ONE fresh authorization URL"
+    );
+    assert!(
+        order_object.get("certificate").is_none(),
+        "no certificate on a pending order"
+    );
+    assert!(order_object["expires"].is_string());
+
+    assert_eq!(order_row.status, AcmeOrderStatus::Pending);
+    assert_eq!(order_row.profile_name, "web-server");
+    assert_eq!(order_row.account_id, account.id);
+    assert_eq!(
+        order_row.expires_at,
+        order_row.created_at + chrono::Duration::days(7),
+        "the 7-day order window"
+    );
+
+    assert_eq!(authz_rows.len(), 1, "one identifier, one fresh authz");
+    let authz = &authz_rows[0];
+    assert_eq!(authz.identifier, "host.wardstone.test");
+    assert_eq!(authz.status, AcmeAuthorizationStatus::Pending);
+    assert_eq!(authz.order_id, Some(order_id));
+    assert_eq!(authz.reused_from, None);
+    assert_eq!(
+        authz.expires_at, order_row.expires_at,
+        "the fresh authz shares the order's 7-day retry window"
+    );
+
+    assert_eq!(challenge_rows.len(), 2, "BOTH flavors minted");
+    let types: Vec<_> = challenge_rows.iter().map(|c| c.challenge_type).collect();
+    assert!(types.contains(&AcmeChallengeType::Http01));
+    assert!(types.contains(&AcmeChallengeType::Dns01));
+    assert!(
+        challenge_rows[0].token != challenge_rows[1].token,
+        "each challenge holds its own OS-random token"
+    );
+    assert!(challenge_rows
+        .iter()
+        .all(|c| c.status == AcmeChallengeStatus::Pending));
+
+    assert_eq!(created_audit.len(), 1, "exactly one creation audit row");
+    let (actor_type, auth_method, actor_id, target_id, details) = &created_audit[0];
+    assert_eq!(actor_type, "acme_account");
+    assert_eq!(auth_method, "acme_account");
+    assert_eq!(actor_id, &account_url(&thumb));
+    assert_eq!(target_id, &order_id.to_string());
+    assert_eq!(details["profile"], "web-server");
+    assert_eq!(details["reused_authorization_count"], 0);
+    assert_eq!(details["minted_authorization_count"], 1);
+}
+
+/// The Wardstone `profile` extension member: absent → the default
+/// `web-server`; the plan-text spelling `profile_name` (and its camelCase
+/// twin) is accepted as the alias; BOTH members with different values is
+/// `malformed`; and an unknown profile is a 400 `malformed` problem
+/// naming it (the plan's Task-6 pin).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_resolves_the_profile_member() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (_thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    // Absent profile member → the default profile.
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "a.wardstone.test"}]}),
+    )
+    .await;
+    let defaulted = response.status();
+    let defaulted_profile = body_json(response).await["profile"].clone();
+
+    // The plan-text alias spelling.
+    seed_profile(&fx, "web-server-ecdsa").await;
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "b.wardstone.test"}],
+               "profile_name": "web-server-ecdsa"}),
+    )
+    .await;
+    let aliased = response.status();
+    let aliased_profile = body_json(response).await["profile"].clone();
+
+    // Both members, DIFFERENT values: refused.
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "c.wardstone.test"}],
+               "profile": "web-server", "profile_name": "web-server-ecdsa"}),
+    )
+    .await;
+    let conflicting = response.status();
+    let conflicting_body = body_json(response).await;
+
+    // Unknown profile: 400 malformed, the name in the detail.
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "d.wardstone.test"}],
+               "profile": "no-such-profile"}),
+    )
+    .await;
+    let unknown = response.status();
+    let unknown_body = body_json(response).await;
+
+    let orders_after = order_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(defaulted, StatusCode::CREATED);
+    assert_eq!(defaulted_profile, "web-server");
+    assert_eq!(aliased, StatusCode::CREATED);
+    assert_eq!(aliased_profile, "web-server-ecdsa");
+    assert_eq!(conflicting, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        conflicting_body["type"],
+        "urn:ietf:params:acme:error:malformed"
+    );
+    assert_eq!(unknown, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert!(
+        unknown_body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("no-such-profile"),
+        "the problem names the missing profile"
+    );
+    assert_eq!(
+        orders_after, 2,
+        "only the two well-formed orders were created"
+    );
+}
+
+/// Identifier validation: a foreign identifier TYPE is the RFC registry's
+/// `rejectedIdentifier` (the type named in the detail); an empty value, a
+/// leading dot, an empty identifiers array, and a repeated value are
+/// `malformed` — and none of the refusals minted anything.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_rejects_foreign_identifier_types_and_bad_dns_values() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (_thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    let foreign_type = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "ip", "value": "127.0.0.1"}]}),
+    )
+    .await;
+    let foreign_status = foreign_type.status();
+    let foreign_body = body_json(foreign_type).await;
+
+    let empty_value = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": ""}]}),
+    )
+    .await;
+    let empty_status = empty_value.status();
+    let empty_body = body_json(empty_value).await;
+
+    let leading_dot = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": ".host.wardstone.test"}]}),
+    )
+    .await;
+    let dot_status = leading_dot.status();
+
+    let none_at_all = post_new_order(&fx, rsa2048(), json!({"identifiers": []})).await;
+    let none_status = none_at_all.status();
+
+    let repeated = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "a.wardstone.test"},
+                               {"type": "dns", "value": "a.wardstone.test"}]}),
+    )
+    .await;
+    let repeated_status = repeated.status();
+
+    let orders_after = order_count(&fx).await;
+    let authzs_after = authz_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(foreign_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        foreign_body["type"],
+        "urn:ietf:params:acme:error:rejectedIdentifier"
+    );
+    assert!(
+        foreign_body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("ip"),
+        "the problem names the rejected identifier type"
+    );
+    assert_eq!(empty_status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(dot_status, StatusCode::BAD_REQUEST);
+    assert_eq!(none_status, StatusCode::BAD_REQUEST);
+    assert_eq!(repeated_status, StatusCode::BAD_REQUEST);
+    assert_eq!(orders_after, 0, "every refusal created nothing");
+    assert_eq!(authzs_after, 0, "every refusal created nothing");
+}
+
+/// new-order is a CREATION endpoint: the POST-as-GET (empty payload) is
+/// refused `malformed`, and nothing was created.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_refuses_post_as_get() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (_thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    let response = kid_post_as_get(
+        &fx,
+        rsa2048(),
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/new-order"),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let orders_after = order_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(orders_after, 0);
+}
+
+/// The account-status gate: a `pending` account (the ToS gate minted it)
+/// and a `deactivated` account both get the 401 `unauthorized` refusal,
+/// and mint nothing.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_refuses_a_pending_account() {
+    let _db = lock_db().await;
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        tos_url: Some("https://acme.wardstone.test/terms"),
+        ..FixtureConfig::default()
+    })
+    .await;
+
+    let signed_out = sign_without_agreement(&fx, rsa2048()).await;
+    assert_eq!(signed_out.status(), StatusCode::FORBIDDEN, "the ToS gate");
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "host.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let orders_after = order_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:unauthorized");
+    assert_eq!(orders_after, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_refuses_a_deactivated_account() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    // Deactivate through the account URL (the Task-5 flow).
+    let account_url_str = account_url(&thumb);
+    let nonce = fetch_nonce(&fx).await;
+    let jws = acme_common::sign_acme_request(
+        rsa2048(),
+        &Identity::Kid(account_url_str),
+        &nonce,
+        &account_url(&thumb),
+        &json!({"status": "deactivated"}),
+    );
+    let deactivated = send(
+        &fx,
+        acme_post(&format!("/acme/{ACME_TENANT}/acct/{thumb}"), &jws),
+    )
+    .await;
+    assert_eq!(deactivated.status(), StatusCode::OK);
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "host.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    let orders_after = order_count(&fx).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["type"], "urn:ietf:params:acme:error:unauthorized");
+    assert_eq!(orders_after, 0);
+}
+
+/// Within the 30-day reuse window: a `valid` account-level authorization
+/// on the identifier is REUSED — the order's `authorizations` array points
+/// at the EXISTING authorization URL, the reused row stays account-level
+/// (`order_id` stays NULL), and NO new row is minted for the identifier.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn new_order_reuses_a_valid_authorization_within_the_window() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+    let account = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the account")
+        .expect("it exists");
+
+    let existing = AcmeAuthorizationModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account.id,
+        identifier: "site.wardstone.test".to_owned(),
+        status: AcmeAuthorizationStatus::Valid,
+        expires_at: chrono::Utc::now() + chrono::Duration::days(29),
+        reused_from: None,
+        order_id: None,
+        created_at: chrono::Utc::now() - chrono::Duration::days(1),
+    };
+    AcmeRepo::new()
+        .insert_authorization(&fx.pool, &existing)
+        .await
+        .expect("seed the valid reuse row");
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "site.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let _order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let body = body_json(response).await;
+    let created_audit = audit_rows(&fx, "acme_order_created").await;
+    let authzs_after = authz_count(&fx).await;
+    let reuse_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, existing.id)
+        .await
+        .expect("read the reuse row")
+        .expect("it survives");
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        body["authorizations"],
+        json!([authz_url(existing.id)]),
+        "the EXISTING authorization URL is reused"
+    );
+    assert_eq!(authzs_after, 1, "no new row was minted for the identifier");
+    assert!(
+        reuse_row.order_id.is_none(),
+        "a reused row keeps order_id NULL (Task 2's design)"
+    );
+    assert_eq!(reuse_row.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(created_audit.len(), 1);
+    assert_eq!(created_audit[0].4["reused_authorization_count"], 1);
+    assert_eq!(created_audit[0].4["minted_authorization_count"], 0);
+}
+
+/// Review Focus 5, route-level: an account-level `valid` authorization
+/// whose `expires_at` has PASSED is OUTSIDE the reuse window — the next
+/// new-order mints a fresh order-scoped pending row (the injected-`now`
+/// repo-level window test lives in the Task-2 repo suite).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn reused_authorization_respects_window() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+    let account = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the account")
+        .expect("it exists");
+
+    let expired = AcmeAuthorizationModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account.id,
+        identifier: "site.wardstone.test".to_owned(),
+        status: AcmeAuthorizationStatus::Valid,
+        expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        reused_from: None,
+        order_id: None,
+        created_at: chrono::Utc::now() - chrono::Duration::days(8),
+    };
+    AcmeRepo::new()
+        .insert_authorization(&fx.pool, &expired)
+        .await
+        .expect("seed the expired valid row");
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "site.wardstone.test"}]}),
+    )
+    .await;
+    let status = response.status();
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let body = body_json(response).await;
+    let authz_rows = AcmeRepo::new()
+        .list_authorizations_by_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order's authorizations");
+    let authzs_after = authz_count(&fx).await;
+    let expired_row: Option<(AcmeAuthorizationStatus, Option<Uuid>)> = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, expired.id)
+        .await
+        .expect("read the expired row")
+        .map(|row| (row.status, row.order_id));
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(authz_rows.len(), 1, "a fresh pending authz was minted");
+    assert_ne!(authz_rows[0].id, expired.id);
+    assert_eq!(authz_rows[0].status, AcmeAuthorizationStatus::Pending);
+    assert_eq!(authz_rows[0].order_id, Some(order_id));
+    assert_eq!(
+        body["authorizations"],
+        json!([authz_url(authz_rows[0].id)]),
+        "the NEW authz URL, never the expired row's"
+    );
+    assert_eq!(authzs_after, 2, "the expired row was not consumed away");
+    let expired_row = expired_row.expect("the expired row survives untouched");
+    assert_eq!(expired_row.0, AcmeAuthorizationStatus::Valid);
+    assert!(expired_row.1.is_none());
+}
+
+/// Order POST-as-GET: the object round-trips identically to the creation
+/// body; a FOREIGN account's kid finds nothing (one 404, no existence
+/// oracle); an unknown id and a non-uuid path are 404s too.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn order_post_as_get_renders_the_order_object_account_scoped() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (_, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_b) = create_account(&fx, p256()).await;
+    assert_eq!(created_b.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "host.wardstone.test"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let creation_body = body_json(response).await;
+
+    let read = kid_post_as_get(&fx, rsa2048(), &order_url(order_id)).await;
+    let read_status = read.status();
+    let read_body = body_json(read).await;
+
+    let foreign = kid_post_as_get(&fx, p256(), &order_url(order_id)).await;
+    let foreign_status = foreign.status();
+    let foreign_body = body_json(foreign).await;
+
+    let missing = kid_post_as_get(&fx, rsa2048(), &order_url(Uuid::new_v4())).await;
+    let missing_status = missing.status();
+    let missing_body = body_json(missing).await;
+
+    let not_a_uuid = kid_post_as_get(
+        &fx,
+        rsa2048(),
+        &format!("{PUBLIC_URL}/acme/{ACME_TENANT}/orders/not-a-uuid"),
+    )
+    .await;
+    let not_a_uuid_status = not_a_uuid.status();
+
+    fx.cleanup().await;
+
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(
+        read_body, creation_body,
+        "the POST-as-GET body equals the creation body"
+    );
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_body["type"], "urn:ietf:params:acme:error:malformed");
+    assert_eq!(not_a_uuid_status, StatusCode::NOT_FOUND);
+}
+
+/// Authorization POST-as-GET: the object renders the identifier, the
+/// expiry, and BOTH stored challenges with their absolute `chall` URLs and
+/// tokens (matching the DB rows); a foreign account finds nothing.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn authz_post_as_get_renders_the_challenge_pair_account_scoped() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (_, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_b) = create_account(&fx, p256()).await;
+    assert_eq!(created_b.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "host.wardstone.test"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let _order_id = Uuid::parse_str(&location_order_id(&response)).expect("the Location's id");
+    let creation_body = body_json(response).await;
+    let authz_id = Uuid::parse_str(
+        creation_body["authorizations"][0]
+            .as_str()
+            .expect("an authz URL")
+            .rsplit('/')
+            .next()
+            .expect("a uuid tail"),
+    )
+    .expect("the authz id");
+
+    let read = kid_post_as_get(&fx, rsa2048(), &authz_url(authz_id)).await;
+    let read_status = read.status();
+    let read_body = body_json(read).await;
+
+    let challenge_rows = AcmeRepo::new()
+        .list_challenges_by_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz's challenges");
+    let foreign = kid_post_as_get(&fx, p256(), &authz_url(authz_id)).await;
+    let foreign_status = foreign.status();
+    let missing = kid_post_as_get(&fx, rsa2048(), &authz_url(Uuid::new_v4())).await;
+    let missing_status = missing.status();
+    fx.cleanup().await;
+
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read_body["status"], "pending");
+    assert_eq!(
+        read_body["identifier"],
+        json!({"type": "dns", "value": "host.wardstone.test"})
+    );
+    assert!(read_body["expires"].is_string());
+    assert!(
+        read_body.get("wildcard").is_none(),
+        "a plain identifier carries no wildcard member"
+    );
+    assert_eq!(challenge_rows.len(), 2);
+    let mut db_pairs: Vec<(String, String, String)> = challenge_rows
+        .iter()
+        .map(|c| {
+            (
+                c.challenge_type.as_str().to_owned(),
+                format!("{PUBLIC_URL}/acme/{ACME_TENANT}/chall/{}", c.id),
+                c.token.clone(),
+            )
+        })
+        .collect();
+    let mut body_pairs: Vec<(String, String, String)> = read_body["challenges"]
+        .as_array()
+        .expect("a challenge array")
+        .iter()
+        .filter_map(|c| {
+            Some((
+                c["type"].as_str()?.to_owned(),
+                c["url"].as_str()?.to_owned(),
+                c["token"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    db_pairs.sort();
+    body_pairs.sort();
+    assert_eq!(body_pairs, db_pairs, "types, urls, and tokens match the DB");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+}
+
+/// An INVALID order object carries its `error` problem document and NO
+/// `authorizations` member (the per-status content shape; a valid order's
+/// `certificate` URL arrives with Task 8's serving route).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn an_invalid_order_object_carries_its_error() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+    let account = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the account")
+        .expect("it exists");
+
+    let order = AcmeOrderModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account.id,
+        status: AcmeOrderStatus::Invalid,
+        profile_name: "web-server".to_owned(),
+        identifiers: json!([{"type": "dns", "value": "host.wardstone.test"}]),
+        csr_pem: None,
+        not_before: None,
+        not_after: None,
+        certificate_id: None,
+        error: Some("account deactivated".to_owned()),
+        expires_at: chrono::Utc::now() + chrono::Duration::days(7),
+        created_at: chrono::Utc::now(),
+    };
+    AcmeRepo::new()
+        .insert_order(&fx.pool, &order)
+        .await
+        .expect("seed the invalid order");
+
+    let read = kid_post_as_get(&fx, rsa2048(), &order_url(order.id)).await;
+    let status = read.status();
+    let body = body_json(read).await;
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "invalid");
+    assert_eq!(
+        body["error"]["type"],
+        "urn:ietf:params:acme:error:serverInternal"
+    );
+    assert_eq!(body["error"]["detail"], "account deactivated");
+    assert!(
+        body.get("authorizations").is_none(),
+        "an order past pending carries no authorizations array"
+    );
+    assert!(body.get("certificate").is_none());
+    assert!(
+        body["finalize"].is_string(),
+        "the finalize URL is always carried"
+    );
+}
+
+/// A `*.`-prefixed order identifier (Task 10's e2e case, stored verbatim
+/// on the rows): the authorization OBJECT renders the value WITHOUT the
+/// prefix plus `wildcard: true` — RFC 8555 §7.5.1's wildcard-authority
+/// form — while the reuse key stays the verbatim stored string.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_wildcard_identifier_renders_the_rfc_authorization_object() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let (thumb, created) = create_account(&fx, rsa2048()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    seed_profile(&fx, "web-server").await;
+    let _account = AcmeRepo::new()
+        .get_account(&fx.pool, fx.tenant_id, &thumb)
+        .await
+        .expect("read the account")
+        .expect("it exists");
+
+    let response = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "*.wild.wardstone.test"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let creation_body = body_json(response).await;
+    let authz_id = Uuid::parse_str(
+        creation_body["authorizations"][0]
+            .as_str()
+            .expect("an authz URL")
+            .rsplit('/')
+            .next()
+            .expect("a uuid tail"),
+    )
+    .expect("the authz id");
+
+    let read = kid_post_as_get(&fx, rsa2048(), &authz_url(authz_id)).await;
+    let read_status = read.status();
+    let read_body = body_json(read).await;
+    let stored: Option<(String,)> =
+        sqlx::query_as("SELECT identifier FROM acme_authorizations WHERE id = $1")
+            .bind(authz_id)
+            .fetch_optional(&fx.pool)
+            .await
+            .expect("read the authz row");
+    fx.cleanup().await;
+
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(
+        read_body["identifier"],
+        json!({"type": "dns", "value": "wild.wardstone.test"}),
+        "the wildcard prefix is off the wire value"
+    );
+    assert_eq!(read_body["wildcard"], true);
+    let stored = stored.expect("the authz row was minted").0;
+    assert_eq!(
+        stored, "*.wild.wardstone.test",
+        "the row stores the order's verbatim identifier (the reuse key)"
+    );
 }
