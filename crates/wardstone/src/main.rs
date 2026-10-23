@@ -24,11 +24,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
+use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_core::error::CoreError;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
+use zeroize::Zeroizing;
 
 /// The listen address when `WARDSTONE_BIND` is unset (the brief's pin).
 const DEFAULT_BIND: &str = "0.0.0.0:8443";
@@ -470,8 +472,8 @@ fn rate_limit_from(
 ///   id (the leaf is a first-class issuance: `load_ca_key(cert.id)`).
 /// - tenant WITHOUT an active leaf — the pinned torn state of a crash
 ///   between setup's bootstrap commit and the leaf-issuance transaction:
-///   a fresh setup certificate keeps TLS SERVING (see [`select_serving_leaf`]'s
-///   docs for the exact predicate and the WARN line that records the
+///   a fresh setup certificate keeps TLS SERVING (see [`resolve_serving_leaf`]'s
+///   docs for the exact walk and the WARN line that records the
 ///   choice; recovery is operator-initiated: log in and re-issue the
 ///   server leaf through the proxied API).
 async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
@@ -535,8 +537,8 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         .list_by_tenant(&pool, tenant.id, 0, 500)
         .await?;
 
-    let leaf = match select_serving_leaf(&certs) {
-        Some(leaf) => {
+    let leaf = match resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))? {
+        Some((leaf, ca_key)) => {
             tracing::info!(
                 certificate_id = %leaf.id,
                 serial = %leaf.serial_hex,
@@ -547,11 +549,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
             // The setup routes are not mounted once the tenant exists, so
             // the fingerprint argument is inert — the empty string keeps
             // that inertness readable at the router call below.
-            Some((
-                leaf.cert_pem.clone(),
-                keystore.load_ca_key(&leaf.id)?,
-                String::new(),
-            ))
+            Some((leaf.cert_pem.clone(), ca_key, String::new()))
         }
         None => {
             // The pinned torn state: the setup bootstrap committed (the
@@ -711,27 +709,77 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
     .await?)
 }
 
-/// The serving-leaf predicate over a tenant's certificates: an ACTIVE
-/// certificate issued on the built-in `web-server` profile — the profile
+/// The serving-leaf candidates over a tenant's certificates: ACTIVE
+/// certificates issued on the built-in `web-server` profile — the profile
 /// setup itself mints the UI's leaf on, and the one an operator re-issue
-/// of the server leaf naturally rides — newest `created_at` wins. `None`
-/// means NO serving leaf exists (the pinned torn state: the UI falls back
-/// to the setup certificate).
+/// of the server leaf naturally rides — newest `created_at` first. An
+/// empty list means NO serving leaf exists (the pinned torn state: the UI
+/// falls back to the setup certificate).
 ///
 /// Deliberately NOT "any active certificate": the UI's own leaf is the
 /// `web-server` one, and serving some other workload's domain certificate
 /// would present the wrong identity to the browsers that connect here.
 ///
-/// The newest-wins rule covers the re-issue flow naturally: once a fresh
+/// The newest-first order covers the re-issue flow naturally: once a fresh
 /// leaf exists on the same profile, the next boot presents it; revoked
 /// leaves drop out through the `active` predicate.
-fn select_serving_leaf(certs: &[CertificateModel]) -> Option<&CertificateModel> {
-    certs
+fn serving_leaf_candidates(certs: &[CertificateModel]) -> Vec<&CertificateModel> {
+    let mut candidates: Vec<&CertificateModel> = certs
         .iter()
         .filter(|cert| {
             cert.status == CertStatus::Active && cert.profile_name == SERVING_LEAF_PROFILE
         })
-        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        .collect();
+    candidates.sort_by_key(|cert| std::cmp::Reverse(cert.created_at));
+    candidates
+}
+
+/// Walk the serving-leaf candidates newest-first and serve the first leaf
+/// whose key envelope the keystore actually holds, pairing the row with
+/// its loaded key so the caller binds TLS without a second keystore trip.
+/// `Ok(None)` — every candidate unenvelopable, or none at all — sends the
+/// caller to the setup-certificate fallback.
+///
+/// A candidate whose envelope is MISSING is passed by, not fatal: an
+/// ACME-issued certificate (or any client-key issuance) has no server-side
+/// private key by design, so the keystore reports NotFound for rows that
+/// are real, active certificates owned by their clients. The first such
+/// renewal to appear above a manual leaf used to abort the boot — a crash
+/// loop on every restart — because the newest-wins pick loaded the key of
+/// a certificate this server provably cannot key. Skipping keeps the
+/// walk's identity promise intact: the UI only ever serves a leaf whose
+/// key it holds.
+///
+/// Any OTHER load error (a corrupt envelope, an io failure at the master
+/// key) aborts the boot: those are keystore-integrity incidents, and
+/// silently serving an older leaf over a broken keystore would mask the
+/// damage the operator needs to see.
+/// The walk's resolution when a leaf is servable: the row paired with the
+/// key bytes its envelope loaded.
+type ServedLeaf<'a> = (&'a CertificateModel, Zeroizing<Vec<u8>>);
+
+fn resolve_serving_leaf(
+    certs: &[CertificateModel],
+    load_key: impl Fn(&CertificateModel) -> Result<Zeroizing<Vec<u8>>, CaError>,
+) -> Result<Option<ServedLeaf<'_>>, CaError> {
+    for leaf in serving_leaf_candidates(certs) {
+        match load_key(leaf) {
+            Ok(key) => return Ok(Some((leaf, key))),
+            Err(CaError::NotFound) => {
+                tracing::warn!(
+                    certificate_id = %leaf.id,
+                    serial = %leaf.serial_hex,
+                    subject = %leaf.subject,
+                    "skipping an active web-server leaf whose key envelope the \
+                     keystore does not hold — an ACME/client-key certificate \
+                     cannot serve here (its private key lives with its \
+                     client); falling back to the next-newest leaf"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(None)
 }
 
 /// # Unit tests
@@ -1014,7 +1062,7 @@ mod tests {
     /// The selection: active web-server certificates only, newest first,
     /// revoked and foreign-profile rows never chosen.
     #[test]
-    fn select_serving_leaf_picks_the_newest_active_web_server_cert() {
+    fn serving_leaf_candidates_orders_active_web_server_newest_first() {
         let old_active = cert(CertStatus::Active, 100);
         let new_active = cert(CertStatus::Active, 10);
         let revoked_newer = cert(CertStatus::Revoked, 5);
@@ -1026,21 +1074,127 @@ mod tests {
         // The candidates are bound so the borrowed slice outlives the
         // call and the later single-cert assertions can reuse the rows.
         let table = [
-            old_active,
+            old_active.clone(),
             new_active.clone(),
             revoked_newer.clone(),
             foreign,
         ];
-        let picks = select_serving_leaf(&table).expect("an active web-server cert exists");
-        assert_eq!(picks.id, new_active.id, "newest active wins");
 
+        let ids: Vec<_> = serving_leaf_candidates(&table)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![new_active.id, old_active.id],
+            "newest active web-server leaf first; revoked and foreign-profile rows never chosen"
+        );
+
+        let only_revoked = [revoked_newer];
         assert!(
-            select_serving_leaf(&[revoked_newer]).is_none(),
+            serving_leaf_candidates(&only_revoked).is_empty(),
             "a revoked leaf is not servable"
         );
         assert!(
-            select_serving_leaf(&[]).is_none(),
+            serving_leaf_candidates(&[]).is_empty(),
             "an empty table has no leaf: the boot falls back to the setup certificate"
+        );
+    }
+
+    /// The walk serves the newest candidate and hands its loaded key back,
+    /// keyed to that candidate.
+    #[test]
+    fn resolve_serving_leaf_serves_the_newest_candidate_with_its_loaded_key() {
+        let old_active = cert(CertStatus::Active, 100);
+        let new_active = cert(CertStatus::Active, 10);
+        let table = [old_active, new_active.clone()];
+        let (leaf, key) = resolve_serving_leaf(&table, |c| {
+            Ok(Zeroizing::new(c.id.to_string().into_bytes()))
+        })
+        .expect("the walk must not abort the boot when keys load")
+        .expect("candidates exist");
+        assert_eq!(leaf.id, new_active.id, "the newest candidate wins");
+        assert_eq!(
+            *key,
+            new_active.id.to_string().into_bytes(),
+            "the served key is the loaded one for the served leaf"
+        );
+    }
+
+    /// A candidate whose envelope is corrupt aborts the boot — an
+    /// integrity incident is never worked around by silently serving a
+    /// different identity.
+    #[test]
+    fn resolve_serving_leaf_hard_fails_on_a_corrupt_envelope() {
+        let only = cert(CertStatus::Active, 10);
+        let table = [only];
+        let err = resolve_serving_leaf(&table, |_| Err(CaError::Corrupt))
+            .expect_err("a corrupt envelope must abort the boot");
+        assert!(matches!(err, CaError::Corrupt), "got {err:?}");
+    }
+
+    /// The newest candidate holds NO key envelope — the shape an ACME
+    /// (client-key) certificate leaves behind by design: the private key
+    /// never existed server-side, so the keystore reports NotFound. The
+    /// walk must pass that candidate by with a WARN and serve the next
+    /// leaf it can actually load — not abort the boot (the deployed
+    /// system crash-looped on exactly this at 18:31) and not silently
+    /// pretend to serve an identity it cannot key.
+    #[test]
+    fn resolve_serving_leaf_walks_past_a_candidate_with_no_key_envelope() {
+        let old_active = cert(CertStatus::Active, 100);
+        let new_active = cert(CertStatus::Active, 10);
+        let table = [old_active.clone(), new_active.clone()];
+        let loaded = std::cell::RefCell::new(Vec::new());
+        let (leaf, key) = resolve_serving_leaf(&table, |c| {
+            loaded.borrow_mut().push(c.id);
+            if c.id == new_active.id {
+                Err(CaError::NotFound)
+            } else {
+                Ok(Zeroizing::new(c.id.to_string().into_bytes()))
+            }
+        })
+        .expect("a missing envelope must not abort the boot")
+        .expect("the next-newest leaf is servable");
+        assert_eq!(
+            leaf.id, old_active.id,
+            "the walk serves the next-newest leaf after the unenveloped one"
+        );
+        assert_eq!(
+            *key,
+            old_active.id.to_string().into_bytes(),
+            "the served key is the loaded one for the served leaf"
+        );
+        assert_eq!(
+            *loaded.borrow(),
+            vec![new_active.id, old_active.id],
+            "the walk stayed on the newest-first candidate order"
+        );
+    }
+
+    /// No candidates at all (or none on the serving profile): the walk
+    /// resolves to None and the caller takes the setup-certificate
+    /// fallback — the pinned torn state. No load is attempted.
+    #[test]
+    fn resolve_serving_leaf_with_no_candidates_resolves_to_none() {
+        let mut foreign = cert(CertStatus::Active, 10);
+        foreign.profile_name = "server".to_owned();
+        let table = [foreign];
+
+        let load = |_: &CertificateModel| {
+            Result::<Zeroizing<Vec<u8>>, CaError>::Ok(Zeroizing::new(Vec::new()))
+        };
+        assert!(
+            resolve_serving_leaf(&table, load)
+                .expect("no load is attempted")
+                .is_none(),
+            "a foreign-profile-only table has no serving leaf"
+        );
+        assert!(
+            resolve_serving_leaf(&[], load)
+                .expect("no load is attempted")
+                .is_none(),
+            "an empty table has no serving leaf"
         );
     }
 
@@ -1232,9 +1386,9 @@ mod tests {
     #[test]
     fn serving_leaf_predicate_is_shared_by_both_boot_outcomes() {
         let leaf = cert(CertStatus::Active, 0);
-        assert!(select_serving_leaf(&[]).is_none());
+        assert!(serving_leaf_candidates(&[]).is_empty());
         assert!(
-            select_serving_leaf(std::slice::from_ref(&leaf)).is_some(),
+            !serving_leaf_candidates(std::slice::from_ref(&leaf)).is_empty(),
             "the same one-predicate rule drives both boot outcomes"
         );
     }
