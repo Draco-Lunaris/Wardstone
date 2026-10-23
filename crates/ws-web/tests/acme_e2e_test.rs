@@ -73,8 +73,7 @@ use ws_ca::keystore::KeyStore;
 use ws_ca::KeyType;
 use ws_core::db::connect;
 use ws_core::models::acme::{
-    AcmeAccountModel, AcmeAuthorizationModel, AcmeAuthorizationStatus, AcmeChallengeStatus,
-    AcmeChallengeType, AcmeOrderStatus,
+    AcmeAuthorizationStatus, AcmeChallengeStatus, AcmeChallengeType, AcmeOrderStatus,
 };
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::CertStatus;
@@ -1196,6 +1195,16 @@ async fn acme_order_issues_end_to_end() {
         .await
         .expect("read the challenge row")
         .expect("the challenge row exists");
+    let authz_id = tail_uuid(
+        order_body["authorizations"][0]
+            .as_str()
+            .expect("an authz URL"),
+    );
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&env.pool, env.tenant_id, authz_id)
+        .await
+        .expect("read the authorization row")
+        .expect("the authorization row exists");
     let issued_audits = audit_rows(&env, "cert_issued").await;
     let served = env.stub.served();
     let fetcher_calls = env.fetcher.calls();
@@ -1264,9 +1273,26 @@ async fn acme_order_issues_end_to_end() {
     assert_eq!(fetcher_calls, 1);
     assert_eq!(challenge_row.status, AcmeChallengeStatus::Valid);
     assert!(challenge_row.validated_at.is_some());
+    // the settlement PROMOTION (fix round 1): the organically settled row
+    // left the order-scope in the settle transaction, and it KEEPS the
+    // 30-day reuse-window stamp the valid transition stamped.
+    assert!(
+        authz_row.order_id.is_none(),
+        "a settled order-scoped authorization is promoted to account-level"
+    );
+    let fresh_days = (authz_row.expires_at - chrono::Utc::now()).num_days();
+    assert!(
+        (29..=30).contains(&fresh_days),
+        "the promoted row keeps the 30-day reuse window, got {fresh_days} days"
+    );
 
     // finalize + issuance assertions
     assert_eq!(ready_body["status"], "ready");
+    assert_eq!(
+        ready_body["authorizations"], order_body["authorizations"],
+        "the READY order's poll still renders its (promoted) authorization \
+         through the reuse-window lookup"
+    );
     assert_eq!(
         finalize_status,
         StatusCode::OK,
@@ -1552,61 +1578,62 @@ async fn acme_revocation_via_account_key() {
     assert_eq!(revoked_audits[0].4["reason"], "superseded");
 }
 
-/// Test 4: the renew-flavored reuse window — a second order on the SAME
-/// identifier points at the EXISTING valid authorization URL, the reused
-/// row stays account-level (order_id NULL) and untouched, and the
+/// Test 4: the renew-flavored reuse window, driven ORGANICALLY — order 1
+/// issues all the way (its HTTP-01 settlement PROMOTED its order-scoped
+/// authorization to account-level inside the settle transaction, fix
+/// round 1), and the SECOND order on the SAME identifier reuses that row
+/// with NO seeding at all: the order points at the EXISTING
+/// authorization URL, nothing is minted for the identifier, and the
 /// `acme_order_created` audit row credits `reused_authorization_count: 1`
-/// with nothing minted.
+/// with `minted_authorization_count: 0`.
 ///
-/// The account-level row the reuse window serves is SEEDED here exactly
-/// as the Task-6 suite seeds it: production v1 offers no pre-authorization
-/// surface (`newAuthz` is absent), so the account-level VALID row the
-/// window is designed around exists in the Task-2 row shape — the
-/// conformance claim is the RFC-visible behavior of the SECOND new-order.
+/// (The SEEDED account-level variant stays in the ws-api suite as the
+/// Task-6 regression pin for the LOOKUP itself; this test pins the LOOP:
+/// settle → promotion → organic reuse.)
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn second_order_reuses_authorizations() {
     let _db = lock_db().await;
     let mut env = env().await;
 
-    // order 1 issues all the way: the identifier has a real, COMPLETED
-    // certificate behind it when the renewal order arrives.
+    // order 1 issues all the way: enrollment, profile + CA seeding, the
+    // HTTP-01 settlement (whose transaction promotes the row), finalize.
     let (order_id, _root_pem) = issue_certificate(&mut env, "host.wardstone-e2e.test").await;
     let key = KeyFixture::rsa2048();
-    let thumb = thumb_of(key);
 
-    let account: AcmeAccountModel = AcmeRepo::new()
-        .get_account(&env.pool, env.tenant_id, &thumb)
-        .await
-        .expect("read the account")
-        .expect("it exists");
-
-    // the Task-2 account-level reuse row: valid, in-window, order-scoped
-    // to NOTHING.
-    let existing = AcmeAuthorizationModel {
-        id: Uuid::new_v4(),
-        tenant_id: env.tenant_id,
-        account_id: account.id,
-        identifier: "host.wardstone-e2e.test".to_owned(),
-        status: AcmeAuthorizationStatus::Valid,
-        expires_at: chrono::Utc::now() + chrono::Duration::days(29),
-        reused_from: None,
-        order_id: None,
-        created_at: chrono::Utc::now() - chrono::Duration::days(1),
-    };
-    AcmeRepo::new()
-        .insert_authorization(&env.pool, &existing)
-        .await
-        .expect("seed the valid reuse row");
-
-    // -- the second order through the front door.
+    // -- the second order through the front door. No account-level row is
+    //    seeded: the one it must reuse is the one order 1's own settlement
+    //    promoted.
     let (second_order_id, second_body) = new_order(&env, key, "host.wardstone-e2e.test").await;
 
+    // -- DB captures, then the cleanup, THEN the assertions.
+    let identifier_rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM acme_authorizations \
+         WHERE tenant_id = $1 AND identifier = $2",
+    )
+    .bind(env.tenant_id)
+    .bind("host.wardstone-e2e.test")
+    .fetch_all(&env.pool)
+    .await
+    .expect("list the identifier's authorizations");
+    let reused_id = identifier_rows
+        .first()
+        .copied()
+        .expect("order 1's settled authorization exists")
+        .0;
     let reuse_row = AcmeRepo::new()
-        .get_authorization(&env.pool, env.tenant_id, existing.id)
+        .get_authorization(&env.pool, env.tenant_id, reused_id)
         .await
-        .expect("read the reuse row")
-        .expect("it survives");
+        .expect("read the reused row")
+        .expect("it exists");
+    let challenge_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM acme_challenges WHERE tenant_id = $1 AND authorization_id = $2",
+    )
+    .bind(env.tenant_id)
+    .bind(reused_id)
+    .fetch_one(&env.pool)
+    .await
+    .expect("count the challenges");
     let order_one_row = AcmeRepo::new()
         .get_order(&env.pool, env.tenant_id, order_id)
         .await
@@ -1616,9 +1643,14 @@ async fn second_order_reuses_authorizations() {
     env.cleanup().await;
 
     assert_eq!(
+        identifier_rows.len(),
+        1,
+        "no second authorization was minted for the identifier"
+    );
+    assert_eq!(
         second_body["authorizations"],
-        json!([authz_url(existing.id)]),
-        "the EXISTING authorization URL is reused"
+        json!([authz_url(reused_id)]),
+        "the SECOND order reuses the row the FIRST settlement promoted"
     );
     assert_eq!(
         second_body["status"], "pending",
@@ -1627,9 +1659,13 @@ async fn second_order_reuses_authorizations() {
     assert_ne!(second_order_id, order_id);
     assert!(
         reuse_row.order_id.is_none(),
-        "a reused row keeps order_id NULL (Task 2's design)"
+        "the promoted row stays account-level (order_id NULL)"
     );
     assert_eq!(reuse_row.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(
+        challenge_count.0, 2,
+        "no challenge rows for the renewal: only order 1's settled pair exists"
+    );
     assert_eq!(
         order_one_row.status,
         AcmeOrderStatus::Valid,
