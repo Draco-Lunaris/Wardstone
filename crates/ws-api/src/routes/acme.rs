@@ -2027,9 +2027,16 @@ fn dns_identifiers(identifiers: &Value) -> Result<Vec<String>, AcmeProblem> {
     Ok(values)
 }
 
-/// The light dns-value validator (see [`dns_identifiers`]): no full
-/// hostname spec, just the shape lines that keep a value speakable as a
-/// challenge target and a reuse key.
+/// The dns-value validator (see [`dns_identifiers`]): no full hostname
+/// spec, but the EXACT charset a DNS name can carry — letters, digits,
+/// hyphens, dots, plus the `*.` wildcard prefix the RFC 8555 wildcard
+/// form needs. The charset is a trust boundary, not cosmetics: the
+/// HTTP-01 verification builds its fetch URL from the identifier
+/// (`http://<identifier>/.well-known/...`), and a character outside the
+/// hostname set — userinfo `@`, a port `:`, query `?`/`#`, percent
+/// escapes — would let an order shape the AUTHORITY of the server's
+/// outbound fetch (fix round 1, F2). Everything outside the charset is
+/// refused `malformed` at new-order.
 fn validate_dns_value(value: &str) -> Result<(), AcmeProblem> {
     let refused = |why: &str| {
         AcmeProblem::malformed(format!(
@@ -2053,8 +2060,13 @@ fn validate_dns_value(value: &str) -> Result<(), AcmeProblem> {
         // A plain name: nothing is stripped.
         None => value,
     };
-    if value.contains(char::is_whitespace) || domain.contains('/') {
-        return Err(refused("it carries whitespace or a slash"));
+    if !domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(refused(
+            "it carries characters outside the DNS-name charset (letters, digits, hyphens, dots)",
+        ));
     }
     Ok(())
 }

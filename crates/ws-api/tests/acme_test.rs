@@ -2101,6 +2101,47 @@ async fn new_order_rejects_foreign_identifier_types_and_bad_dns_values() {
     .await;
     let repeated_status = repeated.status();
 
+    // Fix round 1 (F2): the identifier charset is a trust boundary — the
+    // HTTP-01 fetch URL is built from the identifier, so characters that
+    // could shape the fetch AUTHORITY (userinfo, port, escapes, a bare
+    // wildcard) are refused `malformed` at new-order.
+    let userinfo = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "internal@evil.test"}]}),
+    )
+    .await;
+    let userinfo_status = userinfo.status();
+    let userinfo_body = body_json(userinfo).await;
+    let port_shaped = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "evil.test:8080"}]}),
+    )
+    .await;
+    let port_status = port_shaped.status();
+    let escaped = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "evil%2Etest"}]}),
+    )
+    .await;
+    let escape_status = escaped.status();
+    let bare_wildcard = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "*evil.test"}]}),
+    )
+    .await;
+    let bare_wildcard_status = bare_wildcard.status();
+    let underscore = post_new_order(
+        &fx,
+        rsa2048(),
+        json!({"identifiers": [{"type": "dns", "value": "evil_test.wardstone.test"}]}),
+    )
+    .await;
+    let underscore_status = underscore.status();
+
     let orders_after = order_count(&fx).await;
     let authzs_after = authz_count(&fx).await;
     fx.cleanup().await;
@@ -2122,6 +2163,15 @@ async fn new_order_rejects_foreign_identifier_types_and_bad_dns_values() {
     assert_eq!(dot_status, StatusCode::BAD_REQUEST);
     assert_eq!(none_status, StatusCode::BAD_REQUEST);
     assert_eq!(repeated_status, StatusCode::BAD_REQUEST);
+    assert_eq!(userinfo_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        userinfo_body["type"],
+        "urn:ietf:params:acme:error:malformed"
+    );
+    assert_eq!(port_status, StatusCode::BAD_REQUEST);
+    assert_eq!(escape_status, StatusCode::BAD_REQUEST);
+    assert_eq!(bare_wildcard_status, StatusCode::BAD_REQUEST);
+    assert_eq!(underscore_status, StatusCode::BAD_REQUEST);
     assert_eq!(orders_after, 0, "every refusal created nothing");
     assert_eq!(authzs_after, 0, "every refusal created nothing");
 }
