@@ -2933,7 +2933,7 @@ fn http01_urls(stub: &ChallengeStub, token: &str) -> (String, String) {
     )
 }
 
-/// Review Focus 2, HTTP-01 happy path: the server fetches the canonical
+/// Review Focus 1 (HTTP-01 happy path): the server fetches the canonical
 /// `/.well-known/acme-challenge/<token>` from ITS OWN connection, the
 /// response body EXACTLY equals the computed key authorization, and the
 /// settled state cascades (challenge valid → authz valid with the 30-day
@@ -3832,4 +3832,115 @@ async fn new_order_does_not_reuse_another_accounts_authorization() {
         "account B's row is untouched"
     );
     assert!(foreign_after.order_id.is_none());
+}
+
+/// Fix round 1 (F1): RFC 8555 §7.1.6 has NO valid→invalid authorization
+/// edge. Once http-01 settles the authorization valid (order ready), a
+/// trigger on the still-pending dns-01 SIBLING is refused WITHOUT running
+/// the verifier — the authz stays valid, the order stays ready, the
+/// sibling row stays pending — while the settled challenge itself still
+/// answers its standing object. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_trigger_cannot_regress_a_valid_authorization() {
+    let _db = lock_db().await;
+    let stub = spawn_challenge_stub("placeholder");
+    let fetcher = Arc::new(StubFetcher::new(HashMap::new()));
+    let mut fx = fixture_with(FixtureConfig {
+        public_url: Some(PUBLIC_URL),
+        verification: Some(verification_deps(
+            fetcher.clone(),
+            Arc::new(StaticTxtResolver::new(HashMap::new())),
+        )),
+        ..FixtureConfig::default()
+    })
+    .await;
+    let (order_id, authz_id, challenges) =
+        mint_order_with_challenges(&fx, rsa2048(), "host.wardstone.test").await;
+    let http_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Http01)
+        .expect("the http-01 row")
+        .clone();
+    let dns_row = challenges
+        .iter()
+        .find(|c| c.challenge_type == AcmeChallengeType::Dns01)
+        .expect("the dns-01 row")
+        .clone();
+    stub.set_body(ws_acme::key_authorization(
+        &http_row.token,
+        &thumb_of(rsa2048()),
+    ));
+    let (canonical, target) = http01_urls(&stub, &http_row.token);
+    fetcher.set_rewrite(canonical, target);
+
+    // http-01 settles the authz valid.
+    let settle = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let settle_status = settle.status();
+    let settle_body = body_json(settle).await;
+
+    // The sibling trigger: refused, no verifier run (the authz is valid).
+    let sibling = post_chall(&fx, rsa2048(), dns_row.id, json!({})).await;
+    let sibling_status = sibling.status();
+    let sibling_problem = body_json(sibling).await;
+
+    // The settled challenge still answers its standing object.
+    let settled = post_chall(&fx, rsa2048(), http_row.id, json!({})).await;
+    let settled_status = settled.status();
+    let settled_body = body_json(settled).await;
+
+    let authz_row = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, authz_id)
+        .await
+        .expect("read the authz")
+        .expect("it exists");
+    let order_row = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order_id)
+        .await
+        .expect("read the order")
+        .expect("it exists");
+    let sibling_after = AcmeRepo::new()
+        .get_challenge(&fx.pool, fx.tenant_id, dns_row.id)
+        .await
+        .expect("read the sibling challenge")
+        .expect("it exists");
+    fx.cleanup().await;
+
+    assert_eq!(settle_status, StatusCode::OK);
+    assert_eq!(settle_body["status"], "valid");
+    assert_eq!(sibling_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        sibling_problem["type"],
+        "urn:ietf:params:acme:error:unauthorized"
+    );
+    assert!(
+        sibling_problem["detail"]
+            .as_str()
+            .expect("the refusal detail")
+            .contains("already valid"),
+        "the refusal names the standing state, got {:?}",
+        sibling_problem["detail"]
+    );
+    assert_eq!(settled_status, StatusCode::OK);
+    assert_eq!(settled_body["status"], "valid");
+    assert_eq!(
+        authz_row.status,
+        AcmeAuthorizationStatus::Valid,
+        "the authz cannot regress"
+    );
+    assert_eq!(
+        order_row.status,
+        AcmeOrderStatus::Ready,
+        "the ready order cannot regress"
+    );
+    assert_eq!(
+        sibling_after.status,
+        AcmeChallengeStatus::Pending,
+        "the sibling row is untouched"
+    );
+    assert_eq!(
+        fetcher.calls(),
+        1,
+        "only the http-01 settle ever fetched: the sibling trigger ran no verifier"
+    );
 }

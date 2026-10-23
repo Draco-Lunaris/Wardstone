@@ -1512,9 +1512,31 @@ async fn challenge_url(
     let _trigger: ChallengePayload = serde_json::from_value(payload)
         .map_err(|_| AcmeProblem::malformed("the challenge payload is not a JSON object"))?;
 
+    // A VALID challenge answers its standing object: its verification
+    // already ran, and §7.1.6's state machine offers no edge to undo or
+    // repeat it.
+    if challenge.status == AcmeChallengeStatus::Valid {
+        return Ok(challenge_response(
+            StatusCode::OK,
+            &base,
+            &tenant.name,
+            &challenge,
+        ));
+    }
     // The authorization's lifecycle gates the trigger.
     match authorization.status {
-        AcmeAuthorizationStatus::Pending | AcmeAuthorizationStatus::Valid => {}
+        AcmeAuthorizationStatus::Pending => {}
+        AcmeAuthorizationStatus::Valid => {
+            // Fix round 1 (F1): §7.1.6's AUTHORIZATION state machine has
+            // NO valid→invalid edge either. A trigger on any challenge of
+            // a settled authorization — the still-pending dns-01 sibling
+            // of an http-01 that just settled valid — must never run the
+            // verifier again: one failed sibling attempt would otherwise
+            // regress the authorization and invalidate its order.
+            return Err(AcmeProblem::unauthorized(
+                "the authorization is already valid; a challenge may no longer be verified",
+            ));
+        }
         AcmeAuthorizationStatus::Expired => {
             return Err(AcmeProblem::unauthorized("the authorization has expired"));
         }
@@ -1526,20 +1548,6 @@ async fn challenge_url(
                 "the authorization is deactivated",
             ));
         }
-    }
-    // A decided challenge answers its standing object — a valid challenge
-    // never re-validates, an invalid one is terminal with its
-    // authorization (whose gate already refused).
-    if matches!(
-        challenge.status,
-        AcmeChallengeStatus::Valid | AcmeChallengeStatus::Invalid
-    ) {
-        return Ok(challenge_response(
-            StatusCode::OK,
-            &base,
-            &tenant.name,
-            &challenge,
-        ));
     }
     // Settlement D5's pacing: the next attempt on this authorization is
     // one window after the last; a refusal inside the window touches
