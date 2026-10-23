@@ -518,6 +518,74 @@ impl AcmeRepo {
         row.map(AcmeAuthorizationRow::try_into_model).transpose()
     }
 
+    /// Fetch an authorization by id (the authz-URL routes' ownership
+    /// check: the account URL carrying the kid must match `account_id`);
+    /// `None` when absent or not this tenant's. THE TENANT IS
+    /// LOAD-BEARING.
+    pub async fn get_authorization(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<AcmeAuthorizationModel>, CoreError> {
+        let row: Option<AcmeAuthorizationRow> = sqlx::query_as(&format!(
+            "{AUTHORIZATION_COLUMNS} WHERE tenant_id = $1 AND id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+        row.map(AcmeAuthorizationRow::try_into_model).transpose()
+    }
+
+    /// The ORDER-SCOPED authorizations of one order, oldest first
+    /// (`created_at`, `id` preserves the mint order deterministically) —
+    /// the half of an order's `authorizations` array the order itself
+    /// demanded. REUSED rows (`order_id IS NULL`) are NOT listed here:
+    /// the routes find those per identifier through
+    /// [`Self::valid_authorization_for`], since Task 2's design keeps a
+    /// reused row's `order_id` NULL — no order owns the row it reused.
+    pub async fn list_authorizations_by_order(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        order_id: Uuid,
+    ) -> Result<Vec<AcmeAuthorizationModel>, CoreError> {
+        let rows: Vec<AcmeAuthorizationRow> = sqlx::query_as(&format!(
+            "{AUTHORIZATION_COLUMNS} WHERE tenant_id = $1 AND order_id = $2 \
+             ORDER BY created_at, id"
+        ))
+        .bind(tenant_id)
+        .bind(order_id)
+        .fetch_all(executor)
+        .await?;
+        rows.into_iter()
+            .map(AcmeAuthorizationRow::try_into_model)
+            .collect()
+    }
+
+    /// Both of an authorization's challenge flavors, mint order preserved
+    /// (`created_at`, `id`) — the authorization object's `challenges`
+    /// array. THE TENANT IS LOAD-BEARING.
+    pub async fn list_challenges_by_authorization(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        authorization_id: Uuid,
+    ) -> Result<Vec<AcmeChallengeModel>, CoreError> {
+        let rows: Vec<AcmeChallengeRow> = sqlx::query_as(&format!(
+            "{CHALLENGE_COLUMNS} WHERE tenant_id = $1 AND authorization_id = $2 \
+             ORDER BY created_at, id"
+        ))
+        .bind(tenant_id)
+        .bind(authorization_id)
+        .fetch_all(executor)
+        .await?;
+        rows.into_iter()
+            .map(AcmeChallengeRow::try_into_model)
+            .collect()
+    }
+
     /// Insert an authorization row exactly as given (every field,
     /// `created_at` included) — both shapes: an order-scoped row carries
     /// `order_id`, an account-level REUSED row carries `order_id: None`

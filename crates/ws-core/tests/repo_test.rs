@@ -3140,3 +3140,239 @@ async fn acme_repo_account_order_authorization_challenge_roundtrip() {
         Some("DNS lookup failed".to_string())
     );
 }
+
+/// The order machine's listing shapes: `get_authorization` (the authz
+/// route's ownership lookup — THE TENANT IS LOAD-BEARING, so a foreign
+/// tenant's id finds nothing), `list_authorizations_by_order` (the
+/// order-scoped half of an order's `authorizations` array, mint order
+/// preserved by created_at/id), and `list_challenges_by_authorization`
+/// (an authz object's challenge pair, same ordering). Cleans up before
+/// asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_repo_authorization_listings_serve_the_order_machine() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    let tenant = TenantRepo::new()
+        .insert(&pool, ACME_TENANT)
+        .await
+        .expect("insert test tenant for ACME listing rows");
+
+    let acme = AcmeRepo::new();
+    let account = AcmeAccountModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        jwk_thumbprint: "acme-listings-thumbprint".to_string(),
+        jwk: serde_json::json!({ "kty": "EC", "crv": "P-256", "x": "a", "y": "b" }),
+        status: AcmeAccountStatus::Valid,
+        tos_agreed_at: Some(ts("2026-06-15T12:30:00Z")),
+        contact: None,
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    acme.insert_account(&pool, &account)
+        .await
+        .expect("insert account row");
+    let order = AcmeOrderModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        account_id: account.id,
+        status: AcmeOrderStatus::Pending,
+        profile_name: "web-server".to_string(),
+        identifiers: serde_json::json!([
+            { "type": "dns", "value": "a.example.test" },
+            { "type": "dns", "value": "b.example.test" }
+        ]),
+        csr_pem: None,
+        not_before: None,
+        not_after: None,
+        certificate_id: None,
+        error: None,
+        expires_at: ts("2026-09-15T00:00:00Z"),
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    acme.insert_order(&pool, &order)
+        .await
+        .expect("insert order row");
+
+    let make_authz =
+        |id: uuid::Uuid, identifier: &str, created_at: DateTime<Utc>| AcmeAuthorizationModel {
+            id,
+            tenant_id: tenant.id,
+            account_id: account.id,
+            identifier: identifier.to_string(),
+            status: AcmeAuthorizationStatus::Pending,
+            expires_at: ts("2026-09-15T00:00:00Z"),
+            reused_from: None,
+            order_id: Some(order.id),
+            created_at,
+        };
+    let authz_a = make_authz(
+        uuid::Uuid::new_v4(),
+        "a.example.test",
+        ts("2026-06-15T12:00:00Z"),
+    );
+    let authz_b = make_authz(
+        uuid::Uuid::new_v4(),
+        "b.example.test",
+        ts("2026-06-15T12:10:00Z"),
+    );
+    for authz in [&authz_a, &authz_b] {
+        acme.insert_authorization(&pool, authz)
+            .await
+            .expect("insert authorization row");
+    }
+
+    let make_challenge = |id: uuid::Uuid,
+                          authorization_id: uuid::Uuid,
+                          challenge_type: AcmeChallengeType,
+                          token: &str,
+                          created_at: DateTime<Utc>| AcmeChallengeModel {
+        id,
+        tenant_id: tenant.id,
+        authorization_id,
+        challenge_type,
+        token: token.to_string(),
+        status: AcmeChallengeStatus::Pending,
+        validated_at: None,
+        error: None,
+        created_at,
+    };
+    let challenge_a_http = make_challenge(
+        uuid::Uuid::new_v4(),
+        authz_a.id,
+        AcmeChallengeType::Http01,
+        "token-a-http",
+        ts("2026-06-15T12:00:01Z"),
+    );
+    let challenge_a_dns = make_challenge(
+        uuid::Uuid::new_v4(),
+        authz_a.id,
+        AcmeChallengeType::Dns01,
+        "token-a-dns",
+        ts("2026-06-15T12:00:02Z"),
+    );
+    let challenge_b_http = make_challenge(
+        uuid::Uuid::new_v4(),
+        authz_b.id,
+        AcmeChallengeType::Http01,
+        "token-b-http",
+        ts("2026-06-15T12:10:01Z"),
+    );
+    for challenge in [&challenge_a_http, &challenge_a_dns, &challenge_b_http] {
+        acme.insert_challenge(&pool, challenge)
+            .await
+            .expect("insert challenge row");
+    }
+
+    let fetched = acme.get_authorization(&pool, tenant.id, authz_a.id).await;
+    let foreign_tenant = acme
+        .get_authorization(&pool, uuid::Uuid::new_v4(), authz_a.id)
+        .await;
+    let listed = acme
+        .list_authorizations_by_order(&pool, tenant.id, order.id)
+        .await;
+    let strange_order = acme
+        .list_authorizations_by_order(&pool, tenant.id, uuid::Uuid::new_v4())
+        .await;
+    let challenges_a = acme
+        .list_challenges_by_authorization(&pool, tenant.id, authz_a.id)
+        .await;
+    let foreign_authz_challenges = acme
+        .list_challenges_by_authorization(&pool, tenant.id, uuid::Uuid::new_v4())
+        .await;
+
+    // Cleanup BEFORE asserting.
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let fetched = fetched
+        .expect("get_authorization")
+        .expect("row present after insert");
+    assert_eq!(fetched, authz_a);
+    let foreign_tenant = foreign_tenant.expect("cross-tenant get_authorization");
+    assert!(
+        foreign_tenant.is_none(),
+        "an authorization is invisible under a foreign tenant's id"
+    );
+    let listed = listed.expect("list_authorizations_by_order");
+    assert_eq!(
+        listed.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![authz_a.id, authz_b.id],
+        "the order-scoped rows, mint order preserved"
+    );
+    let strange_order = strange_order.expect("list against a foreign order id");
+    assert!(strange_order.is_empty(), "no rows for an unknown order");
+    let challenges_a = challenges_a.expect("list_challenges_by_authorization");
+    assert_eq!(
+        challenges_a.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![challenge_a_http.id, challenge_a_dns.id],
+        "the authz's challenge pair, mint order preserved"
+    );
+    let foreign_authz_challenges =
+        foreign_authz_challenges.expect("list challenges for a foreign authz");
+    assert!(foreign_authz_challenges.is_empty(), "no rows, none found");
+}
+
+/// `get_by_name` resolves a profile within ITS tenant only: a DIFFERENT
+/// tenant's profile with the same name never surfaces through a foreign
+/// tenant id (the lookup is tenant-scoped), and a name the tenant holds
+/// no profile for is `None` — the by-name resolution the ACME order
+/// surface runs. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_get_by_name_resolves_within_the_tenant() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
+
+    sweep_auth_rows(&pool, AUTH_TENANT).await;
+    sweep_auth_rows(&pool, AUTH_TENANT_B).await;
+    let tenants = TenantRepo::new();
+    let tenant = tenants
+        .insert(&pool, AUTH_TENANT)
+        .await
+        .expect("insert test tenant");
+    let sibling = tenants
+        .insert(&pool, AUTH_TENANT_B)
+        .await
+        .expect("insert sibling test tenant");
+
+    let repo = ProfileRepo::new();
+    let profile = profile_model(tenant.id);
+    repo.insert_profile(&pool, &profile)
+        .await
+        .expect("insert profile");
+    let mut sibling_profile = profile_model(sibling.id);
+    sibling_profile.name = "web-server".to_string();
+    repo.insert_profile(&pool, &sibling_profile)
+        .await
+        .expect("insert sibling profile");
+
+    let found = repo.get_by_name(&pool, tenant.id, "web-server").await;
+    let sibling_found = repo.get_by_name(&pool, sibling.id, "web-server").await;
+    let missing = repo.get_by_name(&pool, tenant.id, "web-client").await;
+
+    // Cleanup BEFORE asserting.
+    delete_auth_rows(&pool, tenant.id).await;
+    delete_auth_rows(&pool, sibling.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY_AUTH).await;
+
+    let found = found.expect("get_by_name").expect("row present");
+    assert_eq!(found.id, profile.id, "the requested tenant's row wins");
+    let sibling_found = sibling_found
+        .expect("sibling get_by_name")
+        .expect("the sibling tenant holds its own row");
+    assert_eq!(
+        sibling_found.id, sibling_profile.id,
+        "the sibling tenant resolves ITS profile, never the other tenant's"
+    );
+    let missing = missing.expect("missing get_by_name");
+    assert!(missing.is_none(), "no profile under that name");
+}

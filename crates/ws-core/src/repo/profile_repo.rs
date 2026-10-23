@@ -170,6 +170,29 @@ impl ProfileRepo {
         Ok(row.map(Into::into))
     }
 
+    /// Fetch a profile by NAME within one tenant — the ACME order surface
+    /// resolves the order's `profile` extension member against the tenant's
+    /// profile catalog by name (the profile's `id` is what issuance wants,
+    /// but the wire carries the human name). `(tenant_id, name)` is UNIQUE
+    /// (migration 008), so at most one row can answer; `None` when absent.
+    /// THE TENANT IS LOAD-BEARING: the same name in another tenant never
+    /// surfaces here.
+    pub async fn get_by_name(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        name: &str,
+    ) -> Result<Option<ProfileModel>, CoreError> {
+        let row: Option<ProfileRow> = sqlx::query_as(&format!(
+            "{PROFILE_COLUMNS} WHERE tenant_id = $1 AND name = $2"
+        ))
+        .bind(tenant_id)
+        .bind(name)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
     /// Fetch a profile revision by id; `None` when absent. Old revisions
     /// stay retrievable for as long as certificates reference them.
     pub async fn get_revision(
