@@ -680,3 +680,48 @@ fn test_setup_envelope_will_not_load_as_a_ca_key() {
         "a setup envelope in a CA slot must fail decryption"
     );
 }
+
+/// An ECDSA P-256 root: generated natively in rcgen (the leaf-key path's
+/// algorithm), self-signed with ecdsa-with-SHA256 (OID 1.2.840.10045.4.3.2,
+/// parameters absent per RFC 5758), self-signature verifying through
+/// x509-parser's ring backend, and the root's structural properties
+/// identical to the Ed25519/RSA roots.
+#[test]
+fn test_create_root_ecdsa_p256() {
+    let mut ks = temp_keystore("root-ecdsa-p256");
+    let spec = CaSpec {
+        name: "root".to_owned(),
+        subject: "Wardstone Test Root ECDSA".to_owned(),
+        key_type: KeyType::EcdsaP256,
+        lifetime: CaLifetime::Root,
+    };
+    let created = create_root(&spec, &mut ks).unwrap();
+
+    assert!(created.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    let (_, pem) = parse_x509_pem(created.cert_pem.as_bytes()).unwrap();
+    let cert = pem.parse_x509().unwrap();
+
+    assert_eq!(
+        cert.signature_algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.4.3.2",
+        "an ECDSA P-256 root signs itself with ecdsa-with-SHA256"
+    );
+    cert.verify_signature(None)
+        .expect("the ECDSA root self-signature must verify");
+
+    let bc = cert.basic_constraints().unwrap().unwrap();
+    assert!(bc.critical, "root BasicConstraints must be critical");
+    assert!(bc.value.ca);
+    assert_eq!(bc.value.path_len_constraint, None);
+
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|c| c.as_str().ok())
+        .unwrap();
+    assert_eq!(cn, "Wardstone Test Root ECDSA");
+
+    assert!(!ski_critical(&cert), "root SKI must be non-critical");
+    assert_random_serial(&cert);
+}

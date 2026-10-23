@@ -51,7 +51,7 @@ use rand::{rngs::SysRng, TryRng};
 use rcgen::{
     date_time_ymd, BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SerialNumber, SignatureAlgorithm,
-    SigningKey, PKCS_ED25519,
+    SigningKey, PKCS_ECDSA_P256_SHA256, PKCS_ED25519,
 };
 use rsa::pkcs8::EncodePrivateKey;
 use rsa::rand_core::{self, CryptoRng, RngCore};
@@ -413,9 +413,7 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
         KeyType::Ed25519 => Ok(KeyPair::generate_for(&PKCS_ED25519)?),
         KeyType::Rsa2048 => Ok(generate_rsa(2048)?.0),
         KeyType::Rsa3072 => Ok(generate_rsa(3072)?.0),
-        KeyType::EcdsaP256 => Err(CaError::UnsupportedKeyType(
-            "ECDSA P-256 CA keys are not generated yet".to_owned(),
-        )),
+        KeyType::EcdsaP256 => Ok(KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?),
     }
 }
 
