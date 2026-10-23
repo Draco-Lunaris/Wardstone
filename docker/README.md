@@ -215,8 +215,14 @@ security boundary — the server-computed challenge verification is.
 ## The image and the keys volume
 
 `compose.yml` does not build anything: the image named by
-`${WARDSTONE_IMAGE:-wardstone:latest}` is supplied by the release flow — the
-Dockerfile itself is out of this bundle's scope. The bundle's contract with
+`${WARDSTONE_IMAGE:-wardstone:latest}` is supplied by the release flow. The
+release flow IS in this repo now: `docker/Dockerfile` carries the image
+definition, and CI (`.github/workflows/docker-image.yml`) builds and pushes
+`ghcr.io/draco-lunaris/wardstone` on every push to `main` (`latest` + a
+sha tag). A deploy therefore needs only `docker compose pull && up` with
+`WARDSTONE_IMAGE=ghcr.io/draco-lunaris/wardstone:latest` in `.env` — the
+pull requires `docker login ghcr.io` (or package visibility set to
+public). The bundle's contract with
 that image is:
 
 1. The image declares **no ENTRYPOINT**; the `wardstone` binary is installed

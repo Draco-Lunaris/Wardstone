@@ -1,0 +1,9 @@
+# Build-context hygiene for docker/Dockerfile. IMPORTANT: ui/dist stays IN —
+# the ws-web binary embeds it at compile time (include_dir; a stale or absent
+# dist breaks the build or ships a stale UI).
+/target
+ui/node_modules
+.git
+.github
+.superpowers
+docs
