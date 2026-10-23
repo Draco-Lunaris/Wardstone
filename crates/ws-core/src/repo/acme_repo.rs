@@ -62,6 +62,38 @@ impl AcmeAccountRow {
     }
 }
 
+/// An `acme_accounts` row joined with the count of the orders its account
+/// placed (Plan 4 Task 10: the operator-visibility listing). The count is
+/// EVERY order row the account owns, regardless of the order's status —
+/// the operator asks "does this account have orders", not "how many are
+/// alive" — and a `LEFT JOIN` keeps an orderless account in the listing at
+/// zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcmeAccountWithOrders {
+    /// The account row itself.
+    pub account: AcmeAccountModel,
+    /// How many `acme_orders` rows reference the account (any status).
+    pub orders_count: i64,
+}
+
+/// Inline row shape for the accounts-with-order-counts join (see
+/// [`AcmeRepo::list_accounts_with_order_counts`]): the account columns
+/// verbatim plus the aggregate the `LEFT JOIN`'s `COUNT` computes. The
+/// account fields replay through [`AcmeAccountRow`] so the two listings
+/// decode the row exactly identically.
+#[derive(sqlx::FromRow)]
+struct AcmeAccountCountRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    jwk_thumbprint: String,
+    jwk: JsonValue,
+    status: String,
+    tos_agreed_at: Option<DateTime<Utc>>,
+    contact: Option<String>,
+    created_at: DateTime<Utc>,
+    orders_count: i64,
+}
+
 /// Inline row shape for an `acme_orders` row.
 #[derive(sqlx::FromRow)]
 struct AcmeOrderRow {
@@ -482,6 +514,80 @@ impl AcmeRepo {
         .fetch_all(executor)
         .await?;
         rows.into_iter().map(AcmeOrderRow::try_into_model).collect()
+    }
+
+    /// The operator-visibility listing (Plan 4 Task 10): one page of the
+    /// tenant's ACME accounts, newest first (`created_at DESC`, ties by
+    /// `id`), each joined with the count of the orders its account placed
+    /// ([`AcmeAccountWithOrders`]). LIMIT/OFFSET through the shared
+    /// [`crate::repo::paging`] helper (clamped page size). THE TENANT IS
+    /// LOAD-BEARING: the join's tenant predicate rides the `ON` clause so
+    /// the COUNT can never pick up another tenant's order rows, and the
+    /// top-level `WHERE` pins the listed accounts to the tenant alone.
+    pub async fn list_accounts_with_order_counts(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<AcmeAccountWithOrders>, CoreError> {
+        let (limit, offset) = crate::repo::paging(page, page_size)?;
+        let rows: Vec<AcmeAccountCountRow> = sqlx::query_as(
+            "SELECT a.id, a.tenant_id, a.jwk_thumbprint, a.jwk, a.status, \
+             a.tos_agreed_at, a.contact, a.created_at, COUNT(o.id) AS orders_count \
+             FROM acme_accounts a \
+             LEFT JOIN acme_orders o ON o.account_id = a.id AND o.tenant_id = a.tenant_id \
+             WHERE a.tenant_id = $1 \
+             GROUP BY a.id, a.tenant_id, a.jwk_thumbprint, a.jwk, a.status, \
+                      a.tos_agreed_at, a.contact, a.created_at \
+             ORDER BY a.created_at DESC, a.id LIMIT $2 OFFSET $3",
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AcmeAccountWithOrders {
+                    account: AcmeAccountRow {
+                        id: row.id,
+                        tenant_id: row.tenant_id,
+                        jwk_thumbprint: row.jwk_thumbprint,
+                        jwk: row.jwk,
+                        status: row.status,
+                        tos_agreed_at: row.tos_agreed_at,
+                        contact: row.contact,
+                        created_at: row.created_at,
+                    }
+                    .try_into_model()?,
+                    orders_count: row.orders_count,
+                })
+            })
+            .collect()
+    }
+
+    /// The order an issued certificate came from (Plan 4 Task 10: the
+    /// certificate-detail page's link back to its ACME order —
+    /// `finalize` stamps `certificate_id`, so the lookup is
+    /// certificate-keyed); `None` when the tenant holds no order on that
+    /// certificate (a manually-issued or foreign certificate — the
+    /// certificate id itself is NEVER cross-tenant here). THE TENANT IS
+    /// LOAD-BEARING.
+    pub async fn get_order_by_certificate(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        certificate_id: Uuid,
+    ) -> Result<Option<AcmeOrderModel>, CoreError> {
+        let row: Option<AcmeOrderRow> = sqlx::query_as(&format!(
+            "{ORDER_COLUMNS} WHERE tenant_id = $1 AND certificate_id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(certificate_id)
+        .fetch_optional(executor)
+        .await?;
+        row.map(AcmeOrderRow::try_into_model).transpose()
     }
 
     /// The REUSE-WINDOW lookup: the newest `valid` ACCOUNT-LEVEL

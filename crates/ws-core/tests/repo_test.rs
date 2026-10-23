@@ -3506,3 +3506,137 @@ async fn profile_get_by_name_resolves_within_the_tenant() {
     let missing = missing.expect("missing get_by_name");
     assert!(missing.is_none(), "no profile under that name");
 }
+
+/// The Plan-4 Task-10 operator-visibility listings: [`AcmeRepo::
+/// list_accounts_with_order_counts`] pages the tenant's accounts newest
+/// first, each with the COUNT of its orders (any status; an orderless
+/// account lists at zero — the `LEFT JOIN`, not a bare inner join), and
+/// [`AcmeRepo::get_order_by_certificate`] finds the one order an issued
+/// certificate came from (`None` on a miss — the tenant filter never
+/// invents a row). Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn acme_repo_ui_listings_accounts_with_counts_and_order_by_certificate() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+
+    let tenant = TenantRepo::new()
+        .insert(&pool, ACME_TENANT)
+        .await
+        .expect("insert test tenant for ACME rows");
+    let ca = acme_ca_model(tenant.id);
+    CaRepo::new()
+        .insert(&pool, &ca)
+        .await
+        .expect("insert test CA row");
+    let cert = acme_cert_model(tenant.id, ca.id);
+    CertificateRepo::new()
+        .insert(&pool, &cert)
+        .await
+        .expect("insert test certificate row");
+
+    let acme = AcmeRepo::new();
+    // Two accounts: the OLDER one carries two orders (one certificate-
+    // backed); the NEWER one carries none — the listing sorts newest first
+    // and must still show the orderless account at count zero.
+    let busy = AcmeAccountModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        jwk_thumbprint: "acme-repo-ui-busy".to_string(),
+        jwk: serde_json::json!({"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}),
+        status: AcmeAccountStatus::Valid,
+        tos_agreed_at: None,
+        contact: None,
+        created_at: ts("2026-06-15T12:30:00Z"),
+    };
+    let idle = AcmeAccountModel {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant.id,
+        jwk_thumbprint: "acme-repo-ui-idle".to_string(),
+        jwk: serde_json::json!({"kty": "EC", "crv": "P-256", "x": "c", "y": "d"}),
+        status: AcmeAccountStatus::Valid,
+        tos_agreed_at: None,
+        contact: None,
+        created_at: ts("2026-06-16T12:30:00Z"),
+    };
+    acme.insert_account(&pool, &busy)
+        .await
+        .expect("insert the busy account");
+    acme.insert_account(&pool, &idle)
+        .await
+        .expect("insert the idle account");
+
+    let make_order =
+        |certificate_id: Option<uuid::Uuid>, created_at: DateTime<Utc>| AcmeOrderModel {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: tenant.id,
+            account_id: busy.id,
+            status: AcmeOrderStatus::Pending,
+            profile_name: "web-server".to_string(),
+            identifiers: serde_json::json!([{ "type": "dns", "value": "example.com" }]),
+            csr_pem: None,
+            not_before: None,
+            not_after: None,
+            certificate_id,
+            error: None,
+            expires_at: ts("2026-09-15T00:00:00Z"),
+            created_at,
+        };
+    let certificates_order = make_order(Some(cert.id), ts("2026-06-15T13:00:00Z"));
+    let plain_order = make_order(None, ts("2026-06-15T14:00:00Z"));
+    acme.insert_order(&pool, &certificates_order)
+        .await
+        .expect("insert the certificate-backed order");
+    acme.insert_order(&pool, &plain_order)
+        .await
+        .expect("insert the plain order");
+
+    let listed = acme
+        .list_accounts_with_order_counts(&pool, tenant.id, 0, 10)
+        .await;
+    let listed_page = acme
+        .list_accounts_with_order_counts(&pool, tenant.id, 0, 1)
+        .await;
+    let foreign_tenant_list = acme
+        .list_accounts_with_order_counts(&pool, uuid::Uuid::new_v4(), 0, 10)
+        .await;
+    let by_certificate = acme
+        .get_order_by_certificate(&pool, tenant.id, cert.id)
+        .await;
+    let certificate_miss = acme
+        .get_order_by_certificate(&pool, tenant.id, uuid::Uuid::new_v4())
+        .await;
+
+    // Cleanup BEFORE asserting.
+    sweep_acme_rows(&pool, ACME_TENANT).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    let listed = listed.expect("list accounts with order counts");
+    assert_eq!(listed.len(), 2, "both accounts of the tenant list");
+    assert_eq!(listed[0].account.id, idle.id, "newest created_at first");
+    assert_eq!(listed[0].orders_count, 0, "an orderless account at zero");
+    assert_eq!(listed[1].account.id, busy.id);
+    assert_eq!(listed[1].orders_count, 2, "every status of order counts");
+    let listed_page = listed_page.expect("page the listing");
+    assert_eq!(listed_page.len(), 1, "LIMIT/OFFSET paging applies");
+    let foreign_tenant_list = foreign_tenant_list.expect("list under a foreign tenant");
+    assert!(
+        foreign_tenant_list.is_empty(),
+        "never another tenant's rows"
+    );
+
+    let by_certificate = by_certificate
+        .expect("get_order_by_certificate")
+        .expect("the certificate-backed order is found");
+    assert_eq!(by_certificate.id, certificates_order.id);
+    let certificate_miss = certificate_miss.expect("get_order_by_certificate miss");
+    assert!(
+        certificate_miss.is_none(),
+        "a certificate with no order is None, never a fabricated row"
+    );
+}

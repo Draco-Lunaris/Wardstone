@@ -57,6 +57,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/tenants", tenants::router())
         .nest("/root-trust", root_trust::router())
         .nest("/oidc", oidc::router())
+        // The ACME rows' operator-visibility window (Plan 4 Task 10):
+        // ordinary capability-gated REST over the SAME account/order rows
+        // the JWS machine surface above serves — no JWS, no nonces.
+        .nest("/acme", acme::rest_router())
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(health::metrics));
 

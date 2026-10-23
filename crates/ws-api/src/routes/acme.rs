@@ -68,7 +68,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -78,7 +78,7 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower_governor::governor::GovernorConfigBuilder;
@@ -95,17 +95,19 @@ use ws_core::models::acme::{
 use ws_core::models::certificate::{CertStatus, CertificateModel, RevocationReason};
 use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Capability};
 use ws_core::models::tenant::Tenant;
-use ws_core::repo::acme_repo::AcmeRepo;
+use ws_core::repo::acme_repo::{AcmeAccountWithOrders, AcmeRepo};
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::profile_repo::ProfileRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
 
+use crate::auth_middleware::AuthActor;
 use crate::error::ApiError;
 use crate::routes::audit_entry;
 use crate::routes::auth::primary_tenant;
 use crate::routes::certificates::{issue_certificate_core, IssueCertificateBody};
+use crate::routes::ListQuery;
 use crate::state::AppState;
 
 /// The problem URN for the ToS gate — in the ACME error registry, though
@@ -3254,4 +3256,317 @@ fn peek_header(raw: &str) -> Result<PeekedHeader, AcmeProblem> {
         .map_err(|_| AcmeProblem::malformed("the protected header is not unpadded base64url"))?;
     serde_json::from_slice(&bytes)
         .map_err(|_| AcmeProblem::malformed("the protected header is not a valid JSON header"))
+}
+
+// ===========================================================================
+// The UI-facing REST projection (Plan 4 Task 10)
+// ===========================================================================
+//
+// The operator's ordinary-REST window over the SAME rows the JWS machine
+// surface above serves. This projection lives under `/api/v1/acme`
+// (nested by `routes::router`) and reads through exactly the machinery
+// Tasks 5-8 already built: the account rows, `list_orders_by_account`,
+// `list_accounts_with_order_counts`, `get_order_by_certificate`, and
+// `deactivation_cascade`. It is deliberately NOT protocol surface: no
+// JWS, no nonces, no problem documents — every handler authenticates
+// with the ordinary session/token bearer ([`AuthActor`]) and gates on a
+// CAPABILITY (`read_acme` for reads, `manage_acme_accounts` for the
+// deactivation, mirroring migration 012's seed). Errors are the house
+// [`ApiError`] envelope; another tenant's account is a 404, exactly as
+// indistinguishable as every other tenant-scoped route.
+//
+// The audit split, pinned by the plan: a deactivation through THIS
+// surface records the CALLING USER as the audit actor (a human acted,
+// through a capability the role granted) — the `AcmeAccount` actor shape
+// above stays for the JWS-machine path, where the account key itself is
+// the acting identity. The action name and target tuple
+// (`acme_account_deactivated` on the `acme_account` row) are identical on
+// both surfaces; the details carry `"surface": "rest"` so the log can
+// tell the two entry points apart.
+
+/// The REST projection's recent-orders window on an account detail: the
+/// account detail serves the first page of `list_orders_by_account` at
+/// this size (the full history pages through `GET /orders?account_id=`).
+const REST_DETAIL_ORDERS_PAGE_SIZE: u32 = 20;
+
+/// The REST projection's route tree, nested at `/api/v1/acme` by
+/// [`crate::routes::router`]. Every handler resolves the actor's OWN
+/// tenant (`auth.tenant_id`) — a browser session cannot name another
+/// tenant the way the path-tenanted JWS surface can.
+pub fn rest_router() -> Router<AppState> {
+    Router::new()
+        .route("/accounts", get(rest_list_accounts))
+        .route("/accounts/{id}", get(rest_get_account))
+        .route("/accounts/{id}/deactivate", post(rest_deactivate_account))
+        .route("/orders", get(rest_list_orders))
+}
+
+/// One ACME account as the operator list answers it: the display-relevant
+/// fields (the thumbprint IS the account's human-facing identity — it is
+/// the kid URL's final segment — hence it rides alongside `contact`),
+/// plus `orders_count` from [`AcmeAccountWithOrders`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AcmeAccountResponse {
+    pub id: Uuid,
+    pub jwk_thumbprint: String,
+    pub status: String,
+    pub tos_agreed_at: Option<DateTime<Utc>>,
+    pub contact: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub orders_count: i64,
+}
+
+impl From<AcmeAccountWithOrders> for AcmeAccountResponse {
+    fn from(row: AcmeAccountWithOrders) -> Self {
+        let account = row.account;
+        AcmeAccountResponse {
+            id: account.id,
+            jwk_thumbprint: account.jwk_thumbprint,
+            status: account.status.as_str().to_string(),
+            tos_agreed_at: account.tos_agreed_at,
+            contact: account.contact,
+            created_at: account.created_at,
+            orders_count: row.orders_count,
+        }
+    }
+}
+
+/// One ACME order as the operator view answers it: lifecycle fields plus
+/// the raw RFC 8555 `identifiers` array (stored verbatim, passed through
+/// verbatim — the UI renders `type`/`value` pairs), the profile NAME (the
+/// display label, matching the manual-path DTOs), and the issued
+/// certificate pointer the UI links back through.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AcmeOrderResponse {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub status: String,
+    pub profile_name: String,
+    pub identifiers: Value,
+    pub certificate_id: Option<Uuid>,
+    pub error: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&AcmeOrderModel> for AcmeOrderResponse {
+    fn from(order: &AcmeOrderModel) -> Self {
+        AcmeOrderResponse {
+            id: order.id,
+            account_id: order.account_id,
+            status: order.status.as_str().to_string(),
+            profile_name: order.profile_name.clone(),
+            identifiers: order.identifiers.clone(),
+            certificate_id: order.certificate_id,
+            error: order.error.clone(),
+            expires_at: order.expires_at,
+            created_at: order.created_at,
+        }
+    }
+}
+
+/// The account detail: the list's fields plus the RECENT orders window
+/// ([`REST_DETAIL_ORDERS_PAGE_SIZE`]).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AcmeAccountDetailResponse {
+    pub id: Uuid,
+    pub jwk_thumbprint: String,
+    pub status: String,
+    pub tos_agreed_at: Option<DateTime<Utc>>,
+    pub contact: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub orders: Vec<AcmeOrderResponse>,
+}
+
+/// The deactivation response: the account's new state and the two cascade
+/// counts — how many pending authorizations were invalidated and how many
+/// open orders were stamped invalid (0/0 on the idempotent repeat, which
+/// writes no second audit row, mirroring the manual revoke's contract).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AcmeDeactivateResponse {
+    pub id: Uuid,
+    pub status: String,
+    pub authorizations_invalidated: u64,
+    pub orders_invalidated: u64,
+}
+
+/// `GET /api/v1/acme/accounts` — the tenant's ACME accounts, one page,
+/// `read_acme`, each row with its order count.
+async fn rest_list_accounts(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<AcmeAccountResponse>>, ApiError> {
+    auth.require(Capability::ReadAcme).map_err(ApiError::from)?;
+    let rows = AcmeRepo::new()
+        .list_accounts_with_order_counts(
+            &state.pool,
+            auth.tenant_id,
+            query.page(),
+            query.page_size(),
+        )
+        .await?;
+    Ok(Json(
+        rows.into_iter().map(AcmeAccountResponse::from).collect(),
+    ))
+}
+
+/// `GET /api/v1/acme/accounts/{id}` — one account (`read_acme`) plus its
+/// recent orders; another tenant's account is a 404.
+async fn rest_get_account(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AcmeAccountDetailResponse>, ApiError> {
+    auth.require(Capability::ReadAcme).map_err(ApiError::from)?;
+    let account = AcmeRepo::new()
+        .get_account_by_id(&state.pool, auth.tenant_id, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("acme account not found".to_string()))?;
+    let orders = AcmeRepo::new()
+        .list_orders_by_account(
+            &state.pool,
+            auth.tenant_id,
+            account.id,
+            0,
+            REST_DETAIL_ORDERS_PAGE_SIZE,
+        )
+        .await?;
+    Ok(Json(AcmeAccountDetailResponse {
+        id: account.id,
+        jwk_thumbprint: account.jwk_thumbprint,
+        status: account.status.as_str().to_string(),
+        tos_agreed_at: account.tos_agreed_at,
+        contact: account.contact,
+        created_at: account.created_at,
+        orders: orders.iter().map(AcmeOrderResponse::from).collect(),
+    }))
+}
+
+/// `POST /api/v1/acme/accounts/{id}/deactivate` — `manage_acme_accounts`.
+/// The one-way RFC 8555 §7.3.7 gate driven by a HUMAN: the account row
+/// moves to `deactivated` and Task 5's cascade invalidates its pending
+/// authorizations and open orders, all in ONE transaction with the audit
+/// row (the calling USER as the actor — see the section doc). Idempotent
+/// on an already-deactivated account (a no-op echo, no second audit row).
+async fn rest_deactivate_account(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AcmeDeactivateResponse>, ApiError> {
+    auth.require(Capability::ManageAcmeAccounts)
+        .map_err(ApiError::from)?;
+    let repo = AcmeRepo::new();
+    let account = repo
+        .get_account_by_id(&state.pool, auth.tenant_id, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("acme account not found".to_string()))?;
+
+    // Idempotency (the certificate-revoke route's shape): an already
+    // deactivated account changes nothing and writes no second audit row.
+    if account.status == AcmeAccountStatus::Deactivated {
+        return Ok(Json(AcmeDeactivateResponse {
+            id: account.id,
+            status: account.status.as_str().to_string(),
+            authorizations_invalidated: 0,
+            orders_invalidated: 0,
+        }));
+    }
+
+    // The same error text the JWS machine path stamps ("account
+    // deactivated") so the two surfaces leave identical order rows; the
+    // audit details tell them apart.
+    let mut tx = state.pool.begin().await?;
+    repo.update_account_status(
+        &mut *tx,
+        auth.tenant_id,
+        account.id,
+        AcmeAccountStatus::Deactivated,
+    )
+    .await?;
+    let (authorizations, orders) = repo
+        .deactivation_cascade(&mut tx, auth.tenant_id, account.id, "account deactivated")
+        .await?;
+    AuditRepo::new()
+        .record(
+            &mut *tx,
+            &audit_entry(
+                &auth.0,
+                "acme_account_deactivated",
+                "acme_account",
+                &account.id.to_string(),
+                json!({
+                    "jwk_thumbprint": account.jwk_thumbprint,
+                    "surface": "rest",
+                    "authorizations_invalidated": authorizations,
+                    "orders_invalidated": orders,
+                }),
+            ),
+        )
+        .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        account = %account.id,
+        authorizations,
+        orders,
+        "acme account deactivated via the REST surface"
+    );
+    Ok(Json(AcmeDeactivateResponse {
+        id: account.id,
+        status: AcmeAccountStatus::Deactivated.as_str().to_string(),
+        authorizations_invalidated: authorizations,
+        orders_invalidated: orders,
+    }))
+}
+
+/// The `GET /api/v1/acme/orders` query axes: exactly one of `account_id`
+/// (an account's orders, paged newest-first) or `certificate_id` (the one
+/// order an issued certificate came from). Naming neither is a 400 — an
+/// un-scoped tenant-wide order listing is not a shape this route offers.
+#[derive(Debug, Deserialize, Default)]
+pub struct AcmeOrdersQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    #[serde(default)]
+    pub account_id: Option<Uuid>,
+    #[serde(default)]
+    pub certificate_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/acme/orders` — `read_acme`; the orders of one account, or
+/// the order behind one certificate ([`AcmeRepo::get_order_by_certificate`]
+/// — `None` for a manually-issued or unknown certificate answers an EMPTY
+/// list, an ordinary not-found state the UI renders, never an error).
+async fn rest_list_orders(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Query(query): Query<AcmeOrdersQuery>,
+) -> Result<Json<Vec<AcmeOrderResponse>>, ApiError> {
+    auth.require(Capability::ReadAcme).map_err(ApiError::from)?;
+    let repo = AcmeRepo::new();
+    let orders = if let Some(account_id) = query.account_id {
+        repo.list_orders_by_account(
+            &state.pool,
+            auth.tenant_id,
+            account_id,
+            query.page.unwrap_or(0),
+            query.page_size.unwrap_or(100),
+        )
+        .await?
+    } else if let Some(certificate_id) = query.certificate_id {
+        repo.get_order_by_certificate(&state.pool, auth.tenant_id, certificate_id)
+            .await?
+            .map(|order| vec![order])
+            .unwrap_or_default()
+    } else {
+        return Err(ApiError::bad_request(
+            "name either an account_id or a certificate_id of the orders to list",
+        ));
+    };
+    Ok(Json(orders.iter().map(AcmeOrderResponse::from).collect()))
 }
