@@ -1,0 +1,31 @@
+[package]
+name = "ws-acme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The JOSE floor under Wardstone's ACME routes (RFC 8555): JWS verification
+# for the protocol's POST bodies, the anti-replay nonce store, and RFC 7638
+# account-key thumbprints. Deliberately dependent on nothing else in the
+# workspace (protocol-floor independence): no ws-core/ws-ca/ws-auth/ws-api —
+# the ACME tasks (5-8) mount this floor onto the route layer, not the other
+# way around.
+[dependencies]
+# JOSE codec only — the RFC 8555 protocol handling in this crate is
+# first-party. jsonwebtoken supplies the compact-JWS signature primitives
+# (`crypto::sign`/`crypto::verify`) behind the workspace's `rust_crypto`
+# pin; the ACME policy (alg-key pinning, nonce discipline, protected-header
+# requirements) lives in this crate's own code.
+jsonwebtoken = { workspace = true }
+# Unpadded base64url for JWS segments, minted nonces, and thumbprints.
+base64 = { workspace = true }
+# OS entropy for nonce minting (the house `rand` 0.10 `SysRng` idiom,
+# ws-auth's opaque-token seeding).
+rand = { workspace = true }
+# JWS protected-header deserialization.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The RFC 7638 thumbprint hash (SHA-256 over the canonical JWK JSON).
+sha2 = { workspace = true }
+# The typed error enum the API layer maps onto ACME problem documents.
+thiserror = { workspace = true }
