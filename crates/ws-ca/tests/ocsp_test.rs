@@ -914,3 +914,59 @@ fn test_ocsp_response_is_well_formed_der() {
         "the SEQUENCE length header must match the response length"
     );
 }
+
+/// An OCSP response from an ECDSA P-256 CA: the response's signature
+/// algorithm is ecdsa-with-SHA256 (absent parameters, RFC 5758 — the
+/// response embeds the CA certificate, so the OID appears in both the
+/// response's own `signatureAlgorithm` and the certificate inside), stock
+/// OpenSSL reports the status as `good` with `Response verify OK` in the
+/// same run as the Ed25519 twin above.
+#[test]
+fn test_ocsp_response_from_ecdsa_root_verifies() {
+    let mut ks = temp_keystore("ecdsa-root");
+    let root = create_root(
+        &CaSpec {
+            name: "ocsp-ecdsa-root".to_owned(),
+            subject: "Wardstone Test OCSP Root ECDSA".to_owned(),
+            key_type: KeyType::EcdsaP256,
+            lifetime: CaLifetime::Root,
+        },
+        &mut ks,
+    )
+    .unwrap();
+    let leaf = issue_leaf(&root);
+
+    let response = build_ocsp_response(
+        &root.cert_pem,
+        root.private_key_der.as_slice(),
+        LEAF_SERIAL,
+        &OcspResponseSpec {
+            status: OcspStatus::Good,
+            this_update: Utc::now(),
+            next_update: Utc::now() + Duration::hours(24),
+            revoked_at: None,
+            reason: None,
+        },
+    )
+    .expect("an ECDSA CA signs an OCSP response with no UnsupportedKeyType");
+
+    // The ecdsa-with-SHA256 AlgorithmIdentifier OID in DER (06 07 2A 86 48
+    // CE 3D 04 03 02): long enough against a ~2KB response that a byte
+    // collision is no concern.
+    let ecdsa_sig_oid_der: [u8; 10] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+    assert!(
+        count_occurrences(&response, &ecdsa_sig_oid_der) >= 1,
+        "the response must name ecdsa-with-SHA256 in its signature algorithm"
+    );
+
+    if let Some(text) = openssl_ocsp("ecdsa-root", &root.cert_pem, &leaf.cert_pem, &response) {
+        assert!(
+            text.contains("good"),
+            "openssl must report the status as good for the ECDSA-signed response:\n{text}"
+        );
+        assert!(
+            text.contains("Response verify OK"),
+            "the ECDSA response signature must verify:\n{text}"
+        );
+    }
+}

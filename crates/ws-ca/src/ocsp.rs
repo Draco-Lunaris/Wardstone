@@ -87,6 +87,11 @@ const OID_SIG_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.
 /// keys sign an OCSP response with, written with NULL parameters.
 const OID_SIG_SHA256_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 
+/// ecdsa-with-SHA256 (RFC 5758 section 3.2): the signature algorithm
+/// ECDSA P-256 CA keys sign an OCSP response with, written with absent
+/// parameters (the SPKI carries the curve).
+const OID_SIG_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+
 /// id-sha1 (RFC 3279): the hash algorithm of the `certID` hashes —
 /// RFC 6960 section 4.1.1 makes SHA-1 mandatory to implement.
 const OID_HASH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
@@ -329,9 +334,7 @@ fn algorithm_identifier(algorithm: &SignatureAlgorithm) -> Result<Vec<u8>, CaErr
     } else if algorithm == &PKCS_RSA_SHA256 {
         (OID_SIG_SHA256_RSA, true)
     } else if algorithm == &PKCS_ECDSA_P256_SHA256 {
-        return Err(CaError::UnsupportedKeyType(format!(
-            "ECDSA P-256 signing is not supported by this path yet ({algorithm:?})"
-        )));
+        (OID_SIG_ECDSA_SHA256, false)
     } else {
         return Err(CaError::UnsupportedKeyType(format!(
             "OCSP signing is not supported for this CA key algorithm ({algorithm:?})"
