@@ -302,13 +302,13 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
             .expect("query the setup tenant");
     let tenant_id = tenant_id.expect("setup creates exactly the one tenant");
 
-    let ca: Option<(uuid::Uuid, bool, String)> =
-        sqlx::query_as("SELECT id, is_root, subject FROM cas WHERE tenant_id = $1")
+    let ca: Option<(uuid::Uuid, bool, String, String)> =
+        sqlx::query_as("SELECT id, is_root, subject, key_type FROM cas WHERE tenant_id = $1")
             .bind(tenant_id)
             .fetch_optional(&pool)
             .await
             .expect("query the setup root CA");
-    let (ca_id, ca_is_root, ca_subject) = ca.expect("setup creates the root CA");
+    let (ca_id, ca_is_root, ca_subject, ca_key_type) = ca.expect("setup creates the root CA");
 
     let admin: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT username, password_hash FROM users WHERE tenant_id = $1")
@@ -357,6 +357,17 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
             .await
             .expect("query the setup audit entries");
 
+    // Captured BEFORE cleanup like the audit actions: the ca-created row's
+    // JSON details carry the key type the bootstrap recorded.
+    let ca_created_details: Option<(String,)> = sqlx::query_as(
+        "SELECT details::text FROM audit_log WHERE tenant_id = $1 \
+             AND action = 'ca_created'",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("query the ca_created audit row");
+
     // The leaf's issuer chain and DER: parsed while the keys directory
     // still exists (cleanup removes it just below).
     let leaf_pem: String = match certs.first() {
@@ -387,6 +398,11 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert_eq!(
         ca_subject, "wardstone.test",
         "the root's subject is the default domain the operator chose"
+    );
+    assert_eq!(
+        ca_key_type, "ecdsa_p256",
+        "the setup root must be the browser-universal ECDSA P-256 default \
+         (an Ed25519 root cannot be trusted by Chromium-family browsers)"
     );
     assert!(root_key_loaded, "the root's key envelope must load");
 
@@ -469,6 +485,16 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert!(
         audit_actions.iter().any(|action| action == "ca_created"),
         "setup audits the root CA creation"
+    );
+    // The bootstrap audit row records the SAME key type the row does — the
+    // operator's observability of "what key is my root" must never depend
+    // on reading the cas row alone.
+    let (ca_created_details,) = ca_created_details.expect("the ca_created audit row exists");
+    let ca_created: Value =
+        serde_json::from_str(&ca_created_details).expect("the ca_created audit details are JSON");
+    assert_eq!(
+        ca_created["key_type"], "ecdsa_p256",
+        "the bootstrap audit row records the ECDSA P-256 root key type"
     );
     assert!(
         audit_actions.iter().any(|action| action == "user_created"),

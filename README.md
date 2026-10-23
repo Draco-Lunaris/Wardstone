@@ -87,10 +87,12 @@ a certificate for identifiers it actually controls.
 
 Two things to prepare:
 
-1. **Trust.** The front door's TLS leaf is signed by Wardstone's own CA.
-   Import the root certificate (downloadable from the UI) into every
-   machine that talks ACME here, or those clients stop at TLS
-   verification.
+1. **Trust.** The front door's TLS leaf is signed by Wardstone's own CA
+   — an **ECDSA P-256 root**, which every mainstream browser verifies
+   once imported (Chromium-family browsers cannot verify Ed25519 chains,
+   so the default is deliberately browser-universal). Import the root
+   certificate (downloadable from the UI) into every machine that talks
+   ACME here, or those clients stop at TLS verification.
 2. **URL base.** ACME URLs are built absolute from the
    `WARDSTONE_PUBLIC_URL` setting — compose defaults it to
    `https://$WARDSTONE_SERVER_HOSTNAME`, which is right when clients dial

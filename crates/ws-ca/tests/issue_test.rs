@@ -1346,3 +1346,104 @@ fn test_key_usage_and_eku_converters_map_every_variant() {
         rcgen::ExtendedKeyUsagePurpose::TimeStamping
     );
 }
+
+/// A leaf issued by an ECDSA P-256 root CA: the leaf's SIGNATURE ALGORITHM
+/// follows the CA's key (ecdsa-with-SHA256, OID 1.2.840.10045.4.3.2) and
+/// the CA's public key verifies the leaf — issuance works against an ECDSA
+/// CA with no `UnsupportedKeyType`. A behavior pin for the CRL/OCSP twins:
+/// wherever a CA signs, the algorithm choice comes from the CA key.
+#[test]
+fn test_leaf_signed_by_ecdsa_root_follows_the_ca_algorithm() {
+    let mut ks = temp_keystore("leaf-from-ecdsa-root");
+    let root = create_root(
+        &CaSpec {
+            name: "root".to_owned(),
+            subject: "Wardstone Test Root ECDSA".to_owned(),
+            key_type: KeyType::EcdsaP256,
+            lifetime: CaLifetime::Root,
+        },
+        &mut ks,
+    )
+    .unwrap();
+
+    let csr = mint_p256_csr(
+        Some("leaf.example.test"),
+        &[SanEntry::Dns("leaf.example.test".to_owned())],
+    );
+    let leaf = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        &csr,
+        &LeafSpec {
+            sans: vec![SanEntry::Dns("leaf.example.test".to_owned())],
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::EcdsaP256,
+            lifetime: chrono::Duration::days(30),
+            subject_cn: Some("leaf.example.test".to_string()),
+            serial: 1,
+        },
+    )
+    .expect("an ECDSA CA signs a leaf; the CSR gate accepts a supported leaf key");
+
+    let leaf_cert = parse_cert(&leaf.cert_pem);
+    assert_eq!(
+        leaf_cert.signature_algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.4.3.2",
+        "the leaf signature algorithm follows the CA key, not the leaf key"
+    );
+
+    let root_cert = parse_cert(&root.cert_pem);
+    leaf_cert
+        .verify_signature(Some(root_cert.public_key()))
+        .expect("the ECDSA root's public key must verify the leaf's signature");
+
+    // The CSR's public key (a P-256 point) is the leaf's public key, and
+    // the requested SAN propagated.
+    match leaf_cert.public_key().parsed().unwrap() {
+        x509_parser::public_key::PublicKey::EC(ec) => assert_eq!(ec.key_size(), 256),
+        other => panic!("expected an EC public key, got {other:?}"),
+    }
+    assert_eq!(
+        cert_general_names(&leaf_cert).and_then(|names| match names.first() {
+            Some(GeneralName::DNSName(d)) => Some(*d),
+            _ => None,
+        }),
+        Some("leaf.example.test"),
+        "the CSR's SAN lands on the issued leaf"
+    );
+
+    // The discriminating case: an RSA-2048 leaf issued by the ECDSA CA.
+    // The leaf's OWN key is RSA — if the signature algorithm followed the
+    // LEAF key it would be RSA; it must be ecdsa-with-SHA256, proving the
+    // signature follows the CA key.
+    let rsa_leaf = ws_ca::issue::sign_leaf_with(
+        &root.cert_pem,
+        &root.private_key_der,
+        MATRIX_RSA2048_CSR_PEM,
+        &LeafSpec {
+            sans: vec![],
+            key_usages: vec![KeyUsagePurpose::DigitalSignature],
+            ekus: vec![ExtKeyUsagePurpose::ServerAuth],
+            key_type: LeafKeyType::Rsa2048,
+            lifetime: chrono::Duration::days(30),
+            subject_cn: Some("matrix-rs2048.example".to_string()),
+            serial: 2,
+        },
+    )
+    .expect("the ECDSA CA also signs an rsa2048 leaf");
+    let rsa_leaf_cert = parse_cert(&rsa_leaf.cert_pem);
+    assert_eq!(
+        rsa_leaf_cert.signature_algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.4.3.2",
+        "the RSA leaf issued by the ECDSA CA is ECDSA-signed — algorithm \
+         follows the CA key, not the leaf key"
+    );
+    match rsa_leaf_cert.public_key().parsed().unwrap() {
+        x509_parser::public_key::PublicKey::RSA(k) => assert_eq!(k.key_size(), 2048),
+        other => panic!("expected an RSA public key, got {other:?}"),
+    }
+    rsa_leaf_cert
+        .verify_signature(Some(root_cert.public_key()))
+        .expect("the ECDSA root's public key must verify the RSA leaf's signature");
+}

@@ -63,7 +63,9 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use der::asn1::{AnyRef, BitString, GeneralizedTime, Null, ObjectIdentifier, OctetString, Uint};
 use der::{Encode, Tag};
-use rcgen::{KeyPair, SignatureAlgorithm, SigningKey, PKCS_ED25519, PKCS_RSA_SHA256};
+use rcgen::{
+    KeyPair, SignatureAlgorithm, SigningKey, PKCS_ECDSA_P256_SHA256, PKCS_ED25519, PKCS_RSA_SHA256,
+};
 use sha1::{Digest, Sha1};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::parse_x509_pem;
@@ -84,6 +86,11 @@ const OID_SIG_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.
 /// sha256WithRSAEncryption (RFC 4055): the signature algorithm RSA CA
 /// keys sign an OCSP response with, written with NULL parameters.
 const OID_SIG_SHA256_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+
+/// ecdsa-with-SHA256 (RFC 5758 section 3.2): the signature algorithm
+/// ECDSA P-256 CA keys sign an OCSP response with, written with absent
+/// parameters (the SPKI carries the curve).
+const OID_SIG_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 
 /// id-sha1 (RFC 3279): the hash algorithm of the `certID` hashes —
 /// RFC 6960 section 4.1.1 makes SHA-1 mandatory to implement.
@@ -319,13 +326,17 @@ fn cert_id(ca_cert: &X509Certificate<'_>, serial: u128) -> Result<Vec<u8>, CaErr
 
 /// The response's `AlgorithmIdentifier`, dispatched from the signing key:
 /// Ed25519 keys sign with id-Ed25519 and absent parameters (RFC 8410),
-/// RSA keys with sha256WithRSAEncryption and NULL parameters. Anything
-/// else is a typed rejection naming the algorithm only.
+/// RSA keys with sha256WithRSAEncryption and NULL parameters (RFC 4055),
+/// and ECDSA P-256 keys with ecdsa-with-SHA256 and absent parameters
+/// (RFC 5758). Anything else is a typed rejection naming the algorithm
+/// only.
 fn algorithm_identifier(algorithm: &SignatureAlgorithm) -> Result<Vec<u8>, CaError> {
     let (oid, null_params) = if algorithm == &PKCS_ED25519 {
         (OID_SIG_ED25519, false)
     } else if algorithm == &PKCS_RSA_SHA256 {
         (OID_SIG_SHA256_RSA, true)
+    } else if algorithm == &PKCS_ECDSA_P256_SHA256 {
+        (OID_SIG_ECDSA_SHA256, false)
     } else {
         return Err(CaError::UnsupportedKeyType(format!(
             "OCSP signing is not supported for this CA key algorithm ({algorithm:?})"

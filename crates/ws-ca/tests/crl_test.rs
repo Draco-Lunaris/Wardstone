@@ -409,3 +409,73 @@ fn test_crl_openssl_verifies() {
         Err(e) => panic!("failed to spawn openssl: {e}"),
     }
 }
+
+/// A CRL from an ECDSA P-256 CA: the signature algorithm is
+/// ecdsa-with-SHA256 with parameters ABSENT (RFC 5758), the signature
+/// verifies in Rust via x509-parser, and stock `openssl crl -CAfile`
+/// prints `verify OK` when the binary exists — the same three layers as
+/// the Ed25519 CRL above.
+#[test]
+fn test_crl_from_ecdsa_root_verifies() {
+    let mut ks = temp_keystore("ecdsa-root");
+    let root = create_root(
+        &CaSpec {
+            name: "crl-ecdsa-root".to_owned(),
+            subject: "Wardstone Test CRL Root ECDSA".to_owned(),
+            key_type: KeyType::EcdsaP256,
+            lifetime: CaLifetime::Root,
+        },
+        &mut ks,
+    )
+    .unwrap();
+    let file = build_crl(&root.cert_pem, root.private_key_der.as_slice(), &crl_spec())
+        .expect("an ECDSA CA builds a CRL with no UnsupportedKeyType");
+
+    // Rust-side verification against the CA certificate's public key.
+    let (_, crl_pem_block) = parse_x509_pem(file.crl_pem.as_bytes()).unwrap();
+    let (_, crl) = CertificateRevocationList::from_der(&crl_pem_block.contents).unwrap();
+    assert_eq!(
+        crl.signature_algorithm.algorithm.to_id_string(),
+        "1.2.840.10045.4.3.2",
+        "the CRL signature algorithm follows the ECDSA CA key"
+    );
+    assert!(
+        crl.signature_algorithm.parameters.is_none(),
+        "the ECDSA AlgorithmIdentifier must carry ABSENT parameters (RFC 5758 \
+         forbids the NULL encoding)"
+    );
+    let (_, ca_pem_block) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
+    let ca_cert = ca_pem_block.parse_x509().unwrap();
+    crl.verify_signature(ca_cert.public_key())
+        .expect("CRL signature must verify against the ECDSA CA");
+
+    // Stock OpenSSL verification, exactly the Ed25519 CRL's interop gate.
+    let crl_path = temp_pem("ecdsa-root", "crl");
+    let ca_path = temp_pem("ecdsa-root", "ca");
+    fs::write(&crl_path, &file.crl_pem).unwrap();
+    fs::write(&ca_path, &root.cert_pem).unwrap();
+    let out = Command::new("openssl")
+        .arg("crl")
+        .arg("-in")
+        .arg(&crl_path)
+        .arg("-CAfile")
+        .arg(&ca_path)
+        .arg("-noout")
+        .output();
+    let _ = fs::remove_file(&crl_path);
+    let _ = fs::remove_file(&ca_path);
+    match out {
+        Ok(out) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success() && text.contains("verify OK"),
+                "openssl must verify the ECDSA-signed CRL, got: {text}"
+            );
+        }
+        Err(_) => println!("openssl absent: skipping the ECDSA CRL interop check"),
+    }
+}
