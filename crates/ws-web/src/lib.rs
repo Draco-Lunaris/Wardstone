@@ -8,10 +8,12 @@
 //!   [`setup::tenant_exists`]), and the self-signed setup certificate
 //!   whose SHA-256 fingerprint the page displays for out-of-band
 //!   verification.
-//! - `proxy` — the `/api/v1/*` forwarder: the browser talks ONLY to
+//! - `proxy` — the verbatim forwarders: the browser talks ONLY to
 //!   ws-web; ws-api publishes no ports to the LAN, so every `/api/v1/*`
 //!   request is proxied verbatim to the API base URL over the internal
-//!   network. ws-api's own routes are never mounted here.
+//!   network, and so is every `/acme*` request (the RFC 8555 machine
+//!   surface — no session machinery on it). ws-api's own routes are
+//!   never mounted here.
 //! - `ui` — the embedded SPA (`ui/dist`, git-committed and included into
 //!   the binary with `include_dir` at compile time): `/`, the hashed
 //!   `/assets/*`, and the SPA fallback, mounted LAST (the composed
@@ -50,7 +52,7 @@ use ws_ca::error::CaError;
 use session::relay::relay_router;
 use session::store::SessionStore;
 
-pub use proxy::{api_router, api_router_with_auth_limit};
+pub use proxy::{acme_router, api_router, api_router_with_auth_limit};
 pub use setup::{
     run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
 };
@@ -160,18 +162,22 @@ pub async fn web_router_with_store(
 }
 
 /// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay
-/// nest and the `/api/v1` proxy (its auth routes limiter-scoped per
-/// `rate_limit`) merged — every web-fronted route EXCEPT the setup
-/// surface and the SPA fallback, which need the tenant check. Public so
-/// the rate-limit suite can drive the COMPOSED stack (relay AND proxy in
-/// one router, the precedence the real front door serves — static auth
-/// routes over the catch-all) without a database.
+/// nest, the `/api/v1` proxy (its auth routes limiter-scoped per
+/// `rate_limit`), and the `/acme` proxy (unlimited at this edge — ws-api
+/// carries the per-account GCRA) merged — every web-fronted route EXCEPT
+/// the setup surface and the SPA fallback, which need the tenant check.
+/// Public so the rate-limit suite can drive the COMPOSED stack (relay AND
+/// proxy in one router, the precedence the real front door serves — static
+/// auth routes over the catch-all) without a database.
 ///
-/// The ONE store instance rides BOTH: as the relay routes' state
-/// (mint/rotate/kill) and as an `Extension` on the proxy router
-/// (read-only injection). The `Option<Extension<_>>` extractor in the
-/// proxy handler keeps `api_router` usable standalone (no store: zero
-/// injection, the machine-token surface is untouched).
+/// The ONE store instance rides BOTH session surfaces: as the relay
+/// routes' state (mint/rotate/kill) and as an `Extension` on the proxy
+/// router (read-only injection). The `Option<Extension<_>>` extractor in
+/// the proxy handler keeps `api_router` usable standalone (no store: zero
+/// injection, the machine-token surface is untouched). The `/acme` proxy
+/// intentionally gets NEITHER the store nor the session machinery — its
+/// handler forwards JWS machine traffic verbatim (see
+/// [`proxy::acme_router`]).
 pub fn session_router_with_store(
     store: std::sync::Arc<SessionStore>,
     api_base_url: &str,
@@ -179,7 +185,10 @@ pub fn session_router_with_store(
 ) -> Router {
     let api = api_router_with_auth_limit(api_base_url, rate_limit).layer(Extension(store.clone()));
     let relay = relay_router(store, api_base_url, rate_limit);
-    Router::new().merge(relay).merge(api)
+    Router::new()
+        .merge(relay)
+        .merge(api)
+        .merge(acme_router(api_base_url))
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
