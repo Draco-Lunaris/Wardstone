@@ -962,8 +962,11 @@ async fn authenticate_kid_account(
 /// POST-as-GET reads (the order poll AND Task 8's certificate download),
 /// every challenge trigger, the account update and key change, and
 /// Task 8's finalize and revoke-cert ride the SAME bucket, spent here
-/// where the account resolves, BEFORE any handler logic. The same
-/// `AuthRateLimit` the public auth routes carry drives it (no new env);
+/// where the account resolves, BEFORE any handler logic. The bucket's
+/// rate limit is `AcmeConfig::acme_account_limit` — its OWN switch
+/// (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`), deliberately NOT the auth
+/// disable (fix round 1: uuid keying does NOT collapse behind ws-web's
+/// proxy, so the auth switch must never unlimit enrolled accounts);
 /// new-account stays per-IP GCRA (no account exists to key on yet — the
 /// middleware form cannot key on an identity that only exists after the
 /// JWS verifies). A refusal is the RFC's rate-limited problem at 429.

@@ -191,8 +191,11 @@ impl Fixture {
     }
 }
 
-/// The fixture's config shape: the ACME `tos_url`, the new-account GCRA,
-/// and the `public_url` (None = the unconfigured degrade posture) — plus
+/// The fixture's config shape: the ACME `tos_url`, the limiter config
+/// (BOTH the new-account per-IP GCRA — through `auth_rate_limit` — and
+/// the per-account bucket — through `AcmeConfig::acme_account_limit` —
+/// ride the one value; they are decoupled knobs in production), and the
+/// `public_url` (None = the unconfigured degrade posture) — plus
 /// the challenge-verification seams a test may swap in (the stub fetcher
 /// and/or the canned TXT resolver) before the router wraps the state.
 #[derive(Default)]
@@ -248,6 +251,10 @@ async fn fixture_with(config: FixtureConfig<'_>) -> Fixture {
     api_config.acme = AcmeConfig {
         public_url: config.public_url.unwrap_or_default().to_string(),
         tos_url: config.tos_url.map(str::to_string),
+        // The per-account bucket rides its OWN knob (decoupled from the
+        // auth disable); the fixture drives BOTH limiters with the one
+        // config value a test names.
+        acme_account_limit: config.rate_limit,
     };
     api_config.auth_rate_limit = config.rate_limit;
     let mut state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), api_config);
@@ -4037,9 +4044,10 @@ async fn create_account_as_peer(fixture: &Fixture, key: &KeyFixture, ip: Ipv4Add
 }
 
 /// Fix round 1 (F3), settlement D8: authenticated ACME is rate-limited
-/// PER ACCOUNT — the same AuthRateLimit the public auth routes carry (no
-/// new env); only new-account stays per-IP GCRA, because no account exists
-/// to key on. Burst 1 with a 60s refill: account A's SECOND POST — any
+/// PER ACCOUNT — its own `AcmeConfig::acme_account_limit` knob (the auth
+/// disable deliberately does not reach it); only new-account stays per-IP
+/// GCRA, because no account exists to key on. Burst 1 with a 60s refill:
+/// account A's SECOND POST — any
 /// route, POST-as-GET included — is the 429 rateLimited problem, while
 /// account B keeps its own bucket. Cleans up before asserting.
 #[tokio::test]

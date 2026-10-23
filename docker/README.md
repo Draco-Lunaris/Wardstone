@@ -122,10 +122,12 @@ variant):
 - **Bundled UI-fronted deployment** (`wardstone ui` publishes the only
   port): ws-web limits BOTH its `/auth/ui/*` relay routes AND the proxied
   credential pair `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh`
-  — so password spraying and TOTP guessing stay per-client limited even
-  though ws-api's own limiter is off (below). Other `/api/v1/*` paths —
-  the machine-token (`ws_at_`/`ws_ot_`) flows — are NOT limited at this
-  edge.
+  AND the proxied enrollment endpoint `POST /acme/<tenant>/new-account` —
+  so password spraying, TOTP guessing, and enrollment abuse stay
+  per-client limited even though ws-api's own per-IP limiter is off
+  (below). Other `/api/v1/*` paths — the machine-token (`ws_at_`/`ws_ot_`)
+  flows — are NOT limited at this edge, and neither is the rest of
+  `/acme/*` (see "The ACME surface" below for who limits THOSE).
 - **Direct API deployment** (clients, or a transparent-TCP proxy, hit
   `ws-api` itself): ws-api's own auth-route GCRA (login, refresh, OIDC
   start/callback) applies.
@@ -139,7 +141,11 @@ front-door limiter stays on regardless of it). Where BOTH limiters run
 (a `ui` deployment that leaves the switch off), the effective per-client
 limit is the tighter of the two buckets — defense in depth, never a gap.
 Only where clients hit ws-api directly (an External variant fronting it
-with a transparent-TCP proxy) is the switch meaningful at all.
+with a transparent-TCP proxy) is the switch meaningful at all. The ACME
+per-account limiter is a SEPARATE knob (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`)
+that the auth switch does not reach: it keys on the ACCOUNT id, which
+does not collapse behind the proxy, so it stays armed — ON by default,
+in the bundled deployment included.
 
 **Egress: the compose network must NOT be `internal: true`.** ws-api performs
 OIDC egress — the discovery fetch and the token exchange are made by the
@@ -184,21 +190,27 @@ front door may enroll: new-account is authorized by the requester's own
 JWS key, and issuance stays bounded by server-computed http-01/dns-01
 challenge verification — a client-supplied answer is never an input, so
 an enrolled key can only win certificates for identifiers it actually
-controls. The limiting posture: ws-web forwards `/acme*` UN-limited — a
-per-IP limit at this edge cannot key on anything an ACME client reveals
-(no cookies, and the account identity exists only after the JWS
-verifies). ws-api carries the limiting: `POST /acme/{tenant}/new-account`
-under a per-IP GCRA keyed on its direct TCP peer, and every
+controls. The limiting posture: ws-web runs the per-client-IP GCRA on
+`POST /acme/<tenant>/new-account` — the one unauthenticated mutating
+endpoint — keyed on the real client address the TLS listener sees; at
+THIS edge keying by account identity is impossible (the identity exists
+only after the JWS verifies), so every other `/acme*` request forwards
+un-limited here. ws-api carries the per-ACCOUNT limiter: every
 authenticated ACME POST (new-order, the POST-as-GET reads, challenge
-triggers, finalize, revoke-cert, account update, key change) against ONE
-per-account bucket keyed on the account id. Caveat with teeth: BOTH
-read the same `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` switch the bundled
-compose sets to `true` for the loopback-proxy reason — so this bundle's
-UI-fronted deployment deliberately runs its ACME surface without rate
-limiting; the direct-API deployment (switch off) keeps it. The buckets
-refill in-process (one credit per 500 ms, burst 20 by default) and a
-restart refills them all; the limiter is not a security boundary — the
-server-computed challenge verification is.
+triggers, finalize, revoke-cert, account update, key change) spends one
+credit from the account's bucket — keyed on the ACCOUNT ID, which does
+NOT collapse behind the proxy, so it works unchanged in every variant:
+one credit per 500 ms, burst 20 by default, tuned by the
+`WARDSTONE_RATE_LIMIT_*` pair. That limiter's switch is
+`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` (only `1`/`true` disable; any
+other non-blank value fails the boot loudly) — deliberately NOT the auth
+switch above, so disabling the auth limiter never silently unlimits
+enrolled accounts. The bundled UI-fronted deployment therefore covers
+the ACME surface at BOTH corners: ws-web's per-client GCRA on
+enrollment, and ws-api's per-account limiter (ON — this bundle sets
+neither `ACME_ACCOUNT_LIMIT_DISABLED` nor per-account envs). The buckets
+refill in-process and a restart refills them; the limiters are not a
+security boundary — the server-computed challenge verification is.
 
 ## The image and the keys volume
 
@@ -239,6 +251,7 @@ Per service (the binary's contract, one variable at a time):
 | `WARDSTONE_API_URL`         | `http://ws-api:8080` | ignored | The `ui` proxy's target |
 | `WARDSTONE_BIND`            | `0.0.0.0:8443` | `0.0.0.0:8080` | The listen address (one variable, per-service values) |
 | `WARDSTONE_PUBLIC_URL`      | ignored | optional | The absolute URL base every ACME (RFC 8555) URL is built from — unset, the ACME routes answer `serverInternal` problem documents |
+| `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` | ignored | optional switch | `1`/`true` disables the ACME per-account rate limiter; any other non-blank value fails the boot |
 
 Compose-level:
 

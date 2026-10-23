@@ -92,15 +92,28 @@ pub struct AcmeConfig {
     /// immediately. `Some` turns `termsOfServiceAgreed` into an enforced
     /// gate (the account is minted `pending` until the client agrees).
     pub tos_url: Option<String>,
+    /// The per-account ACME limiter's OWN rate limit
+    /// (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` is its only switch):
+    /// `Some` arms the per-account bucket on every authenticated ACME
+    /// POST; `None` disables it (the binary's switch, or an in-process
+    /// test). Deliberately NOT the auth routes' `auth_rate_limit`: THAT
+    /// disable exists because per-IP keying collapses behind ws-web's
+    /// proxy, while this limiter keys on the ACCOUNT id, which does NOT
+    /// collapse — so flipping the auth switch must never silently unlimit
+    /// enrolled accounts (fix round 1 decoupling).
+    pub acme_account_limit: Option<AuthRateLimit>,
 }
 
 impl AcmeConfig {
     /// The unconfigured default (the test/blank-env shape): an empty
-    /// public URL and no ToS.
+    /// public URL, no ToS, and NO per-account limiter (in-process tests;
+    /// the binary arms the limiter explicitly — an unset switch keeps it
+    /// ON).
     pub fn unconfigured() -> Self {
         AcmeConfig {
             public_url: String::new(),
             tos_url: None,
+            acme_account_limit: None,
         }
     }
 }
@@ -321,8 +334,10 @@ impl VerificationDeps {
 }
 
 /// The per-account ACME rate limiter (settlement D8, fix round 1):
-/// authenticated ACME runs one refill curve per account — the SAME
-/// [`AuthRateLimit`] values the public auth routes carry (no new env);
+/// authenticated ACME runs one refill curve per account — the
+/// [`AuthRateLimit`] values `AcmeConfig::acme_account_limit` carries (its
+/// OWN env switch, `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`; the auth
+/// disable deliberately no longer reaches it — fix round 1 decoupling);
 /// `None` disables it (in-process tests). tower_governor's middleware
 /// keying was ruled out: the account identity only exists AFTER the JWS
 /// verifies inside the handler, past any middleware layer — so this is a
@@ -338,7 +353,7 @@ pub struct AcmeAccountLimiter {
 }
 
 impl AcmeAccountLimiter {
-    /// Build over the shared auth-route limit config (or None).
+    /// Build over the per-account limit config (or `None`).
     pub fn new(config: Option<AuthRateLimit>) -> Self {
         AcmeAccountLimiter {
             config,
@@ -401,9 +416,9 @@ pub struct AppState {
     /// these; client-supplied data is never a verification input.
     pub verification: VerificationDeps,
     /// The per-account ACME rate limiter (settlement D8): keyed buckets
-    /// over the same AuthRateLimit values the public auth routes carry;
-    /// spends one credit per authenticated ACME POST where the account
-    /// resolves.
+    /// over `AcmeConfig::acme_account_limit` (its OWN switch — the auth
+    /// disable does not reach it); spends one credit per authenticated
+    /// ACME POST where the account resolves.
     pub acme_accounts: AcmeAccountLimiter,
 }
 
@@ -411,7 +426,7 @@ impl AppState {
     /// Build the state from the pool, the JWT key pair, and the config;
     /// the mutable-by-product stores start empty.
     pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
-        let acme_accounts = AcmeAccountLimiter::new(config.auth_rate_limit);
+        let acme_accounts = AcmeAccountLimiter::new(config.acme.acme_account_limit);
         AppState {
             pool,
             jwt,

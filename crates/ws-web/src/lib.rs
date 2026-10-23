@@ -163,12 +163,15 @@ pub async fn web_router_with_store(
 
 /// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay
 /// nest, the `/api/v1` proxy (its auth routes limiter-scoped per
-/// `rate_limit`), and the `/acme` proxy (unlimited at this edge — ws-api
-/// carries the per-account GCRA) merged — every web-fronted route EXCEPT
-/// the setup surface and the SPA fallback, which need the tenant check.
-/// Public so the rate-limit suite can drive the COMPOSED stack (relay AND
-/// proxy in one router, the precedence the real front door serves — static
-/// auth routes over the catch-all) without a database.
+/// `rate_limit`), and the `/acme` proxy (its ENROLLMENT route
+/// limiter-scoped per the SAME value — the one unauthenticated ACME
+/// mutator, per-IP limited at this edge because ws-api's per-IP bucket
+/// collapses behind the proxy; the rest of `/acme` forwards unlimited)
+/// merged — every web-fronted route EXCEPT the setup surface and the SPA
+/// fallback, which need the tenant check. Public so the rate-limit suite
+/// can drive the COMPOSED stack (relay AND proxy in one router, the
+/// precedence the real front door serves — static auth routes over the
+/// catch-all) without a database.
 ///
 /// The ONE store instance rides BOTH session surfaces: as the relay
 /// routes' state (mint/rotate/kill) and as an `Extension` on the proxy
@@ -188,7 +191,7 @@ pub fn session_router_with_store(
     Router::new()
         .merge(relay)
         .merge(api)
-        .merge(acme_router(api_base_url))
+        .merge(acme_router(api_base_url, rate_limit))
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired

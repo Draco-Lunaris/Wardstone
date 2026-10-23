@@ -400,7 +400,7 @@ async fn csrf_ok_cases_pass_the_check_into_the_proxy() {
 /// (an immediate connection refusal — the forwarded 502 the assertions
 /// read), the SPA router on the fallback — the real front door's shape.
 fn acme_router_dead() -> Router {
-    acme_router("http://127.0.0.1:9").fallback_service(ui::ui_router())
+    acme_router("http://127.0.0.1:9", None).fallback_service(ui::ui_router())
 }
 
 /// The COMPOSED front-door core ([`ws_web::web_router_with_store`]'s

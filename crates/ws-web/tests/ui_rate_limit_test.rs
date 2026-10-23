@@ -21,7 +21,14 @@
 //! 5. the proxied limiter's scope stays credential-shaped: with an IP's
 //!    bucket exhausted, machine-token traffic on non-auth routes and
 //!    `GET /api/v1/auth/me` FORWARD unlimited (502 at the dead upstream,
-//!    never 429).
+//!    never 429);
+//! 6. (fix round 1) the ACME surface inherits the same pattern at the
+//!    edge: the proxied enrollment route `POST /acme/{tenant}/new-account`
+//!    — the ONE unauthenticated mutating `/acme` endpoint — carries the
+//!    per-IP GCRA through the COMPOSED stack (a rapid second enrollment
+//!    from one IP is 429; `None` still mounts nothing), because behind
+//!    the proxy ws-api's per-IP new-account bucket collapses into ONE
+//!    collective bucket while ws-web holds the real client addresses.
 //!
 //! No database, no upstream, no real sockets: the router is driven
 //! in-process through `tower::ServiceExt::oneshot`, with the peer address
@@ -314,4 +321,55 @@ async fn non_auth_proxied_routes_are_not_limited() {
         StatusCode::BAD_GATEWAY,
         "/me is not on the limited credential pair"
     );
+}
+
+/// Property 6a (fix round 1): the proxied ACME enrollment route — the one
+/// UNAUTHENTICATED mutating `/acme` endpoint — carries the per-IP GCRA
+/// through the COMPOSED stack. The body is fake: nothing reads it — the
+/// edge forwards verbatim, so the first request dies at the dead upstream
+/// (502, never 429) and the rapid SAME-IP second is limited (behind the
+/// proxy, ws-api's per-IP new-account bucket collapses into one
+/// collective bucket — ws-web spends the per-client bucket itself).
+fn acme_enroll_from(ip: Ipv4Addr, port: u16) -> Request<Body> {
+    request_from(ip, port, "POST", "/acme/primary/new-account", b"")
+}
+
+#[tokio::test]
+async fn second_acme_enrollment_from_the_same_ip_is_429_through_the_composed_stack() {
+    let router = composed_router_for(ONE_SHOT);
+
+    let first = send(&router, acme_enroll_from(PEER_A, 44444)).await;
+    assert_eq!(
+        first.status(),
+        StatusCode::BAD_GATEWAY,
+        "the first enrollment passes the limiter and dies at the proxy's dead upstream"
+    );
+
+    let second = send(&router, acme_enroll_from(PEER_A, 56565)).await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a rapid second enrollment from the same peer IP is limited at the front door"
+    );
+    assert!(
+        second.headers().get(header::RETRY_AFTER).is_some(),
+        "the default tower_governor 429 carries Retry-After"
+    );
+}
+
+/// Property 6b: `None` still mounts no layer on the ACME enrollment
+/// route — same-IP rapid enrollments all forward (502 at the dead
+/// upstream, never 429).
+#[tokio::test]
+async fn acme_enrollment_none_mounts_no_layer() {
+    let router = composed_router_for(None);
+
+    for _ in 0..3 {
+        let response = send(&router, acme_enroll_from(PEER_A, 44444)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "an unlimited enrollment route never answers 429"
+        );
+    }
 }
