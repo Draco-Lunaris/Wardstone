@@ -995,8 +995,14 @@ async fn new_order(
     // ONE transaction: the order, each minted authorization (with its
     // challenge pair), and the audit row. The deferred composite foreign
     // keys (migration 011) bless any statement order. The reuse lookup
-    // reads through this transaction's snapshot, so a concurrent order
-    // settling the same identifier reuses or mints — never both.
+    // reads this transaction's READ COMMITTED snapshot (T6-M2: the fix of
+    // an earlier overclaim): a concurrent order on the same identifier is
+    // INVISIBLE to this snapshot, so the two orders can BOTH MINT (each
+    // keeps its own pending authorization — the rows coexist, every FK
+    // holds, and the reuse window serves whichever settles first), and
+    // both may equally REUSE the same already-valid row (a read-only hit).
+    // No lock is added for this: minting extra pending rows is harmless,
+    // and the reuse hit never mutates anything.
     let mut tx = state.pool.begin().await?;
     AcmeRepo::new().insert_order(&mut *tx, &order).await?;
     let mut authorization_urls = Vec::with_capacity(identifiers.len());
