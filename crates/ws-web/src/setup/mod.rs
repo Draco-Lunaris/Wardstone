@@ -212,10 +212,14 @@ pub async fn run_setup(
     let spec = CaSpec {
         name: ROOT_CA_NAME.to_owned(),
         subject: fields.default_domain.clone(),
-        // An Ed25519 root: instant key generation (setup should not stall
-        // on RSA prime search for a key the operator never rotates
-        // casually) and the smallest signatures the engine supports.
-        key_type: KeyType::Ed25519,
+        // An ECDSA P-256 root: the browser-universal choice — every
+        // mainstream browser verifies an ECDSA chain once the root is
+        // imported, while an Ed25519 root cannot be trusted by
+        // Chromium-family browsers AT ALL (the chain fails their verifier
+        // with a no-bypass error even after import). Generation is instant
+        // like Ed25519's (no RSA prime search), and the signatures are
+        // small and fast.
+        key_type: KeyType::EcdsaP256,
         lifetime: CaLifetime::Root,
     };
     let created = create_root(&spec, keystore)?;
