@@ -201,12 +201,27 @@ pub fn swap_payload(token: &str, payload: &Value) -> String {
     parts.join(".")
 }
 
-/// Corrupt the signature segment: flips the final character into the other
-/// member of a four-bit-safe pair, so the string stays valid unpadded
-/// base64url while almost certainly no longer matching the signature.
+/// Corrupt the signature: flips the FIRST character of the signature
+/// segment into the other member of a four-bit-safe pair, so the string
+/// stays valid canonically-padded-free base64url while almost certainly no
+/// longer matching the signature. (The FINAL characters sit in base64's
+/// last group, where a flip can land in the non-canonical trailing bits and
+/// fail the BASE64 decode — a `malformed` refusal — instead of the
+/// signature verdict the trap is about; the base64 crate rejects trailing
+/// bits that are not zero. The first character is a full 6-bit group: it
+/// corrupts the top signature byte without ever touching the canonicality
+/// of the segment.)
 pub fn tamper_signature(token: &str) -> String {
-    let mut token = token.to_string();
-    let last = token.pop().expect("a compact JWS ends with its signature");
-    token.push(if last == 'A' { 'B' } else { 'A' });
-    token
+    let parts: Vec<&str> = token.split('.').collect();
+    let signature = parts[2];
+    let mut chars = signature.chars();
+    let first = chars.next().expect("a signature segment is non-empty");
+    let replacement = if first == 'A' { 'B' } else { 'A' };
+    format!(
+        "{}.{}.{}{}",
+        parts[0],
+        parts[1],
+        replacement,
+        chars.as_str()
+    )
 }

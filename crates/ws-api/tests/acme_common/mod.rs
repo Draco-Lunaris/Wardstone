@@ -208,7 +208,7 @@ pub fn tamper_signature(token: &str) -> String {
     let first = chars.next().expect("a signature segment is non-empty");
     let replacement = if first == 'A' { 'B' } else { 'A' };
     format!(
-        "{}.{}.{}{replacement}{}",
+        "{}.{}.{}{}",
         parts[0],
         parts[1],
         replacement,
