@@ -145,8 +145,24 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
       body: JSON.stringify(payload),
     });
     const body = await response.json().catch(() => ({}));
-    note.textContent = response.ok ? body.message : (body.error || 'Setup failed');
-    if (!response.ok) { note.style.color = '#a11'; }
+    if (response.ok) {
+      note.style.color = '#161';
+      // NOTE: this script lives inside a Rust double-quoted string — the JS
+      // must never contain a raw double quote. The login link is therefore
+      // built with DOM calls (single quotes only).
+      const login = document.createElement('a');
+      login.href = location.origin + '/';
+      login.textContent = 'open the operator login';
+      note.textContent = 'Setup complete. This server is restarting on its CA-issued certificate — ' +
+        'give it a few seconds, then ' + body.message + ' ';
+      note.appendChild(login);
+      note.insertAdjacentText('beforeend',
+        ' Log in with the admin account you just created. Expect one more ' +
+        'certificate warning on the new leaf, and accept it once.');
+    } else {
+      note.textContent = body.error || 'Setup failed';
+      note.style.color = '#a11';
+    }
   } catch (error) {
     note.textContent = 'Setup failed: ' + error;
     note.style.color = '#a11';
@@ -182,14 +198,20 @@ fn render(fingerprint: &str, hostname: &str) -> String {
             "<input id=\"admin_username\" name=\"admin_username\" autocomplete=\"username\" required>\n",
             "<label for=\"admin_password\">Admin password</label>\n",
             "<input id=\"admin_password\" name=\"admin_password\" type=\"password\" autocomplete=\"new-password\" required>\n",
-            "<label for=\"default_domain\">Default domain</label>\n",
-            "<input id=\"default_domain\" name=\"default_domain\" placeholder=\"certificates.example.com\" required>\n",
+            "<label for=\"default_domain\">Default domain — the SAN scope for issued certificates</label>\n",
+            "<input id=\"default_domain\" name=\"default_domain\" placeholder=\"example.com\" required>\n",
+            "<p class=\"hint\">The <strong>bare registrable domain</strong> every issued certificate's name must fit \
+             — e.g. <code>example.com</code>, never <code>*.example.com</code> or <code>certificates.example.com</code>. \
+             Profile SAN patterns derive from it (the domain itself plus one-label subdomains), and the server \
+             hostname below must be a subdomain of it.</p>\n",
             "<label for=\"admin_cidrs\">Admin CIDRs (comma-separated, optional)</label>\n",
             "<textarea id=\"admin_cidrs\" name=\"admin_cidrs\" rows=\"2\" placeholder=\"10.0.0.0/8, 192.168.0.0/16\"></textarea>\n",
-            "<label for=\"server_hostname\">Server hostname</label>\n",
+            "<label for=\"server_hostname\">Server hostname — must be a subdomain of the default domain</label>\n",
             "<input id=\"server_hostname\" name=\"server_hostname\" placeholder=\"wardstone.example.com\" required>\n",
             "<p class=\"hint\">The server hostname is the SAN of the certificate this UI \
-             will serve after setup — it is not derived from the default domain.</p>\n",
+             will serve after setup — it is not derived from the default domain, but it MUST \
+             fall under the default domain above (e.g. <code>wardstone.example.com</code> \
+             with default domain <code>example.com</code>).</p>\n",
             "<button type=\"submit\">Complete setup</button>\n",
             "</form>\n",
             "<div id=\"result\"></div>\n",
