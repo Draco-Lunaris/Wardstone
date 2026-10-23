@@ -1406,7 +1406,7 @@ fn test_leaf_signed_by_ecdsa_root_follows_the_ca_algorithm() {
     }
     assert_eq!(
         cert_general_names(&leaf_cert).and_then(|names| match names.first() {
-            Some(GeneralName::DNSName(d)) => Some(d.clone()),
+            Some(GeneralName::DNSName(d)) => Some(*d),
             _ => None,
         }),
         Some("leaf.example.test"),
