@@ -40,6 +40,8 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::ReadAudit,
     Capability::ReadUsers,
     Capability::ReadServiceIdentities,
+    Capability::ReadAcme,
+    Capability::ManageAcmeAccounts,
 ];
 
 /// What an actor may do. Stored in TEXT columns as its serde (`snake_case`)
@@ -77,6 +79,11 @@ pub enum Capability {
     ReadUsers,
     /// List and read service identities.
     ReadServiceIdentities,
+    /// List and read ACME accounts and orders.
+    ReadAcme,
+    /// Create, deactivate, and delete ACME accounts, and mint ACME-token
+    /// credentials.
+    ManageAcmeAccounts,
 }
 
 impl Capability {
@@ -99,6 +106,8 @@ impl Capability {
             Capability::ReadAudit => "read_audit",
             Capability::ReadUsers => "read_users",
             Capability::ReadServiceIdentities => "read_service_identities",
+            Capability::ReadAcme => "read_acme",
+            Capability::ManageAcmeAccounts => "manage_acme_accounts",
         }
     }
 

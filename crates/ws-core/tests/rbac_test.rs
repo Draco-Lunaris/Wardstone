@@ -30,6 +30,8 @@ const ALL_CAPABILITIES: &[Capability] = &[
     Capability::ReadAudit,
     Capability::ReadUsers,
     Capability::ReadServiceIdentities,
+    Capability::ReadAcme,
+    Capability::ManageAcmeAccounts,
 ];
 
 const ALL_ROLES: &[Role] = &[Role::Admin, Role::Issuer, Role::Viewer];
@@ -83,6 +85,10 @@ fn issuer_bundle() {
     assert!(issuer.contains(&Capability::ReadProfiles));
     assert!(!issuer.contains(&Capability::ManageProfiles));
     assert!(!issuer.contains(&Capability::ReadAudit));
+    // The ACME additions (migration 012) are Admin-only: Issuer gains
+    // nothing.
+    assert!(!issuer.contains(&Capability::ReadAcme));
+    assert!(!issuer.contains(&Capability::ManageAcmeAccounts));
 }
 
 #[test]
@@ -94,6 +100,10 @@ fn viewer_bundle() {
     assert!(viewer.contains(&Capability::ReadAudit));
     assert!(!viewer.contains(&Capability::Issue));
     assert!(!viewer.contains(&Capability::ManageCas));
+    // The ACME additions (migration 012) are Admin-only: Viewer gains
+    // nothing.
+    assert!(!viewer.contains(&Capability::ReadAcme));
+    assert!(!viewer.contains(&Capability::ManageAcmeAccounts));
 }
 
 #[test]

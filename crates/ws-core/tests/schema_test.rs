@@ -383,9 +383,10 @@ async fn cas_parent_tenant_composite_fk_exists() {
 
 /// `role_capabilities` is SEEDED, not merely created: exactly the role →
 /// capability pairs of `ws_core::models::rbac::role_capabilities()` (admin
-/// = all 15, issuer = 4, viewer = 4), and every seeded role/capability
-/// string parses back into the `Role`/`Capability` enums — the table's
-/// values and the code's vocabulary cannot drift.
+/// = all 17, issuer = 4, viewer = 4; migration 012 added the two ACME
+/// capabilities to the Admin seed on top of migration 007's), and every
+/// seeded role/capability string parses back into the `Role`/`Capability`
+/// enums — the table's values and the code's vocabulary cannot drift.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn role_capabilities_is_seeded() {
@@ -424,6 +425,8 @@ async fn role_capabilities_is_seeded() {
                 "read_audit",
                 "read_users",
                 "read_service_identities",
+                "read_acme",
+                "manage_acme_accounts",
             ],
         ),
         (
