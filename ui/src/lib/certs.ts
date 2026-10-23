@@ -222,6 +222,44 @@ export function fetchCertificates(filters: CertificateListFilters): Promise<Cert
   return apiFetch<Certificate[]>(qs ? `${CERTIFICATES_BASE}?${qs}` : CERTIFICATES_BASE);
 }
 
+/** The dashboard sieve's slim row, as `GET /api/v1/certificates/slim`
+ * answers: the five small fields the expiring-soon list reads, WITHOUT the
+ * full row's PEM/SAN bulk. Timestamps arrive RFC 3339. */
+export interface SlimCertificate {
+  id: string;
+  subject: string;
+  serial_hex: string;
+  not_after: string;
+  status: string;
+}
+
+/** The slim list's filter axes: the sieve pins `status="active"` and the
+ * repo's 500-row clamp; `page`/`pageSize` are the shared paging. */
+export interface SlimListFilters {
+  status?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+/** `GET /api/v1/certificates/slim` — registered BEFORE `/{id}` upstream,
+ * so `slim` is never read as a certificate id. */
+export function fetchCertificatesSlim(filters: SlimListFilters): Promise<SlimCertificate[]> {
+  const params = new URLSearchParams();
+  if (filters.status) {
+    params.set("status", filters.status);
+  }
+  if (filters.page != null) {
+    params.set("page", String(filters.page));
+  }
+  if (filters.pageSize != null) {
+    params.set("page_size", String(filters.pageSize));
+  }
+  const qs = params.toString();
+  return apiFetch<SlimCertificate[]>(
+    qs ? `${CERTIFICATES_BASE}/slim?${qs}` : `${CERTIFICATES_BASE}/slim`,
+  );
+}
+
 /** `GET /api/v1/certificates/statistics`. */
 export function fetchCertificateStatistics(): Promise<CertificateStatistics> {
   return apiFetch<CertificateStatistics>(`${CERTIFICATES_BASE}/statistics`);

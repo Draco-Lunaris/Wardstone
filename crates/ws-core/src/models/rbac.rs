@@ -40,6 +40,8 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::ReadAudit,
     Capability::ReadUsers,
     Capability::ReadServiceIdentities,
+    Capability::ReadAcme,
+    Capability::ManageAcmeAccounts,
 ];
 
 /// What an actor may do. Stored in TEXT columns as its serde (`snake_case`)
@@ -77,6 +79,19 @@ pub enum Capability {
     ReadUsers,
     /// List and read service identities.
     ReadServiceIdentities,
+    /// List and read ACME accounts and orders (the operator-visibility
+    /// REST routes of Plan 4 Task 10).
+    ReadAcme,
+    /// Deactivate ACME accounts through the REST operator routes.
+    ///
+    /// Narrower than the name reads: account CREATION is unauthenticated
+    /// machine enrollment (an embedded-JWK new-account that the account's
+    /// own key later carries), deactivation through the JWS surface rides
+    /// the account key too, and neither account DELETION nor ACME-token
+    /// MINTING exists in v1 — this capability gates exactly the
+    /// operator-side deactivation (migration 012 plants the seeds; this
+    /// doc is the vocabulary's source of truth).
+    ManageAcmeAccounts,
 }
 
 impl Capability {
@@ -99,6 +114,8 @@ impl Capability {
             Capability::ReadAudit => "read_audit",
             Capability::ReadUsers => "read_users",
             Capability::ReadServiceIdentities => "read_service_identities",
+            Capability::ReadAcme => "read_acme",
+            Capability::ManageAcmeAccounts => "manage_acme_accounts",
         }
     }
 

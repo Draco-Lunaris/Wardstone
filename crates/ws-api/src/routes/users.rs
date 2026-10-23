@@ -163,6 +163,13 @@ async fn create_user(
 /// user-removal path. The `user_deactivated` audit row commits with the
 /// flag flip; deactivating an already-deactivated user changes nothing
 /// and writes no second row; another tenant's user is a 404.
+///
+/// The last-admin guard is the PATCH route's policy, aligned: deactivating
+/// an active admin (the acting actor's OWN account included — the blanket
+/// actor-self-refusal it replaced refused all self-deactivation) is
+/// refused `409` with the PATCH route's exact message unless the tenant
+/// retains ANOTHER active admin. The count is tenant-wide, not
+/// actor-relative, and runs INSIDE the same transaction as the flip.
 async fn deactivate_user(
     auth: AuthActor,
     State(state): State<AppState>,
@@ -178,15 +185,26 @@ async fn deactivate_user(
     if !user.is_active {
         return Ok(StatusCode::NO_CONTENT);
     }
-    if Uuid::parse_str(&auth.actor_id).ok() == Some(id) {
-        // Self-deactivation would lock the operator out of their own
-        // account mid-session; require another actor to do it.
-        return Err(ApiError::bad_request(
-            "an actor cannot deactivate its own account",
-        ));
-    }
 
     let mut tx = state.pool.begin().await?;
+    if user.role == Role::Admin {
+        // The exact count check (and message) the PATCH route runs: a
+        // change that would leave ZERO active admins is refused. The
+        // same residual read-committed race the PATCH route documents
+        // applies here too, for the same accepted reason.
+        let active_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users \
+             WHERE tenant_id = $1 AND role = 'admin' AND is_active = TRUE",
+        )
+        .bind(auth.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_admins <= 1 {
+            return Err(ApiError::Conflict(
+                "refusing to remove the last active administrator".to_string(),
+            ));
+        }
+    }
     UserRepo::new().deactivate(&mut *tx, id).await?;
     AuditRepo::new()
         .record(

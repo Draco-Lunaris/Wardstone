@@ -45,8 +45,13 @@ use ws_api::{ApiConfig, AppState};
 use ws_auth::jwt::{issue_access_token, AccessClaims, JwtKeys};
 use ws_auth::service_identity::create_service_identity;
 use ws_core::db::connect;
+use ws_core::models::acme::{
+    AcmeAccountModel, AcmeAccountStatus, AcmeAuthorizationModel, AcmeAuthorizationStatus,
+    AcmeOrderModel, AcmeOrderStatus,
+};
 use ws_core::models::rbac::Role;
 use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Capability, ALL_CAPABILITIES};
+use ws_core::repo::acme_repo::AcmeRepo;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::credential_repo::CredentialRepo;
 
@@ -138,6 +143,14 @@ impl Fixture {
             .await
             .expect("delete fixture audit rows");
         for table in [
+            // The ACME children first (challenges → authorizations →
+            // orders → accounts): the Plan-4 Task-10 REST tests seed ACME
+            // rows, and `acme_orders.certificate_id` references
+            // certificates.
+            "DELETE FROM acme_challenges WHERE tenant_id = $1",
+            "DELETE FROM acme_authorizations WHERE tenant_id = $1",
+            "DELETE FROM acme_orders WHERE tenant_id = $1",
+            "DELETE FROM acme_accounts WHERE tenant_id = $1",
             "DELETE FROM certificates WHERE tenant_id = $1",
             "DELETE FROM used_serials WHERE tenant_id = $1",
             "DELETE FROM one_shot_tokens WHERE tenant_id = $1",
@@ -263,6 +276,15 @@ async fn sweep_tenant(pool: &PgPool, name: &str) {
     .await
     .expect("sweep stale capability grant rows");
     for table in [
+        // The ACME children first (see Fixture::cleanup's comment).
+        "DELETE FROM acme_challenges WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM acme_authorizations WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM acme_orders WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+        "DELETE FROM acme_accounts WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM certificates WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM used_serials WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
         "DELETE FROM one_shot_tokens WHERE tenant_id IN (SELECT id FROM tenants WHERE name = $1)",
@@ -2622,6 +2644,117 @@ async fn profile_creation_refuses_the_star_dot_pattern() {
     fx.cleanup().await;
 }
 
+/// The PUT edit path persists the description (the round-trip the admin
+/// table renders): a description on the PUT body lands in the row the list
+/// serves, the PUT response echoes the STORED value (not merely the
+/// request's), a blank one stores NULL and round-trips as `null`, and the
+/// create path is unchanged. One profile, edited twice.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn profile_put_persists_the_description() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let policy = json!({
+        "key_type": "ecdsa-p256",
+        "key_usages": ["digital_signature"],
+        "eku": ["server_auth"],
+        "lifetime_days": 30,
+        "san_patterns": ["d.test"]
+    });
+
+    let mut create_body = policy.clone();
+    create_body["name"] = json!("desc-edit");
+    create_body["description"] = json!("first wording");
+    let create_res = post_json(&fx, "/api/v1/profiles", Some(&token), create_body).await;
+    assert_eq!(
+        create_res.status(),
+        StatusCode::CREATED,
+        "create the profile"
+    );
+    let raw = axum::body::to_bytes(create_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&raw).unwrap();
+    let profile_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        created["description"], "first wording",
+        "the create path persists and echoes the description (unchanged)"
+    );
+
+    let mut edit_body = policy.clone();
+    edit_body["description"] = json!("second wording");
+    let edit_res = put_json(
+        &fx,
+        &format!("/api/v1/profiles/{profile_id}"),
+        Some(&token),
+        edit_body,
+    )
+    .await;
+    let edit_status = edit_res.status();
+    let raw = axum::body::to_bytes(edit_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let edited: Value = serde_json::from_slice(&raw).unwrap();
+    let first_list = get_json(&fx, "/api/v1/profiles", &token).await;
+
+    let mut blank_body = policy.clone();
+    blank_body["description"] = json!("   ");
+    let blank_res = put_json(
+        &fx,
+        &format!("/api/v1/profiles/{profile_id}"),
+        Some(&token),
+        blank_body,
+    )
+    .await;
+    let blank_status = blank_res.status();
+    let raw = axum::body::to_bytes(blank_res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let blanked: Value = serde_json::from_slice(&raw).unwrap();
+    let second_list = get_json(&fx, "/api/v1/profiles", &token).await;
+
+    let audits = audit_rows(&fx).await;
+    let row_description = |list: &Value| -> Value {
+        list.as_array()
+            .expect("the list body is a JSON array")
+            .iter()
+            .find(|profile| profile["id"].as_str() == Some(profile_id.as_str()))
+            .map(|profile| profile["description"].clone())
+            .expect("the edited profile appears in the list")
+    };
+
+    fx.cleanup().await;
+
+    assert_eq!(edit_status, StatusCode::OK, "the description edit");
+    assert_eq!(
+        edited["description"], "second wording",
+        "the PUT response echoes the STORED description"
+    );
+    assert_eq!(
+        row_description(&first_list),
+        json!("second wording"),
+        "the edit persisted into the row the list serves"
+    );
+    assert_eq!(blank_status, StatusCode::OK, "the blank edit");
+    assert_eq!(
+        blanked["description"],
+        json!(null),
+        "a blank description stores NULL and the response echoes null"
+    );
+    assert_eq!(
+        row_description(&second_list),
+        json!(null),
+        "the cleared description round-trips as null"
+    );
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["profile_created", "profile_revised", "profile_revised"],
+        "exactly the create and the two edit audit rows: {audits:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The filtered listing and estate statistics (Plan 3 Task 1)
 // ---------------------------------------------------------------------------
@@ -2787,6 +2920,113 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
         "bad_request",
         "the invalid-status code"
     );
+}
+
+/// The slim list, the dashboard sieve's feed: `GET /certificates/slim`
+/// answers `{id, subject, serial_hex, not_after, status}` and NOTHING
+/// else (no PEM, no SAN arrays, no audit fields), honors the `status`
+/// filter, and gates on `read_certificates` like the full list does.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn slim_listing_serves_the_sieve_projection() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let (profile_id, _ca_id) = setup_profile_and_ca(&fx).await;
+
+    let (a_status, a_body) = issue_csr(
+        &fx,
+        profile_id,
+        "slim-a.wardstone.test",
+        &["slim-a.wardstone.test"],
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK, "issue A: {a_body}");
+    let a_id = a_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let a_serial_hex = a_body["serial_hex"].as_str().unwrap().to_string();
+    let (b_status, b_body) = issue_csr(
+        &fx,
+        profile_id,
+        "slim-b.wardstone.test",
+        &["slim-b.wardstone.test"],
+    )
+    .await;
+    assert_eq!(b_status, StatusCode::OK, "issue B: {b_body}");
+    let b_id = b_body["certificate_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let revoke = post_json(
+        &fx,
+        &format!("/api/v1/certificates/{b_id}/revoke"),
+        Some(&token),
+        json!({"reason": "superseded"}),
+    )
+    .await;
+    assert_eq!(revoke.status(), StatusCode::OK, "revoke B");
+
+    let slim = get_json(&fx, "/api/v1/certificates/slim", &token).await;
+    let slim_active = get_json(&fx, "/api/v1/certificates/slim?status=active", &token).await;
+    let gate_status = get_bearer(&fx, "/api/v1/certificates/slim", &api_token(&fx, &[]).await)
+        .await
+        .status();
+
+    fx.cleanup().await;
+
+    let rows = slim.as_array().expect("the slim body is a JSON array");
+    let a_row = rows
+        .iter()
+        .find(|row| row["id"].as_str() == Some(a_id.to_string().as_str()))
+        .expect("A appears in the slim list");
+    let mut keys: Vec<&str> = a_row
+        .as_object()
+        .expect("a slim row is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["id", "not_after", "serial_hex", "status", "subject"],
+        "the slim projection carries EXACTLY five fields"
+    );
+    assert_eq!(a_row["subject"], "CN=slim-a.wardstone.test");
+    assert_eq!(a_row["serial_hex"], a_serial_hex);
+    assert_eq!(a_row["status"], "active");
+    assert!(
+        a_row["not_after"].is_string(),
+        "not_after arrives as an RFC 3339 timestamp"
+    );
+
+    let ids = |list: &Value| -> Vec<Uuid> {
+        list.as_array()
+            .expect("the slim body is a JSON array")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .collect()
+    };
+    assert!(
+        ids(&slim).contains(&a_id) && ids(&slim).contains(&b_id),
+        "the unfiltered slim list lists both"
+    );
+    let active_ids = ids(&slim_active);
+    assert!(active_ids.contains(&a_id), "the active filter keeps A");
+    assert!(
+        !active_ids.contains(&b_id),
+        "the active filter drops the revoked B"
+    );
+    let b_row = rows
+        .iter()
+        .find(|row| row["id"].as_str() == Some(b_id.to_string().as_str()))
+        .expect("B appears in the slim list");
+    assert_eq!(b_row["status"], "revoked", "the revoked status decodes");
+
+    assert_eq!(gate_status, StatusCode::FORBIDDEN, "the capability gate");
 }
 
 /// The estate statistics endpoint counts, in one response: active,
@@ -3961,4 +4201,565 @@ async fn user_patch_unknown_and_foreign_ids_are_404() {
 
     assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
     assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
+}
+
+/// The deactivate route runs the SAME self-deactivation policy the PATCH
+/// route pins: the acting actor may deactivate THEMSELVES when the tenant
+/// retains another active admin (the count is tenant-wide, not actor-
+/// relative). The route's `user_deactivated` audit row is untouched, and a
+/// second deactivate of the now-inactive user is an idempotent no-op.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn self_deactivation_allowed_with_a_second_admin() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    // A second ACTIVE admin so the self-deactivation is not the
+    // last-admin case.
+    insert_user(
+        &fx.pool,
+        fx.tenant_id,
+        Uuid::new_v4(),
+        "admin-two",
+        Role::Admin,
+    )
+    .await;
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let after = sqlx::query_scalar::<_, bool>("SELECT is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row after self-deactivation");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::NO_CONTENT, "the self-deactivation");
+    assert!(!after, "is_active flips to FALSE");
+    let actions: Vec<&str> = audits.iter().map(|(action, ..)| action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["user_deactivated"],
+        "exactly one audit row: {audits:?}"
+    );
+}
+
+/// The last-admin guard applies to the self-deactivation too: with NO
+/// second active admin, the actor deactivating their own account is
+/// refused 409 with the exact PATCH-route message, the row is unchanged,
+/// and no audit rows are written.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn self_deactivation_still_refused_as_last_admin() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", fx.admin_id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let status = res.status();
+    let raw = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let row: (String, bool) = sqlx::query_as("SELECT role, is_active FROM users WHERE id = $1")
+        .bind(fx.admin_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the admin row");
+    let audits = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "the last-admin refusal");
+    assert_eq!(error_code(&body), "conflict");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "refusing to remove the last active administrator"
+    );
+    assert_eq!(row, ("admin".to_string(), true), "the row is unchanged");
+    assert!(
+        audits.is_empty(),
+        "no audit rows on the refusal: {audits:?}"
+    );
+}
+
+/// The deactivate route keeps its tenant scoping: another tenant's user
+/// (and an absent one) is a 404, indistinguishably.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn deactivate_unknown_and_foreign_ids_are_404() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let unknown_status = post_json(
+        &fx,
+        &format!("/api/v1/users/{}/deactivate", Uuid::new_v4()),
+        Some(&token),
+        json!({}),
+    )
+    .await
+    .status();
+
+    let foreign_name = "rt-api-foreign-deactivate-user";
+    sqlx::query(
+        "DELETE FROM audit_log WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user audit rows");
+    sqlx::query(
+        "DELETE FROM users WHERE tenant_id IN \
+         (SELECT id FROM tenants WHERE name = $1)",
+    )
+    .bind(foreign_name)
+    .execute(&fx.pool)
+    .await
+    .expect("sweep stale foreign-user rows");
+    sqlx::query("DELETE FROM tenants WHERE name = $1")
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("sweep stale foreign-user tenant");
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(foreign_tenant)
+        .bind(foreign_name)
+        .execute(&fx.pool)
+        .await
+        .expect("insert the foreign-user tenant");
+    fx.extra_tenants.lock().unwrap().push(foreign_tenant);
+    let foreign_user = Uuid::new_v4();
+    insert_user(
+        &fx.pool,
+        foreign_tenant,
+        foreign_user,
+        "foreign-deactivate-user",
+        Role::Viewer,
+    )
+    .await;
+    let foreign_status = post_json(
+        &fx,
+        &format!("/api/v1/users/{foreign_user}/deactivate"),
+        Some(&token),
+        json!({}),
+    )
+    .await
+    .status();
+
+    fx.cleanup().await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "an unknown id");
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND, "a foreign tenant id");
+}
+
+// ---------------------------------------------------------------------------
+// The ACME UI-facing REST routes (Plan 4 Task 10)
+// ---------------------------------------------------------------------------
+
+/// Read a JSON response body as a serde_json `Value`.
+async fn json_body(res: TestResponse, cap: usize) -> Value {
+    let bytes = axum::body::to_bytes(res.into_body(), cap).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Seed one `acme_accounts` row directly through the Task-2 repo (no JWS
+/// machinery needed — the REST projection reads the SAME rows).
+async fn seed_acme_account(
+    fx: &Fixture,
+    thumbprint: &str,
+    status: AcmeAccountStatus,
+) -> AcmeAccountModel {
+    let account = AcmeAccountModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        jwk_thumbprint: thumbprint.to_string(),
+        jwk: json!({"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}),
+        status,
+        tos_agreed_at: None,
+        contact: Some(format!("mailto:{thumbprint}@wardstone.test")),
+        created_at: Utc::now(),
+    };
+    AcmeRepo::new()
+        .insert_account(&fx.pool, &account)
+        .await
+        .expect("seed the acme account");
+    account
+}
+
+/// Seed one `acme_orders` row for `account_id` (`certificate_id` stays
+/// `None` at the route-test level: the column is a real foreign key and
+/// the repo-level suite covers the certificate-keyed lookup).
+async fn seed_acme_order(
+    fx: &Fixture,
+    account_id: Uuid,
+    status: AcmeOrderStatus,
+) -> AcmeOrderModel {
+    let order = AcmeOrderModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id,
+        status,
+        profile_name: "web-server".to_string(),
+        identifiers: json!([{"type": "dns", "value": "host.wardstone.test"}]),
+        csr_pem: None,
+        not_before: None,
+        not_after: None,
+        certificate_id: None,
+        error: None,
+        expires_at: Utc::now() + Duration::days(7),
+        created_at: Utc::now(),
+    };
+    AcmeRepo::new()
+        .insert_order(&fx.pool, &order)
+        .await
+        .expect("seed the acme order");
+    order
+}
+
+/// The REST projection's reads: the list carries `orders_count` per
+/// account, the detail serves the account plus its recent orders, and the
+/// orders route scopes to exactly one of `account_id` / `certificate_id`
+/// (neither is a 400; a miss answers an EMPTY list). Unknown accounts are
+/// one indistinguishable 404.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ui_acme_rest_lists_accounts_orders_and_details() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let account = seed_acme_account(&fx, "ui-acme-thumb-a", AcmeAccountStatus::Valid).await;
+    let other = seed_acme_account(&fx, "ui-acme-thumb-b", AcmeAccountStatus::Deactivated).await;
+    seed_acme_order(&fx, account.id, AcmeOrderStatus::Pending).await;
+    seed_acme_order(&fx, account.id, AcmeOrderStatus::Valid).await;
+
+    let list_status = get_bearer(&fx, "/api/v1/acme/accounts", &token)
+        .await
+        .status();
+    let list = json_body(
+        get_bearer(&fx, "/api/v1/acme/accounts", &token).await,
+        1 << 20,
+    )
+    .await;
+    let detail_status = get_bearer(
+        &fx,
+        &format!("/api/v1/acme/accounts/{}", account.id),
+        &token,
+    )
+    .await
+    .status();
+    let detail = json_body(
+        get_bearer(
+            &fx,
+            &format!("/api/v1/acme/accounts/{}", account.id),
+            &token,
+        )
+        .await,
+        1 << 20,
+    )
+    .await;
+    let unknown = Uuid::new_v4();
+    let unknown_detail = get_bearer(&fx, &format!("/api/v1/acme/accounts/{unknown}"), &token).await;
+    let unknown_detail_status = unknown_detail.status();
+    let unknown_detail_code = error_code(&json_body(unknown_detail, 1 << 20).await);
+    let orders_by_account = json_body(
+        get_bearer(
+            &fx,
+            &format!("/api/v1/acme/orders?account_id={}", account.id),
+            &token,
+        )
+        .await,
+        1 << 20,
+    )
+    .await;
+    let orders_of_other = json_body(
+        get_bearer(
+            &fx,
+            &format!("/api/v1/acme/orders?account_id={}", other.id),
+            &token,
+        )
+        .await,
+        1 << 20,
+    )
+    .await;
+    let orders_by_unknown_certificate = json_body(
+        get_bearer(
+            &fx,
+            &format!("/api/v1/acme/orders?certificate_id={}", Uuid::new_v4()),
+            &token,
+        )
+        .await,
+        1 << 20,
+    )
+    .await;
+    let unscoped = get_bearer(&fx, "/api/v1/acme/orders", &token).await;
+    let orders_unscoped_status = unscoped.status();
+    let orders_unscoped_code = error_code(&json_body(unscoped, 1 << 20).await);
+
+    fx.cleanup().await;
+
+    assert_eq!(list_status, StatusCode::OK);
+    let rows = list.as_array().expect("a JSON array");
+    assert_eq!(rows.len(), 2);
+    let listed: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["id"] == account.id.to_string())
+        .collect();
+    let other_row: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["id"] == other.id.to_string())
+        .collect();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(other_row.len(), 1);
+    assert_eq!(listed[0]["orders_count"], 2, "both seeded orders count");
+    assert_eq!(other_row[0]["orders_count"], 0);
+    assert_eq!(listed[0]["jwk_thumbprint"], "ui-acme-thumb-a");
+    assert_eq!(listed[0]["status"], "valid");
+    assert_eq!(other_row[0]["status"], "deactivated");
+    assert!(listed[0]["contact"].is_string());
+
+    assert_eq!(detail_status, StatusCode::OK);
+    assert_eq!(detail["id"], account.id.to_string());
+    assert_eq!(detail["status"], "valid");
+    assert_eq!(
+        detail["orders"].as_array().expect("orders array").len(),
+        2,
+        "the detail serves the account's recent orders"
+    );
+    let first_order = &detail["orders"][0];
+    assert_eq!(first_order["profile_name"], "web-server");
+    assert_eq!(first_order["account_id"], account.id.to_string());
+    assert!(first_order["identifiers"].as_array().is_some());
+    assert!(first_order["certificate_id"].is_null());
+
+    assert_eq!(unknown_detail_status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown_detail_code, "not_found");
+
+    assert_eq!(
+        orders_by_account.as_array().expect("a JSON array").len(),
+        2,
+        "the account's orders page through the same rows"
+    );
+    assert_eq!(
+        orders_of_other.as_array().expect("a JSON array").len(),
+        0,
+        "an account without orders lists empty, never an error"
+    );
+    assert_eq!(
+        orders_by_unknown_certificate
+            .as_array()
+            .expect("a JSON array")
+            .len(),
+        0,
+        "a certificate with no order answers an empty list"
+    );
+    assert_eq!(orders_unscoped_status, StatusCode::BAD_REQUEST);
+    assert_eq!(orders_unscoped_code, "bad_request");
+}
+
+/// The REST deactivation drives the SAME cascade the JWS machine path
+/// runs — pending authorizations invalidated, open orders stamped invalid
+/// — commits the audit row with the CALLING USER as the actor (a human
+/// acted), and is idempotent: a repeat answers 0/0 and writes no second
+/// audit row.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ui_acme_rest_deactivate_cascades_and_audits_the_calling_user() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let account = seed_acme_account(&fx, "ui-acme-thumb-c", AcmeAccountStatus::Valid).await;
+    let order = seed_acme_order(&fx, account.id, AcmeOrderStatus::Pending).await;
+    let now = Utc::now();
+    let pending_authz = AcmeAuthorizationModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account.id,
+        identifier: "pending.wardstone.test".to_string(),
+        status: AcmeAuthorizationStatus::Pending,
+        expires_at: now + Duration::days(7),
+        reused_from: None,
+        order_id: Some(order.id),
+        created_at: now,
+    };
+    AcmeRepo::new()
+        .insert_authorization(&fx.pool, &pending_authz)
+        .await
+        .expect("seed the pending authorization");
+    let valid_authz = AcmeAuthorizationModel {
+        id: Uuid::new_v4(),
+        tenant_id: fx.tenant_id,
+        account_id: account.id,
+        identifier: "valid.wardstone.test".to_string(),
+        status: AcmeAuthorizationStatus::Valid,
+        expires_at: now + Duration::days(30),
+        reused_from: None,
+        order_id: None,
+        created_at: now,
+    };
+    AcmeRepo::new()
+        .insert_authorization(&fx.pool, &valid_authz)
+        .await
+        .expect("seed the valid authorization");
+
+    let first_response = post_json(
+        &fx,
+        &format!("/api/v1/acme/accounts/{}/deactivate", account.id),
+        Some(&token),
+        json!({}),
+    )
+    .await;
+    let first_status = first_response.status();
+    let first = json_body(first_response, 1 << 20).await;
+    let repeat = json_body(
+        post_json(
+            &fx,
+            &format!("/api/v1/acme/accounts/{}/deactivate", account.id),
+            Some(&token),
+            json!({}),
+        )
+        .await,
+        1 << 20,
+    )
+    .await;
+
+    // Readback through the repos BEFORE the fixture's self-clean.
+    let account_after = AcmeRepo::new()
+        .get_account_by_id(&fx.pool, fx.tenant_id, account.id)
+        .await
+        .expect("read the deactivated account")
+        .expect("the account row survives deactivation");
+    let pending_after = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, pending_authz.id)
+        .await
+        .expect("read the pending authorization")
+        .expect("row present");
+    let valid_after = AcmeRepo::new()
+        .get_authorization(&fx.pool, fx.tenant_id, valid_authz.id)
+        .await
+        .expect("read the valid authorization")
+        .expect("row present");
+    let order_after = AcmeRepo::new()
+        .get_order(&fx.pool, fx.tenant_id, order.id)
+        .await
+        .expect("read the open order")
+        .expect("row present");
+    let audit = audit_rows(&fx).await;
+
+    fx.cleanup().await;
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first["status"], "deactivated");
+    assert_eq!(first["authorizations_invalidated"], 1);
+    assert_eq!(first["orders_invalidated"], 1);
+    assert_eq!(repeat["authorizations_invalidated"], 0, "idempotent");
+    assert_eq!(repeat["orders_invalidated"], 0);
+
+    assert_eq!(account_after.status, AcmeAccountStatus::Deactivated);
+    assert_eq!(pending_after.status, AcmeAuthorizationStatus::Deactivated);
+    assert_eq!(valid_after.status, AcmeAuthorizationStatus::Valid);
+    assert_eq!(order_after.status, AcmeOrderStatus::Invalid);
+    assert_eq!(order_after.error.as_deref(), Some("account deactivated"));
+
+    let rows: Vec<_> = audit
+        .iter()
+        .filter(|(action, ..)| action == "acme_account_deactivated")
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one audit row across both POSTs");
+    let (action, actor_type, auth_method, details) = rows[0];
+    assert_eq!(action, "acme_account_deactivated");
+    assert_eq!(actor_type, "user", "the CALLING USER is the actor");
+    assert_eq!(auth_method, "session");
+    assert_eq!(details["jwk_thumbprint"], "ui-acme-thumb-c");
+    assert_eq!(details["surface"], "rest");
+    assert_eq!(details["authorizations_invalidated"], 1);
+    assert_eq!(details["orders_invalidated"], 1);
+}
+
+/// The capability split the REST projection gates on: `read_acme` alone
+/// reads both lists and is 403 on the deactivation; a no-grant token is
+/// 403 everywhere; an admin (both capabilities) gets a 404 on an unknown
+/// account's deactivation — authorization first, indistinguishable 404
+/// last.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn ui_acme_rest_capability_gates_and_unknown_404s() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let admin = admin_token(&fx);
+    let readonly = api_token(&fx, &[Capability::ReadAcme]).await;
+    let nogrant = api_token(&fx, &[]).await;
+    let unknown = Uuid::new_v4();
+
+    let readonly_list = get_bearer(&fx, "/api/v1/acme/accounts", &readonly)
+        .await
+        .status();
+    let readonly_orders = get_bearer(
+        &fx,
+        &format!("/api/v1/acme/orders?account_id={}", Uuid::new_v4()),
+        &readonly,
+    )
+    .await
+    .status();
+    let readonly_deactivate = post_json(
+        &fx,
+        &format!("/api/v1/acme/accounts/{unknown}/deactivate"),
+        Some(&readonly),
+        json!({}),
+    )
+    .await;
+    let readonly_deactivate_status = readonly_deactivate.status();
+    let readonly_deactivate_code = error_code(&json_body(readonly_deactivate, 1 << 20).await);
+    let nogrant_list = get_bearer(&fx, "/api/v1/acme/accounts", &nogrant)
+        .await
+        .status();
+    let nogrant_detail = get_bearer(&fx, &format!("/api/v1/acme/accounts/{unknown}"), &nogrant)
+        .await
+        .status();
+    let nogrant_deactivate = post_json(
+        &fx,
+        &format!("/api/v1/acme/accounts/{unknown}/deactivate"),
+        Some(&nogrant),
+        json!({}),
+    )
+    .await
+    .status();
+    let admin_unknown = post_json(
+        &fx,
+        &format!("/api/v1/acme/accounts/{unknown}/deactivate"),
+        Some(&admin),
+        json!({}),
+    )
+    .await;
+    let admin_unknown_status = admin_unknown.status();
+    let admin_unknown_code = error_code(&json_body(admin_unknown, 1 << 20).await);
+
+    fx.cleanup().await;
+
+    assert_eq!(readonly_list, StatusCode::OK);
+    assert_eq!(readonly_orders, StatusCode::OK);
+    assert_eq!(readonly_deactivate_status, StatusCode::FORBIDDEN);
+    assert_eq!(readonly_deactivate_code, "forbidden");
+    assert_eq!(nogrant_list, StatusCode::FORBIDDEN);
+    assert_eq!(nogrant_detail, StatusCode::FORBIDDEN);
+    assert_eq!(nogrant_deactivate, StatusCode::FORBIDDEN);
+    assert_eq!(admin_unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(admin_unknown_code, "not_found");
 }

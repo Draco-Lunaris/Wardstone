@@ -8,6 +8,7 @@
 //! limit (the Task 13 binary does; in-process tests don't — axum's
 //! `ConnectInfo` the peer-IP key extractor needs does not exist there).
 
+pub mod acme;
 pub mod audit;
 pub mod auth;
 pub mod cas;
@@ -56,11 +57,19 @@ pub fn router(state: AppState) -> Router {
         .nest("/tenants", tenants::router())
         .nest("/root-trust", root_trust::router())
         .nest("/oidc", oidc::router())
+        // The ACME rows' operator-visibility window (Plan 4 Task 10):
+        // ordinary capability-gated REST over the SAME account/order rows
+        // the JWS machine surface above serves — no JWS, no nonces.
+        .nest("/acme", acme::rest_router())
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(health::metrics));
 
     Router::new()
         .nest("/api/v1", api_v1)
+        // The ACME surface (Plan 4 Task 5): JWS-machine traffic at the
+        // Plan-1-pinned `/acme/<tenant>/…` shape — deliberately OUTSIDE
+        // `/api/v1`; no bearer/session extractor touches it.
+        .nest("/acme", acme::router(&state))
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(health::metrics))
         // The access log: one line per request — method, path, status —

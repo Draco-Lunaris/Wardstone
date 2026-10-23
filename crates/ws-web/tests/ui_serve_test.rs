@@ -12,7 +12,11 @@
 //! - a stub `/api/v1/healthz` route + the ui fallback (router-shape
 //!   tests: API precedence never masked, SPA routes served);
 //! - the REAL `api_router` aimed at a dead loopback port (CSRF-rule
-//!   tests: what passes the check then 502s at the unreachable upstream).
+//!   tests: what passes the check then 502s at the unreachable upstream);
+//! - the REAL `acme_router`, and the composed
+//!   `session_router_with_store` (relay + api proxy + acme proxy), for
+//!   the ACME forwarding tests (Plan 4 Task 9: /acme past the fallback,
+//!   outside the CSRF rule and the session machinery).
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
@@ -21,7 +25,8 @@ use axum::Router;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use ws_web::{api_router, session, ui};
+use ws_web::session::SessionStore;
+use ws_web::{acme_router, api_router, session, session_router_with_store, ui};
 
 /// Where the committed bundle lives, from ws-web's own manifest dir
 /// (the same directory the binary embeds at compile time). The tests
@@ -386,6 +391,126 @@ async fn csrf_ok_cases_pass_the_check_into_the_proxy() {
         get_with_cookie,
         StatusCode::BAD_GATEWAY,
         "GET carries no rule"
+    );
+}
+
+/// # The ACME surfaces (Plan 4 Task 9)
+///
+/// The ACME proxy composition: `/acme*` forwarded to a dead loopback port
+/// (an immediate connection refusal — the forwarded 502 the assertions
+/// read), the SPA router on the fallback — the real front door's shape.
+fn acme_router_dead() -> Router {
+    acme_router("http://127.0.0.1:9", None).fallback_service(ui::ui_router())
+}
+
+/// The COMPOSED front-door core ([`ws_web::web_router_with_store`]'s
+/// DB-free merge): the relay nest, the `/api/v1` proxy (store Extension
+/// attached), AND the `/acme` proxy — one store, dead upstream — with the
+/// SPA router on the fallback. The acme assertions drive THIS whenever the
+/// question is the real stack's precedence or isolation.
+fn composed_router() -> Router {
+    session_router_with_store(
+        std::sync::Arc::new(SessionStore::new(
+            std::time::Duration::from_secs(60),
+            ws_web::DEFAULT_IDLE_EVICTION,
+        )),
+        "http://127.0.0.1:9",
+        None,
+    )
+    .fallback_service(ui::ui_router())
+}
+
+#[tokio::test]
+async fn acme_routes_forward_past_the_fallback() {
+    // Every route shape ws-api mounts under /acme — the tenantless
+    // nonce endpoint, the directory (certbot's --server entry point),
+    // and a per-tenant account URL — FORWARDED: against the dead
+    // upstream that is a 502, never the SPA fallback's 200 + index.html.
+    let forwarded = acme_router_dead();
+    for (method, uri) in [
+        (Method::GET, "/acme/primary/directory"),
+        (Method::POST, "/acme/primary/new-account"),
+        (Method::GET, "/acme/new-nonce"),
+        (Method::POST, "/acme/primary/acct/dead-beef-thumbprint"),
+    ] {
+        let response = forwarded
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "{method} {uri} was forwarded, not caught by the SPA fallback"
+        );
+    }
+
+    // The same shapes through the COMPOSED stack (relay + api proxy +
+    // acme proxy, one store): the merge carries the /acme routes too.
+    let response = composed_router()
+        .oneshot(
+            Request::builder()
+                .uri("/acme/primary/directory")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "the composed front door forwards the ACME directory request"
+    );
+
+    // Regression guard: the SPA fallback is still the LAST resort — an
+    // extension-less path outside every mounted prefix reaches the
+    // document through the same composition.
+    let response = composed_router()
+        .oneshot(
+            Request::builder()
+                .uri("/certificates")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the SPA fallback still serves client routes"
+    );
+}
+
+#[tokio::test]
+async fn acme_mutations_with_a_session_cookie_forward_without_the_csrf_rule() {
+    // The CSRF rule (and the whole session machinery) belongs to the
+    // BROWSER surfaces: an ACME POST is JWS machine traffic whose
+    // authority is the account key. A request that happens to carry a
+    // `wardstone_session` cookie (a browser tab pointed at the ACME
+    // endpoint, say) must still be forwarded verbatim — no marker
+    // demanded, no session resolved/injected — so against the dead
+    // upstream it answers the forwarded 502, NOT the rule's 403.
+    let response = composed_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/acme/primary/new-account")
+                .header(header::COOKIE, cookie(&Uuid::new_v4()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "the cookie-carrying ACME mutation was forwarded — the CSRF rule never fires on /acme"
     );
 }
 

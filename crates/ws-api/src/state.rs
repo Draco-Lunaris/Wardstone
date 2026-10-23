@@ -1,6 +1,6 @@
 //! The application state of the REST surface: the pool, the JWT key pair,
-//! the deployment config, the bounded access log, and the OIDC csrf-state
-//! store.
+//! the deployment config (including the ACME URL base), the bounded access
+//! log, the OIDC csrf-state store, and the ACME nonce ledger.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -8,7 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
+use ws_acme::NonceStore;
 use ws_auth::jwt::JwtKeys;
+
+use crate::routes::acme::{
+    ChallengeFetch, FailingFetcher, FailingTxtResolver, Http01Fetcher, TxtResolver,
+    TxtResolverHandle,
+};
 
 /// The name of the TOTP/OIDC secret-encryption key file inside the keys
 /// directory (`ws_core::crypto::SecretBox`'s envelope key, created at
@@ -43,17 +49,71 @@ pub struct ApiConfig {
     /// in-process `oneshot` request; the Task 13 binary always configures
     /// it.
     pub auth_rate_limit: Option<AuthRateLimit>,
+    /// The ACME (RFC 8555) surface config: the public URL base and the
+    /// optional ToS URL — see [`AcmeConfig`].
+    pub acme: AcmeConfig,
 }
 
 impl ApiConfig {
     /// Build the config with the setup values and no rate limit (the test
-    /// default); the binary sets `auth_rate_limit` explicitly.
+    /// default); the binary sets `auth_rate_limit` explicitly. The ACME
+    /// config starts UNCONFIGURED (an empty `public_url`): the ACME routes
+    /// answer the problem document `serverInternal` under that config
+    /// until the binary (or a test) carries a real value — see
+    /// [`routes::acme`](crate::routes::acme).
     pub fn new(domain: String, keys_dir: PathBuf) -> Self {
         ApiConfig {
             domain,
             keys_dir,
             admin_cidrs: Vec::new(),
             auth_rate_limit: None,
+            acme: AcmeConfig::unconfigured(),
+        }
+    }
+}
+
+/// The ACME (RFC 8555) deployment configuration: the absolute URL base
+/// every ACME URL is built from (`WARDSTONE_PUBLIC_URL`, the settlement's
+/// anti-Host-trust rule — the `Host` header is NEVER consulted) and the
+/// optional terms-of-service URL (`WARDSTONE_ACME_TOS_URL`).
+#[derive(Clone, Debug)]
+pub struct AcmeConfig {
+    /// The public base URL (`https://ca.example.test`): directory links,
+    /// kid account URLs, and every `Location` header are built from it.
+    /// An EMPTY value means "not configured": the ACME routes keep
+    /// serving, but every one that would build an absolute URL answers
+    /// the problem document `serverInternal` (the binary warns loudly at
+    /// boot — the deployment choice: a misconfigured ACME env degrades the
+    /// ACME surface alone, never the process).
+    pub public_url: String,
+    /// The terms-of-service document URL. `None` means the instance
+    /// publishes no ToS: directories carry no `Link
+    /// rel="terms-of-service"` header and new accounts are `valid`
+    /// immediately. `Some` turns `termsOfServiceAgreed` into an enforced
+    /// gate (the account is minted `pending` until the client agrees).
+    pub tos_url: Option<String>,
+    /// The per-account ACME limiter's OWN rate limit
+    /// (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` is its only switch):
+    /// `Some` arms the per-account bucket on every authenticated ACME
+    /// POST; `None` disables it (the binary's switch, or an in-process
+    /// test). Deliberately NOT the auth routes' `auth_rate_limit`: THAT
+    /// disable exists because per-IP keying collapses behind ws-web's
+    /// proxy, while this limiter keys on the ACCOUNT id, which does NOT
+    /// collapse — so flipping the auth switch must never silently unlimit
+    /// enrolled accounts (fix round 1 decoupling).
+    pub acme_account_limit: Option<AuthRateLimit>,
+}
+
+impl AcmeConfig {
+    /// The unconfigured default (the test/blank-env shape): an empty
+    /// public URL, no ToS, and NO per-account limiter (in-process tests;
+    /// the binary arms the limiter explicitly — an unset switch keeps it
+    /// ON).
+    pub fn unconfigured() -> Self {
+        AcmeConfig {
+            public_url: String::new(),
+            tos_url: None,
+            acme_account_limit: None,
         }
     }
 }
@@ -176,6 +236,161 @@ impl OidcStateStore {
     }
 }
 
+/// The pacing window between server-side verification attempts on one
+/// authorization (settlement D5, the plan's Task-7 pin): a challenge POST
+/// may run a verification per authorization per window; attempts inside
+/// the window answer the `rateLimited` problem document without touching
+/// the row. The counter lives in MEMORY ([`VerificationDeps`]): a restart
+/// lifts the backoff — the accepted v1 shape, because the backoff paces a
+/// retrying client, it is not a security boundary.
+pub const CHALLENGE_ATTEMPT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The challenge-verification seams (Plan 4 Task 7): the server-side
+/// fetcher for HTTP-01, the TXT resolver for DNS-01, and the per-
+/// authorization attempt pacing. Clonable: the fetcher/resolver fields
+/// are `Arc` handles and the pacing map rides its own `Arc`, so every
+/// clone shares one live set of seams and one pacing map.
+#[derive(Clone)]
+pub struct VerificationDeps {
+    /// HTTP-01: GET the canonical fetch URL; the body is the exact-match
+    /// input (`Ok`) or the failure detail (`Err`) the challenge error
+    /// records.
+    pub http_fetcher: Arc<dyn ChallengeFetch>,
+    /// DNS-01: resolve the `_acme-challenge.<identifier>.` TXT name; the
+    /// returned record strings are the any-match input.
+    pub txt_resolver: Arc<dyn TxtResolver>,
+    /// `authorization id -> the instant the NEXT attempt is allowed`;
+    /// entries past their instant are stale and dropped opportunistically.
+    attempts: Arc<Mutex<HashMap<uuid::Uuid, Instant>>>,
+}
+
+impl VerificationDeps {
+    /// The production seams: the bounded reqwest fetcher (10s total per
+    /// request, direct connections only — proxy environment variables are
+    /// never trusted) and the hickory resolver over the system DNS
+    /// configuration. A seam that cannot construct (an unreadable
+    /// resolv.conf, a client build failure) degrades CLOSED — every
+    /// verification attempt it serves fails, never a fake success.
+    pub fn production() -> Self {
+        let http_fetcher: Arc<dyn ChallengeFetch> = match Http01Fetcher::bounded() {
+            Ok(fetcher) => Arc::new(fetcher),
+            Err(err) => {
+                tracing::error!(error = %err, "the HTTP-01 fetcher failed to construct");
+                Arc::new(FailingFetcher(format!(
+                    "the HTTP-01 fetcher is unavailable: {err}"
+                )))
+            }
+        };
+        let txt_resolver: Arc<dyn TxtResolver> = match TxtResolverHandle::from_system_conf() {
+            Ok(resolver) => Arc::new(resolver),
+            Err(err) => {
+                tracing::error!(error = %err, "the DNS-01 resolver failed to construct");
+                Arc::new(FailingTxtResolver(format!(
+                    "the DNS-01 resolver is unavailable: {err}"
+                )))
+            }
+        };
+        Self::with_seams(http_fetcher, txt_resolver)
+    }
+
+    /// The injection constructor (tests and future alternate
+    /// deployments): caller-supplied seam objects over an empty pacing
+    /// map.
+    pub fn with_seams(
+        http_fetcher: Arc<dyn ChallengeFetch>,
+        txt_resolver: Arc<dyn TxtResolver>,
+    ) -> Self {
+        VerificationDeps {
+            http_fetcher,
+            txt_resolver,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The pacing gate: `true` when the attempt is allowed, spending the
+    /// allowance atomically under one lock hold (the next attempt on this
+    /// authorization inside [`CHALLENGE_ATTEMPT_BACKOFF`] is refused). A
+    /// poisoned lock fails OPEN — only a panic while the lock was held
+    /// poisons it, and pacing is not a security boundary — while
+    /// opportunistic GC drops the stale entries the check walks over.
+    pub fn try_record_attempt(&self, authorization_id: uuid::Uuid) -> bool {
+        let Ok(mut attempts) = self.attempts.lock() else {
+            tracing::warn!(
+                "the challenge-attempt pacing map is poisoned; the attempt runs un-paced"
+            );
+            return true;
+        };
+        let now = Instant::now();
+        if attempts
+            .get(&authorization_id)
+            .is_some_and(|next| *next > now)
+        {
+            return false;
+        }
+        attempts.retain(|_, next| *next > now);
+        attempts.insert(authorization_id, now + CHALLENGE_ATTEMPT_BACKOFF);
+        true
+    }
+}
+
+/// The per-account ACME rate limiter (settlement D8, fix round 1):
+/// authenticated ACME runs one refill curve per account — the
+/// [`AuthRateLimit`] values `AcmeConfig::acme_account_limit` carries (its
+/// OWN env switch, `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`; the auth
+/// disable deliberately no longer reaches it — fix round 1 decoupling);
+/// `None` disables it (in-process tests). tower_governor's middleware
+/// keying was ruled out: the account identity only exists AFTER the JWS
+/// verifies inside the handler, past any middleware layer — so this is a
+/// hand-rolled token bucket with the same refill semantics (one credit
+/// per `per_millis`, `burst` held at most), checked exactly where the
+/// account resolves. In-memory by the same accepted consequence class as
+/// the challenge pacing map: a restart refills every bucket, and the
+/// limiter is not a security boundary.
+#[derive(Clone)]
+pub struct AcmeAccountLimiter {
+    config: Option<AuthRateLimit>,
+    buckets: Arc<Mutex<HashMap<uuid::Uuid, (f64, Instant)>>>,
+}
+
+impl AcmeAccountLimiter {
+    /// Build over the per-account limit config (or `None`).
+    pub fn new(config: Option<AuthRateLimit>) -> Self {
+        AcmeAccountLimiter {
+            config,
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Check-and-consume one credit for `account_id`: elapsed credits
+    /// refill since the bucket's last touch (capped at the burst), one
+    /// credit is spent, `false` answers when the bucket is empty. A
+    /// poisoned lock fails OPEN (only a panic inside the lock poisons
+    /// it, and the limiter is not a security boundary).
+    pub fn try_consume(&self, account_id: uuid::Uuid) -> bool {
+        let Some(config) = self.config else {
+            return true;
+        };
+        let Ok(mut buckets) = self.buckets.lock() else {
+            tracing::warn!("the ACME account-limiter map is poisoned; the request runs un-limited");
+            return true;
+        };
+        let now = Instant::now();
+        let (tokens, last) = buckets
+            .get(&account_id)
+            .copied()
+            .unwrap_or((config.burst as f64, now));
+        let elapsed_millis = now.saturating_duration_since(last).as_millis() as f64;
+        let refilled =
+            (tokens + elapsed_millis / config.per_millis as f64).min(config.burst as f64);
+        if refilled < 1.0 {
+            buckets.insert(account_id, (refilled, now));
+            return false;
+        }
+        buckets.insert(account_id, (refilled - 1.0, now));
+        true
+    }
+}
+
 /// The application state of the REST surface. Clonable (the pool and the
 /// shared handles are cheap `Arc`/connection copies).
 #[derive(Clone)]
@@ -190,18 +405,37 @@ pub struct AppState {
     pub access_log: Arc<AccessLog>,
     /// The OIDC csrf-state store (Task 3's R8 contract).
     pub oidc_states: Arc<OidcStateStore>,
+    /// The ACME anti-replay nonce ledger (Plan 4 Task 4's store): every
+    /// `/acme` response mints a fresh `Replay-Nonce` from it and every
+    /// ACME request spends one through `verify_jws` — single-use,
+    /// in-memory (a restart simply re-nonces).
+    pub nonces: Arc<NonceStore>,
+    /// The challenge-verification seams (Plan 4 Task 7): the server-side
+    /// HTTP-01 fetcher, the DNS-01 TXT resolver, and the per-authorization
+    /// attempt pacing — the routes compute every expected answer from
+    /// these; client-supplied data is never a verification input.
+    pub verification: VerificationDeps,
+    /// The per-account ACME rate limiter (settlement D8): keyed buckets
+    /// over `AcmeConfig::acme_account_limit` (its OWN switch — the auth
+    /// disable does not reach it); spends one credit per authenticated
+    /// ACME POST where the account resolves.
+    pub acme_accounts: AcmeAccountLimiter,
 }
 
 impl AppState {
     /// Build the state from the pool, the JWT key pair, and the config;
     /// the mutable-by-product stores start empty.
     pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
+        let acme_accounts = AcmeAccountLimiter::new(config.acme.acme_account_limit);
         AppState {
             pool,
             jwt,
             config,
             access_log: Arc::new(AccessLog::default()),
             oidc_states: Arc::new(OidcStateStore::default()),
+            nonces: Arc::new(NonceStore::new()),
+            verification: VerificationDeps::production(),
+            acme_accounts,
         }
     }
 

@@ -58,6 +58,16 @@
 # burst 20 per IP) — this bundle deliberately sets neither. Positive
 # integers only: zero or unparsable values fail the boot loudly, they do
 # not disable the limiter.
+#
+# The ACME surface (`/acme*`, RFC 8555 — certbot) is limited at BOTH
+# edges: ws-web runs the per-client-IP GCRA on `POST /acme/<tenant>/new-account`
+# (the one unauthenticated mutating endpoint — behind the proxy, ws-api's
+# own per-IP keying would collapse into ONE collective bucket), and ws-api
+# carries the per-ACCOUNT limiter on every authenticated ACME POST — armed
+# ON here, driven by its OWN switch (the bundle does NOT set
+# `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`; the auth disable above does not
+# reach it, because the ACCOUNT-id keying survives the proxy hop — see
+# "The ACME surface" in docker/README.md).
 
 name: wardstone
 
@@ -139,8 +149,26 @@ services:
       # the per-IP limiter would throttle ALL operators collectively; the
       # front door carries the per-client limit instead — on /auth/ui/*
       # AND the proxied POST /api/v1/auth/login + /api/v1/auth/refresh
-      # (password spraying and TOTP guessing are limited at ws-web).
+      # (password spraying and TOTP guessing are limited at ws-web). The
+      # ACME per-account limiter reads a SEPARATE switch
+      # (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`) and stays ON here: the
+      # ACCOUNT-id keying survives the proxy hop, so only THIS per-IP
+      # limiter needed disabling.
       WARDSTONE_AUTH_RATE_LIMIT_DISABLED: "true"
+      # The ACME (RFC 8555) surface's absolute URL base: every URL ws-api
+      # builds — the directory address certbot's --server fetches, the
+      # nonce/account/order URLs inside it — starts from
+      # `{WARDSTONE_PUBLIC_URL}/acme/{tenant}/directory`. The value MUST
+      # be the public URL the ACME client actually dials: the OPERATOR's
+      # own host of this bundle's TLS front door (ws-web), e.g.
+      # `https://wardstone.home.test` — never the internal ws-api
+      # address. The default matches the front door published at the
+      # standard HTTPS port on WARDSTONE_SERVER_HOSTNAME; when certbot
+      # reaches a non-standard port or another public name, override
+      # WARDSTONE_PUBLIC_URL to exactly that base (docker/README.md).
+      # Unset (a direct-API deployment): the ACME routes degrade to
+      # urn:ietf:params:acme:error:serverInternal problem documents.
+      WARDSTONE_PUBLIC_URL: ${WARDSTONE_PUBLIC_URL:-https://${WARDSTONE_SERVER_HOSTNAME}}
     # NO `ports:` — intentionally. The REST surface is reachable ONLY over
     # the internal compose network via ws-web's proxy (the Global
     # Constraint). An External deployment that fronts this service with

@@ -256,11 +256,15 @@ async fn create_profile(
 }
 
 /// `PUT /api/v1/profiles/{id}` — `manage_profiles`. Appends a NEW
-/// immutable revision and repoints `current_revision_id` with the
-/// conditional write (Task 5): a concurrent edit elsewhere collapses the
+/// immutable revision, repoints `current_revision_id` with the
+/// conditional write (Task 5), and persists the body's description —
+/// all in ONE transaction: a concurrent edit elsewhere collapses the
 /// repoint to zero rows and this request fails 409 (retry-safe — the
-/// caller re-reads). The `profile_revised` audit row commits with the
-/// repoint.
+/// caller re-reads), while a stored description and its revision commit
+/// or roll back together. A blank description is stored as NULL (the
+/// round-trip shape `ProfileRepo::set_description` pins); the response
+/// echoes the STORED value. The `profile_revised` audit row commits with
+/// both writes.
 async fn update_profile(
     auth: AuthActor,
     State(state): State<AppState>,
@@ -301,6 +305,13 @@ async fn update_profile(
         .await
     {
         Ok(()) => {
+            // The description is the edit path's OTHER persisted field,
+            // written INSIDE the same revision transaction so a saved
+            // description and its revision commit or roll back together
+            // (the blank→NULL normalization lives in the repo method).
+            repos
+                .set_description(&mut *tx, id, body.description.as_deref())
+                .await?;
             AuditRepo::new()
                 .record(
                     &mut *tx,
@@ -325,11 +336,19 @@ async fn update_profile(
     }
     tx.commit().await?;
 
+    // The response echoes the STORED description — read back post-commit,
+    // so the blank→NULL normalization `set_description` applied is what the
+    // caller sees (no more success/lie on the edit path). The name never
+    // changes (the immutable history's spine).
+    let stored = repos
+        .get_profile(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("profile not found".to_string()))?;
     Ok(Json(ProfileResponse {
         id,
         tenant_id: auth.tenant_id,
         name: profile.name,
-        description: body.description,
+        description: stored.description,
         current_revision: Some(RevisionResponse::of(&revision)),
         created_at: revision.created_at,
     }))

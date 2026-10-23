@@ -1,4 +1,4 @@
-//! The `/api/v1` path proxy: the browser talks ONLY to ws-web; the API
+//! ws-web's path proxies: the browser talks ONLY to ws-web; the API
 //! process publishes no ports to the LAN.
 //!
 //! Every `/api/v1*` request is forwarded VERBATIM to the API's base URL
@@ -6,9 +6,16 @@
 //! the hop-by-hop set (and `Host`, which the transport re-derives), the
 //! exact path-and-query, and the full body. The response streams back
 //! with the upstream status and headers, minus the same hop-by-hop set.
-//! ws-api's routes are never mounted here — the two are separate,
-//! independently restartable processes (the spec's anti-goal rules out one
-//! process serving both).
+//!
+//! The `/acme*` surface forwards under the exact same contract — the
+//! RFC 8555 headers (`Replay-Nonce`, `Location`, `Link`, the
+//! `application/problem+json` content type) cross untouched — but it
+//! carries NO session machinery of its own: ACME is JWS machine traffic
+//! whose sole authority is the account key, so there is no CSRF rule, no
+//! session resolution, and no token injection on those routes (see
+//! [`acme_request`]). ws-api's routes are never mounted here — the two
+//! are separate, independently restartable processes (the spec's
+//! anti-goal rules out one process serving both).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,10 +87,7 @@ pub fn api_router_with_auth_limit(
     // build — an essentially unreachable TLS-backend init error — is
     // carried as a fail-closed per-request 502, never an unbounded
     // fallback client.
-    let backend = Arc::new(ProxyBackend {
-        client: proxy_client().ok(),
-        base: api_base_url.trim_end_matches('/').to_owned(),
-    });
+    let backend = proxy_backend(api_base_url);
     let proxy = Router::new()
         .route("/api/v1", any(proxy_request))
         .route("/api/v1/{*path}", any(proxy_request))
@@ -146,15 +150,145 @@ pub(crate) fn proxy_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-/// The proxy target: the reqwest client (unless the per-config
-/// construction failed — then every forward fails closed) and the API base
-/// URL it forwards to. `Clone` (the axum state bound) is cheap — the
-/// client holds its own connection pool internals behind an `Arc` already,
-/// and the backend wraps in `Arc`.
+/// The proxy target both path proxies forward through: the reqwest
+/// client (unless the per-config construction failed — then every forward
+/// fails closed) and the API base URL. `Clone` (the axum state bound) is
+/// cheap — the client holds its own connection pool internals behind an
+/// `Arc` already, and the backend wraps in `Arc`.
 #[derive(Debug, Clone)]
 struct ProxyBackend {
     client: Option<reqwest::Client>,
     base: String,
+}
+
+/// One [`ProxyBackend`] for `api_base_url`: the exact construction
+/// [`api_router_with_auth_limit`] has carried since Plan 3 (the fallible
+/// client build travels as `client == None`, fail-closed per request).
+/// The `/acme` router reuses this CONSTRUCTOR — not one client instance:
+/// each router holds its own reqwest client, built with the very same
+/// bounded settings (timeouts, no-redirect policy).
+fn proxy_backend(api_base_url: &str) -> Arc<ProxyBackend> {
+    Arc::new(ProxyBackend {
+        client: proxy_client().ok(),
+        base: api_base_url.trim_end_matches('/').to_owned(),
+    })
+}
+
+/// The ACME (RFC 8555) proxy router: every `/acme*` request is forwarded
+/// VERBATIM to the API base URL — same route shape as the `/api/v1`
+/// group (static `/acme` beside the `/acme/{*path}` wildcard), same
+/// backend construction, same verbatim contract.
+///
+/// `rate_limit` is the front-door GCRA configuration (the SAME value the
+/// auth surfaces carry): when `Some`, the ONE unauthenticated mutating
+/// ACME endpoint — `POST /acme/{tenant}/new-account`, enrollment abuse's
+/// target — is registered in its own sub-router under [`GovernorLayer`],
+/// keyed on the peer IP. This is the fix-round edge limit: behind ws-web,
+/// ws-api's per-IP new-account bucket COLLAPSES (every proxied ACME
+/// request arrives from ws-web's container IP — one collective bucket),
+/// while ws-web holds the real client address per connection, so the
+/// edge spends a per-client bucket on enrollment — the same
+/// `limited_auth`-shape trick the Plan-3 final review installed for the
+/// proxied credential pair. The REST of `/acme*` forwards unlimited at
+/// this edge — identity keying is impossible here (the account identity
+/// exists only after the JWS verifies) — and ws-api's own per-account
+/// limiter (`AcmeConfig::acme_account_limit`, armed by default, its OWN
+/// `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` switch) carries the
+/// authenticated-POST budget.
+///
+/// No session machinery rides these routes: ACME is JWS machine traffic
+/// (no cookies, no bearer, no browser), so `acme_request` is the narrow
+/// handler — no CSRF rule consultation, no `SessionStore` extension, no
+/// token injection. A request that happens to carry a browser session
+/// cookie is forwarded exactly as sent.
+pub fn acme_router(api_base_url: &str, rate_limit: Option<ws_api::AuthRateLimit>) -> Router {
+    let backend = proxy_backend(api_base_url);
+    // The forwarding net mirrors ws-api's OWN tree under the nest (a
+    // parameterized tenant level with catch-alls and statics UNDER it):
+    // matchit refuses a `{param}` sibling beside a `/{*path}` catch-all on
+    // ONE node, but a static sibling beside a catch-all is legal (the
+    // /api/v1 proof — `/api/v1/{*path}` beside `/api/v1/auth/login`). So
+    // `/acme`, `/acme/{tenant}`, and `/acme/{tenant}/{*path}` catch every
+    // shape verbatim (an unmatched one would leak to the SPA fallback and
+    // answer 200 + index.html instead of ws-api's problem document), and
+    // the enrollment limit rides the parameterized static tail below —
+    // static beats the catch-all in axum 0.8's priority order, so ONLY
+    // new-account pays the governor.
+    let acme = Router::new()
+        .route("/acme", any(acme_request))
+        .route("/acme/{tenant}", any(acme_request))
+        .route("/acme/{tenant}/{*path}", any(acme_request))
+        .with_state(backend.clone());
+    let Some(limit) = rate_limit else {
+        return acme;
+    };
+    // `finish()` fails only on a zero burst or period (both
+    // caller-configured; the binary refuses a zero at boot, so this skip
+    // branch is unreachable from `run_ui`) — the same logs-and-skips
+    // contract `api_router_with_auth_limit` documents.
+    match GovernorConfigBuilder::<PeerIpKeyExtractor, _>::default()
+        .per_millisecond(limit.per_millis)
+        .burst_size(limit.burst)
+        .finish()
+    {
+        Some(config) => {
+            // The layer rides the enrollment route's OWN sub-router
+            // (applied to it BEFORE the merge), so the catch-alls never
+            // pass through the governor. The peer IP is `ConnectInfo` —
+            // `serve_tls`'s make service attaches the real client address
+            // to every request and ws-web IS the edge, exactly as on the
+            // proxied-auth nest.
+            let limited_enrollment = Router::new()
+                .route("/acme/{tenant}/new-account", any(acme_request))
+                .with_state(backend)
+                .layer(GovernorLayer::new(std::sync::Arc::new(config)));
+            acme.merge(limited_enrollment)
+        }
+        None => {
+            tracing::error!(
+                per_millis = limit.per_millis,
+                burst = limit.burst,
+                "invalid proxied-ACME rate-limit configuration: per_millis and burst must \
+                 be positive; the proxied ACME new-account route runs WITHOUT \
+                 rate limiting"
+            );
+            acme
+        }
+    }
+}
+
+/// Forward one `/acme*` request: the verbatim path-and-query and headers
+/// (minus the hop-by-hop set) through the shared [`forward_one`]. The
+/// caller's `Authorization` (if any) travels unchanged — ACME requests
+/// carry no bearer, and no session token is ever injected here.
+async fn acme_request(
+    State(backend): State<Arc<ProxyBackend>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+
+    let Some(client) = backend.client.as_ref() else {
+        return Err(ProxyError(
+            "the proxy HTTP client could not be initialized".to_owned(),
+        ));
+    };
+
+    forward_one(
+        client,
+        &backend.base,
+        &method,
+        &path_and_query,
+        &headers,
+        body,
+        None,
+    )
+    .await
 }
 
 /// A proxy-side failure: the API is unreachable, misbehaved at the

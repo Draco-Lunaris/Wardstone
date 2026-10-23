@@ -51,14 +51,34 @@ ws-auth = { path = "../ws-auth" }
 # The CA engine: CSR validation, leaf signing, CA creation, keystore, the
 # serial allocator, leaf-key generation.
 ws-ca = { path = "../ws-ca" }
+# The ACME (RFC 8555) JOSE floor: JWS verification for the protocol's POST
+# bodies, the anti-replay nonce store, and RFC 7638 account-key
+# thumbprints (Plan 4 Task 4; mounted by the Task 5 /acme routes).
+ws-acme = { path = "../ws-acme" }
 # PKCS#10 CSR building for the server-key-generation path: the handler
 # mints a fresh leaf key with ws_ca::leafkey::generate_leaf_key and wraps
 # it in a self-signed CSR (subject + SANs) fed to sign_leaf_with. The
 # feature set matches ws-ca's pin exactly.
 rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
 
+# HTTP-01 challenge fetches (Task 7): the server GETs
+# `http://<identifier>/.well-known/acme-challenge/<token>` itself — the
+# workspace pin (rustls-tls, default features off; the fetch is plain
+# HTTP anyway). The bounded client never trusts proxy environment
+# variables, and the fetcher sits behind an injectable seam in AppState.
+reqwest = { workspace = true }
+# Native TXT resolution for the DNS-01 challenge (Task 7): TXT lookups
+# have no std path, so the `TxtResolver` seam rides the workspace's
+# hickory-resolver pin (first-party DNS; hickory knows nothing about
+# ACME); tests inject a canned resolver instead.
+hickory-resolver = { workspace = true }
+
 [dev-dependencies]
 # The TOTP test computes RFC 6238 codes with the workspace's own totp-rs
 # pin (the same parameters ws-auth's mfa_totp module verifies with);
 # never used by production code.
 totp-rs = { workspace = true }
+# The acme_test suite builds client-side ACME JWS fixtures (compact JWS
+# over test keys) with the same JOSE codec the production verifier sits
+# on; test-only — production ws-api code uses ws-acme's verifier instead.
+jsonwebtoken = { workspace = true }

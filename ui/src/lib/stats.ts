@@ -1,14 +1,14 @@
 // The dashboard's pure view layer: the statistics → stat-card mapping and
 // the client-side "expiring soon" selection. The API exposes no dedicated
 // "expiring" query axis, so the dashboard feeds
-// `GET /api/v1/certificates?status=active` into `selectExpiringSoon` — the
-// window (still-valid certificates whose `not_after` falls inside the
-// coming 30 days, soonest first) deliberately matches the server's
-// `expiring_soon` horizon pinned in crates/ws-api/src/routes/certificates.rs,
-// so the list can only drift from its tile by the moment between the two
-// fetches.
+// `GET /api/v1/certificates/slim?status=active` into `selectExpiringSoon`
+// (the window — still-valid certificates whose `not_after` falls inside
+// the coming 30 days, soonest first — deliberately matches the server's
+// `expiring_soon` horizon pinned in
+// crates/ws-api/src/routes/certificates.rs, so the list can only drift
+// from its tile by the moment between the two fetches).
 
-import type { Certificate, CertificateStatistics } from "./certs";
+import type { CertificateStatistics } from "./certs";
 
 /** The server-side 30-day expiry horizon (certificates.rs pins it). */
 export const EXPIRY_WINDOW_DAYS = 30;
@@ -35,12 +35,14 @@ export function statCards(stats: CertificateStatistics): StatCard[] {
  * `not_after` not already past and inside the window, sorted soonest
  * first (a certificate expiring exactly `now` still counts; anything
  * strictly earlier is already expired). Unparsable timestamps are
- * dropped (a bad date is never shown as "expiring"). */
-export function selectExpiringSoon(
-  certificates: Certificate[],
+ * dropped (a bad date is never shown as "expiring"). Generic over the
+ * row shape: the sieve feeds SLIM rows (`GET /certificates/slim`) and
+ * any caller with full certificate rows gets them back untouched. */
+export function selectExpiringSoon<T extends { status: string; not_after: string }>(
+  certificates: T[],
   now: Date = new Date(),
   windowDays: number = EXPIRY_WINDOW_DAYS,
-): Certificate[] {
+): T[] {
   const nowMs = now.getTime();
   return certificates
     .map((certificate) => ({ certificate, at: new Date(certificate.not_after).getTime() }))

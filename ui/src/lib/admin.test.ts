@@ -145,11 +145,17 @@ describe("buildProfilePayload", () => {
     expect(body!.san_patterns).toEqual(["*.test", "10.0.0.0/8"]);
   });
 
-  it("omits BOTH name and description on an EDIT body — the PUT only revises policy", () => {
+  it("carries a name-less, always-present description on an EDIT body — the PUT persists it", () => {
     const { body, error } = buildProfilePayload(PROFILE_BASE, true);
     expect(error).toBeNull();
-    expect("name" in body!).toBe(false);
-    expect("description" in body!).toBe(false);
+    expect("name" in body!).toBe(false); // The update keeps the profile's name.
+    expect(body!.description).toBe("Server certificates"); // …and persists its description now.
+  });
+
+  it("sends description: null when an EDIT leaves it blank (stored as NULL server-side)", () => {
+    const { body } = buildProfilePayload({ ...PROFILE_BASE, description: "  " }, true);
+    expect("description" in body!).toBe(true);
+    expect(body!.description).toBeNull();
   });
 
   it("refuses a blank name on create with the server's wording", () => {

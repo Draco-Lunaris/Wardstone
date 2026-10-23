@@ -94,6 +94,14 @@ x509-parser = { workspace = true }
 # workspace pin (ws-auth's own signer/verifier, `rust_crypto` feature),
 # DEV-ONLY: no production binary gains the signing dependency through it.
 jsonwebtoken = { workspace = true }
+# Task 11's acme_e2e_test suite: the TEST-side ACME client computes the
+# same values certbot would with ws-acme's own functions (the RFC 7638
+# `thumbprint`, `key_authorization`, `dns01_record_value`) rather than
+# re-deriving them test-locally — the client and the routes land on the
+# same canonical answers. Test-only: ws-web's production graph stays
+# acyclic without it.
+ws-acme = { path = "../ws-acme" }
+
 # The fixture keypair's modulus bytes → the JWK `n` (base64url).
 # (base64 itself is a regular dependency above; the URL-safe engine rides
 # the same crate.)

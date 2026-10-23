@@ -57,7 +57,7 @@ use ws_core::models::certificate::{
     CertStatus, CertificateFilter, CertificateModel, CertificateStatistics, RevocationReason,
 };
 use ws_core::models::profile::{ProfileModel, ProfileRevisionModel};
-use ws_core::models::rbac::{Actor, Capability, KeyUsagePurpose};
+use ws_core::models::rbac::{Actor, ActorType, Capability, KeyUsagePurpose};
 use ws_core::profile_match::san_is_permitted;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::ca_repo::CaRepo;
@@ -81,6 +81,10 @@ pub fn router() -> Router<AppState> {
         // Exact-match wins anyway, but the literal `/statistics` is pinned
         // BEFORE `/{id}` so the router reads in the order the routes nest.
         .route("/statistics", get(certificate_statistics))
+        // The dashboard sieve's slim projection, same reason: the literal
+        // `/slim` is registered BEFORE `/{id}` so `slim` is never read as
+        // a certificate id.
+        .route("/slim", get(list_certificates_slim))
         .route("/{id}", get(get_certificate))
         .route("/{id}/chain", get(get_certificate_chain))
         .route("/{id}/revoke", post(revoke_certificate))
@@ -143,9 +147,10 @@ async fn issue_certificate(
     Ok(json_no_store(response))
 }
 
-/// The issuance core: shared by the HTTP handler, the Task-10 tests (the
-/// audit-collision and stale-revision cases drive it directly), and a
-/// future ACME path.
+/// The issuance core: shared by the HTTP handler, the one-shot pull, the
+/// Task-10 tests (the audit-collision and stale-revision cases drive it
+/// directly), and the Task-8 ACME finalize path — which calls it with the
+/// AcmeAccount actor carrying exactly `Issue`.
 ///
 /// `cert_id` / `audit_id` are caller-chosen (the handler passes fresh
 /// v4s; the tests pass a pre-existing audit id to force the audit insert
@@ -401,6 +406,16 @@ async fn issue_in_tx(
         body,
         &signed.issued,
         serial,
+        // The certificate's recorded source follows the ACTOR that issued
+        // it: the ACME account (Plan 4's finalize path) writes `acme`; the
+        // bearer/session/one-shot actors write `manual` (the pull's minted
+        // actor is a service identity, not an ACME account). Task 9/10's
+        // UI links a certificate detail to its order off this value.
+        if actor.actor_type == ActorType::AcmeAccount {
+            "acme"
+        } else {
+            "manual"
+        },
     );
 
     CertificateRepo::new().insert(&mut *exec, &cert).await?;
@@ -601,7 +616,9 @@ fn leaf_spec(
 
 /// The `certificates` row the issuance writes, from the engine's output.
 /// The row's tenant is the CA's (the CA was chosen within the actor's
-/// tenant), so no separate tenant argument is needed.
+/// tenant), so no separate tenant argument is needed. `source` is the
+/// issuing surface's label (`manual` for the API routes, `acme` for the
+/// ACME finalize path — chosen by the ACTOR's type at the call site).
 #[allow(clippy::too_many_arguments)]
 fn certificate_model(
     id: Uuid,
@@ -611,6 +628,7 @@ fn certificate_model(
     body: &IssueCertificateBody,
     issued: &IssuedLeaf,
     serial: u128,
+    source: &str,
 ) -> CertificateModel {
     let san_dns: Vec<String> = body
         .sans
@@ -642,7 +660,7 @@ fn certificate_model(
         revoked_at: None,
         revocation_reason: None,
         revocation_detail: None,
-        source: "manual".to_string(),
+        source: source.to_string(),
         created_at: Utc::now(),
     }
 }
@@ -917,6 +935,66 @@ async fn list_certificates(
         .map(CertificateResponse::from_model)
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(certs))
+}
+
+/// `GET /api/v1/certificates/slim` query: the sieve's axes — `page`,
+/// `page_size` (the shared paging; the dashboard pins 500, the repo clamp),
+/// and `status`.
+#[derive(Debug, Deserialize, Default)]
+pub struct SlimListQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub status: Option<String>,
+}
+
+/// One slim certificate, as the dashboard sieve consumes it: the five
+/// small fields, none of the full-row bulk (no PEM, no SANs).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SlimCertificateResponse {
+    pub id: Uuid,
+    pub subject: String,
+    pub serial_hex: String,
+    pub not_after: DateTime<Utc>,
+    pub status: String,
+}
+
+/// `GET /api/v1/certificates/slim` — `read_certificates`, the same gate the
+/// full list sits behind; an unparseable `status` is a 400, like there.
+/// Registered BEFORE `/{id}` so `slim` is never read as a certificate id.
+async fn list_certificates_slim(
+    auth: AuthActor,
+    State(state): State<AppState>,
+    Query(query): Query<SlimListQuery>,
+) -> Result<Json<Vec<SlimCertificateResponse>>, ApiError> {
+    auth.require(Capability::ReadCertificates)
+        .map_err(ApiError::from)?;
+    let status = match query.status.as_deref() {
+        Some(raw) => Some(
+            raw.parse::<CertStatus>()
+                .map_err(|_| ApiError::bad_request("invalid status value"))?,
+        ),
+        None => None,
+    };
+    let rows = CertificateRepo::new()
+        .list_slim(
+            &state.pool,
+            auth.tenant_id,
+            status,
+            query.page.unwrap_or(0),
+            query.page_size.unwrap_or(100),
+        )
+        .await?
+        .into_iter()
+        .map(|row| SlimCertificateResponse {
+            id: row.id,
+            subject: row.subject,
+            serial_hex: row.serial_hex,
+            not_after: row.not_after,
+            status: row.status.as_str().to_string(),
+        })
+        .collect();
+    Ok(Json(rows))
 }
 
 /// `GET /api/v1/certificates/statistics` — the estate's headline counts,

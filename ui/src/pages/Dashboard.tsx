@@ -1,13 +1,14 @@
 // The dashboard: the estate's headline statistics and the "expiring
-// soon" list. The statistics route and the certificate list both sit
-// behind `read_certificates` — an actor without it gets a plain notice
-// (the nav still lands here: it is the home route), never a 403.
+// soon" list. The statistics route and both certificate lists sit behind
+// `read_certificates` — an actor without it gets a plain notice (the nav
+// still lands here: it is the home route), never a 403.
 //
-// The expiring list has no dedicated query axis: it feeds
-// `GET /certificates?status=active` into the pure client-side selection
-// pinned in lib/stats (`selectExpiringSoon`, the same 30-day horizon the
-// server's `expiring_soon` tile counts) and links each row to its detail
-// route.
+// The expiring list has no dedicated query axis: it feeds the SLIM list
+// route (`GET /certificates/slim?status=active`) into the pure
+// client-side selection pinned in lib/stats (`selectExpiringSoon`, the
+// same 30-day horizon the server's `expiring_soon` tile counts) and
+// links each row to its detail route. Full certificate rows ride only
+// the detail paths — the sieve needs five small fields, not 500 PEMs.
 
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -15,21 +16,22 @@ import { Link } from "react-router-dom";
 import { ApiError } from "../lib/api";
 import { useAuthState } from "../lib/auth";
 import {
-  fetchCertificates,
   fetchCertificateStatistics,
+  fetchCertificatesSlim,
   hasCapability,
-  type Certificate,
   type CertificateStatistics,
+  type SlimCertificate,
 } from "../lib/certs";
 import { selectExpiringSoon, statCards } from "../lib/stats";
 
 /** The active-certificate page the sieve reads: 500 is the repo's clamp
- * (crates/ws-core/src/repo/mod.rs `paging`). The certificates list
- * orders by `not_after DESC` — furthest expiry FIRST — so the
- * within-30-day rows sit at the ordering's bottom: a full page means
- * more active certificates may exist beyond the sieve, and the list,
- * then shown with an explicit "may be incomplete" warning, defers to the
- * statistics tile above as the authoritative count. */
+ * (crates/ws-core/src/repo/mod.rs `paging`). The slim list orders by
+ * `not_after DESC` — furthest expiry FIRST — so the within-30-day rows
+ * sit at the ordering's bottom: a full page means more active
+ * certificates may exist beyond the sieve, and the list, then shown with
+ * an explicit "may be incomplete" warning, defers to the statistics tile
+ * above as the authoritative count. The slim rows carry no profile
+ * label, so the sieve's table shows Subject and Expires only. */
 const ACTIVE_DASHBOARD_PAGE = 500;
 
 function formatDate(iso: string): string {
@@ -45,7 +47,7 @@ export default function Dashboard() {
   const canReadCertificates = hasCapability(auth.me?.capabilities, "read_certificates");
 
   const [stats, setStats] = useState<CertificateStatistics | null>(null);
-  const [expiring, setExpiring] = useState<Certificate[] | null>(null);
+  const [expiring, setExpiring] = useState<SlimCertificate[] | null>(null);
   // True when the sieve's source page came back FULL — at the 500 clamp
   // that means actives may exist beyond the window the sieve saw.
   const [expiringPageFull, setExpiringPageFull] = useState(false);
@@ -59,7 +61,7 @@ export default function Dashboard() {
     setError(null);
     setExpiringPageFull(false);
     const statistics = fetchCertificateStatistics();
-    const active = fetchCertificates({ status: "active", pageSize: ACTIVE_DASHBOARD_PAGE });
+    const active = fetchCertificatesSlim({ status: "active", pageSize: ACTIVE_DASHBOARD_PAGE });
     statistics
       .then((value) => {
         if (!cancelled) setStats(value);
@@ -144,7 +146,6 @@ export default function Dashboard() {
           <thead>
             <tr>
               <th>Subject</th>
-              <th>Profile</th>
               <th>Expires</th>
             </tr>
           </thead>
@@ -154,7 +155,6 @@ export default function Dashboard() {
                 <td>
                   <Link to={`/certificates/${certificate.id}`}>{certificate.subject}</Link>
                 </td>
-                <td>{certificate.profile_name}</td>
                 <td>{formatDate(certificate.not_after)}</td>
               </tr>
             ))}

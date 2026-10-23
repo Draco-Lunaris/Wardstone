@@ -22,6 +22,7 @@ import {
   buildCertificateListQuery,
   buildRevokePayload,
   fetchCertificates,
+  fetchCertificatesSlim,
   fetchText,
   makeOneTimeDownload,
   parseSans,
@@ -105,6 +106,41 @@ describe("fetchCertificates", () => {
     await fetchCertificates({});
     const [path] = fetchMock.mock.calls[0] as unknown as [string];
     expect(path).toBe("/api/v1/certificates");
+  });
+});
+
+describe("fetchCertificatesSlim", () => {
+  it("hits the slim route with the sieve's query axes", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response("[]", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const rows = await fetchCertificatesSlim({ status: "active", pageSize: 500 });
+    expect(rows).toEqual([]);
+    const [path] = fetchMock.mock.calls[0] as unknown as [string];
+    // The dashboard sieve's exact wire request.
+    expect(path).toBe("/api/v1/certificates/slim?status=active&page_size=500");
+  });
+
+  it("keeps page 0 and answers the bare route when nothing is filtered", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response("[]", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchCertificatesSlim({ page: 0 });
+    const [paged] = fetchMock.mock.calls[0] as unknown as [string];
+    expect(paged).toBe("/api/v1/certificates/slim?page=0");
+    await fetchCertificatesSlim({});
+    const [bare] = fetchMock.mock.calls[1] as unknown as [string];
+    expect(bare).toBe("/api/v1/certificates/slim");
   });
 });
 

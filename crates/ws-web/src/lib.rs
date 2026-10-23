@@ -8,10 +8,12 @@
 //!   [`setup::tenant_exists`]), and the self-signed setup certificate
 //!   whose SHA-256 fingerprint the page displays for out-of-band
 //!   verification.
-//! - `proxy` — the `/api/v1/*` forwarder: the browser talks ONLY to
+//! - `proxy` — the verbatim forwarders: the browser talks ONLY to
 //!   ws-web; ws-api publishes no ports to the LAN, so every `/api/v1/*`
 //!   request is proxied verbatim to the API base URL over the internal
-//!   network. ws-api's own routes are never mounted here.
+//!   network, and so is every `/acme*` request (the RFC 8555 machine
+//!   surface — no session machinery on it). ws-api's own routes are
+//!   never mounted here.
 //! - `ui` — the embedded SPA (`ui/dist`, git-committed and included into
 //!   the binary with `include_dir` at compile time): `/`, the hashed
 //!   `/assets/*`, and the SPA fallback, mounted LAST (the composed
@@ -50,7 +52,7 @@ use ws_ca::error::CaError;
 use session::relay::relay_router;
 use session::store::SessionStore;
 
-pub use proxy::{api_router, api_router_with_auth_limit};
+pub use proxy::{acme_router, api_router, api_router_with_auth_limit};
 pub use setup::{
     run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
 };
@@ -61,6 +63,14 @@ pub use setup::{
 /// binary passes this value at [`web_router`]; env override is a Task 13
 /// concern. Tests pass `Duration::ZERO` (always rotate).
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(900);
+
+/// The default server-side idle-eviction window ws-web bookkeeps: an entry
+/// nobody has touched for six hours (`get`, a login insert, or a token
+/// rotation all touch) is dropped from the store the next time anything
+/// reads it. This is memory hygiene for forgotten browser tabs, not
+/// revocation: the ws-api refresh token a dropped entry carried stays valid
+/// under the stateless-JWT model. Env override is a Task 13 concern.
+pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
 
 /// The front-door router a fresh (`ui`-mode) process serves: the setup
 /// surface ONLY while the default tenant does not exist, plus the
@@ -93,7 +103,7 @@ pub async fn web_router(
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
-    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl));
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
     web_router_with_store(
         pool,
         keys_dir,
@@ -113,9 +123,12 @@ pub async fn web_router(
 /// structural instead of a promise, and it is how the session_test suite
 /// inspects store contents alongside a live router.
 ///
-/// `rate_limit` threads to BOTH auth surfaces — [`relay_router`]'s
-/// `/auth/ui` GCRA nest and the proxy's `/api/v1/auth` limiter scope (see
-/// [`web_router`] and [`session_router_with_store`]).
+/// `rate_limit` threads to auth surfaces AND the ACME enrollment edge —
+/// [`relay_router`]'s `/auth/ui` GCRA nest, the proxy's `/api/v1/auth`
+/// limiter scope, and the proxy's `/acme` ENROLLMENT route
+/// (`POST /acme/{tenant}/new-account`, the one unauthenticated ACME
+/// mutator — see [`proxy::acme_router`]; see [`web_router`] and
+/// [`session_router_with_store`]).
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
@@ -152,18 +165,25 @@ pub async fn web_router_with_store(
 }
 
 /// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay
-/// nest and the `/api/v1` proxy (its auth routes limiter-scoped per
-/// `rate_limit`) merged — every web-fronted route EXCEPT the setup
-/// surface and the SPA fallback, which need the tenant check. Public so
-/// the rate-limit suite can drive the COMPOSED stack (relay AND proxy in
-/// one router, the precedence the real front door serves — static auth
-/// routes over the catch-all) without a database.
+/// nest, the `/api/v1` proxy (its auth routes limiter-scoped per
+/// `rate_limit`), and the `/acme` proxy (its ENROLLMENT route
+/// limiter-scoped per the SAME value — the one unauthenticated ACME
+/// mutator, per-IP limited at this edge because ws-api's per-IP bucket
+/// collapses behind the proxy; the rest of `/acme` forwards unlimited)
+/// merged — every web-fronted route EXCEPT the setup surface and the SPA
+/// fallback, which need the tenant check. Public so the rate-limit suite
+/// can drive the COMPOSED stack (relay AND proxy in one router, the
+/// precedence the real front door serves — static auth routes over the
+/// catch-all) without a database.
 ///
-/// The ONE store instance rides BOTH: as the relay routes' state
-/// (mint/rotate/kill) and as an `Extension` on the proxy router
-/// (read-only injection). The `Option<Extension<_>>` extractor in the
-/// proxy handler keeps `api_router` usable standalone (no store: zero
-/// injection, the machine-token surface is untouched).
+/// The ONE store instance rides BOTH session surfaces: as the relay
+/// routes' state (mint/rotate/kill) and as an `Extension` on the proxy
+/// router (read-only injection). The `Option<Extension<_>>` extractor in
+/// the proxy handler keeps `api_router` usable standalone (no store: zero
+/// injection, the machine-token surface is untouched). The `/acme` proxy
+/// intentionally gets NEITHER the store nor the session machinery — its
+/// handler forwards JWS machine traffic verbatim (see
+/// [`proxy::acme_router`]).
 pub fn session_router_with_store(
     store: std::sync::Arc<SessionStore>,
     api_base_url: &str,
@@ -171,7 +191,10 @@ pub fn session_router_with_store(
 ) -> Router {
     let api = api_router_with_auth_limit(api_base_url, rate_limit).layer(Extension(store.clone()));
     let relay = relay_router(store, api_base_url, rate_limit);
-    Router::new().merge(relay).merge(api)
+    Router::new()
+        .merge(relay)
+        .merge(api)
+        .merge(acme_router(api_base_url, rate_limit))
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired

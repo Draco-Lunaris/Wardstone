@@ -122,10 +122,12 @@ variant):
 - **Bundled UI-fronted deployment** (`wardstone ui` publishes the only
   port): ws-web limits BOTH its `/auth/ui/*` relay routes AND the proxied
   credential pair `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh`
-  — so password spraying and TOTP guessing stay per-client limited even
-  though ws-api's own limiter is off (below). Other `/api/v1/*` paths —
-  the machine-token (`ws_at_`/`ws_ot_`) flows — are NOT limited at this
-  edge.
+  AND the proxied enrollment endpoint `POST /acme/<tenant>/new-account` —
+  so password spraying, TOTP guessing, and enrollment abuse stay
+  per-client limited even though ws-api's own per-IP limiter is off
+  (below). Other `/api/v1/*` paths — the machine-token (`ws_at_`/`ws_ot_`)
+  flows — are NOT limited at this edge, and neither is the rest of
+  `/acme/*` (see "The ACME surface" below for who limits THOSE).
 - **Direct API deployment** (clients, or a transparent-TCP proxy, hit
   `ws-api` itself): ws-api's own auth-route GCRA (login, refresh, OIDC
   start/callback) applies.
@@ -139,13 +141,76 @@ front-door limiter stays on regardless of it). Where BOTH limiters run
 (a `ui` deployment that leaves the switch off), the effective per-client
 limit is the tighter of the two buckets — defense in depth, never a gap.
 Only where clients hit ws-api directly (an External variant fronting it
-with a transparent-TCP proxy) is the switch meaningful at all.
+with a transparent-TCP proxy) is the switch meaningful at all. The ACME
+per-account limiter is a SEPARATE knob (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`)
+that the auth switch does not reach: it keys on the ACCOUNT id, which
+does not collapse behind the proxy, so it stays armed — ON by default,
+in the bundled deployment included.
 
 **Egress: the compose network must NOT be `internal: true`.** ws-api performs
 OIDC egress — the discovery fetch and the token exchange are made by the
 `api` process over the IdP's public URL. Marking the compose network
 `internal: true` would cut that off and break both SSO setup and SSO login.
 NEVER apply `internal: true` to this bundle's network.
+
+## The ACME surface (certbot and other RFC 8555 clients)
+
+The front door also exposes ws-api's ACME (RFC 8555) server under `/acme`:
+ws-web forwards every `/acme*` request VERBATIM to the api process — the
+same path proxying as `/api/v1`, so the ACME response headers
+(`Replay-Nonce`, `Location`, `Link`) and the `application/problem+json`
+problem bodies cross untouched. There are no cookies and no CSRF marker on
+this surface: ACME is JWS machine traffic whose sole authority is the
+account key (a request that happens to carry a browser session cookie is
+forwarded exactly as sent, never resolved or injected).
+
+**The directory URL** — what certbot's `--server` (or any RFC 8555
+client's server URL) takes:
+
+    https://<host>/acme/<tenant>/directory
+
+`<tenant>` is the install's PRIMARY tenant name (the first one created at
+setup; a mismatched segment answers one `unknown ACME tenant` 404 problem
+document, never a cross-tenant read). Every URL the directory contains is
+built ABSOLUTE from `WARDSTONE_PUBLIC_URL` — the value must be the public
+URL the ACME client actually dials. The bundled compose derives it as
+`https://$WARDSTONE_SERVER_HOSTNAME`, which is correct while the front
+door is reached at the standard HTTPS port on that hostname; when certbot
+dials a non-standard port (this bundle publishes 8443) or a different
+public name, override `WARDSTONE_PUBLIC_URL` to exactly that base.
+
+**TLS trust.** The front door serves the CA-issued `web-server` leaf,
+signed by Wardstone's own CA. The machine running certbot must trust THAT
+CA (its root certificate in the client's trust store, or leaf pinning), or
+the directory fetch fails TLS verification before any ACME exchange
+starts.
+
+**Open enrollment and rate limiting.** Any ACME client that can reach the
+front door may enroll: new-account is authorized by the requester's own
+JWS key, and issuance stays bounded by server-computed http-01/dns-01
+challenge verification — a client-supplied answer is never an input, so
+an enrolled key can only win certificates for identifiers it actually
+controls. The limiting posture: ws-web runs the per-client-IP GCRA on
+`POST /acme/<tenant>/new-account` — the one unauthenticated mutating
+endpoint — keyed on the real client address the TLS listener sees; at
+THIS edge keying by account identity is impossible (the identity exists
+only after the JWS verifies), so every other `/acme*` request forwards
+un-limited here. ws-api carries the per-ACCOUNT limiter: every
+authenticated ACME POST (new-order, the POST-as-GET reads, challenge
+triggers, finalize, revoke-cert, account update, key change) spends one
+credit from the account's bucket — keyed on the ACCOUNT ID, which does
+NOT collapse behind the proxy, so it works unchanged in every variant:
+one credit per 500 ms, burst 20 by default, tuned by the
+`WARDSTONE_RATE_LIMIT_*` pair. That limiter's switch is
+`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` (only `1`/`true` disable; any
+other non-blank value fails the boot loudly) — deliberately NOT the auth
+switch above, so disabling the auth limiter never silently unlimits
+enrolled accounts. The bundled UI-fronted deployment therefore covers
+the ACME surface at BOTH corners: ws-web's per-client GCRA on
+enrollment, and ws-api's per-account limiter (ON — this bundle sets
+neither `ACME_ACCOUNT_LIMIT_DISABLED` nor per-account envs). The buckets
+refill in-process and a restart refills them; the limiters are not a
+security boundary — the server-computed challenge verification is.
 
 ## The image and the keys volume
 
@@ -185,6 +250,8 @@ Per service (the binary's contract, one variable at a time):
 | `WARDSTONE_SERVER_HOSTNAME` | required | required | The setup certificate's SAN; also the API's domain context |
 | `WARDSTONE_API_URL`         | `http://ws-api:8080` | ignored | The `ui` proxy's target |
 | `WARDSTONE_BIND`            | `0.0.0.0:8443` | `0.0.0.0:8080` | The listen address (one variable, per-service values) |
+| `WARDSTONE_PUBLIC_URL`      | ignored | optional | The absolute URL base every ACME (RFC 8555) URL is built from — unset, the ACME routes answer `serverInternal` problem documents |
+| `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` | ignored | optional switch | `1`/`true` disables the ACME per-account rate limiter; any other non-blank value fails the boot |
 
 Compose-level:
 
@@ -193,6 +260,7 @@ Compose-level:
 | `WARDSTONE_SERVER_HOSTNAME` | yes (`:?`) | Interpolated into both services |
 | `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' password |
 | `WARDSTONE_IMAGE`           | no (default `wardstone:latest`) | Override the image; the e2e harness points it at a local build |
+| `WARDSTONE_PUBLIC_URL`      | no (default `https://$WARDSTONE_SERVER_HOSTNAME`) | The ACME URL base; override when certbot reaches the front door on a non-standard port or a different public name |
 
 ## Operations notes
 

@@ -170,6 +170,29 @@ impl ProfileRepo {
         Ok(row.map(Into::into))
     }
 
+    /// Fetch a profile by NAME within one tenant — the ACME order surface
+    /// resolves the order's `profile` extension member against the tenant's
+    /// profile catalog by name (the profile's `id` is what issuance wants,
+    /// but the wire carries the human name). `(tenant_id, name)` is UNIQUE
+    /// (migration 008), so at most one row can answer; `None` when absent.
+    /// THE TENANT IS LOAD-BEARING: the same name in another tenant never
+    /// surfaces here.
+    pub async fn get_by_name(
+        &self,
+        executor: impl PgExecutor<'_>,
+        tenant_id: Uuid,
+        name: &str,
+    ) -> Result<Option<ProfileModel>, CoreError> {
+        let row: Option<ProfileRow> = sqlx::query_as(&format!(
+            "{PROFILE_COLUMNS} WHERE tenant_id = $1 AND name = $2"
+        ))
+        .bind(tenant_id)
+        .bind(name)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
     /// Fetch a profile revision by id; `None` when absent. Old revisions
     /// stay retrievable for as long as certificates reference them.
     pub async fn get_revision(
@@ -276,6 +299,31 @@ impl ProfileRepo {
                  (moved or absent); re-read and retry"
             )));
         }
+        Ok(())
+    }
+
+    /// Replace the profile's `description` — the edit-path write the PUT
+    /// route runs INSIDE the same revision transaction as the repoint, so
+    /// a saved description and its revision commit or roll back together.
+    ///
+    /// The stored value is normalized here, in exactly one place: a blank
+    /// or empty string is stored as NULL, so "no description" round-trips
+    /// as `null` instead of a phantom `""` (the route's response echoes the
+    /// STORED value, which makes the normalization observable). `None`
+    /// clears the column too. A missing profile row updates zero rows and
+    /// stays `Ok` — existence is the caller's check.
+    pub async fn set_description(
+        &self,
+        executor: impl PgExecutor<'_>,
+        id: Uuid,
+        description: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let description = description.map(str::trim).filter(|d| !d.is_empty());
+        sqlx::query("UPDATE profiles SET description = $2 WHERE id = $1")
+            .bind(id)
+            .bind(description)
+            .execute(executor)
+            .await?;
         Ok(())
     }
 

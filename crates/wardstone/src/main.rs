@@ -108,6 +108,32 @@ struct BootConfig {
     /// values validated) regardless of the switch. `None` in api mode (no
     /// web router exists to mount it on).
     web_rate_limit: Option<ws_api::AuthRateLimit>,
+    /// The absolute URL base every ACME (RFC 8555) URL is built from
+    /// (`WARDSTONE_PUBLIC_URL`, `api` only; e.g. `https://ca.home.test`).
+    /// The ui mode constructs no ACME URLs and ignores it. OPTIONAL (the
+    /// deployment choice): unset or blank leaves the process booting, but
+    /// the ACME routes that would build an absolute URL answer the problem
+    /// document `serverInternal` and the boot logs a loud warning — a
+    /// misconfigured ACME env degrades the ACME surface alone, never the
+    /// whole CA.
+    public_url: Option<String>,
+    /// The terms-of-service document URL (`WARDSTONE_ACME_TOS_URL`, `api`
+    /// only, optional). Set, the directory answers with `Link:
+    /// <tos>;rel="terms-of-service"` and `new-account` mints `pending`
+    /// accounts until the client agrees; unset, there is no ToS flow at
+    /// all (spec settlement 9).
+    acme_tos_url: Option<String>,
+    /// The ACME per-account rate limiter's config (`api` only): armed
+    /// with the house rate defaults unless
+    /// `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` is truthy (`1`/`true` —
+    /// the only disable words; anything else fails the boot loudly).
+    /// Deliberately its OWN switch, NOT the auth disable: that one exists
+    /// because per-IP keying collapses behind ws-web's proxy, while this
+    /// limiter keys on the ACCOUNT id, which does NOT collapse — so
+    /// turning the auth limiter off must never silently unlimit enrolled
+    /// accounts (fix round 1 decoupling). The `ui` mode ignores this
+    /// field like the other ACME envs.
+    acme_account_limit: Option<ws_api::AuthRateLimit>,
 }
 
 /// Variables whose absence is fatal, with their roles — listed together
@@ -228,7 +254,16 @@ the api's auth routes, and the ui's /auth/ui login routes; defaults \
          \x20 WARDSTONE_AUTH_RATE_LIMIT_DISABLED\n\
          \x20                            `true` disables the api's auth \
 rate limiter (api; for UI-fronted deployments — the ui's own /auth/ui \
-limiter stays on)\n"
+limiter stays on)\n\
+         \x20 WARDSTONE_PUBLIC_URL        the absolute base URL for the ACME \
+surface (api; unset degrades the ACME routes to serverInternal problems)\n\
+         \x20 WARDSTONE_ACME_TOS_URL     the terms-of-service URL the ACME \
+directory links (api; optional — unset means no ToS flow)\n\
+         \x20 WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED\n\
+         \x20                            `true` disables the ACME per-account \
+rate limiter (api; `1`/`true` only — anything else fails the boot. Its \
+OWN switch: the auth disable above does NOT unlimit enrolled accounts, \
+whose keying survives the proxy hop)\n"
     )
 }
 
@@ -277,6 +312,10 @@ fn config_from(
     };
 
     let auth_rate_limit = auth_rate_limit_from(&lookup)?;
+    // The ACME per-account limiter: its OWN switch, the same loud-toggle
+    // contract as the auth one, parsed in BOTH modes (api consumes it;
+    // ui ignores the field, like the other ACME envs).
+    let acme_account_limit = acme_account_limit_from(&lookup)?;
     // The web limiter: parsed (and validated) ONLY in ui mode, from the
     // same rate envs, unconditionally — the disable switch above is the
     // API's machinery and never unlimits the UI's own /auth/ui limiter.
@@ -297,6 +336,13 @@ fn config_from(
         bind,
         auth_rate_limit,
         web_rate_limit,
+        // The ACME envs (api mode consumes them; ui ignores the fields):
+        // the URL/ToS lookups are OPTIONAL — blank is already filtered to
+        // None by the lookup contract — and the account limiter's switch
+        // follows the auth switch's loud-toggle contract.
+        public_url: lookup("WARDSTONE_PUBLIC_URL"),
+        acme_tos_url: lookup("WARDSTONE_ACME_TOS_URL"),
+        acme_account_limit,
     })
 }
 
@@ -307,11 +353,13 @@ fn config_from(
 /// with the variable and its value named (`false`, `0`, `no` are NOT
 /// disable words: a mistyped switch must never silently change the
 /// security posture). When the switch is truthy the rate-limit env vars
-/// are not read at all — a deployment that disabled the limiter cannot
-/// be held back by stale `WARDSTONE_RATE_LIMIT_*` leftovers, however
-/// garbled. Unset or blank keeps the limiter on with the configured (or
-/// default) values, and the zero/unparsable checks in [`rate_limit_from`]
-/// stay in force.
+/// are not read FOR THE AUTH LIMITER — but the ACME per-account limiter
+/// (fix round 1) shares them under its OWN switch
+/// (`WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED`), so they stay readable and
+/// validated while that limiter is armed, and are fully inert only when
+/// BOTH switches are truthy. Unset or blank keeps the limiter on with
+/// the configured (or default) values, and the zero/unparsable checks in
+/// [`rate_limit_from`] stay in force.
 fn auth_rate_limit_from(
     lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<Option<ws_api::AuthRateLimit>, BootError> {
@@ -329,6 +377,40 @@ fn auth_rate_limit_from(
                 Err(BootError::Config(format!(
                     "WARDSTONE_AUTH_RATE_LIMIT_DISABLED only takes `1` or `true` \
                      (case-insensitive) to disable the auth rate limiter; got \
+                     {value:?}"
+                )))
+            }
+        }
+    }
+}
+
+/// The ACME per-account rate limit: `Some` (the house defaults, or the
+/// `WARDSTONE_RATE_LIMIT_*` envs where set) unless truthy
+/// `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` turns the limiter OFF. The
+/// SAME loud-toggle contract [`auth_rate_limit_from`] pins: only `1` and
+/// `true` — case-insensitive — are disable words; any OTHER non-blank
+/// value fails the boot loudly. The switch is deliberately INDEPENDENT
+/// of `WARDSTONE_AUTH_RATE_LIMIT_DISABLED`: that one exists because per-IP
+/// keying collapses behind ws-web's proxy, while this limiter keys on the
+/// account id and does NOT collapse — so disabling the auth limiter must
+/// not silently unlimit enrolled accounts (fix round 1 decoupling).
+fn acme_account_limit_from(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ws_api::AuthRateLimit>, BootError> {
+    match lookup("WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED") {
+        None => Ok(Some(rate_limit_from(
+            lookup,
+            DEFAULT_RATE_PER_MILLIS,
+            DEFAULT_RATE_BURST,
+        )?)),
+        Some(value) => {
+            let word = value.trim();
+            if word == "1" || word.eq_ignore_ascii_case("true") {
+                Ok(None)
+            } else {
+                Err(BootError::Config(format!(
+                    "WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED only takes `1` or `true` \
+                     (case-insensitive) to disable the per-account ACME rate limiter; got \
                      {value:?}"
                 )))
             }
@@ -598,6 +680,25 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
         // per-client limit on `/auth/ui/*` itself. ws-api's layer skips
         // when `None`.
         auth_rate_limit: cfg.auth_rate_limit,
+        // The ACME surface config: the URL base (unset → the ACME routes
+        // degrade to `serverInternal` problems; the choice is LOUD here),
+        // the optional ToS URL, and the per-account limiter's OWN knob —
+        // armed by default, and NOT governed by the auth disable above
+        // (fix round 1: uuid keying survives the proxy hop).
+        acme: {
+            if cfg.public_url.is_none() {
+                tracing::warn!(
+                    "WARDSTONE_PUBLIC_URL is not set: the ACME directory cannot build \
+                     absolute URLs and every ACME route that needs one will answer \
+                     urn:ietf:params:acme:error:serverInternal until it is configured"
+                );
+            }
+            ws_api::AcmeConfig {
+                public_url: cfg.public_url.clone().unwrap_or_default(),
+                tos_url: cfg.acme_tos_url.clone(),
+                acme_account_limit: cfg.acme_account_limit,
+            }
+        },
     };
     let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
 
@@ -780,24 +881,60 @@ mod tests {
 
     /// The `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` switch: only `1` and
     /// `true` (case-insensitive) disable the limiter — and make the
-    /// rate-limit env vars entirely inert (zero, garbage: ignored).
-    /// Unset or blank keeps it on; ANY other non-blank value fails the
-    /// boot loudly, naming the variable and the offending value (`false`
-    /// and `0` are deliberately NOT disable words — a mistyped switch
-    /// must never silently change the security posture).
+    /// rate-limit env vars inert FOR THE AUTH LIMITER. Unset or blank
+    /// keeps it on; ANY other non-blank value fails the boot loudly,
+    /// naming the variable and the offending value (`false` and `0` are
+    /// deliberately NOT disable words — a mistyped switch must never
+    /// silently change the security posture).
+    ///
+    /// Fix round 1 nuance: the ACME per-account limiter shares the
+    /// `WARDSTONE_RATE_LIMIT_*` envs under its OWN switch, so garbage in
+    /// those envs is a loud failure while the ACME limiter is armed — the
+    /// envs are fully inert only when BOTH switches are truthy (a
+    /// deployment that wants every limiter off must say so twice).
     #[test]
     fn auth_rate_limit_disabled_switch_semantics() {
         let truthy = [
             MINIMAL[0],
             MINIMAL[1],
             ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
-            // Values that would be LOUD boot failures with the limiter on:
-            // with the limiter off they are simply not read.
-            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
-            ("WARDSTONE_RATE_LIMIT_BURST", "0"),
         ];
         let cfg = config_from(BootMode::Api, table(&truthy)).expect("`true` disables the limiter");
         assert!(cfg.auth_rate_limit.is_none(), "the limiter is off");
+
+        // With the auth limiter OFF but the per-account ACME limiter
+        // armed (its own switch untouched), the shared rate envs are
+        // still read and validated — a broken number refuses to
+        // mis-tune a limiter that is running.
+        let garbage = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
+        ];
+        let err = config_from(BootMode::Api, table(&garbage))
+            .expect_err("the armed ACME limiter still validates the shared rate envs");
+        assert!(
+            err.to_string().contains("WARDSTONE_RATE_LIMIT_PER_MILLIS"),
+            "the error names the variable: {err}"
+        );
+
+        // With BOTH switches truthy the rate envs are fully inert: zero
+        // and garbage are simply never read.
+        let both_off = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+            ("WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED", "true"),
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "soon"),
+            ("WARDSTONE_RATE_LIMIT_BURST", "0"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&both_off))
+            .expect("both limiters off: the rate envs are fully inert");
+        assert!(
+            cfg.auth_rate_limit.is_none() && cfg.acme_account_limit.is_none(),
+            "both limiters are off"
+        );
 
         let upper = [
             MINIMAL[0],
@@ -974,6 +1111,110 @@ mod tests {
     fn api_mode_has_no_web_rate_limit() {
         let cfg = config_from(BootMode::Api, table(&MINIMAL)).expect("the minimal table parses");
         assert!(cfg.web_rate_limit.is_none(), "no web router in api mode");
+    }
+
+    /// The ACME env contract: `WARDSTONE_PUBLIC_URL` is OPTIONAL (blank or
+    /// unset is the degrade-to-`serverInternal` posture, never a boot
+    /// failure) and `WARDSTONE_ACME_TOS_URL` is optional and independent —
+    /// a ToS URL without a public URL would be inert, since nothing can
+    /// build absolute URLs without the base.
+    #[test]
+    fn acme_envs_are_optional_and_pass_through() {
+        let bare = config_from(BootMode::Api, table(&MINIMAL)).expect("bare table parses");
+        assert!(
+            bare.public_url.is_none(),
+            "no WARDSTONE_PUBLIC_URL → unset (the warn-and-degrade posture)"
+        );
+        assert!(bare.acme_tos_url.is_none(), "no ToS URL configured");
+
+        let full = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_PUBLIC_URL", "https://ca.home.test"),
+            ("WARDSTONE_ACME_TOS_URL", "https://ca.home.test/terms"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&full)).expect("the full table parses");
+        assert_eq!(cfg.public_url.as_deref(), Some("https://ca.home.test"));
+        assert_eq!(
+            cfg.acme_tos_url.as_deref(),
+            Some("https://ca.home.test/terms")
+        );
+
+        let blank = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_PUBLIC_URL", "   "),
+            ("WARDSTONE_ACME_TOS_URL", ""),
+        ];
+        let cfg = config_from(BootMode::Api, table(&blank)).expect("blank values parse");
+        assert!(
+            cfg.public_url.is_none() && cfg.acme_tos_url.is_none(),
+            "blank ACME env values count as unset (the lookup contract)"
+        );
+    }
+
+    /// The ACME per-account limiter's switch semantics (fix round 1): ON
+    /// by default with the house rate envs (the `WARDSTONE_RATE_LIMIT_*`
+    /// pair tunes it); only `1`/`true` — case-insensitive — disarm it;
+    /// any OTHER non-blank value fails the boot loudly; and the auth
+    /// disable switch does NOT touch it (the two limiters are decoupled
+    /// knobs: uuid keying survives the proxy hop, per-IP keying does not).
+    #[test]
+    fn acme_account_limit_switch_semantics() {
+        let bare = config_from(BootMode::Api, table(&MINIMAL)).expect("bare table parses");
+        let on = bare
+            .acme_account_limit
+            .expect("an unset switch keeps the per-account limiter ON");
+        assert_eq!((on.per_millis, on.burst), (500, 20), "house defaults");
+
+        let tuned = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_RATE_LIMIT_PER_MILLIS", "250"),
+            ("WARDSTONE_RATE_LIMIT_BURST", "7"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&tuned)).expect("the tuned table parses");
+        let on = cfg.acme_account_limit.expect("still ON with tuned envs");
+        assert_eq!((on.per_millis, on.burst), (250, 7));
+
+        for word in ["1", "true", "TRUE", "True"] {
+            let off = [
+                MINIMAL[0],
+                MINIMAL[1],
+                ("WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED", word),
+            ];
+            let cfg = config_from(BootMode::Api, table(&off)).expect("the disable word parses");
+            assert!(
+                cfg.acme_account_limit.is_none(),
+                "{word} disarms the per-account limiter"
+            );
+        }
+
+        let junk = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED", "false"),
+        ];
+        let err = config_from(BootMode::Api, table(&junk))
+            .expect_err("a non-disable word must fail the boot loudly");
+        assert!(
+            err.to_string()
+                .contains("WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED"),
+            "the error names the variable: {err}"
+        );
+
+        // The AUTH disable switch is a different knob: turning the auth
+        // limiter off leaves the per-account ACME limiter armed.
+        let auth_off = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_AUTH_RATE_LIMIT_DISABLED", "true"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&auth_off)).expect("the auth-off table parses");
+        assert!(
+            cfg.auth_rate_limit.is_none() && cfg.acme_account_limit.is_some(),
+            "the auth disable does not unlimit the ACME account limiter"
+        );
     }
 
     /// The tenant name the boot lookup and the setup flow agree on: the

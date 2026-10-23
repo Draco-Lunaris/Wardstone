@@ -9,6 +9,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Shell from "./components/Shell";
 import { useAuthState } from "./lib/auth";
 import Login from "./pages/Login";
+import Acme from "./pages/Acme";
 import Audit from "./pages/Audit";
 import Cas from "./pages/Cas";
 import CertificateDetail from "./pages/CertificateDetail";
@@ -57,6 +58,7 @@ export default function App() {
         <Route path="cas" element={<Cas />} />
         <Route path="tokens" element={<Tokens />} />
         <Route path="audit" element={<Audit />} />
+        <Route path="acme" element={<Acme />} />
         <Route path="admin" element={<Admin />} />
       </Route>
       {/* Everything else is the dashboard: a deep link that outlived its
