@@ -564,14 +564,29 @@ async fn account_url(
     ))
 }
 
-/// `POST /acme/{tenant}/key-change` — the RFC 8555 §7.3.6 account-key
-/// rollover in ONE transaction: the request body is the OUTER JWS (signed
-/// by the NEW key, its `jwk` embedded), whose payload is the INNER JWS in
-/// flattened JSON serialization (signed by the OLD key as the account's
-/// kid), whose payload names the account and the NEW key. RFC 8555 binds
-/// BOTH `url` protected members to the key-change URL, and the NEW account
-/// location comes back in the response's `Location` header (under the new
-/// full-thumbprint URL).
+/// `POST /acme/{tenant}/key-change` — the RFC 8555 §7.3.5 account-key
+/// rollover in ONE transaction, as TWO nested envelopes:
+///
+/// - the OUTER JWS is signed by the EXISTING (old) account key, AS that
+///   account's `kid`, with a fresh anti-replay `nonce`, and its payload is
+///   the INNER JWS in flattened JSON serialization
+///   (`{"protected","payload","signature"}`);
+/// - the INNER JWS is signed by the NEW key with that key's `jwk`
+///   embedded, binds the SAME `url` (the key-change URL), and MUST OMIT
+///   the `nonce` member — its payload is `{"account": <account URL>,
+///   "oldKey": <the OLD key's JWK>}`.
+///
+/// The nonce gate: the OUTER's nonce is consumed (the anti-replay ledger
+/// runs on the request as a whole); the inner's gate is non-consuming and
+/// accepts exactly the nonce member's ABSENCE — a `nonce` that IS present
+/// on the inner (the RFC's MUST NOT) is refused `badNonce` by the same
+/// seam.
+///
+/// The swap keeps the account ROW ID, so every order/authorization
+/// linkage survives; the old thumbprint — the old kid — stops resolving,
+/// because the identity IS the key. The NEW account location comes back
+/// in the response's `Location` header (under the new full-thumbprint
+/// URL).
 async fn key_change(
     State(state): State<AppState>,
     Path(tenant_name): Path<String>,
@@ -582,21 +597,44 @@ async fn key_change(
     let expected_url = format!("{base}/acme/{}/key-change", tenant.name);
     let raw = as_str(&raw)?;
 
+    // Pre-resolve the outer's kid (the OLD account URL) synchronously, the
+    // same way the account route does: peek the UNVERIFIED protected
+    // header, parse the kid against the tenant prefix, and cache the
+    // stored key the verifier's resolver will answer with.
+    let peeked = peek_header(raw)?;
+    let mut kid_keys: HashMap<String, Value> = HashMap::new();
+    if let Some(kid) = peeked.kid.filter(|_| peeked.jwk.is_none()) {
+        if let Some(thumb) = kid_thumbprint(&kid, &base, &tenant.name) {
+            if let Some(account) = AcmeRepo::new()
+                .get_account(&state.pool, tenant.id, &thumb)
+                .await?
+            {
+                kid_keys.insert(kid, account.jwk);
+            }
+        }
+    }
+
     let outer = ws_acme::verify_jws(
         raw,
-        &|_kid: &str| {
-            Err(AcmeError::Malformed(
-                "the outer key-change JWS must embed the NEW account key as a \
-                 protected jwk, not a kid"
-                    .to_owned(),
-            ))
-        },
+        &|kid: &str| Ok(kid_keys.get(kid).cloned()),
         &|n| state.nonces.consume(n),
         &expected_url,
     )
     .map_err(AcmeProblem::from)?;
 
-    // The outer payload holds the inner JWS in flattened JSON
+    // The outer envelope authenticates AS the existing account: kid-carried
+    // (an embedded jwk names nothing — the account keeps its identity while
+    // changing keys).
+    if outer.header.jwk.is_some() {
+        return Err(AcmeProblem::malformed(
+            "the outer key-change JWS must authenticate with its kid, not an embedded jwk",
+        ));
+    }
+    let kid = outer.header.kid.as_deref().ok_or_else(|| {
+        AcmeProblem::malformed("the outer key-change JWS must name its account URL as a kid")
+    })?;
+
+    // The outer's payload is the inner JWS in flattened JSON
     // serialization: {"protected", "payload", "signature"} — the same
     // base64url segments the compact form would carry.
     let members = outer.payload.as_object().ok_or_else(|| {
@@ -608,7 +646,7 @@ async fn key_change(
     let inner_compact = format!("{protected}.{payload}.{signature}");
 
     // The inner JWS's payload names the account being rolled over and the
-    // NEW account key.
+    // key being retired.
     let inner_payload_bytes = URL_SAFE_NO_PAD
         .decode(payload.as_bytes())
         .map_err(|_| AcmeProblem::malformed("the inner JWS's payload is not valid base64url"))?;
@@ -621,59 +659,41 @@ async fn key_change(
             AcmeProblem::malformed("the inner payload must name the account being updated")
         })?
         .to_owned();
-    let inner_key = inner_payload
-        .get("key")
-        .ok_or_else(|| AcmeProblem::malformed("the inner payload must present the new key"))?;
-    if inner_key != &outer.key {
+    let old_key = inner_payload.get("oldKey").ok_or_else(|| {
+        AcmeProblem::malformed("the inner payload must present the old key as oldKey")
+    })?;
+    // §7.3.5's bindings: the inner payload's account is the account the
+    // OUTER authenticated as, and its `oldKey` is that account's
+    // registered key (the very key the outer verified under).
+    if account_url_field != kid {
         return Err(AcmeProblem::malformed(
-            "the inner payload's key does not match the outer JWS's embedded jwk",
+            "the inner payload's account does not match the outer JWS's kid",
+        ));
+    }
+    if old_key != &outer.key {
+        return Err(AcmeProblem::malformed(
+            "the inner payload's oldKey does not match the account's registered key",
         ));
     }
 
-    // Pre-resolve the inner kid (the OLD account URL) synchronously, the
-    // same way the account route does.
-    let protected_bytes = URL_SAFE_NO_PAD
-        .decode(protected.as_bytes())
-        .map_err(|_| AcmeProblem::malformed("the inner JWS's protected is not valid base64url"))?;
-    let inner_peeked: PeekedHeader = serde_json::from_slice(&protected_bytes)
-        .map_err(|_| AcmeProblem::malformed("the inner JWS's protected is not a valid header"))?;
-    let mut kid_keys: HashMap<String, Value> = HashMap::new();
-    if let Some(kid) = inner_peeked.kid.filter(|_| inner_peeked.jwk.is_none()) {
-        if let Some(thumb) = kid_thumbprint(&kid, &base, &tenant.name) {
-            if let Some(account) = AcmeRepo::new()
-                .get_account(&state.pool, tenant.id, &thumb)
-                .await?
-            {
-                // Cached under THE KID STRING the closure reads.
-                kid_keys.insert(kid, account.jwk);
-            }
-        }
-    }
-
+    // The inner envelope: signed by the NEW key with its `jwk` embedded
+    // (a kid here names nothing), SAME url as the outer, and the
+    // non-consuming nonce gate that accepts exactly the nonce member's
+    // absence (§7.3.5: the inner MUST NOT carry one).
     let inner = ws_acme::verify_jws(
         &inner_compact,
-        &|kid: &str| Ok(kid_keys.get(kid).cloned()),
-        &|n| state.nonces.consume(n),
+        &|_kid: &str| {
+            Err(AcmeError::Malformed(
+                "the inner key-change JWS must embed the NEW account key as a \
+                 protected jwk, not a kid"
+                    .to_owned(),
+            ))
+        },
+        &|n: &str| n.is_empty(),
         &expected_url,
     )
     .map_err(AcmeProblem::from)?;
 
-    // RFC 8555 §7.3.6's bindings: the inner JWS is signed with the
-    // existing account's key, AS that account's kid, and its payload must
-    // name that same account and the same new key the outer JWS embedded.
-    if inner.header.jwk.is_some() {
-        return Err(AcmeProblem::malformed(
-            "the inner JWS must authenticate with its kid, not an embedded jwk",
-        ));
-    }
-    let kid = inner.header.kid.as_deref().ok_or_else(|| {
-        AcmeProblem::malformed("the inner JWS must name its account URL as a kid")
-    })?;
-    if kid != account_url_field {
-        return Err(AcmeProblem::malformed(
-            "the inner payload's account does not match the inner JWS's kid",
-        ));
-    }
     let old_thumb = kid_thumbprint(kid, &base, &tenant.name)
         .ok_or(AcmeError::NoSuchAccount)
         .map_err(AcmeProblem::from)?;
@@ -688,11 +708,11 @@ async fn key_change(
         ));
     }
 
-    let new_thumb = ws_acme::thumbprint(&outer.key).map_err(AcmeProblem::from)?;
+    let new_thumb = ws_acme::thumbprint(&inner.key).map_err(AcmeProblem::from)?;
     let new_url = format!("{base}/acme/{}/acct/{new_thumb}", tenant.name);
     let mut tx = state.pool.begin().await?;
     AcmeRepo::new()
-        .swap_account_key(&mut *tx, tenant.id, account.id, &outer.key, &new_thumb)
+        .swap_account_key(&mut *tx, tenant.id, account.id, &inner.key, &new_thumb)
         .await
         .map_err(|err| match err {
             // The tenant already holds another account on the NEW key.

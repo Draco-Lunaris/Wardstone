@@ -40,6 +40,8 @@ use std::sync::OnceLock;
 use axum::body::{to_bytes, Body};
 use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
@@ -1209,10 +1211,12 @@ async fn a_deactivated_account_refuses_mutations_but_stays_readable() {
 // Account-key rollover
 // ---------------------------------------------------------------------------
 
-/// The §7.3.6 roll: inner JWS (OLD key, kid = account URL, payload naming
-/// the account and the NEW key) inside the outer JWS (NEW key embedded) —
-/// 200 with the NEW Location, ONE row (the row id survives, so order
-/// linkage survives), the audit row, the old kid DEAD, the new kid live.
+/// The §7.3.5 roll: the OUTER JWS is signed by the OLD key (kid = the
+/// account URL) with a fresh nonce, wrapping the INNER JWS — signed by
+/// the NEW key (its `jwk` embedded), SAME url, nonce OMITTED — whose
+/// payload is `{"account", "oldKey"}`. 200 with the NEW Location, ONE row
+/// (the row id survives, so order linkage survives), the audit row, the
+/// old kid DEAD, the new kid live.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn key_change_rolls_the_account_key_in_a_single_transaction() {
@@ -1233,25 +1237,84 @@ async fn key_change_rolls_the_account_key_in_a_single_transaction() {
     let new_url = account_url(&new_thumb);
     let key_change_url = format!("{PUBLIC_URL}/acme/{ACME_TENANT}/key-change");
 
-    // The inner JWS: signed by the OLD account key, as that account's kid,
-    // over {"account": url, "key": new key}.
-    let nonce = fetch_nonce(&fx).await;
-    let inner = acme_common::sign_acme_request(
-        rsa2048(),
-        &Identity::Kid(old_url.clone()),
-        &nonce,
-        &key_change_url,
-        &json!({"account": old_url, "key": p256().jwk}),
+    // The INNER JWS: signed by the NEW key with its `jwk` embedded, the
+    // SAME url as the outer, and NO nonce member (RFC 8555 §7.3.5 — the
+    // outer envelope is the request the nonce disciplines), over
+    // {"account": url, "oldKey": the OLD key's JWK}.
+    let inner = acme_common::sign_with_header(
+        p256(),
+        &json!({"alg": p256().alg_name, "jwk": p256().jwk, "url": key_change_url}),
+        &json!({"account": old_url, "oldKey": rsa2048().jwk}),
     );
-    // The outer JWS: signed by the NEW key (embedded), over the inner JWS
-    // in flattened JSON serialization.
+    // The OUTER JWS: signed by the OLD key as that account's kid, with a
+    // fresh nonce, over the inner JWS in flattened JSON serialization.
     let outer_nonce = fetch_nonce(&fx).await;
     let outer = acme_common::sign_acme_request(
-        p256(),
-        &Identity::Jwk,
+        rsa2048(),
+        &Identity::Kid(old_url.clone()),
         &outer_nonce,
         &key_change_url,
         &acme_common::inner_jws_object(&inner),
+    );
+
+    // The wire shape, decoded from the bytes POSTed: the outer carries the
+    // kid + the nonce; the inner embeds the NEW key and carries NO kid and
+    // NO nonce.
+    let decode_b64 = |segment: &str| {
+        String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(segment)
+                .expect("the segment is unpadded base64url"),
+        )
+        .expect("the segment is UTF-8")
+    };
+    let outer_header: Value = serde_json::from_str(&decode_b64(
+        outer
+            .split('.')
+            .next()
+            .expect("the outer's protected segment"),
+    ))
+    .expect("the outer's protected header is JSON");
+    assert_eq!(
+        outer_header["kid"],
+        json!(old_url),
+        "the outer is kid-carried by the OLD account URL"
+    );
+    assert!(
+        outer_header.get("nonce").is_some(),
+        "the outer envelope is the one that carries the anti-replay nonce"
+    );
+    let outer_payload: Value = serde_json::from_str(&decode_b64(
+        outer
+            .split('.')
+            .nth(1)
+            .expect("the outer's payload segment"),
+    ))
+    .expect("the outer's payload is JSON");
+    assert!(
+        outer_payload.get("protected").is_some()
+            && outer_payload.get("payload").is_some()
+            && outer_payload.get("signature").is_some(),
+        "the outer wraps the inner JWS as a flattened JSON serialization"
+    );
+    let inner_header: Value = serde_json::from_str(&decode_b64(
+        outer_payload["protected"]
+            .as_str()
+            .expect("the inner's protected"),
+    ))
+    .expect("the inner's protected header is JSON");
+    assert!(
+        inner_header.get("kid").is_none(),
+        "the inner MUST NOT carry a kid: it embeds its key"
+    );
+    assert_eq!(
+        inner_header["jwk"],
+        p256().jwk,
+        "the inner embeds the NEW key"
+    );
+    assert!(
+        inner_header.get("nonce").is_none(),
+        "RFC 8555 §7.3.5: the inner JWS omits the nonce"
     );
     let response = send(
         &fx,

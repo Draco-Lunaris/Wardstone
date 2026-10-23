@@ -69,7 +69,10 @@ pub struct VerifiedJws {
 ///    otherwise);
 /// 5. the nonce passing `nonce_check` — the ledger spends it here,
 ///    before the signature is even looked at, so a request whose
-///    signature fails cannot be replayed with the same nonce;
+///    signature fails cannot be replayed with the same nonce; an ABSENT
+///    `nonce` member delegates the same gate to `nonce_check` with the
+///    empty string (a consuming check refuses; the RFC 8555 §7.3.5
+///    inner-envelope caller accepts the nonceless form);
 /// 6. the payload (inside the JWS; the empty segment is the
 ///    POST-as-GET empty string, presented as [`Value::Null`]) decoding
 ///    to JSON;
@@ -137,9 +140,13 @@ pub fn verify_jws(
 
     // (5) the anti-replay nonce — spent before the signature verdict, so
     // single-use holds regardless of how the verification comes out. An
-    // absent nonce is the failure too: RFC 8555's protected header must
-    // carry one, and without it there is nothing to spend.
-    let nonce = header.nonce.as_deref().ok_or(AcmeError::BadNonce)?;
+    // ABSENT nonce delegates the same gate to the caller's `nonce_check`
+    // seam, called with the empty string: a normal consuming check still
+    // refuses it ("" is never a minted nonce), while RFC 8555 §7.3.5's
+    // key-change INNER envelope — which MUST omit the nonce, the outer
+    // envelope being the request the nonce disciplines — accepts exactly
+    // that case through its own non-consuming seam.
+    let nonce = header.nonce.as_deref().unwrap_or("");
     if !nonce_check(nonce) {
         return Err(AcmeError::BadNonce);
     }
