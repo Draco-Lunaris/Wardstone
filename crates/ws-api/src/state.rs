@@ -334,15 +334,18 @@ impl VerificationDeps {
     /// The pacing gate: `true` when the attempt is allowed, spending the
     /// allowance atomically under one lock hold (the next attempt on this
     /// authorization inside [`CHALLENGE_ATTEMPT_BACKOFF`] is refused). A
-    /// poisoned lock fails OPEN — only a panic while the lock was held
-    /// poisons it, and pacing is not a security boundary — while
-    /// opportunistic GC drops the stale entries the check walks over.
+    /// poisoned lock fails **closed** — a poison is a bug that panicked
+    /// while the lock was held, and the conservative answer to a broken
+    /// control is to refuse, not to run un-paced (threat-model G5) —
+    /// while opportunistic GC drops the stale entries the check walks
+    /// over.
     pub fn try_record_attempt(&self, authorization_id: uuid::Uuid) -> bool {
         let Ok(mut attempts) = self.attempts.lock() else {
-            tracing::warn!(
-                "the challenge-attempt pacing map is poisoned; the attempt runs un-paced"
+            tracing::error!(
+                "the challenge-attempt pacing map is poisoned: the attempt is REFUSED \
+                 (fail-closed default)"
             );
-            return true;
+            return false;
         };
         let now = Instant::now();
         if attempts
@@ -388,15 +391,19 @@ impl AcmeAccountLimiter {
     /// Check-and-consume one credit for `account_id`: elapsed credits
     /// refill since the bucket's last touch (capped at the burst), one
     /// credit is spent, `false` answers when the bucket is empty. A
-    /// poisoned lock fails OPEN (only a panic inside the lock poisons
-    /// it, and the limiter is not a security boundary).
+    /// poisoned lock fails **closed** — a poison is a bug that panicked
+    /// inside the lock, and the conservative answer is to refuse the
+    /// request (threat-model G5), never to run un-limited.
     pub fn try_consume(&self, account_id: uuid::Uuid) -> bool {
         let Some(config) = self.config else {
             return true;
         };
         let Ok(mut buckets) = self.buckets.lock() else {
-            tracing::warn!("the ACME account-limiter map is poisoned; the request runs un-limited");
-            return true;
+            tracing::error!(
+                "the ACME account-limiter map is poisoned: the request is REFUSED \
+                 (fail-closed default)"
+            );
+            return false;
         };
         let now = Instant::now();
         let (tokens, last) = buckets
@@ -502,5 +509,57 @@ mod tests {
     fn consume_of_an_unknown_state_is_none() {
         let store = OidcStateStore::default();
         assert!(store.consume("totally-unknown-state").is_none());
+    }
+}
+
+#[cfg(test)]
+mod poisoned_lock_tests {
+    use super::{AcmeAccountLimiter, AuthRateLimit, VerificationDeps};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Poison a std Mutex by panicking a thread while it holds the guard.
+    fn poison<V: Send + 'static>(map: &Arc<Mutex<HashMap<uuid::Uuid, V>>>) {
+        let cloned = Arc::clone(map);
+        let _ = std::thread::spawn(move || {
+            let _guard = cloned.lock().unwrap();
+            panic!("deliberate poison");
+        })
+        .join();
+        assert!(
+            map.lock().is_err(),
+            "the fixture must actually poison the mutex"
+        );
+    }
+
+    /// Threat-model G5: a poisoned pacing map refuses the attempt — the
+    /// conservative answer to a broken control is to stop, not to run
+    /// un-paced. The pacing deps come from the failing-seam constructor
+    /// (the seams are unused by the pacing gate itself).
+    #[test]
+    fn a_poisoned_pacing_map_refuses_the_attempt() {
+        let deps = VerificationDeps::with_seams(
+            Arc::new(super::FailingFetcher("unused".to_string())),
+            Arc::new(super::FailingTxtResolver("unused".to_string())),
+        );
+        poison(&deps.attempts);
+        assert!(
+            !deps.try_record_attempt(uuid::Uuid::new_v4()),
+            "a poisoned pacing map must refuse (fail-closed)"
+        );
+    }
+
+    /// G5's other half: a poisoned account-limiter map refuses the credit.
+    #[test]
+    fn a_poisoned_account_limiter_refuses_the_credit() {
+        let limiter = AcmeAccountLimiter::new(Some(AuthRateLimit {
+            per_millis: 500,
+            burst: 20,
+        }));
+        poison(&limiter.buckets);
+        assert!(
+            !limiter.try_consume(uuid::Uuid::new_v4()),
+            "a poisoned account limiter must refuse (fail-closed)"
+        );
     }
 }

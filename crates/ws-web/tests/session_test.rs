@@ -290,6 +290,11 @@ async fn env(ttl: Duration) -> TestEnv {
     ));
     let jwt =
         Arc::new(JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair"));
+    // The sealing key: the proxied OIDC config routes seal/unseal the
+    // client secret through it (the same fixture shape the api/oidc and
+    // acme suites use).
+    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
+        .expect("create the secret-encryption key");
     let config = ApiConfig::new("wardstone-relay.test".to_owned(), keys_dir.clone());
     let state = AppState::new(pool.clone(), jwt.clone(), config);
     let refresh_counter = Arc::new(AtomicUsize::new(0));

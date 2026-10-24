@@ -96,6 +96,14 @@ pub struct SetupFields {
     /// The server's own hostname: the SAN of the CA-issued leaf that
     /// replaces the setup certificate at the end of setup.
     pub server_hostname: String,
+    /// The operator PASTES the setup certificate's SHA-256 fingerprint as
+    /// shown in the SERVER'S CONSOLE LOG — not merely the page's display,
+    /// which a page-level attacker controls. The window between a fresh
+    /// boot and a completed setup is the setup-window takeover surface
+    /// (threat-model G8): first-mover takes the CA, and the only defense
+    /// in that window is the operator confirming they are talking to the
+    /// instance whose console they administer.
+    pub fingerprint_confirmation: String,
 }
 
 /// The state the setup handlers need: the pool, the keys directory (the
@@ -438,8 +446,9 @@ pub async fn run_setup(
     let lifetime = chrono::Duration::days(i64::from(template.lifetime_days));
     let issuance = tokio::task::spawn_blocking(
         move || -> Result<(IssuedLeaf, Zeroizing<Vec<u8>>), CaError> {
+            // Zeroized on drop: the DER never leaves the wrapped buffer
+            // between mint and envelope-write.
             let (key_pair, private_key_der) = generate_leaf_key(serial_key_type)?;
-            let private_key_der = Zeroizing::new(private_key_der);
             // The CSR carries the requested subject CN and SANs,
             // self-signed with the generated key (proof of possession,
             // verified by the signing leg — the same contract as the

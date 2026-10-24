@@ -40,6 +40,25 @@ pub async fn submit_setup(
 ) -> Result<Json<serde_json::Value>, SubmitError> {
     validate(&fields).map_err(SubmitError::BadRequest)?;
 
+    // The setup-window takeover gate (threat-model G8): the pasted
+    // fingerprint must equal the fingerprint THIS LISTENER serves —
+    // compared against the server-side value, never the page's own
+    // display. An attacker who can re-render the page cannot re-render
+    // the console the operator copies from, so the paste binds the form
+    // to the instance the operator actually administers.
+    if !fields
+        .fingerprint_confirmation
+        .trim()
+        .eq_ignore_ascii_case(&state.fingerprint)
+    {
+        return Err(SubmitError::BadRequest(
+            "the pasted fingerprint does not match this instance's setup \
+             certificate: copy the SHA-256 fingerprint from this server's \
+             console log, not from this page."
+                .to_string(),
+        ));
+    }
+
     // The Plan-2 I-3 fix's primary seam: refuse a `server_hostname` the
     // built-in `web-server` profile's SAN patterns forbid BEFORE any
     // bootstrap work — nothing is committed, the form gets a 400. The
@@ -98,6 +117,10 @@ fn validate(fields: &SetupFields) -> Result<(), String> {
         ("admin_username", fields.admin_username.as_str()),
         ("admin_password", fields.admin_password.as_str()),
         ("default_domain", fields.default_domain.as_str()),
+        (
+            "fingerprint_confirmation",
+            fields.fingerprint_confirmation.as_str(),
+        ),
         ("server_hostname", fields.server_hostname.as_str()),
     ];
     for (name, value) in required {
@@ -136,6 +159,7 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
     default_domain: form.default_domain.value,
     admin_cidrs: form.admin_cidrs.value.split(',').map(s => s.trim()).filter(Boolean),
     server_hostname: form.server_hostname.value,
+    fingerprint_confirmation: form.fingerprint_confirmation.value,
   };
   const note = document.getElementById('result');
   try {
@@ -194,7 +218,12 @@ fn render(fingerprint: &str, hostname: &str) -> String {
              instance, verify its SHA-256 fingerprint out of band:</p>\n",
             "<code class=\"fingerprint\">{fingerprint}</code>\n",
             "<form id=\"setup-form\">\n",
-            "<label for=\"admin_username\">Admin username</label>\n",
+            "<p class=\"hint\">To close the setup window safely, paste the SHA-256 fingerprint \
+     <strong>from this server's console log</strong> (the same value shown above; the \
+     console is the copy you can verify out of band).</p>\n",
+    "<label for=\"fingerprint_confirmation\">Fingerprint (paste from the server console)</label>\n",
+    "<input id=\"fingerprint_confirmation\" name=\"fingerprint_confirmation\" autocomplete=\"off\" required>\n",
+    "<label for=\"admin_username\">Admin username</label>\n",
             "<input id=\"admin_username\" name=\"admin_username\" autocomplete=\"username\" required>\n",
             "<label for=\"admin_password\">Admin password</label>\n",
             "<input id=\"admin_password\" name=\"admin_password\" type=\"password\" autocomplete=\"new-password\" required>\n",

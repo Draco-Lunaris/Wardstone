@@ -377,6 +377,7 @@ async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        fingerprint_confirmation: PAGE_FINGERPRINT.to_string(),
     };
     let response = web_request(
         &pre_setup,
@@ -563,6 +564,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        fingerprint_confirmation: PAGE_FINGERPRINT.to_string(),
     };
     let response = post_json(
         &setup_router,
@@ -1006,6 +1008,7 @@ async fn ui_session_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        fingerprint_confirmation: PAGE_FINGERPRINT.to_string(),
     };
     let response = web_request(
         &web,

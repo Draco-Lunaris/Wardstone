@@ -512,6 +512,8 @@ async fn spawn_signing(
                 // consumes. The profile pins the exact key type — the
                 // generated key is the pinned size by construction.
                 let key_type = leaf_key_type(revision.key_type.as_str())?;
+                // The DER copies are zeroized on drop now (threat-model
+                // G10): the plaintext bytes never linger unwrapped.
                 let (key_pair, _der) = generate_leaf_key(key_type).map_err(ApiError::from)?;
                 let pem = key_pair.serialize_pem();
                 let csr = build_generated_csr(&key_pair, &subject_cn, &sans)?;

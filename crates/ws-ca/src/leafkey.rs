@@ -17,6 +17,7 @@
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::ca::generate_rsa;
 use crate::error::CaError;
@@ -106,15 +107,15 @@ impl LeafKeyType {
 /// here because the caller encrypts these bytes immediately (keystore
 /// envelope); a caller that keeps the pair in memory longer than one
 /// statement should prefer the [`KeyPair`] half, which rcgen zeroizes.
-pub fn generate_leaf_key(key_type: LeafKeyType) -> Result<(KeyPair, Vec<u8>), CaError> {
+pub fn generate_leaf_key(key_type: LeafKeyType) -> Result<(KeyPair, Zeroizing<Vec<u8>>), CaError> {
     match key_type {
         LeafKeyType::Rsa2048 => {
             let (key_pair, der) = generate_rsa(2048)?;
-            Ok((key_pair, der.to_vec()))
+            Ok((key_pair, Zeroizing::new(der.to_vec())))
         }
         LeafKeyType::Rsa3072 => {
             let (key_pair, der) = generate_rsa(3072)?;
-            Ok((key_pair, der.to_vec()))
+            Ok((key_pair, Zeroizing::new(der.to_vec())))
         }
         LeafKeyType::EcdsaP256 => generated_for(&PKCS_ECDSA_P256_SHA256),
         LeafKeyType::EcdsaP384 => generated_for(&PKCS_ECDSA_P384_SHA384),
@@ -125,9 +126,11 @@ pub fn generate_leaf_key(key_type: LeafKeyType) -> Result<(KeyPair, Vec<u8>), Ca
 /// Generate inside rcgen for one algorithm and return the pair with its
 /// serialized PKCS#8 DER (rcgen's own plain copy; the pair's internal
 /// serialization is dropped and zeroized via the `zeroize` feature).
-fn generated_for(alg: &'static rcgen::SignatureAlgorithm) -> Result<(KeyPair, Vec<u8>), CaError> {
+fn generated_for(
+    alg: &'static rcgen::SignatureAlgorithm,
+) -> Result<(KeyPair, Zeroizing<Vec<u8>>), CaError> {
     let key_pair = KeyPair::generate_for(alg)?;
-    let der = key_pair.serialize_der();
+    let der = Zeroizing::new(key_pair.serialize_der());
     Ok((key_pair, der))
 }
 

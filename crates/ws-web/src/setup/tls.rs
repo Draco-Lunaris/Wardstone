@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
-use zeroize::Zeroizing;
 
 /// The placeholder SAN the setup certificate carries when the instance
 /// configuration (`WARDSTONE_SERVER_HOSTNAME`) is unset. The setup
@@ -46,8 +45,8 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
     // the operator's BROWSER, and browsers do not support Ed25519 TLS
     // certificates (curl/openssl do, which hid the gap from server-side
     // probes). P-256 keeps instant generation AND universal browser support.
+    // Zeroized on drop; the DER never leaves the wrapped buffer.
     let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
-    let private_key_der = Zeroizing::new(private_key_der);
 
     let mut params = rcgen::CertificateParams::default();
     let mut dn = rcgen::DistinguishedName::new();

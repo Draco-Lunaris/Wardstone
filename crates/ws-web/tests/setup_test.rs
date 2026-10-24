@@ -159,6 +159,7 @@ fn test_fields() -> SetupFields {
         default_domain: "wardstone.test".to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
         server_hostname: LEAF_HOSTNAME.to_string(),
+        fingerprint_confirmation: PAGE_FINGERPRINT.to_string(),
     }
 }
 
@@ -890,5 +891,28 @@ async fn setup_completed_audit_row_written() {
             "admin_cidrs": fields.admin_cidrs,
         }),
         "the details carry the submitted domain and admin CIDRs"
+    );
+}
+
+/// Threat-model G8: a pasted fingerprint that does not match THIS
+/// instance's fingerprint (the state the listener carries) refuses the
+/// setup even when every other field is perfect — the setup window
+/// closes for anyone who cannot read this server's console.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_rejects_a_mismatched_fingerprint_paste() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    let mut fields = test_fields();
+    fields.fingerprint_confirmation = "deadbeef".to_string();
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &fields).await;
+
+    fixture.cleanup().await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a mismatched paste refuses the bootstrap"
     );
 }

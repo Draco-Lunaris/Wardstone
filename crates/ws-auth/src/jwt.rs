@@ -21,7 +21,7 @@ use pkcs8::{EncodePrivateKey, LineEnding};
 use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::AuthError;
 
@@ -124,8 +124,9 @@ impl RefreshClaims {
 /// `Debug` redacts it.
 #[derive(Clone)]
 pub struct JwtKeys {
-    /// Ed25519 private key, PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-    pub signing_key_pem: String,
+    /// Ed25519 private key, PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`),
+    /// zeroized on drop (threat-model G10).
+    pub signing_key_pem: Zeroizing<String>,
     /// Ed25519 public key, SPKI PEM (`-----BEGIN PUBLIC KEY-----`).
     pub verification_key_pem: String,
     /// Access-token lifetime in seconds, for claim minting by the login flow.
@@ -197,7 +198,7 @@ impl JwtKeys {
             (Some(signing_key_pem), Some(verification_key_pem)) => {
                 assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
                 Ok(Self {
-                    signing_key_pem,
+                    signing_key_pem: Zeroizing::new(signing_key_pem),
                     verification_key_pem,
                     ttl_secs: DEFAULT_ACCESS_TTL_SECS,
                 })
@@ -210,7 +211,7 @@ impl JwtKeys {
                 // depth against a future write-path defect, at probe cost.
                 assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
                 Ok(Self {
-                    signing_key_pem,
+                    signing_key_pem: Zeroizing::new(signing_key_pem),
                     verification_key_pem,
                     ttl_secs: DEFAULT_ACCESS_TTL_SECS,
                 })

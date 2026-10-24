@@ -36,7 +36,10 @@ pub struct UserModel {
     pub totp_secret_encrypted: Option<Vec<u8>>,
     /// The AEAD nonce for [`UserModel::totp_secret_encrypted`].
     pub totp_secret_nonce: Option<Vec<u8>>,
-    /// WebAuthn credential JSON payload, if registered.
+    /// WebAuthn credential JSON payload, if registered. STATUS: a reserved
+    /// schema member with no implementation anywhere in the workspace (the
+    /// only writes are test fixtures) — carried for the schema's shape,
+    /// not a working second factor (as-built inventory G11).
     pub webauthn_credential: Option<JsonValue>,
     /// Whether a second factor is registered and enforced.
     pub mfa_enabled: bool,
