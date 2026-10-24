@@ -139,8 +139,12 @@ fn id_token_claims(issuer: &str, audience: &str) -> Value {
 
 /// Serve `discovery_doc`'s relative paths on a localhost listener until the
 /// test process ends. Returns the base URL ("http://127.0.0.1:port").
-fn spawn_server(config: &OidcConfig) -> String {
+fn spawn_server(config: &OidcConfig) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
     // The discovery document points back at this server's /jwks and /token.
+    // The handle captures the last POSTed token-endpoint body so tests can
+    // assert the exact form the exchange sent.
+    let captured: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+    let captured_for_thread = std::sync::Arc::clone(&captured);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let discovery = json!({
@@ -166,6 +170,15 @@ fn spawn_server(config: &OidcConfig) -> String {
             } else if path.starts_with("/jwks") {
                 ("200 OK", jwks.clone())
             } else if path.starts_with("/token") {
+                // The request bytes after the header block are the posted form.
+                let posted = request
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut slot) = captured_for_thread.lock() {
+                    *slot = posted;
+                }
                 let signed = sign_token(
                     KEY_PEM,
                     TEST_KID,
@@ -194,12 +207,13 @@ fn spawn_server(config: &OidcConfig) -> String {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), captured)
 }
 
 #[tokio::test]
 async fn discovery_fetches_the_provider_document() {
-    let config = test_config(&format!("{}/discovery", spawn_server(&test_config(""))));
+    let (base, _captured) = spawn_server(&test_config(""));
+    let config = test_config(&format!("{base}/discovery"));
     let disc = discover(&config).await.unwrap();
     assert!(disc.authorization_endpoint.ends_with("/authorize"));
     assert!(disc.token_endpoint.ends_with("/token"));
@@ -221,12 +235,18 @@ async fn discovery_of_an_unreachable_provider_is_a_config_error() {
 #[tokio::test]
 async fn exchange_code_yields_a_verified_identity() {
     let config = test_config("PLACEHOLDER");
-    let base = spawn_server(&config);
+    let (base, _captured) = spawn_server(&config);
     let config = test_config(&format!("{base}/discovery"));
     let disc = discover(&config).await.unwrap();
-    let identity = exchange_code(&config, &disc, "the-auth-code", "the-state")
-        .await
-        .unwrap();
+    let identity = exchange_code(
+        &config,
+        &disc,
+        "the-auth-code",
+        "the-state",
+        "pkce-placeholder",
+    )
+    .await
+    .unwrap();
     // Claims come from the signed (and signature-verified) ID token.
     assert_eq!(identity.subject, "user-12345");
     assert_eq!(identity.email.as_deref(), Some("alice@example.test"));
@@ -236,7 +256,7 @@ async fn exchange_code_yields_a_verified_identity() {
 #[tokio::test]
 async fn exchange_code_rejects_provider_side_rejection() {
     let config = test_config("PLACEHOLDER");
-    let base = spawn_server(&config);
+    let (base, _captured) = spawn_server(&config);
     // Point the token endpoint at the 404 path: the provider never grants.
     let disc = ws_auth::oidc::OidcDiscovery {
         issuer: base.clone(),
@@ -244,7 +264,7 @@ async fn exchange_code_rejects_provider_side_rejection() {
         token_endpoint: format!("{base}/no-such-token"),
         jwks_uri: format!("{base}/jwks"),
     };
-    let err = exchange_code(&config, &disc, "the-auth-code", "s")
+    let err = exchange_code(&config, &disc, "the-auth-code", "s", "ignored-verifier")
         .await
         .unwrap_err();
     assert!(matches!(err, AuthError::BadCredentials), "got: {err:?}");
@@ -393,4 +413,23 @@ fn pkce_mint_is_wellformed_and_random() {
     assert_ne!(v1, v2, "two mints must not collide");
     assert_ne!(c1, c2);
     assert_eq!(v1.len(), 43);
+}
+/// PKCE at the token endpoint: the exchange POST carries the verifier
+/// exactly once, form-encoded, alongside the code.
+#[tokio::test]
+async fn exchange_code_posts_the_pkce_verifier() {
+    let config = test_config("PLACEHOLDER");
+    let (base, captured) = spawn_server(&config);
+    let config = test_config(&format!("{base}/discovery"));
+    let disc = discover(&config).await.unwrap();
+    let (_v, _c) = ws_auth::oidc::pkce::mint_verifier().unwrap();
+    let verifier = "kVerif1er_of_43_chars_from_the_mint_step_ok";
+    let _identity = exchange_code(&config, &disc, "the-auth-code", "the-state", verifier)
+        .await
+        .unwrap();
+    let posted = captured.lock().unwrap().clone();
+    assert!(
+        posted.contains(&format!("code_verifier={}", verifier)),
+        "the token POST must carry the PKCE verifier, posted form: {posted:?}"
+    );
 }

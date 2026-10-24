@@ -173,7 +173,21 @@ impl AccessLog {
 #[derive(Debug)]
 struct OidcPending {
     tenant_id: uuid::Uuid,
+    /// PKCE (RFC 7636) verifier minted with this state: the challenge rides
+    /// the authorize URL, and the verifier is returned to the callback for
+    /// the token exchange — the proof binds code to the flow that started it.
+    code_verifier: String,
     expires_at: Instant,
+}
+
+/// One minted OIDC state: what the callback needs (the state token and the
+/// PKCE verifier pair it belongs to) and what the authorize URL carries
+/// (the challenge).
+#[derive(Debug, Clone)]
+pub struct OidcMintedState {
+    pub state: String,
+    pub code_verifier: String,
+    pub code_challenge: String,
 }
 
 /// The in-memory OIDC csrf-state store (Task 3's R8 contract: `exchange_code`
@@ -190,10 +204,14 @@ pub struct OidcStateStore {
 }
 
 impl OidcStateStore {
-    /// Mint a random state token, store it for `tenant_id`, and return its
-    /// plaintext. 32 OS-entropy bytes, hex-encoded — the same size and
-    /// encoding as every other bearer token in the workspace.
-    pub fn mint(&self, tenant_id: uuid::Uuid) -> Result<String, ws_auth::error::AuthError> {
+    /// Mint a random state token and its PKCE pair, store the pair for
+    /// `tenant_id`, and return the full mint. 32 OS-entropy bytes
+    /// hex-encoded for the state (the bearer-token encoding), 32 more for
+    /// the PKCE verifier (S256 challenge via [`ws_auth::oidc::pkce`]).
+    pub fn mint(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> Result<OidcMintedState, ws_auth::error::AuthError> {
         use rand::{rngs::SysRng, TryRng};
         let mut raw = [0u8; 32];
         SysRng.try_fill_bytes(&mut raw).map_err(|e| {
@@ -202,31 +220,37 @@ impl OidcStateStore {
             ))
         })?;
         let state = hex::encode(raw);
+        let (code_verifier, code_challenge) = ws_auth::oidc::pkce::mint_verifier()?;
         if let Ok(mut states) = self.states.lock() {
             states.insert(
                 state.clone(),
                 OidcPending {
                     tenant_id,
+                    code_verifier: code_verifier.clone(),
                     expires_at: Instant::now() + OIDC_STATE_TTL,
                 },
             );
             // Opportunistic gc: drop expired states while the lock is held.
             states.retain(|_, pending| pending.expires_at > Instant::now());
         }
-        Ok(state)
+        Ok(OidcMintedState {
+            state,
+            code_verifier,
+            code_challenge,
+        })
     }
 
-    /// Validate AND consume the state: `Some((tenant_id))` only when the
-    /// state is known and unexpired, in which case it is removed — a
-    /// replayed state validates once. The house's DashMap-removal check,
-    /// here under one mutex.
-    pub fn consume(&self, state: &str) -> Option<uuid::Uuid> {
+    /// Validate AND consume the state: `Some((tenant_id, code_verifier))`
+    /// only when the state is known and unexpired, in which case it is
+    /// removed — a replayed state validates once. The house's
+    /// DashMap-removal check, here under one mutex.
+    pub fn consume(&self, state: &str) -> Option<(uuid::Uuid, String)> {
         let mut states = self.states.lock().ok()?;
         let pending = states.remove(state)?;
         if pending.expires_at <= Instant::now() {
             return None;
         }
-        Some(pending.tenant_id)
+        Some((pending.tenant_id, pending.code_verifier))
     }
 
     /// How many states are pending (observability; the Task 13 binary may
@@ -443,5 +467,40 @@ impl AppState {
     /// client-secret envelope key under the keys directory).
     pub fn secret_key_path(&self) -> PathBuf {
         self.config.keys_dir.join(SECRET_KEY_FILE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OidcStateStore;
+
+    /// A minted state consums once and hands back the PKCE verifier pair
+    /// with its tenant: the callback's whole authorization context.
+    #[test]
+    fn mint_consume_roundtrip_returns_tenant_and_verifier() {
+        let store = OidcStateStore::default();
+        let tenant_id = uuid::Uuid::new_v4();
+        let minted = store.mint(tenant_id).unwrap();
+
+        assert_ne!(minted.code_verifier, minted.state);
+        assert_eq!(minted.code_verifier.len(), 43);
+        assert_eq!(minted.code_challenge.len(), 43);
+
+        let (returned_tenant, returned_verifier) = store
+            .consume(&minted.state)
+            .expect("the minted state consums");
+        assert_eq!(returned_tenant, tenant_id);
+        assert_eq!(returned_verifier, minted.code_verifier);
+
+        assert!(
+            store.consume(&minted.state).is_none(),
+            "a consumed state is dead (replay blocked)"
+        );
+    }
+
+    #[test]
+    fn consume_of_an_unknown_state_is_none() {
+        let store = OidcStateStore::default();
+        assert!(store.consume("totally-unknown-state").is_none());
     }
 }

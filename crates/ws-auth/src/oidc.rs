@@ -185,6 +185,7 @@ pub async fn exchange_code(
     discovery: &OidcDiscovery,
     code: &str,
     state: &str,
+    code_verifier: &str,
 ) -> Result<OidcIdentity, AuthError> {
     // `state` is the CSRF token the API layer validated (and atomically
     // consumed) against its session store before calling — the house checks it
@@ -200,11 +201,15 @@ pub async fn exchange_code(
         ("redirect_uri", &config.redirect_uri),
         ("client_id", &config.client_id),
     ];
-    // House: an empty client_secret is a public client; it is then omitted
-    // outright rather than sent as an empty credential.
+    // PKCE (RFC 7636 §4.6): the verifier the start route minted — the IdP
+    // compares its S256 transform against the challenge from the authorize
+    // URL, so only the flow that started the login can complete the grant.
+    // House: an empty client_secret is a public client — omitted outright
+    // rather than sent as an empty credential.
     if !config.client_secret.is_empty() {
         params.push(("client_secret", &config.client_secret));
     }
+    params.push(("code_verifier", code_verifier));
 
     let resp = client
         .post(&discovery.token_endpoint)

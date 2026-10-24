@@ -618,7 +618,7 @@ async fn oidc_start(
 ) -> Result<Redirect, ApiError> {
     let tenant = primary_tenant(&TenantRepo::new(), &state.pool).await?;
     let config = provider_config(&state, tenant.id, &provider).await?;
-    let state_token = state.oidc_states.mint(tenant.id).map_err(ApiError::from)?;
+    let minted = state.oidc_states.mint(tenant.id).map_err(ApiError::from)?;
 
     // The authorization URL needs the provider's `authorization_endpoint`
     // — one discovery fetch on the start route. The state is already in
@@ -633,13 +633,17 @@ async fn oidc_start(
         }
     };
 
+    // PKCE S256: the challenge is all the authorize URL may carry; the
+    // verifier stays in the state store until the callback consumes it.
     let url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}\
+         &code_challenge={}&code_challenge_method=S256",
         discovery.authorization_endpoint,
         url_encode(&config.client_id),
         url_encode(&config.redirect_uri),
         url_encode(&config.scopes),
-        url_encode(&state_token),
+        url_encode(&minted.state),
+        url_encode(&minted.code_challenge),
     );
     Ok(Redirect::to(&url))
 }
@@ -675,7 +679,7 @@ async fn oidc_callback(
 
     // Task 3's R8: the csrf state is validated and consumed HERE, before
     // any token exchange. An unknown, expired, or replayed state is 401.
-    let tenant_id = state.oidc_states.consume(&state_token).ok_or_else(|| {
+    let (tenant_id, code_verifier) = state.oidc_states.consume(&state_token).ok_or_else(|| {
         ApiError::Unauthorized("unknown, expired, or replayed oidc state".to_string())
     })?;
 
@@ -692,14 +696,21 @@ async fn oidc_callback(
     // handler warns with the typed error (its messages are static and
     // never carry the client_secret) before it maps to the user-facing
     // error.
-    let identity =
-        match ws_auth::oidc::exchange_code(&config, &discovery, &code, &state_token).await {
-            Ok(identity) => identity,
-            Err(e) => {
-                tracing::warn!(error = ?e, "oidc code exchange rejected by the provider");
-                return Err(ApiError::from(e));
-            }
-        };
+    let identity = match ws_auth::oidc::exchange_code(
+        &config,
+        &discovery,
+        &code,
+        &state_token,
+        &code_verifier,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(e) => {
+            tracing::warn!(error = ?e, "oidc code exchange rejected by the provider");
+            return Err(ApiError::from(e));
+        }
+    };
 
     let user = resolve_oidc_user(&state, tenant_id, &identity).await?;
     if !user.is_active {
