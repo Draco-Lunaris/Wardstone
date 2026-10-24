@@ -175,14 +175,15 @@ impl IntoResponse for ApiError {
 
 /// The `CoreError` → `ApiError` mapping table (the plan's):
 ///
-/// - `Database` → 500, `Migration` → 500;
+/// - `Database` → **500 (generic)**: the sqlx detail is logged for the
+///   operator, never sent (threat-model G9);
+/// - `Migration` → **500 (generic)**, for the same reason;
 /// - `Duplicate` → `Conflict` 409;
 /// - `Forbidden` → `Forbidden` 403 (a missing capability is
 ///   authorization, not authentication);
-/// - `Config` → **500**: a corrupt stored profile is a server-side data
-///   problem, not a client error;
-/// - `Crypto` → 500.
-
+/// - `Config` / `Crypto` → **500 (generic)**: server-side problems whose
+///   stored-profile detail is logged, not sent.
+///
 /// The generic 500: one message for every server-side failure whose
 /// detail the operator gets from the log, never the response body
 /// (threat-model G9). `Database`/`Config`/`Crypto` details are logged,
