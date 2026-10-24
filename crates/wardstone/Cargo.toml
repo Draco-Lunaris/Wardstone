@@ -33,6 +33,8 @@ ws-api = { path = "../ws-api" }
 # The sealed build closures in both modes return BoxFuture (the unlock
 # constructs pools + routers asynchronously).
 futures-util = { workspace = true }
+# The sealed boot's TLS reload wraps the leaf key's DER as PKCS#8 PEM.
+base64 = { workspace = true }
 # The TLS front door: `web_router`, `serve_tls`, the setup certificate.
 ws-web = { path = "../ws-web" }
 # The CA engine: the keystore (setup slot, per-certificate key envelopes).

@@ -476,7 +476,172 @@ fn rate_limit_from(
 ///   docs for the exact walk and the WARN line that records the
 ///   choice; recovery is operator-initiated: log in and re-issue the
 ///   server leaf through the proxied API).
+///
+/// The sealed ui boot: the front door binds with an EPHEMERAL
+/// sealed-mode certificate (no key material exists in this process yet)
+/// and serves the locked page until the operator's unlock. The build
+/// closure opens the envelopes (the master for the keystore, the DB
+/// credential for the pool), relays the passphrase to the api once,
+/// resolves the CA-issued leaf with the unlocked keystore, reloads the
+/// listener's TLS in place (the resume contract), and swaps the full
+/// `web_router` in behind the locked door's delegate.
+async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
+    let hostname = cfg
+        .server_hostname
+        .clone()
+        .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned());
+    // The ephemeral sealed certificate: hours of validity, no keystore.
+    let (sealed_pem, sealed_key, sealed_fingerprint) =
+        ws_web::setup::tls::sealed_certificate(&hostname)?;
+    // The sealed key exists only long enough to build the initial config.
+    let sealed_key = Zeroizing::new(sealed_key);
+    let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
+    let reload_handle = tls_config.clone();
+
+    let keys_dir = cfg.keys_dir.clone();
+    let database_url = cfg.database_url.clone();
+    let api_url = cfg.api_url.clone();
+    let hostname_for_router = hostname.clone();
+    let bind = cfg.bind;
+    let session_ttl = ws_web::DEFAULT_SESSION_TTL;
+    let rate_limit = cfg.web_rate_limit;
+
+    let build: ws_web::locked::LockedWebBuild = std::sync::Arc::new(move |passphrase: &str| {
+        let keys_dir = keys_dir.clone();
+        let database_url = database_url.clone();
+        let api_url = api_url.clone();
+        let hostname = hostname_for_router.clone();
+        let reload = reload_handle.clone();
+        let passphrase = passphrase.to_string();
+        futures_util::future::FutureExt::boxed(async move {
+            let err = |msg: String| msg; // the ui's build reports strings
+                                         // The master envelope: the keystore's unwrapped custody.
+            let master = ws_core::crypto::KeyEnvelope::open_envelope(
+                &keys_dir.join(MASTER_ENVELOPE_FILE),
+                &passphrase,
+            )
+            .map_err(|e| err(format!("the master envelope: {e}")))?;
+            let mut master_bytes = [0u8; 32];
+            master_bytes.copy_from_slice(&master);
+            let keystore =
+                ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, Zeroizing::new(master_bytes))
+                    .map_err(|e| err(format!("the keystore: {e}")))?;
+
+            // The ui's own pool: the db credential (read-only unwrap
+            // per the spec — the api rotates, the ui re-reads).
+            let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
+            let connect_url =
+                match ws_core::crypto::KeyEnvelope::open_envelope(&db_credential_path, &passphrase)
+                {
+                    Ok(current) => {
+                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
+                    }
+                    Err(ws_core::error::CoreError::Config(_)) => database_url.clone(),
+                    Err(other) => return Err(err(format!("the db credential: {other}"))),
+                };
+            let pool = ws_core::db::connect(&connect_url)
+                .await
+                .map_err(|e| err(format!("the database: {e}")))?;
+
+            // Relay the unlock to the api: one POST, best-effort with
+            // a logged verdict (the api may be seeding, a redeploy
+            // racer, or already unlocked — every one of those is the
+            // spec's documented fallback, never a ui failure).
+            if let Err(e) = ws_web::locked::relay_unlock(&api_url, &passphrase).await {
+                tracing::warn!(
+                    error = %e,
+                    "the api unlock relay did not complete; the api logs its own state"
+                );
+            }
+
+            // The serving leaf with the unlocked keystore: the same
+            // walk the unsealed boot performs, then the in-place TLS
+            // reload onto the CA-issued leaf.
+            let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+                .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
+                .await
+                .map_err(|e| err(format!("the tenant lookup: {e}")))?
+                .ok_or_else(|| err("the default tenant vanished mid-unlock".to_string()))?;
+            let certs = ws_core::repo::certificate_repo::CertificateRepo::new()
+                .list_by_tenant(&pool, tenant.id, 0, 500)
+                .await
+                .map_err(|e| err(format!("the certificate listing: {e}")))?;
+            let leaf = resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))
+                .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
+            match leaf {
+                Some((leaf_row, key_der)) => {
+                    let key_pem = pkcs8_pem_of(&key_der);
+                    reload
+                        .reload_from_pem(
+                            leaf_row.cert_pem.clone().into_bytes(),
+                            key_pem.clone().into_bytes(),
+                        )
+                        .await
+                        .map_err(|e| err(format!("the TLS reload: {e}")))?;
+                    tracing::info!(
+                        certificate_id = %leaf_row.id,
+                        subject = %leaf_row.subject,
+                        "the TLS listener resumed onto the CA-issued leaf"
+                    );
+                }
+                None => {
+                    // The torn state keeps the sealed certificate: the
+                    // operator reaches the recovery flow next.
+                    tracing::warn!(
+                        "no active serving leaf after unlock; the sealed \
+                             certificate keeps serving"
+                    );
+                }
+            }
+
+            ws_web::web_router(
+                pool,
+                keys_dir,
+                String::new(),
+                hostname,
+                &api_url,
+                session_ttl,
+                rate_limit,
+            )
+            .await
+            .map_err(|e| err(format!("the web router: {e}")))
+        })
+    });
+
+    let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
+    let router = ws_web::locked::locked_router(ui, &hostname);
+    tracing::info!(
+        hostname = %hostname,
+        fingerprint = %sealed_fingerprint,
+        bind = %bind,
+        "serving the sealed front door: enter the master passphrase to continue"
+    );
+    Ok(ws_web::serve_tls_with_config(bind, tls_config, router).await?)
+}
+
+/// A PKCS#8 DER private key as the PEM form rustls's reload takes (the
+/// same 64-column wrapping the house's `pem_from_der` uses).
+fn pkcs8_pem_of(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    let mut rest = body.as_str();
+    while !rest.is_empty() {
+        let (line, tail) = rest.split_at(rest.len().min(64));
+        pem.push_str(line);
+        pem.push('\n');
+        rest = tail;
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    pem
+}
+
 async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
+    // The sealed instance: the front door locks and waits for the
+    // operator's master passphrase — no key material at boot.
+    if sealed_instance(&cfg.keys_dir) {
+        return run_ui_sealed(cfg).await;
+    }
     let pool = ws_core::db::connect(&cfg.database_url).await?;
     // The JWT keys are the process-lifecycle boot step the brief pins:
     // they exist (or are created) before anything is served — on a virgin

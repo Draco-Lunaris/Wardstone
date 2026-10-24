@@ -231,6 +231,34 @@ pub fn rustls_server_config(
 /// (cert: the `certificates` row, key: the envelope under the
 /// certificate's id) after setup — a process restart, not a hot reload,
 /// is the TLS switch between the two.
+/// A RELOADABLE TLS config: the sealed ui's listener holds one of these
+/// from its first bind (the ephemeral sealed certificate) and the unlock
+/// closure reloads it with the CA-issued leaf in place — the resume
+/// contract's TLS half (no re-listen, no restart).
+pub fn reloadable_tls_config(
+    cert_pem: &str,
+    key_der: &[u8],
+) -> Result<axum_server::tls_rustls::RustlsConfig, CaError> {
+    let config = rustls_server_config(cert_pem, key_der)?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(config),
+    ))
+}
+
+/// Serve `router` under a caller-held RELOADABLE TLS config (the sealed
+/// boot binds with the ephemeral certificate; the unlock closure reloads
+/// the same listener onto the CA-issued leaf).
+pub async fn serve_tls_with_config(
+    addr: SocketAddr,
+    config: axum_server::tls_rustls::RustlsConfig,
+    router: Router,
+) -> Result<(), CaError> {
+    axum_server::tls_rustls::bind_rustls(addr, config)
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .map_err(CaError::Io)
+}
+
 pub async fn serve_tls(
     addr: SocketAddr,
     router: Router,

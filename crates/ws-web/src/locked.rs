@@ -58,6 +58,33 @@ impl SealedUi {
     }
 }
 
+/// Relay the unlock to the api process ONCE (spec §5): a plain POST of
+/// the passphrase over the compose-internal channel — the same trust
+/// domain the api's own plaintext HTTP occupies. Best-effort BY DESIGN:
+/// the api may be seeding a fresh install, a redeploy racer, or already
+/// unlocked; every one of those is the spec's documented fallback, and
+/// the CALLER logs the verdict — the relay never fails the ui's own
+/// unlock.
+pub async fn relay_unlock(api_base_url: &str, passphrase: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{api_base_url}/api/internal/unlock"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "passphrase": passphrase }).to_string())
+        .send()
+        .await
+        .map_err(|e| format!("the relay transport: {e}"))?;
+    if response.status().is_success() || response.status().as_u16() == 409 {
+        // 409 = already unlocked: the api is live and serving; the relay's
+        // job is done either way.
+        return Ok(());
+    }
+    Err(format!(
+        "the api answered the relay with HTTP {}",
+        response.status().as_u16()
+    ))
+}
+
 /// The sealed front door: the unlock page, the health surface, the unlock
 /// POST, and the 503 delegate for everything else. Served by `main` while
 /// the instance is sealed; the delegate hands over to the full
