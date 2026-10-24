@@ -201,6 +201,10 @@ async fn fixture() -> Fixture {
         Uuid::new_v4()
     ));
     let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The sealing key: the OIDC config routes seal/unseal the client
+    // secret through it (the acme_common fixture pattern).
+    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
+        .expect("create the secret-encryption key");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
     let state = AppState::new(pool.clone(), Arc::new(jwt), config);
@@ -839,5 +843,168 @@ async fn test_route_roundtrips_a_local_discovery_document() {
     assert_eq!(
         probe["issuer"],
         "https://sso.wardstone.test/realms/wardstone"
+    );
+}
+
+/// The DB row shapes the sealing assertions read (sqlx tuples read better
+/// through named aliases than inline).
+type SealedSecretRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+type SealedBytes = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Threat-model gap G2: the client secret lands SEALED — the row's TEXT
+/// slot is empty and the two bytea columns are populated — while the read
+/// still answers `client_secret_set: true` and never the secret itself.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn client_secret_is_sealed_at_rest() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let res = put_json(
+        &fx,
+        "/api/v1/oidc/config",
+        Some(&token),
+        serde_json::json!({
+            "provider_type": "custom", "display_name": "Seal Test IdP",
+            "discovery_url": "https://idp.example.test/.well-known/openid-configuration",
+            "client_id": "wardstone", "client_secret": "swordfish",
+            "redirect_uri": "https://wardstone.example.test/api/oidc/callback",
+            "scopes": "openid profile email",
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // EVERYTHING reads BEFORE the cleanup sweep (which deletes the row):
+    // the GET body, then the raw row.
+    let body = json_body(get_bearer(&fx, "/api/v1/oidc/config", &token).await).await;
+    let row: Option<SealedSecretRow> = sqlx::query_as(
+        "SELECT client_secret, client_secret_encrypted, client_secret_nonce \
+         FROM oidc_config WHERE tenant_id = $1",
+    )
+    .bind(fx.tenant_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("query the sealed row");
+    fx.cleanup().await;
+
+    let (text, enc, nonce) = row.expect("the configured row exists");
+    assert_eq!(
+        text, "",
+        "the legacy TEXT slot must stay empty for fresh installs"
+    );
+    assert!(
+        matches!(enc, Some(bytes) if bytes.len() == "swordfish".len() + 16),
+        "the secret is sealed: ciphertext = plaintext + the 16-byte AEAD tag"
+    );
+    assert!(nonce.is_some(), "the seal carries its AEAD nonce");
+
+    assert_eq!(body["client_secret_set"], serde_json::json!(true));
+    assert!(
+        !serde_json::to_string(&body).unwrap().contains("swordfish"),
+        "the secret itself must never appear in a response body"
+    );
+}
+
+/// `client_secret: null` on an existing row KEEPS the stored seal: the
+/// sealed bytes are passed through untouched (no re-seal, no plaintext
+/// resurrection).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn put_without_secret_keeps_the_sealed_value() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+    let body = serde_json::json!({
+        "provider_type": "custom", "display_name": "Keep Test",
+        "discovery_url": "https://idp.example.test/.well-known/openid-configuration",
+        "client_id": "wardstone", "client_secret": "swordfish",
+        "redirect_uri": "https://wardstone.example.test/api/oidc/callback",
+        "scopes": "openid profile email",
+    });
+    let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let first: Option<SealedBytes> = sqlx::query_as(
+        "SELECT client_secret_encrypted, client_secret_nonce FROM oidc_config WHERE tenant_id = $1",
+    )
+    .bind(fx.tenant_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("read the sealed row");
+
+    // Same shape, but no client_secret at all (the JSON omits the field):
+    // the display_name change must keep the stored seal byte-for-byte.
+    let res = put_json(
+        &fx,
+        "/api/v1/oidc/config",
+        Some(&token),
+        serde_json::json!({
+            "provider_type": "custom", "display_name": "Renamed IdP",
+            "discovery_url": "https://idp.example.test/.well-known/openid-configuration",
+            "client_id": "wardstone",
+            "redirect_uri": "https://wardstone.example.test/api/oidc/callback",
+            "scopes": "openid profile email",
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let second: Option<SealedBytes> = sqlx::query_as(
+        "SELECT client_secret_encrypted, client_secret_nonce FROM oidc_config WHERE tenant_id = $1",
+    )
+    .bind(fx.tenant_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("read the kept row");
+    fx.cleanup().await;
+
+    let first = first.expect("the first row exists");
+    let second = second.expect("the kept row exists");
+    assert_eq!(
+        first.0, second.0,
+        "the seal is kept byte-for-byte on a null-secret PUT"
+    );
+    assert_eq!(first.1, second.1);
+}
+
+/// A row configured before the sealing migration carries a PLAINTEXT
+/// client_secret; the next config GET migrates it lazily: the columns fill
+/// and the TEXT slot clears — upgrade installs never revisit plaintext.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn legacy_plaintext_secret_seals_on_the_next_read() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    sqlx::query(
+        "INSERT INTO oidc_config (tenant_id, provider_type, display_name, discovery_url, \
+         client_id, client_secret, redirect_uri, scopes) \
+         VALUES ($1, 'custom', 'Legacy IdP', 'https://idp.example.test/.well-known/openid-configuration', \
+         'wardstone', 'pre-migration-swordfish', 'https://wardstone.example.test/api/oidc/callback', \
+         'openid profile email')")
+        .bind(fx.tenant_id)
+        .execute(&fx.pool).await.expect("insert the legacy row");
+
+    let get = get_bearer(&fx, "/api/v1/oidc/config", &token).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let row: Option<SealedSecretRow> = sqlx::query_as(
+        "SELECT client_secret, client_secret_encrypted, client_secret_nonce \
+         FROM oidc_config WHERE tenant_id = $1",
+    )
+    .bind(fx.tenant_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .expect("read the migrated row");
+    fx.cleanup().await;
+
+    let (text, enc, nonce) = row.expect("the row exists");
+    assert_eq!(
+        text, "",
+        "the plaintext slot cleared during the lazy reseal"
+    );
+    assert!(
+        enc.is_some() && nonce.is_some(),
+        "the legacy secret was sealed"
     );
 }

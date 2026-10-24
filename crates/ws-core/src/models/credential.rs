@@ -51,9 +51,17 @@ pub struct OidcConfigModel {
     pub discovery_url: String,
     /// OIDC client id.
     pub client_id: String,
-    /// OIDC client secret (empty string for public clients; sealing at
-    /// rest is applied by the auth layer, Task 5 carries the column).
+    /// The client secret, TRANSIENT plaintext: populated only after
+    /// unsealing for an outgoing token exchange (or by a legacy
+    /// plaintext column row). At rest the row carries the sealed bytes
+    /// ([`Self::client_secret_encrypted`]/[`Self::client_secret_nonce`]);
+    /// an empty string means a public client.
     pub client_secret: String,
+    /// The sealed client secret (threat-model G2): XChaCha20-Poly1305
+    /// under the per-install SecretBox key, `None` for a public client.
+    pub client_secret_encrypted: Option<Vec<u8>>,
+    /// The AEAD nonce paired with [`Self::client_secret_encrypted`].
+    pub client_secret_nonce: Option<Vec<u8>>,
     /// Redirect URI registered with the provider.
     pub redirect_uri: String,
     /// Requested scopes (space separated).

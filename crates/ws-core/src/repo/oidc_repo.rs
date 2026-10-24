@@ -26,6 +26,8 @@ struct OidcConfigRow {
     discovery_url: String,
     client_id: String,
     client_secret: String,
+    client_secret_encrypted: Option<Vec<u8>>,
+    client_secret_nonce: Option<Vec<u8>>,
     redirect_uri: String,
     scopes: String,
 }
@@ -38,7 +40,12 @@ impl From<OidcConfigRow> for OidcConfigModel {
             display_name: row.display_name,
             discovery_url: row.discovery_url,
             client_id: row.client_id,
+            // The legacy TEXT slot: rows configured before the sealing
+            // migration carry the plaintext here; sealed rows keep it
+            // empty. The caller decides (unseal / lazy reseal).
             client_secret: row.client_secret,
+            client_secret_encrypted: row.client_secret_encrypted,
+            client_secret_nonce: row.client_secret_nonce,
             redirect_uri: row.redirect_uri,
             scopes: row.scopes,
         }
@@ -46,7 +53,8 @@ impl From<OidcConfigRow> for OidcConfigModel {
 }
 
 const OIDC_COLUMNS: &str = "SELECT tenant_id, provider_type, display_name, discovery_url, \
-     client_id, client_secret, redirect_uri, scopes FROM oidc_config";
+     client_id, client_secret, client_secret_encrypted, client_secret_nonce, \
+     redirect_uri, scopes FROM oidc_config";
 
 impl OidcConfigRepo {
     /// Build the (stateless) repository.
@@ -89,14 +97,17 @@ impl OidcConfigRepo {
     ) -> Result<(), CoreError> {
         sqlx::query(
             "INSERT INTO oidc_config (tenant_id, provider_type, display_name, discovery_url, \
-             client_id, client_secret, redirect_uri, scopes) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             client_id, client_secret, client_secret_encrypted, client_secret_nonce, \
+             redirect_uri, scopes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (tenant_id) DO UPDATE SET \
              provider_type = EXCLUDED.provider_type, \
              display_name = EXCLUDED.display_name, \
              discovery_url = EXCLUDED.discovery_url, \
              client_id = EXCLUDED.client_id, \
              client_secret = EXCLUDED.client_secret, \
+             client_secret_encrypted = EXCLUDED.client_secret_encrypted, \
+             client_secret_nonce = EXCLUDED.client_secret_nonce, \
              redirect_uri = EXCLUDED.redirect_uri, \
              scopes = EXCLUDED.scopes",
         )
@@ -106,6 +117,8 @@ impl OidcConfigRepo {
         .bind(&config.discovery_url)
         .bind(&config.client_id)
         .bind(&config.client_secret)
+        .bind(&config.client_secret_encrypted)
+        .bind(&config.client_secret_nonce)
         .bind(&config.redirect_uri)
         .bind(&config.scopes)
         .execute(executor)

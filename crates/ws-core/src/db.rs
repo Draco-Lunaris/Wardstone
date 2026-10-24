@@ -14,7 +14,7 @@ use crate::error::CoreError;
 /// `connect` refuses to serve traffic against a database whose
 /// `_sqlx_migrations` bookkeeping disagrees with this constant.
 /// Bump it exactly when a migration file is added.
-pub const REQUIRED_MIGRATION_COUNT: u16 = 12;
+pub const REQUIRED_MIGRATION_COUNT: u16 = 13;
 
 /// Open a Postgres connection pool (max 10 connections) and bring the database
 /// up to date:

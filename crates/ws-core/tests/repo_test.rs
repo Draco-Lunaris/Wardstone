@@ -1629,6 +1629,8 @@ fn oidc_config_model(tenant_id: uuid::Uuid) -> OidcConfigModel {
         discovery_url: "https://idp.example.test/.well-known/openid-configuration".to_string(),
         client_id: "wardstone".to_string(),
         client_secret: String::new(),
+        client_secret_encrypted: None,
+        client_secret_nonce: None,
         redirect_uri: "https://wardstone.example.test/api/oidc/callback".to_string(),
         scopes: "openid profile email".to_string(),
     }

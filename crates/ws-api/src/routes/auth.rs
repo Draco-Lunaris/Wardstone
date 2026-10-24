@@ -32,6 +32,7 @@ use ws_auth::error::AuthError;
 use ws_auth::jwt::{issue_access_token, AccessClaims};
 use ws_auth::refresh::{authenticate_refresh_token, issue_refresh_token, rotate_refresh_token};
 use ws_core::crypto::SecretBox;
+use ws_core::models::credential::OidcConfigModel;
 use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Role};
 use ws_core::models::tenant::Tenant;
 use ws_core::models::user::UserModel;
@@ -726,6 +727,26 @@ async fn oidc_callback(
 /// The per-tenant configured provider row for `{provider}` — the row's
 /// `provider_type` must equal the label in the path; anything else is a
 /// 404 (the provider is not configured).
+/// The row's client secret as transient plaintext for an outgoing flow:
+/// unsealed bytes, the legacy TEXT slot, or `` (public client).
+fn unsealed_client_secret(state: &AppState, model: &OidcConfigModel) -> Result<String, ApiError> {
+    if let (Some(encrypted), Some(nonce)) =
+        (&model.client_secret_encrypted, &model.client_secret_nonce)
+    {
+        let key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+        let opened = key.open(encrypted, nonce).map_err(ApiError::from)?;
+        return std::str::from_utf8(&opened)
+            .map(str::to_string)
+            .map_err(|_| {
+                ApiError::Internal("the stored oidc client secret is not text".to_string())
+            });
+    }
+    if !model.client_secret.is_empty() {
+        tracing::warn!("an oidc_config row still carries a legacy plaintext client_secret");
+    }
+    Ok(model.client_secret.clone())
+}
+
 async fn provider_config(
     state: &AppState,
     tenant_id: Uuid,
@@ -736,12 +757,14 @@ async fn provider_config(
         .await?
         .filter(|row| row.provider_type == provider)
         .ok_or_else(|| ApiError::NotFound(format!("provider {provider:?} is not configured")))?;
+    // The outgoing flow needs the transient plaintext: unseal per request.
+    let client_secret = unsealed_client_secret(state, &row)?;
     Ok(ws_auth::oidc::OidcConfig {
         provider_type: row.provider_type,
         display_name: row.display_name,
         discovery_url: row.discovery_url,
         client_id: row.client_id,
-        client_secret: row.client_secret,
+        client_secret,
         redirect_uri: row.redirect_uri,
         scopes: row.scopes,
     })

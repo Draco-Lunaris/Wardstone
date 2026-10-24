@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use ws_auth::oidc::{discover, OidcConfig};
+use ws_core::crypto::SecretBox;
 use ws_core::models::credential::OidcConfigModel;
 use ws_core::models::rbac::Capability;
 use ws_core::repo::audit_repo::AuditRepo;
@@ -84,6 +85,60 @@ async fn config_status(
             "provider_type": serde_json::Value::Null,
         }))),
     }
+}
+
+/// Whether the row carries a secret at all: sealed bytes or the legacy
+/// plaintext slot (rows configured before the sealing migration).
+fn secret_is_present(model: &OidcConfigModel) -> bool {
+    model.client_secret_encrypted.is_some() || !model.client_secret.is_empty()
+}
+
+/// The row's secret as transient plaintext: the sealed bytes unsealed with
+/// the per-install SecretBox key (loaded per request — the TOTP pattern),
+/// the legacy TEXT slot, or `` for a public client.
+fn unsealed_secret(state: &AppState, model: &OidcConfigModel) -> Result<String, ApiError> {
+    if let (Some(encrypted), Some(nonce)) =
+        (&model.client_secret_encrypted, &model.client_secret_nonce)
+    {
+        let key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+        let opened = key.open(encrypted, nonce).map_err(ApiError::from)?;
+        return std::str::from_utf8(&opened)
+            .map(str::to_string)
+            .map_err(|_| {
+                ApiError::Internal("the stored oidc client secret is not text".to_string())
+            });
+    }
+    if !model.client_secret.is_empty() {
+        tracing::warn!(
+            tenant_id = %model.tenant_id,
+            "an oidc_config row still carries a legacy plaintext client_secret; \
+             it seals on the next config GET/PUT"
+        );
+    }
+    Ok(model.client_secret.clone())
+}
+
+/// The lazy legacy reseal for a pool-backed read: a row configured before
+/// the sealing migration gets its plaintext sealed under the SecretBox key
+/// and the TEXT slot cleared. Idempotent, no-op for fresh rows.
+async fn reseal_legacy(state: &AppState, model: &OidcConfigModel) -> Result<(), ApiError> {
+    if model.client_secret_encrypted.is_some() || model.client_secret.is_empty() {
+        return Ok(());
+    }
+    let key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+    let (sealed, nonce) = key
+        .seal(model.client_secret.as_bytes())
+        .map_err(ApiError::from)?;
+    sqlx::query(
+        "UPDATE oidc_config SET client_secret_encrypted = $2, \
+         client_secret_nonce = $3, client_secret = '' WHERE tenant_id = $1",
+    )
+    .bind(model.tenant_id)
+    .bind(&sealed)
+    .bind(&nonce)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 /// The provider configuration, as the UI reads it — never the secret.
@@ -151,6 +206,9 @@ async fn get_config(
         .get(&state.pool, auth.tenant_id)
         .await?
         .ok_or_else(not_configured)?;
+    // A pool-backed read is where the legacy row migrates: one extra UPDATE
+    // on the same pool connection, before the response is built.
+    reseal_legacy(&state, &row).await?;
     Ok(json_no_store(OidcConfigResponse::of(&row)))
 }
 
@@ -177,29 +235,58 @@ async fn put_config(
     }
 
     // The upsert replaces the whole row, so a `None` secret on an
-    // EXISTING row is filled from that very row (keep the stored
-    // secret); on a NEW row there is nothing to keep — the secret is
-    // required. Read, upsert, and the audit row share one transaction.
+    // EXISTING row is filled from that very row (keep the stored seal);
+    // on a NEW row there is nothing to keep — the secret is required.
+    // The stored form is ALWAYS the sealed bytes: the plaintext exists
+    // only inside this transaction, on its way into the seal.
+    let secret_key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
     let mut tx = state.pool.begin().await?;
     let existing = OidcConfigRepo::new().get(&mut *tx, auth.tenant_id).await?;
-    let client_secret = match body.client_secret.as_deref() {
-        Some(secret) => secret.to_string(),
-        None => existing
-            .as_ref()
-            .map(|row| row.client_secret.clone())
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "client_secret is required when first configuring the provider",
-                )
-            })?,
-    };
+    let (client_secret_encrypted, client_secret_nonce): (Option<Vec<u8>>, Option<Vec<u8>>) =
+        match body.client_secret.as_deref() {
+            // Empty string = the public-client convention: nothing sealed.
+            Some("") => (None, None),
+            // An explicit secret seals into two bytea columns; the TEXT
+            // slot is bound empty below and never carries it again.
+            Some(secret) => {
+                let (sealed, nonce) = secret_key.seal(secret.as_bytes()).map_err(ApiError::from)?;
+                (Some(sealed), Some(nonce))
+            }
+            // `None` keeps the stored seal byte-for-byte — or a legacy
+            // plaintext row, which re-seals right here in the transaction.
+            None => match existing.as_ref() {
+                Some(row) if row.client_secret_encrypted.is_some() => {
+                    let sealed = row
+                        .client_secret_encrypted
+                        .clone()
+                        .expect("checked Some above");
+                    let nonce = row.client_secret_nonce.clone().expect("checked Some above");
+                    (Some(sealed), Some(nonce))
+                }
+                Some(row) if !row.client_secret.is_empty() => {
+                    let (sealed, nonce) = secret_key
+                        .seal(row.client_secret.as_bytes())
+                        .map_err(ApiError::from)?;
+                    (Some(sealed), Some(nonce))
+                }
+                Some(_) => (None, None),
+                None => {
+                    return Err(ApiError::bad_request(
+                        "client_secret is required when first configuring the provider",
+                    ))
+                }
+            },
+        };
     let model = OidcConfigModel {
         tenant_id: auth.tenant_id,
         provider_type: body.provider_type,
         display_name: body.display_name,
         discovery_url: body.discovery_url,
         client_id: body.client_id,
-        client_secret,
+        // The TEXT slot is bound empty: the plaintext was never at rest.
+        client_secret: String::new(),
+        client_secret_encrypted,
+        client_secret_nonce,
         redirect_uri: body.redirect_uri,
         scopes: body.scopes,
     };
@@ -285,12 +372,16 @@ async fn test_config(
             redirect_uri: override_body.redirect_uri,
             scopes: override_body.scopes,
         },
-        None => to_auth_config(
-            &OidcConfigRepo::new()
+        None => {
+            let row = OidcConfigRepo::new()
                 .get(&state.pool, auth.tenant_id)
                 .await?
-                .ok_or_else(not_configured)?,
-        ),
+                .ok_or_else(not_configured)?;
+            let client_secret = unsealed_secret(&state, &row)?;
+            let mut config = to_auth_config(&row);
+            config.client_secret = client_secret;
+            config
+        }
     };
     let discovery = discover(&config).await.map_err(|e| {
         // The shared AuthError table maps `Config` to 500 (a login-flow
@@ -332,7 +423,7 @@ impl OidcConfigResponse {
             client_id: model.client_id.clone(),
             redirect_uri: model.redirect_uri.clone(),
             scopes: model.scopes.clone(),
-            client_secret_set: !model.client_secret.is_empty(),
+            client_secret_set: secret_is_present(model),
         }
     }
 }
