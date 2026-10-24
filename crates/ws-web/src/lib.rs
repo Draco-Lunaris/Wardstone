@@ -161,7 +161,45 @@ pub async fn web_router_with_store(
     // masked. A Router is itself a fallback Service — `ui::ui_router()`
     // carries its own route tree (`/`, `/assets/*`, the SPA catch-all) and
     // its own routing.
+    // The request-body ceiling: the SAME bound ws-api enforces, so the
+    // proxy never accepts what the API would refuse (threat-model G12).
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(
+        ws_api::REQUEST_BODY_LIMIT,
+    ));
+    // The response-header baseline (threat-model G4): nosniff, both forms
+    // of frame denial, referrer minimization — on EVERY response ws-web
+    // serves (SPA, setup page, proxied API/ACME bodies alike).
+    let app = app.layer(axum::middleware::from_fn(security_headers));
     Ok(app.fallback_service(ui::ui_router()))
+}
+
+/// The response-header baseline. The CSP is deliberately narrow here:
+/// `frame-ancestors 'none'` (clickjacking) without a default-src policy —
+/// the SPA's asset story deserves its own task, and a hand-rolled
+/// default-src that breaks assets would be its own security incident.
+pub async fn security_headers(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let heads = response.headers_mut();
+    heads.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    heads.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    heads.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    heads.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 /// The DB-free core of [`web_router_with_store`]: the `/auth/ui` relay

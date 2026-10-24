@@ -77,7 +77,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
                 .burst_size(limit.burst)
                 .finish()
             {
-                Some(config) => public.layer(GovernorLayer::new(std::sync::Arc::new(config))),
+                Some(config) => public.layer(
+                    GovernorLayer::new(std::sync::Arc::new(config))
+                        .error_handler(crate::rate_limit::house_error_handler()),
+                ),
                 None => {
                     tracing::error!(
                         per_millis = limit.per_millis,

@@ -180,6 +180,16 @@ async fn second_login_from_the_same_ip_is_429() {
         StatusCode::BAD_GATEWAY,
         "the first login passes the limiter and dies at the relay target"
     );
+    // The 502 speaks the house JSON envelope; its detail goes to the log,
+    // not the body (threat-model G9).
+    {
+        let bytes = axum::body::to_bytes(first.into_body(), 1 << 20)
+            .await
+            .expect("read the 502 body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the proxy 502 speaks the house JSON envelope");
+        assert_eq!(body["error"]["code"], "bad_gateway");
+    }
 
     let second = send(&router, login_from(PEER_A, 55555)).await;
     assert_eq!(
@@ -189,8 +199,17 @@ async fn second_login_from_the_same_ip_is_429() {
     );
     assert!(
         second.headers().get(header::RETRY_AFTER).is_some(),
-        "the default tower_governor 429 carries Retry-After (the shape ws-api answers with)"
+        "the house 429 re-attaches the governor's Retry-After"
     );
+    // Body contract (threat-model G13): the JSON envelope, one vocabulary.
+    {
+        let bytes = axum::body::to_bytes(second.into_body(), 1 << 20)
+            .await
+            .expect("read the 429 body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the 429 speaks the house JSON envelope");
+        assert_eq!(body["error"]["code"], "rate_limited");
+    }
 }
 
 /// Property 2, both halves: the layer covers every `/auth/ui` route (an

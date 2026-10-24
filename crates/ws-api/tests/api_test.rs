@@ -4763,3 +4763,28 @@ async fn ui_acme_rest_capability_gates_and_unknown_404s() {
     assert_eq!(admin_unknown_status, StatusCode::NOT_FOUND);
     assert_eq!(admin_unknown_code, "not_found");
 }
+
+/// Threat-model G12: request bodies are capped — an oversized POST is 413
+/// before it reaches any handler, on the shared 1 MiB bound.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn oversized_request_bodies_are_413() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+
+    let oversized = "x".repeat(ws_api::REQUEST_BODY_LIMIT + 1);
+    let res = post_json(
+        &fx,
+        "/api/v1/auth/login",
+        None,
+        serde_json::json!({"username": "u", "password": oversized}),
+    )
+    .await;
+
+    fx.cleanup().await;
+    assert_eq!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body over the shared ceiling is refused before any handler"
+    );
+}

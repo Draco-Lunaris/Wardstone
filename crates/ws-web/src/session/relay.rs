@@ -108,7 +108,10 @@ pub fn relay_router(
                 .burst_size(limit.burst)
                 .finish()
             {
-                Some(config) => router.layer(GovernorLayer::new(std::sync::Arc::new(config))),
+                Some(config) => router.layer(
+                    GovernorLayer::new(std::sync::Arc::new(config))
+                        .error_handler(ws_api::rate_limit::house_error_handler()),
+                ),
                 None => {
                     tracing::error!(
                         per_millis = limit.per_millis,

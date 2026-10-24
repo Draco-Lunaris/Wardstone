@@ -41,6 +41,11 @@ use crate::state::AppState;
 /// level liveness and metrics spellings (`/healthz`, `/metrics`) — the
 /// liveness probe of the Task 13 compose file points at the root, while
 /// the versioned spellings keep the whole API under one prefix.
+/// The request-body ceiling for every API route (threat-model G12): the
+/// largest legitimate body in the product is an ACME finalize CSR — a few
+/// KB — so 1 MiB is generous headroom and closes unbounded buffering.
+pub const REQUEST_BODY_LIMIT: usize = 1024 * 1024;
+
 pub fn router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .nest("/auth", auth::router(&state))
@@ -75,6 +80,9 @@ pub fn router(state: AppState) -> Router {
         // The access log: one line per request — method, path, status —
         // and NEVER a request or response body (the key-generation and
         // CA-key-export responses therefore cannot leak through logging).
+        // The request-body ceiling (threat-model G12): applied on the
+        // composed router so every route shares the one bound.
+        .layer(axum::extract::DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             access_log_middleware,

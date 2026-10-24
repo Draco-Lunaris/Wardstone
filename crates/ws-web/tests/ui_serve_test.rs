@@ -577,3 +577,48 @@ async fn unmounted_setup_routes_are_explicit_404s_over_the_fallback() {
         "the SPA fallback still serves other client routes"
     );
 }
+
+/// The response-header baseline (threat-model G4): every ws-web response
+/// — SPA, proxied API, plain text — carries nosniff, both forms of frame
+/// denial, and referrer minimization. The CSP is deliberately the narrow
+/// `frame-ancestors 'none'` only.
+#[tokio::test]
+async fn responses_carry_the_security_header_baseline() {
+    let router = stub_health_router().layer(axum::middleware::from_fn(ws_web::security_headers));
+    for uri in ["/api/v1/healthz", "/", "/assets/whatever.js", "/setup"] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let heads = response.headers();
+        assert_eq!(
+            heads
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "nosniff rides every response ({uri})"
+        );
+        assert_eq!(
+            heads
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY"),
+            "the legacy frame guard rides every response ({uri})"
+        );
+        assert_eq!(
+            heads
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none'"),
+            "the frame-ancestors CSP rides every response ({uri})"
+        );
+        assert_eq!(
+            heads
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-referrer"),
+            "the referrer policy rides every response ({uri})"
+        );
+    }
+}

@@ -23,6 +23,7 @@
 
 pub mod auth_middleware;
 pub mod error;
+pub mod rate_limit;
 pub mod routes;
 pub mod state;
 
@@ -30,5 +31,5 @@ pub mod state;
 /// vocabulary (`ws_api::error`, `ws_api::routes`, `ws_api::state`) —
 /// plus the two names every consumer needs: the state and the router.
 pub use error::ApiError;
-pub use routes::router;
+pub use routes::{router, REQUEST_BODY_LIMIT};
 pub use state::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, OidcStateStore, VerificationDeps};

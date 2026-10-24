@@ -115,7 +115,10 @@ pub fn api_router_with_auth_limit(
                 .route("/api/v1/auth/login", any(proxy_request))
                 .route("/api/v1/auth/refresh", any(proxy_request))
                 .with_state(backend)
-                .layer(GovernorLayer::new(std::sync::Arc::new(config)));
+                .layer(
+                    GovernorLayer::new(std::sync::Arc::new(config))
+                        .error_handler(ws_api::rate_limit::house_error_handler()),
+                );
             proxy.merge(limited_auth)
         }
         None => {
@@ -241,7 +244,10 @@ pub fn acme_router(api_base_url: &str, rate_limit: Option<ws_api::AuthRateLimit>
             let limited_enrollment = Router::new()
                 .route("/acme/{tenant}/new-account", any(acme_request))
                 .with_state(backend)
-                .layer(GovernorLayer::new(std::sync::Arc::new(config)));
+                .layer(
+                    GovernorLayer::new(std::sync::Arc::new(config))
+                        .error_handler(ws_api::rate_limit::house_error_handler()),
+                );
             acme.merge(limited_enrollment)
         }
         None => {
@@ -302,7 +308,17 @@ pub struct ProxyError(pub(crate) String);
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_GATEWAY, self.0).into_response()
+        // The detail belongs to the operator (stderr/log), never to the
+        // response body — the client's side of the house envelope is the
+        // code alone (threat-model G9).
+        tracing::error!(error = %self.0, "a proxy failure answered the client");
+        (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "error": { "code": "bad_gateway", "message": "the API process is unreachable" }
+            })),
+        )
+            .into_response()
     }
 }
 
