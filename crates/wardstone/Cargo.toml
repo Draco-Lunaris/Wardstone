@@ -30,6 +30,9 @@ ws-core = { path = "../ws-core" }
 ws-auth = { path = "../ws-auth" }
 # The REST surface: `router(AppState)` and the config vocabulary.
 ws-api = { path = "../ws-api" }
+# The sealed build closures in both modes return BoxFuture (the unlock
+# constructs pools + routers asynchronously).
+futures-util = { workspace = true }
 # The TLS front door: `web_router`, `serve_tls`, the setup certificate.
 ws-web = { path = "../ws-web" }
 # The CA engine: the keystore (setup slot, per-certificate key envelopes).

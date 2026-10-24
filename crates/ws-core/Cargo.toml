@@ -26,6 +26,9 @@ argon2 = { workspace = true }
 # The envelope file format carries base64 (standard) fields — the same
 # encoding idiom as the keystore envelope's JSON.
 base64 = { workspace = true }
+# Hex encoding of the DB-credential rotation's fresh random bytes (the
+# same encoding the opaque token family uses).
+hex = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

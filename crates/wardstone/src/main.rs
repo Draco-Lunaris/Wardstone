@@ -652,52 +652,156 @@ async fn setup_watch(pool: sqlx::PgPool) {
 /// ws-api's `GovernorLayer` per-IP rate limiting actually effective (its
 /// key extractor is the peer IP; without `ConnectInfo` the layer would
 /// see none).
+/// The sealed-at-rest envelope file names on the keys volume (the
+/// design's state predicate: `master.envelope` present ⇒ the instance
+/// is sealed at boot).
+const MASTER_ENVELOPE_FILE: &str = "master.envelope";
+const JWT_ENVELOPE_FILE: &str = "jwt-keys.envelope";
+const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
+
+/// Keys-directory-only state derivation (spec §3): `master.envelope`
+/// present → the instance boots sealed and waits for the unlock relay.
+fn sealed_instance(keys_dir: &std::path::Path) -> bool {
+    keys_dir.join(MASTER_ENVELOPE_FILE).exists()
+}
+
+/// Substitute the password portion of a `postgres://user:pass@…` URL,
+/// leaving user/host/port/db untouched. Inserts a password when the URL
+/// carries none. The URL that reaches here is operator-supplied env; the
+/// substitution never logs the result.
+fn substitute_db_password(url: &str, password: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let auth_start = scheme_end + 3;
+    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
+        return url.to_string();
+    };
+    match url[auth_start..at].rfind(':') {
+        Some(colon_rel) => {
+            let colon_abs = auth_start + colon_rel;
+            format!("{}{}{}", &url[..=colon_abs], password, &url[at..])
+        }
+        None => format!("{}:{}{}", &url[..at], password, &url[at..]),
+    }
+}
+
+/// The api's [`ws_api::ApiConfig`] from the boot env — shared by both the
+/// legacy boot and the sealed unlock's build closure.
+fn api_config_from(cfg: &BootConfig) -> ws_api::ApiConfig {
+    if cfg.public_url.is_none() {
+        tracing::warn!(
+            "WARDSTONE_PUBLIC_URL is not set: the ACME directory cannot build \
+             absolute URLs and every ACME route that needs one will answer \
+             urn:ietf:params:acme:error:serverInternal until it is configured"
+        );
+    }
+    ws_api::ApiConfig {
+        domain: cfg
+            .server_hostname
+            .clone()
+            .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned()),
+        keys_dir: cfg.keys_dir.clone(),
+        admin_cidrs: Vec::new(),
+        auth_rate_limit: cfg.auth_rate_limit,
+        acme: ws_api::AcmeConfig {
+            public_url: cfg.public_url.clone().unwrap_or_default(),
+            tos_url: cfg.acme_tos_url.clone(),
+            acme_account_limit: cfg.acme_account_limit,
+        },
+    }
+}
+
+/// The sealed api boot: the process binds its listener immediately (the
+/// health surface answers `200 sealed`) and waits for the ui's unlock
+/// relay. The build closure opens the envelopes, rotates the DB credential
+/// (unconditionally, every unlock — a leaked credential dies at the next
+/// unlock), and swaps the FULL `ws_api::router` in.
+async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
+    let keys_dir = cfg.keys_dir.clone();
+    let database_url = cfg.database_url.clone();
+    let config = api_config_from(&cfg);
+
+    let build: ws_api::sealed::LockedBuild =
+        std::sync::Arc::new(move |req: &ws_api::sealed::UnlockRequest| {
+            let keys_dir = keys_dir.clone();
+            let database_url = database_url.clone();
+            let config = config.clone();
+            let passphrase = req.passphrase.clone();
+            futures_util::future::FutureExt::boxed(async move {
+                // The JWT pair: sealed under the passphrase.
+                let jwt = ws_auth::jwt::load_sealed(&keys_dir.join(JWT_ENVELOPE_FILE), &passphrase)
+                    .map_err(ws_api::error::ApiError::from)?;
+                // The DB credential: the envelope holds the CURRENT one; a
+                // fresh install (envelope absent) connects with the env's
+                // bootstrap credential.
+                let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
+                let connect_url = match ws_core::crypto::KeyEnvelope::open_envelope(
+                    &db_credential_path,
+                    &passphrase,
+                ) {
+                    Ok(current) => {
+                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
+                    }
+                    Err(ws_core::error::CoreError::Config(_)) => database_url.clone(),
+                    Err(other) => {
+                        return Err(ws_api::error::ApiError::from(other));
+                    }
+                };
+                let pool = ws_core::db::connect(&connect_url).await?;
+                // The rotation (spec §5.6): a fresh in-memory credential,
+                // ALTER over the just-opened connection, re-seal. A leaked
+                // credential (including the compose bootstrap) dies here.
+                let fresh = ws_core::crypto::random_hex(32)?;
+                sqlx::query("ALTER USER wardstone PASSWORD $1")
+                    .bind(&fresh)
+                    .execute(&pool)
+                    .await
+                    .map_err(ws_core::error::CoreError::Database)?;
+                ws_core::crypto::KeyEnvelope::write_envelope(
+                    &db_credential_path,
+                    &passphrase,
+                    fresh.as_bytes(),
+                    ws_core::crypto::PROD_KDF_PARAMS,
+                )?;
+                drop(pool);
+                let pool =
+                    ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
+                Ok(ws_api::router(ws_api::AppState::new(
+                    pool,
+                    std::sync::Arc::new(jwt),
+                    config,
+                )))
+            })
+        });
+
+    let api = std::sync::Arc::new(ws_api::sealed::SealedApi::new(build));
+    let app = ws_api::sealed::sealed_router(api);
+    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    tracing::info!(
+        bind = %cfg.bind,
+        "serving the sealed REST API: unlock through the front door to continue"
+    );
+    Ok(axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?)
+}
+
 async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
+    // The sealed instance: the envelopes exist, so the process waits for
+    // the unlock relay instead of touching any key material at boot.
+    if sealed_instance(&cfg.keys_dir) {
+        return run_api_sealed(cfg).await;
+    }
     let pool = ws_core::db::connect(&cfg.database_url).await?;
     // The JWT key pair: ws-api signs every access token with it. Loading
     // (or creating, on a virgin volume) exactly once per boot — the same
     // on-disk pair the `ui` process guarantees exists.
     let jwt = std::sync::Arc::new(ws_auth::jwt::JwtKeys::load_or_create(&cfg.keys_dir)?);
 
-    let config = ws_api::ApiConfig {
-        domain: cfg
-            .server_hostname
-            .clone()
-            .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned()),
-        keys_dir: cfg.keys_dir.clone(),
-        // The admin CIDRs are collected by the setup flow (which runs in
-        // the `ui` process and persists them through the profiles /
-        // deployment values it creates); the API surface currently reads
-        // no runtime behavior from this field, so the empty vector is the
-        // honest value a directly-served `api` process has at boot.
-        admin_cidrs: Vec::new(),
-        // The per-IP GCRA on the public auth routes: `Some` (the governor
-        // mounted) unless `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` was truthy
-        // — the UI-fronted deployment's switch, where logins arrive from
-        // ws-web's proxy's ONE loopback IP and ws-web enforces the
-        // per-client limit on `/auth/ui/*` itself. ws-api's layer skips
-        // when `None`.
-        auth_rate_limit: cfg.auth_rate_limit,
-        // The ACME surface config: the URL base (unset → the ACME routes
-        // degrade to `serverInternal` problems; the choice is LOUD here),
-        // the optional ToS URL, and the per-account limiter's OWN knob —
-        // armed by default, and NOT governed by the auth disable above
-        // (fix round 1: uuid keying survives the proxy hop).
-        acme: {
-            if cfg.public_url.is_none() {
-                tracing::warn!(
-                    "WARDSTONE_PUBLIC_URL is not set: the ACME directory cannot build \
-                     absolute URLs and every ACME route that needs one will answer \
-                     urn:ietf:params:acme:error:serverInternal until it is configured"
-                );
-            }
-            ws_api::AcmeConfig {
-                public_url: cfg.public_url.clone().unwrap_or_default(),
-                tos_url: cfg.acme_tos_url.clone(),
-                acme_account_limit: cfg.acme_account_limit,
-            }
-        },
-    };
+    let config = api_config_from(&cfg);
     let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
@@ -1057,6 +1161,46 @@ mod tests {
             source: "manual".to_owned(),
             created_at: Utc::now() - Duration::minutes(minutes_ago),
         }
+    }
+
+    /// The DB-URL password substitution replaces exactly the password and
+    /// leaves everything else byte-identical — and inserts a password into
+    /// a URL that carried none.
+    #[test]
+    fn db_password_substitution_is_surgical() {
+        let url = "postgres://wardstone:old-secret@db:5432/wardstone";
+        let substituted = substitute_db_password(url, "new-credential");
+        assert_eq!(
+            substituted, "postgres://wardstone:new-credential@db:5432/wardstone",
+            "only the password changes"
+        );
+        let bare = "postgres://wardstone@db:5432/wardstone";
+        assert_eq!(
+            substitute_db_password(bare, "inserted"),
+            "postgres://wardstone:inserted@db:5432/wardstone",
+            "a password-less URL gains one"
+        );
+        let weird = "not-a-url";
+        assert_eq!(
+            substitute_db_password(weird, "x"),
+            weird,
+            "a non-URL passes through"
+        );
+    }
+
+    /// The sealed-instance predicate: `master.envelope` present ⇒ sealed.
+    #[test]
+    fn sealed_instance_reads_the_envelope_predicate() {
+        let dir = std::env::temp_dir().join(format!("ws-sealed-predicate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!sealed_instance(&dir), "a clean dir is not sealed");
+        std::fs::write(dir.join(MASTER_ENVELOPE_FILE), b"{}").unwrap();
+        assert!(
+            sealed_instance(&dir),
+            "master.envelope marks the sealed state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The selection: active web-server certificates only, newest first,

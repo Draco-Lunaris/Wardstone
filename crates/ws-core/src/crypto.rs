@@ -129,6 +129,17 @@ impl SecretBox {
     }
 }
 
+/// `len` OS-entropy bytes, hex-encoded: the DB-credential rotation's
+/// fresh password material (and any future random-string need). The OS
+/// source failing is a typed error, never a panic.
+pub fn random_hex(len: usize) -> Result<String, CoreError> {
+    let mut bytes = vec![0u8; len];
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| CoreError::Crypto(format!("os entropy unavailable: {e}")))?;
+    Ok(hex::encode(bytes))
+}
+
 /// Build an XChaCha20-Poly1305 cipher from the 32-byte key.
 ///
 /// The transient `Key` copy is zeroized the moment the cipher has taken
@@ -278,6 +289,34 @@ impl KeyEnvelope {
     /// the envelope file itself; held here for wrap/unwrap callers.
     pub fn salt(&self) -> &[u8] {
         &self.salt
+    }
+
+    /// Read an envelope file's stored salt + KDF parameters WITHOUT
+    /// opening it: the unlock's derive step needs them before the
+    /// passphrase is known to be right (the derive itself is the check).
+    /// A missing file is [`CoreError::Config`] naming the path.
+    pub fn read_kdf_params(path: &Path) -> Result<(Vec<u8>, KdfParams), CoreError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let raw = fs::read(path)
+            .map_err(|e| CoreError::Config(format!("key envelope {}: {e}", path.display())))?;
+        let envelope: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| CoreError::Crypto("key envelope is not valid JSON".to_string()))?;
+        let missing = || CoreError::Crypto("key envelope lacks KDF parameters".to_string());
+        let salt = B64
+            .decode(envelope["salt"].as_str().ok_or_else(missing)?)
+            .map_err(|_| CoreError::Crypto("key envelope salt is not base64".to_string()))?;
+        let m_cost = envelope["m_cost"].as_u64().ok_or_else(missing)? as u32;
+        let t_cost = envelope["t_cost"].as_u64().ok_or_else(missing)? as u32;
+        let p_cost = envelope["p_cost"].as_u64().ok_or_else(missing)? as u32;
+        Ok((
+            salt,
+            KdfParams {
+                m_cost,
+                t_cost,
+                p_cost,
+            },
+        ))
     }
 
     /// The envelope's recorded KDF parameters: the passphrase-change flow
