@@ -17,7 +17,7 @@ RUN cargo build --release --bin wardstone
 
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -r wardstone \
  && useradd -r -g wardstone -d /var/lib/wardstone -s /usr/sbin/nologin wardstone \

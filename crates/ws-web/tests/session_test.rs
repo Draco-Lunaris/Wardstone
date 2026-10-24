@@ -1129,3 +1129,46 @@ async fn logout_after_concurrent_rotation_leaves_no_live_refresh() {
 
     env.cleanup().await;
 }
+
+/// Composition pin for the security-header baseline and the body ceiling
+/// (threat-model G4/G12): `/` is served by the SPA FALLBACK, and axum
+/// wraps a fallback only when the layers mount AFTER `fallback_service`.
+/// A regressed layer ordering would strip nosniff/frame-DENY/CSP/referrer
+/// from every browser surface exactly where they matter, while layered
+/// API routes kept them — this asserts the fallback side through the REAL
+/// composed `web_router_with_store`, not a synthetic copy of it.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn the_spa_fallback_carries_the_security_header_baseline() {
+    let mut env = env(DEFAULT_TTL).await;
+
+    let response = drive(&env.web, Method::GET, "/", None, None, false, None).await;
+    env.cleanup().await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let heads = response.headers();
+    assert_eq!(
+        heads
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+        "the SPA fallback is covered by the header baseline"
+    );
+    assert_eq!(
+        heads
+            .get(header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        heads
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok()),
+        Some("frame-ancestors 'none'")
+    );
+    assert_eq!(
+        heads
+            .get(header::REFERRER_POLICY)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+}

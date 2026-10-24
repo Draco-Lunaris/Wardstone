@@ -96,17 +96,29 @@ fn secret_is_present(model: &OidcConfigModel) -> bool {
 /// The row's secret as transient plaintext: the sealed bytes unsealed with
 /// the per-install SecretBox key (loaded per request — the TOTP pattern),
 /// the legacy TEXT slot, or `` for a public client.
-fn unsealed_secret(state: &AppState, model: &OidcConfigModel) -> Result<String, ApiError> {
-    if let (Some(encrypted), Some(nonce)) =
-        (&model.client_secret_encrypted, &model.client_secret_nonce)
-    {
-        let key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
-        let opened = key.open(encrypted, nonce).map_err(ApiError::from)?;
-        return std::str::from_utf8(&opened)
-            .map(str::to_string)
-            .map_err(|_| {
-                ApiError::Internal("the stored oidc client secret is not text".to_string())
-            });
+pub(crate) fn unsealed_secret(
+    state: &AppState,
+    model: &OidcConfigModel,
+) -> Result<String, ApiError> {
+    match (&model.client_secret_encrypted, &model.client_secret_nonce) {
+        (Some(encrypted), Some(nonce)) => {
+            let key = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+            let opened = key.open(encrypted, nonce).map_err(ApiError::from)?;
+            return std::str::from_utf8(&opened)
+                .map(str::to_string)
+                .map_err(|_| {
+                    ApiError::Internal("the stored oidc client secret is not text".to_string())
+                });
+        }
+        // Exactly ONE sealed half is a broken row (manual SQL only): the
+        // loud answer is a 500 — never a silent fall-through that would
+        // demote a sealed credential to a public client.
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ApiError::Internal(
+                "the stored oidc client secret has an inconsistent seal shape".to_string(),
+            ))
+        }
+        _ => {}
     }
     if !model.client_secret.is_empty() {
         tracing::warn!(
@@ -129,13 +141,19 @@ async fn reseal_legacy(state: &AppState, model: &OidcConfigModel) -> Result<(), 
     let (sealed, nonce) = key
         .seal(model.client_secret.as_bytes())
         .map_err(ApiError::from)?;
+    // Compare-and-set on the state this GET read: a concurrent PUT that
+    // already sealed a NEWER secret must not be reverted here (0 rows = a
+    // no-op is correct). An unconditional UPDATE could silently resurrect
+    // the row's old plaintext as the new seal — the whole-seal revert race.
     sqlx::query(
         "UPDATE oidc_config SET client_secret_encrypted = $2, \
-         client_secret_nonce = $3, client_secret = '' WHERE tenant_id = $1",
+         client_secret_nonce = $3, client_secret = '' WHERE tenant_id = $1 \
+         AND client_secret_encrypted IS NULL AND client_secret = $4",
     )
     .bind(model.tenant_id)
     .bind(&sealed)
     .bind(&nonce)
+    .bind(&model.client_secret)
     .execute(&state.pool)
     .await?;
     Ok(())
@@ -256,11 +274,20 @@ async fn put_config(
             // plaintext row, which re-seals right here in the transaction.
             None => match existing.as_ref() {
                 Some(row) if row.client_secret_encrypted.is_some() => {
-                    let sealed = row
-                        .client_secret_encrypted
-                        .clone()
-                        .expect("checked Some above");
-                    let nonce = row.client_secret_nonce.clone().expect("checked Some above");
+                    // A half-sealed row is manual-SQL damage only; the loud
+                    // answer is a 500, never an unwrap panic per request.
+                    let Some(sealed) = row.client_secret_encrypted.clone() else {
+                        return Err(ApiError::Internal(
+                            "the stored oidc client secret has an inconsistent seal shape"
+                                .to_string(),
+                        ));
+                    };
+                    let Some(nonce) = row.client_secret_nonce.clone() else {
+                        return Err(ApiError::Internal(
+                            "the stored oidc client secret has an inconsistent seal shape"
+                                .to_string(),
+                        ));
+                    };
                     (Some(sealed), Some(nonce))
                 }
                 Some(row) if !row.client_secret.is_empty() => {

@@ -109,7 +109,10 @@ async fn create_user(
     let password_hash =
         tokio::task::spawn_blocking(move || ws_auth::password::hash_password(&password))
             .await
-            .map_err(|e| ApiError::Internal(format!("the password task failed: {e}")))?
+            .map_err(|e| {
+                tracing::error!(error = %e, "the password-hashing task failed");
+                ApiError::internal_generic()
+            })?
             .map_err(ApiError::from)?;
 
     let user = UserModel {

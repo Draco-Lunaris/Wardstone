@@ -103,6 +103,8 @@ pub struct SetupFields {
     /// (threat-model G8): first-mover takes the CA, and the only defense
     /// in that window is the operator confirming they are talking to the
     /// instance whose console they administer.
+    #[serde(default)] // a missing field is a blank paste: the required-field
+    // check turns it into the house 400 envelope, not a serde 422.
     pub fingerprint_confirmation: String,
 }
 

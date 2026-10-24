@@ -530,7 +530,10 @@ async fn spawn_signing(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("the signing task failed: {e}")))?
+    .map_err(|e| {
+        tracing::error!(error = %e, "the leaf-signing task failed");
+        ApiError::internal_generic()
+    })?
 }
 
 /// The profile's pinned leaf key type; an unknown stored value is data-

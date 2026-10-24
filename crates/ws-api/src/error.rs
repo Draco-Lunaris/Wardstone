@@ -117,6 +117,15 @@ impl ApiError {
         }
     }
 
+    /// The generic 500: one message for every server-side failure whose
+    /// detail the operator gets from the log, never the response body
+    /// (threat-model G9). `Database`/`Config`/`Crypto` details are logged,
+    /// not sent — the response body carries only what the client could act
+    /// on, which for an internal failure is nothing.
+    pub fn internal_generic() -> Self {
+        ApiError::Internal("an internal server error occurred".to_string())
+    }
+
     /// The machine code this error renders in its JSON body.
     fn code(&self) -> &'static str {
         match self {
@@ -184,35 +193,26 @@ impl IntoResponse for ApiError {
 /// - `Config` / `Crypto` → **500 (generic)**: server-side problems whose
 ///   stored-profile detail is logged, not sent.
 ///
-/// The generic 500: one message for every server-side failure whose
-/// detail the operator gets from the log, never the response body
-/// (threat-model G9). `Database`/`Config`/`Crypto` details are logged,
-/// not sent — the response body carries only what the client could act
-/// on, which for an internal failure is nothing.
-fn internal_generic() -> ApiError {
-    ApiError::Internal("an internal server error occurred".to_string())
-}
-
 impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         match err {
             CoreError::Database(e) => {
                 tracing::error!(error = %e, "a database error reached the API surface");
-                internal_generic()
+                ApiError::internal_generic()
             }
             CoreError::Migration { expected, found } => {
                 tracing::error!(expected, found, "migration count mismatch");
-                internal_generic()
+                ApiError::internal_generic()
             }
             CoreError::Duplicate => ApiError::Conflict("the resource already exists".to_string()),
             CoreError::Forbidden => ApiError::Forbidden("missing required capability".to_string()),
             CoreError::Config(message) => {
                 tracing::error!(error = %message, "a config error reached the API surface");
-                internal_generic()
+                ApiError::internal_generic()
             }
             CoreError::Crypto(message) => {
                 tracing::error!(error = %message, "a crypto error reached the API surface");
-                internal_generic()
+                ApiError::internal_generic()
             }
         }
     }
@@ -248,8 +248,17 @@ impl From<AuthError> for ApiError {
             AuthError::AccountDisabled => ApiError::Forbidden("account is disabled".to_string()),
             AuthError::RateLimited => ApiError::RateLimited("rate limit exceeded".to_string()),
             AuthError::NotFound => ApiError::NotFound("not found".to_string()),
-            AuthError::Config(message) => ApiError::Internal(format!("config error: {message}")),
-            AuthError::Crypto(message) => ApiError::Internal(format!("crypto error: {message}")),
+            // Deployment-shaped failures (discovery/JWKS/token-endpoint
+            // transport) carry provider URLs and ports — logged for the
+            // operator, generalized for the wire (threat-model G9).
+            AuthError::Config(message) => {
+                tracing::error!(error = %message, "an auth config error reached the API surface");
+                ApiError::internal_generic()
+            }
+            AuthError::Crypto(message) => {
+                tracing::error!(error = %message, "an auth crypto error reached the API surface");
+                ApiError::internal_generic()
+            }
         }
     }
 }
@@ -264,7 +273,7 @@ impl From<CaError> for ApiError {
             CaError::UnsupportedKeyType(message) => ApiError::bad_request(message),
             other => {
                 tracing::error!(error = %other, "a certificate-authority error reached the API surface");
-                internal_generic()
+                ApiError::internal_generic()
             }
         }
     }
@@ -275,7 +284,7 @@ impl From<CaError> for ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         tracing::error!(error = %err, "a database error reached the API surface");
-        internal_generic()
+        ApiError::internal_generic()
     }
 }
 

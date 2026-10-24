@@ -161,16 +161,19 @@ pub async fn web_router_with_store(
     // masked. A Router is itself a fallback Service — `ui::ui_router()`
     // carries its own route tree (`/`, `/assets/*`, the SPA catch-all) and
     // its own routing.
-    // The request-body ceiling: the SAME bound ws-api enforces, so the
-    // proxy never accepts what the API would refuse (threat-model G12).
-    let app = app.layer(axum::extract::DefaultBodyLimit::max(
-        ws_api::REQUEST_BODY_LIMIT,
-    ));
-    // The response-header baseline (threat-model G4): nosniff, both forms
-    // of frame denial, referrer minimization — on EVERY response ws-web
-    // serves (SPA, setup page, proxied API/ACME bodies alike).
-    let app = app.layer(axum::middleware::from_fn(security_headers));
-    Ok(app.fallback_service(ui::ui_router()))
+    // The SPA fallback mounts FIRST: axum's `Router::layer` wraps only the
+    // endpoints registered at layer time, so layers applied BEFORE
+    // `fallback_service` would never wrap the fallback — `/`, `/assets/*`
+    // and the setup page (the browser surfaces the header baseline and
+    // body ceiling exist for) would have been uncovered. Fallback first,
+    // layers after (the ws-web composition convention).
+    let app = app
+        .fallback_service(ui::ui_router())
+        .layer(axum::middleware::from_fn(security_headers))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            ws_api::REQUEST_BODY_LIMIT,
+        ));
+    Ok(app)
 }
 
 /// The response-header baseline. The CSP is deliberately narrow here:

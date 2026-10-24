@@ -221,18 +221,24 @@ impl OidcStateStore {
         })?;
         let state = hex::encode(raw);
         let (code_verifier, code_challenge) = ws_auth::oidc::pkce::mint_verifier()?;
-        if let Ok(mut states) = self.states.lock() {
-            states.insert(
-                state.clone(),
-                OidcPending {
-                    tenant_id,
-                    code_verifier: code_verifier.clone(),
-                    expires_at: Instant::now() + OIDC_STATE_TTL,
-                },
-            );
-            // Opportunistic gc: drop expired states while the lock is held.
-            states.retain(|_, pending| pending.expires_at > Instant::now());
-        }
+        // A poisoned store fails LOUDLY: minting a state that was never
+        // stored guarantees the callback 401s and the operator learns
+        // nothing from it (threat-model G5's loudness rule).
+        let mut states = self.states.lock().map_err(|_| {
+            ws_auth::error::AuthError::Crypto(
+                "the oidc csrf-state store lock is poisoned".to_string(),
+            )
+        })?;
+        states.insert(
+            state.clone(),
+            OidcPending {
+                tenant_id,
+                code_verifier: code_verifier.clone(),
+                expires_at: Instant::now() + OIDC_STATE_TTL,
+            },
+        );
+        // Opportunistic gc: drop expired states while the lock is held.
+        states.retain(|_, pending| pending.expires_at > Instant::now());
         Ok(OidcMintedState {
             state,
             code_verifier,
