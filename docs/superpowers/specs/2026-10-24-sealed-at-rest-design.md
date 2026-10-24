@@ -48,12 +48,26 @@ their PRIVATE keys seal), and the host TLS/private material the listener
 needs before unlock… see §4 (the listener uses a **self-issued "locked"
 certificate** minted at first unlock: no CA keys online while sealed, and
 an unambiguous visual state for the operator).
+- The **`ws-worker` crate**: it has NO deployed entry point (absent from the
+  binary's modes and from compose) — it is dormant code in every shipped
+  shape, and sealing it is deferred until it actually ships. Stated here so
+  "everything sensitive seals" remains truthful about what SHIPS.
 
 ## 3. The boot state machine
 
 Both processes boot **sealed** unless the runtime already holds an unlocked
 session (in-memory only; never written):
 
+- **State derivation is keys-directory-only** (the sealed boot has no DB):
+  `master.envelope` present → `Sealed`; absent with ANY legacy plaintext
+  (`master.key` / `secret-encryption.key` / JWT PEMs) → `LegacyConversion`
+  (the INIT page offers the one-time conversion — **per-file**, each
+  present plaintext file wraps and deletes independently; a torn JWT pair
+  is wrapped as-is with its loud torn-state error preserved post-unlock —
+  conversion never heals what the loader refuses); absent and entirely
+  clean → fresh run. The tenant-existence check moves to post-unlock
+  routing (no DB at boot), so a legacy install with an existing tenant
+  lands on the conversion page and then straight into service.
 - **`Uninitialized`** (no KEK envelope exists; first run or fresh upgrade):
   the ui serves the **initialization page** over a self-issued locked-mode
   certificate: the operator sets the master passphrase (entered twice), the
