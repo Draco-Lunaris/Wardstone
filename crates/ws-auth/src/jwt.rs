@@ -325,6 +325,73 @@ fn assert_pair_usable(
     Ok(())
 }
 
+/// Write BOTH PEMs as ONE sealed envelope (`jwt-keys.envelope`): the pair
+/// travels under the operator's KeyEnvelope and exists on disk ONLY as
+/// inert ciphertext. The legacy plaintext pair's re-key-by-deletion
+/// recovery becomes a post-unlock operator action.
+pub fn write_sealed(
+    path: &Path,
+    passphrase: &str,
+    keys: &JwtKeys,
+) -> Result<(), crate::error::AuthError> {
+    let combined = serde_json::json!({
+        "signing": keys.signing_key_pem.as_str(),
+        "verification": keys.verification_key_pem,
+    })
+    .to_string();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        path,
+        passphrase,
+        combined.as_bytes(),
+        ws_core::crypto::PROD_KDF_PARAMS,
+    )
+    .map_err(|e| crate::error::AuthError::Crypto(format!("jwt key envelope: {e}")))
+}
+
+/// Open the sealed pair from `path` with the passphrase.
+///
+/// A torn PAIR (one plaintext file present, or an envelope whose stored
+/// JSON lost one half) is the same typed torn-state failure as ever —
+/// sealing never heals what the loader refuses.
+pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::error::AuthError> {
+    let opened =
+        ws_core::crypto::KeyEnvelope::open_envelope(path, passphrase).map_err(|e| match e {
+            ws_core::error::CoreError::Crypto(m) if m.contains("master passphrase") => {
+                crate::error::AuthError::Crypto(
+                    "the master passphrase is wrong for the jwt key envelope".to_string(),
+                )
+            }
+            ws_core::error::CoreError::Config(m) | ws_core::error::CoreError::Crypto(m) => {
+                crate::error::AuthError::Config(format!(
+                    "jwt key envelope {}: {}",
+                    path.display(),
+                    m
+                ))
+            }
+            _ => crate::error::AuthError::Crypto(format!("jwt key envelope open failed: {e}")),
+        })?;
+    let body: serde_json::Value = serde_json::from_slice(&opened).map_err(|_| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload is not valid JSON".to_string(),
+        )
+    })?;
+    let signing = body["signing"].as_str().ok_or_else(|| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload lacks the signing key".to_string(),
+        )
+    })?;
+    let verification = body["verification"].as_str().ok_or_else(|| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload lacks the verification key".to_string(),
+        )
+    })?;
+    Ok(JwtKeys {
+        signing_key_pem: signing.to_string(),
+        verification_key_pem: verification.to_string(),
+        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
+    })
+}
+
 /// Sign the given claims as a compact EdDSA JWT.
 pub fn issue_access_token(claims: &AccessClaims, keys: &JwtKeys) -> Result<String, AuthError> {
     let key = EncodingKey::from_ed_pem(keys.signing_key_pem.as_bytes())

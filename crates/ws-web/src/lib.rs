@@ -33,6 +33,7 @@
 //! socket address attached to every request (`ConnectInfo`, Task 12's
 //! per-IP limiter's key input).
 
+pub mod locked;
 pub mod proxy;
 pub mod session;
 pub mod setup;

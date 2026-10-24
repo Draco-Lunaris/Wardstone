@@ -24,6 +24,7 @@
 pub mod auth_middleware;
 pub mod error;
 pub mod routes;
+pub mod sealed;
 pub mod state;
 
 /// Re-export at the crate root for the call sites that import the whole
