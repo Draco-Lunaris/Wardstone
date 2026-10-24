@@ -48,6 +48,18 @@ their PRIVATE keys seal), and the host TLS/private material the listener
 needs before unlock… see §4 (the listener uses a **self-issued "locked"
 certificate** minted at first unlock: no CA keys online while sealed, and
 an unambiguous visual state for the operator).
+
+**After unlock, the TLS identity swaps IN-PROCESS.** The `serve_tls`
+ArcSwap hot-reload path — present in the code and deliberately unused
+until now — becomes load-bearing: at unlock (or at setup commit), the
+process loads the CA-issued `web-server` leaf from the freshly opened
+envelopes and swaps the listener's certificate without exiting. The
+setup-era **self-exit restart contract is thereby REPLACED**: a restart
+would re-seal the process by design, so `POST /setup {"restart": true}`
+becomes `{"resume": true}` — the same in-process hand-off, with the docs
+and the setup page updated to match. (The owner-facing change is stated
+in the approval note rather than buried here: the restart-and-return flow
+the guides describe today becomes unlock-and-continue.)
 - The **`ws-worker` crate**: it has NO deployed entry point (absent from the
   binary's modes and from compose) — it is dormant code in every shipped
   shape, and sealing it is deferred until it actually ships. Stated here so
@@ -119,11 +131,11 @@ The browser POSTs `{passphrase}` to `POST /unlock` on the ui:
    HTTP already occupies. Upgrading that hop to mTLS (the product can issue
    both processes' certificates) is listed as future hardening, not in this
    pass.
-6. Rotation: at unlock, the api **rotates the DB credential** (generates a
-   fresh one, `ALTER ROLE` over the connection it just opened, re-seals)
-   when `db-credential.envelope` predates the current unlock — the rotation
-   cadence the threat-model thread settled on, at the cadence unlock
-   provides.
+6. Rotation: at unlock, the api **rotates the DB credential** —
+   unconditionally, every unlock (no env knob: the unlock cadence is
+   operator-driven already, and each unlock retires any credential that
+   leaked since the previous one — including the compose bootstrap, which
+   the first unlock thereby retires as dead weight).
 
 **Failure postures** (all loud, house style): wrong passphrase → unlock
 page re-renders with a typed error and no hint of *why* beyond that; KMS…
@@ -171,6 +183,21 @@ made while unlocked).
 The compose `:?` requirements stay (the db container must init with
 something), but the README now explains the credential's lifecycle
 explicitly.
+
+**`DATABASE_URL` in sealed mode is password-less** —
+`postgres://wardstone@db:5432/wardstone` — and the api **substitutes the
+envelope credential** into it at unlock (host/user/db remain env-defined);
+a password-bearing URL on a sealed-mode boot fails loudly (mixed-mode
+detection). **Migrations run at unlock** — the sealed boot has no database
+connection by design, so `connect`'s migration step moves onto the
+post-unlock path. **Seeding**: the ui INIT page consumes the bootstrap
+(`WARDSTONE_DB_BOOTSTRAP_PASSWORD`, passed to the ui service ONLY — the
+api never holds a bootstrap credential) to first-authenticate, `ALTER`,
+and seal. **The recovery runbook** for a re-initialized db volume (the
+envelope's rotated password now dead): stop the stack, delete
+`db-credential.envelope` from the keys volume, set a fresh
+`WARDSTONE_DB_PASSWORD`, boot — the unlock flow re-seeds through the
+identical first-install path. The docs carry exactly this runbook.
 
 ## 9. Tests (TDD; each red watched)
 

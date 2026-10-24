@@ -69,9 +69,10 @@ unlock/init pages, the api answers `503 sealed`; the unlock POST (GCRA-limited) 
 
 **Files:**
 - Modify: `crates/wardstone/src/main.rs` — boot constructs `SealedState` (Arc<RwLock>) as `Uninitialized` / `Sealed` / derived from the envelopes' presence; the TLS front door binds with the locked-mode certificate path; `run_ui`/`run_api` thread the guard into ws-web/ws-api.
+- The post-unlock TLS identity swap rides the existing (unused) `serve_tls` ArcSwap path; the setup self-exit contract (`restart: true`) is replaced by the in-process swap + `resume: true` (spec §4).
 - Modify: `crates/ws-web/src/lib.rs` + new `crates/ws-web/src/locked.rs` — the `locked_router`: serves `GET /` (init or unlock page by state) + the unlock POST + `GET /healthz` (200 + state field) + **503 on everything else**; `web_router` gains the guard and 503-s the sealed-material-dependent handlers until unlocked (sessions/JWT).
 - Modify: `crates/ws-api/src/routes/health.rs` — `healthz` gains the state field; `crates/ws-api/src/lib.rs` — the api's guard flips `503 sealed` → service.
-- Modify: `docker/compose.yml` — the `db` healthcheck → `pg_isready`; the ui/api healthchecks hit their own `healthz` (liveness-in-sealed = 200, so no restart churn).
+- Modify: `docker/compose.yml` — the `db` healthcheck → `pg_isready`; the ui/api healthchecks hit their own `healthz` (liveness-in-sealed = 200, so no restart churn); `ws-web` gains `WARDSTONE_DB_BOOTSTRAP_PASSWORD` (the ui is the sole seeding consumer), the api's env becomes the password-less `DATABASE_URL`.
 
 - [ ] Red: boot-state unit tests (uninitialized → init page; sealed → unlock page; non-unlock routes 503; the flip is in-process; restart re-seals state; healthz 200-with-state) — `ws-web` sealed_page tests + `ws-api` health tests.
 - [ ] Green. Commit: `feat(wardstone): the sealed boot state machine`
@@ -80,8 +81,9 @@ unlock/init pages, the api answers `503 sealed`; the unlock POST (GCRA-limited) 
 
 **Files:**
 - Modify: `crates/ws-web/src/locked.rs` — `POST /unlock {passphrase}`: GCRA-limited (new budget or the auth budget), argon2 derive, open, flip ui guard, relay to `POST /api/v1/internal/unlock` (a one-time nonce minted at page render to bind the relay; the internal hop carries the passphrase once — spec §5).
-- Modify: `crates/ws-api/src/routes/mod.rs` + a new `internal.rs` — the relay endpoint, nonce-bound; on success: unwrap the DB credential (`db-credential.envelope`; absent on fresh installs → seeded per spec §4.3), rotate (`WARDSTONE_DB_ROTATE_ON_BOOT` semantics from the folded spec answer: default OFF, bundled Tier-on), build the pool, flip the api guard.
+- Modify: `crates/ws-api/src/routes/mod.rs` + a new `internal.rs` — the relay endpoint, nonce-bound; on success: unwrap the DB credential (`db-credential.envelope`; absent on fresh installs → seeded via the ui INIT bootstrap per spec §4.3), rotate **unconditionally** (every unlock; no env knob — spec §5.6), build the pool, run `connect`'s migration step post-unlock, flip the api guard.
 - Modify: `crates/wardstone/src/main.rs` — the boot DB connect waits for the flip (no DB at boot in sealed mode; the connect moves to unlock completion).
+- `ws-worker` is OUT of scope (no deployed entry point — the spec §2 note states it); `connect` splits into connect-with-credential + the migration runner (migrations execute post-unlock).
 
 - [ ] Red: harness tests — wrong passphrase flips nothing (typed error); correct flips both (the loopback relay covered); the relay nonce binds the one POST; DB-gated: rotation alters + re-seals + the old password stops connecting.
 - [ ] Green. Commit: `feat: the unlock handshake — derive, open, relay, rotate`
