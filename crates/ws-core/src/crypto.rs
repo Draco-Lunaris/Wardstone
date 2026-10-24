@@ -352,7 +352,7 @@ fn seal_bytes(
     kek: &Zeroizing<[u8; 32]>,
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
-    let cipher = cipher_for(&kek)?;
+    let cipher = cipher_for(kek)?;
     let mut nonce = [0u8; NONCE_LEN];
     SysRng.try_fill_bytes(&mut nonce).map_err(|e| {
         CoreError::Crypto(format!("os entropy unavailable for the AEAD nonce: {e}"))
@@ -369,7 +369,7 @@ fn open_bytes(
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CoreError> {
-    let cipher = cipher_for(&kek)?;
+    let cipher = cipher_for(kek)?;
     let nonce = XNonce::try_from(nonce).map_err(|_| {
         CoreError::Crypto(format!("AEAD nonce must be {NONCE_LEN} bytes").to_string())
     })?;
