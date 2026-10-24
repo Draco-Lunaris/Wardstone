@@ -53,17 +53,30 @@ docker compose -f docker/compose.yml up -d
 
 The first two variables are required by design — an unset hostname would
 serve the setup certificate with a placeholder SAN, and an unset password
-would make the bundled Postgres guessable. The image publish requires the
-GitHub package to be public (or an existing `docker login ghcr.io`).
+would make the bundled Postgres guessable. **`WARDSTONE_DB_PASSWORD` is a
+bootstrap-only value**: it initializes the bundled database and seeds the
+first credential, and the first unlock of the instance retires it (a fresh
+in-memory credential is rotated into place and sealed under your master
+passphrase). The image publish requires the GitHub package to be public
+(or an existing `docker login ghcr.io`).
 `WARDSTONE_IMAGE=wardstone:latest` is the default when you build locally.
 
 **First run.** Browse `https://<host>:8443/`, accept the freshly minted
 self-signed setup certificate (its SHA-256 fingerprint is displayed on
-the page for out-of-band verification), and fill the setup form: admin
-username and password, default domain, optional admin CIDRs, and the
-server hostname. On success the UI process exits cleanly and its restart
-policy brings it back serving the CA-issued TLS leaf. Sign in with the
-admin account you just created — `POST /setup` now returns 404 forever.
+the page for out-of-band verification), and fill the setup form: **set
+your master passphrase** (the key that seals every sensitive file on the
+instance — it exists nowhere on any disk, and it is not recoverable,
+store it in your password manager), then the admin username and password,
+default domain, optional admin CIDRs, and the server hostname. The UI
+process **resumes in place** serving the CA-issued TLS leaf — no restart,
+no re-typing. Sign in with the admin account you just created — `POST
+/setup` now returns 404 forever.
+
+**Sealed boots.** Every container restart returns the instance to the
+locked page: enter your master passphrase on it and the instance resumes
+where it left off. While sealed the database is unreachable, the keys are
+ciphertext on disk, and the only thing the front door serves is the
+unlock page — that is the design, not an outage.
 
 **First certificate.** Two paths, both open on the same instance:
 
@@ -218,9 +231,22 @@ docker build -f docker/Dockerfile -t wardstone:local .
 ## Security
 
 Key handling, issuance flows, and the web UI are security-sensitive by
-nature; the design treats them accordingly (encrypted key envelopes, no
-forwarded-for trust, challenge verification computed server-side, tokens
-never in browser state, migrations that enforce tenancy in the schema).
+nature; the design treats them accordingly. The headline control is
+**sealed at rest**: every sensitive file on the instance (the CA key
+envelopes, the session-key pair, the second-factor seals, the database
+credential) is ciphertext under a key derived from **your master
+passphrase** — entered at the HTTPS front door when you unlock the
+instance, existing nowhere on any disk. A sealed instance is correctly
+unhealthy while locked; the disk copy of a running instance is inert
+until unlocked; a database copy carries no plaintext secrets. The stated
+residuals, plainly: a **host-root** attacker on the running instance
+reads unlocked memory (no software defends that); a **stolen passphrase**
+defeats the seal (keep it in your password manager, not on the same
+machine); and **losing the passphrase** loses the instance — its
+identities are re-issued from the offline root you control. Further
+hardening habits (no forwarded-for trust, server-computed challenge
+verification, tokens never in browser state, tenancy enforced in the
+schema) ride along underneath.
 Please report potential vulnerabilities privately through GitHub's
 private vulnerability reporting rather than a public issue.
 

@@ -277,19 +277,48 @@ Compose-level:
 | Variable                  | Required | Meaning |
 |---------------------------|----------|---------|
 | `WARDSTONE_SERVER_HOSTNAME` | yes (`:?`) | Interpolated into both services |
-| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' password |
+| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' **bootstrap** password: initializes the database and seeds the first credential; the first unlock rotates it away — it is not a standing secret |
+| `WARDSTONE_DB_BOOTSTRAP_PASSWORD` | no (ui only) | Alternative name for passing the bootstrap credential to the ui service alone (the api never holds it; both default to `WARDSTONE_DB_PASSWORD`) |
 | `WARDSTONE_IMAGE`           | no (default `wardstone:latest`) | Override the image; the e2e harness points it at a local build |
 | `WARDSTONE_PUBLIC_URL`      | no (default `https://$WARDSTONE_SERVER_HOSTNAME`) | The ACME URL base; override when certbot reaches the front door on a non-standard port or a different public name |
 
 ## Operations notes
 
-**The `ws-web` service MUST keep `restart: unless-stopped`.** The `ui`
-process self-exits (exit code 0) when the setup flow completes — that is the
-documented `{"restart": true}` contract, not a crash — and only a restart
-policy brings it back onto the CA-issued leaf. A `no` policy would leave a
-freshly set-up instance serving nothing. The same policy is what carries the
-leaf re-issue flow (a re-issued leaf takes over on the next restart; TLS
-configuration is built at boot).
+**The `ws-web` service MUST keep `restart: unless-stopped`.** With the
+sealed-at-rest model the ui process does NOT self-exit: setup completes
+with an in-process hand-off (`{"resume": true}` — the listener swaps onto
+the CA-issued leaf via the hot-reload path), and every container restart
+lands the instance on the **locked page** awaiting the operator's master
+passphrase. A locked instance is a correct state, not a crash — its
+healthcheck stays 200 (liveness) while gated. The restart policy is what
+carries the leaf re-issue flow and what brings the stack back after host
+reboots (where it waits locked, as designed: enter the master passphrase
+to resume).
+
+**Locked instances are a state, not a failure.** After any container
+restart the instance serves the locked page until the operator enters the
+master passphrase. The `ws-web`/`ws-api` healthchecks stay 200 while
+locked (liveness, with the current state in the response), so the restart
+policy never churns a sealed instance; the database's own healthcheck is
+`pg_isready` (auth-independent — the rotated credential is none of the
+healthcheck's business).
+
+**Converting an existing (pre-sealing) install** — the first boot after
+upgrading shows the initialization page instead of the unlock page when
+plaintext key files are found: set your master passphrase there, and the
+conversion wraps every plaintext file into an envelope **and deletes the
+plaintext originals**. Verify before you convert that your backups of the
+keys volume are current: after conversion those backups open nothing
+until they are made again *from the unlocked instance* — inert backups are
+the feature, but a passphrase lost with no unlocked backup is a
+re-issued-identities restart, not a restored one.
+
+**Changing the master passphrase** — in the unlocked UI's admin section:
+enter the current passphrase and the new one; every envelope re-wraps
+under a fresh key and the change is audited. A partially-completed change
+(the process dies mid-rotation) leaves envelopes across two generations
+that BOTH open with THEIR passphrases — the next unlock offers to finish
+the change; nothing sits in a silent mixed state.
 
 **Lost or broken JWT key files are a hard stop, with a recovery that costs
 every session.** A missing or corrupt `jwt-signing-key.pem` /
