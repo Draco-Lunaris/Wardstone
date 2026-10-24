@@ -354,3 +354,43 @@ async fn identity_from_response_rejects_a_stale_jwks_key() {
         .unwrap_err();
     assert!(matches!(err, AuthError::TokenInvalid), "got: {err:?}");
 }
+
+/// RFC 7636 §4.1-4.2, S256: the verifier is base64url (no pad) of 32
+/// entropy bytes — 43 unreserved-charset characters; the challenge is
+/// base64url(SHA-256(verifier)). The challenge is the ONLY material the
+/// authorize URL may carry.
+#[test]
+fn pkce_challenge_is_sha256_of_the_verifier() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let seed = [0xa5u8; 32];
+    let (verifier, challenge) = ws_auth::oidc::pkce::generate_verifier(seed);
+
+    assert_eq!(
+        verifier.len(),
+        43,
+        "base64url(no-pad) of 32 bytes is exactly 43 characters"
+    );
+    assert!(
+        verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "the verifier uses the RFC 7636 unreserved charset, got {verifier:?}"
+    );
+
+    // Independent recomputation of the challenge.
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let expected = URL_SAFE_NO_PAD.encode(hasher.finalize());
+    assert_eq!(challenge, expected);
+}
+
+#[test]
+fn pkce_mint_is_wellformed_and_random() {
+    let (v1, c1) = ws_auth::oidc::pkce::mint_verifier().unwrap();
+    let (v2, c2) = ws_auth::oidc::pkce::mint_verifier().unwrap();
+    assert_ne!(v1, v2, "two mints must not collide");
+    assert_ne!(c1, c2);
+    assert_eq!(v1.len(), 43);
+}

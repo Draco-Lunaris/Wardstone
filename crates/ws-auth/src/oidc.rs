@@ -22,6 +22,44 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// PKCE (RFC 7636) S256 material for the authorization-code flow: the
+/// verifier travels to the token endpoint, the challenge — the only
+/// half that leaves the server before the code arrives — rides the
+/// authorize URL. The S256 transform means the IdP never sees the
+/// verifier and nothing but the verifier proves code ownership.
+pub mod pkce {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::{rngs::SysRng, TryRng};
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroize;
+
+    /// Derive `(verifier, challenge)` from 32 bytes of entropy: the
+    /// verifier is base64url (no pad) of the seed — 43 unreserved-charset
+    /// characters (RFC 7636 §4.1) — and the challenge is
+    /// base64url(SHA-256(verifier)) (§4.2's `S256`). The seed is
+    /// zeroized before return; the challenge derives from the verifier
+    /// alone, so the challenge can leave while the verifier stays.
+    pub fn generate_verifier(mut seed: [u8; 32]) -> (String, String) {
+        let verifier = URL_SAFE_NO_PAD.encode(seed);
+        seed.zeroize();
+        let digest = Sha256::digest(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(digest);
+        (verifier, challenge)
+    }
+
+    /// Draw 32 bytes of OS entropy and produce `(verifier, challenge)`.
+    pub fn mint_verifier() -> Result<(String, String), crate::error::AuthError> {
+        let mut seed = [0u8; 32];
+        SysRng.try_fill_bytes(&mut seed).map_err(|e| {
+            crate::error::AuthError::Crypto(format!(
+                "os entropy unavailable for the PKCE verifier: {e}"
+            ))
+        })?;
+        Ok(generate_verifier(seed))
+    }
+}
+
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;

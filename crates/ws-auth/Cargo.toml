@@ -36,6 +36,7 @@ zeroize = { workspace = true }
 # presented to the client as `{prefix}{hex}` (the house's token encoding,
 # pm-auth/src/refresh.rs:38-48) and their verifier hash is stored as
 # hex(Sha256(raw_bytes)).
+base64 = { workspace = true }
 hex = { workspace = true }
 # SHA-256 for the opaque token verifier hashes — the house's refresh-token
 # precedent (pm-auth/src/refresh.rs:11,46,100,153), NOT argon2id: argon2id's
