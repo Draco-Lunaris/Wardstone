@@ -210,3 +210,171 @@ fn key_io_err(path: &Path, e: std::io::Error) -> CoreError {
         path.display()
     ))
 }
+
+/// The operator master passphrase, derived into a KEK, and the sealed
+/// envelope file format (the sealed-at-rest design): every sensitive file
+/// on the keys volume is an envelope — argon2id KDF parameters + a fresh
+/// salt per write, the plaintext AEAD-encrypted under the derived key.
+/// `write_envelope`/`open_envelope` are file-shaped and crash-atomic; the
+/// KEK exists only in RAM for the process lifetime and is zeroized on
+/// drop.
+///
+/// A wrong passphrase fails AEAD authentication and surfaces as
+/// [`CoreError::Crypto`] — never garbage output; a missing/malformed
+/// envelope is [`CoreError::Config`] where the path is the issue.
+pub const ENVELOPE_VERSION: u32 = 1;
+
+/// The production KDF parameters: argon2id at 256 MiB / 3 passes targets
+/// the ~1 s unlock latency budget while making off-box brute force meet
+/// real cost. The parameters travel INSIDE each envelope, so a deployed
+/// tuning change does not strand old envelopes.
+#[derive(Debug, Clone, Copy)]
+pub struct KdfParams {
+    pub m_cost: u32,
+    pub t_cost: u32,
+    pub p_cost: u32,
+}
+
+/// Production unlock parameters.
+pub const PROD_KDF_PARAMS: KdfParams = KdfParams {
+    m_cost: 262_144,
+    t_cost: 3,
+    p_cost: 1,
+};
+
+pub struct KeyEnvelope {
+    kek: Zeroizing<[u8; 32]>,
+}
+
+impl KeyEnvelope {
+    /// Derive the KEK from the passphrase with the stored salt + params.
+    /// Deterministic per (passphrase, salt, params) — the envelope's own
+    /// salt means every write re-randomizes.
+    pub fn derive_kek(
+        passphrase: &str,
+        salt: &[u8],
+        params: KdfParams,
+    ) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+        use argon2::{Algorithm, Argon2, Params, Version};
+        let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+            .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
+        let mut kek = Zeroizing::new([0u8; 32]);
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
+            .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut())
+            .map_err(|e| CoreError::Crypto(format!("the master-key derivation failed: {e}")))?;
+        Ok(kek)
+    }
+
+    /// Write a sealed envelope file for `plaintext` under the passphrase:
+    /// a fresh OS-entropy salt, the derivation, and a crash-atomic 0600
+    /// write of the JSON form (version, KDF parameters, salt, nonce,
+    /// ciphertext — the plaintext's bytes appear NOWHERE in the file).
+    pub fn write_envelope(
+        path: &Path,
+        passphrase: &str,
+        plaintext: &[u8],
+        params: KdfParams,
+    ) -> Result<(), CoreError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let mut salt = [0u8; 16];
+        SysRng.try_fill_bytes(&mut salt).map_err(|e| {
+            CoreError::Crypto(format!("os entropy unavailable for the envelope salt: {e}"))
+        })?;
+        let kek = Self::derive_kek(passphrase, &salt, params)?;
+        let (ciphertext, nonce) = seal_bytes(&kek, plaintext)?;
+        let envelope = serde_json::json!({
+            "version": ENVELOPE_VERSION,
+            "kdf": "argon2id",
+            "m_cost": params.m_cost,
+            "t_cost": params.t_cost,
+            "p_cost": params.p_cost,
+            "salt": B64.encode(salt),
+            "nonce": B64.encode(nonce),
+            "ciphertext": B64.encode(ciphertext),
+        });
+        write_private(path, envelope.to_string().as_bytes())
+    }
+
+    /// Open an envelope file with the passphrase: derive from the file's
+    /// stored salt/params and AEAD-open — a wrong passphrase is a typed
+    /// crypto failure, never partial output.
+    pub fn open_envelope(path: &Path, passphrase: &str) -> Result<Zeroizing<Vec<u8>>, CoreError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let raw = fs::read(path)
+            .map_err(|e| CoreError::Config(format!("key envelope {}: {e}", path.display())))?;
+        let envelope: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| CoreError::Crypto("key envelope is not valid JSON".to_string()))?;
+        if envelope["version"].as_u64() != Some(u64::from(ENVELOPE_VERSION))
+            || envelope["kdf"].as_str() != Some("argon2id")
+        {
+            return Err(CoreError::Crypto(format!(
+                "key envelope {} has an unsupported version or KDF",
+                path.display()
+            )));
+        }
+        let params_missing = || CoreError::Crypto("key envelope lacks KDF parameters".to_string());
+        let m_cost = envelope["m_cost"].as_u64().ok_or_else(params_missing)? as u32;
+        let t_cost = envelope["t_cost"].as_u64().ok_or_else(params_missing)? as u32;
+        let p_cost = envelope["p_cost"].as_u64().ok_or_else(params_missing)? as u32;
+        let salt = B64
+            .decode(envelope["salt"].as_str().ok_or_else(params_missing)?)
+            .map_err(|_| CoreError::Crypto("key envelope salt is not base64".to_string()))?;
+        let nonce = B64
+            .decode(envelope["nonce"].as_str().ok_or_else(params_missing)?)
+            .map_err(|_| CoreError::Crypto("key envelope nonce is not base64".to_string()))?;
+        let ciphertext = B64
+            .decode(envelope["ciphertext"].as_str().ok_or_else(params_missing)?)
+            .map_err(|_| CoreError::Crypto("key envelope ciphertext is not base64".to_string()))?;
+        let kek = Self::derive_kek(
+            passphrase,
+            &salt,
+            KdfParams {
+                m_cost,
+                t_cost,
+                p_cost,
+            },
+        )?;
+        open_bytes(&kek, &nonce, &ciphertext)
+    }
+
+    /// The KEK as a 32-byte secret-encryption key: the SecretBox consumer
+    /// (TOTP/OIDC seals) takes custody of it at unlock and zeroizes on
+    /// drop.
+    pub fn secrets(&self) -> Zeroizing<[u8; 32]> {
+        self.kek.clone()
+    }
+}
+
+/// AEAD-seal bytes under a KEK (fresh entropy nonce; the tag appended).
+fn seal_bytes(
+    kek: &Zeroizing<[u8; 32]>,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+    let cipher = cipher_for(&kek)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    SysRng.try_fill_bytes(&mut nonce).map_err(|e| {
+        CoreError::Crypto(format!("os entropy unavailable for the AEAD nonce: {e}"))
+    })?;
+    let ciphertext = cipher
+        .encrypt(&XNonce::from(nonce), plaintext)
+        .map_err(|_| CoreError::Crypto("envelope sealing failed".to_string()))?;
+    Ok((ciphertext, nonce.to_vec()))
+}
+
+/// AEAD-open bytes under a KEK; the plaintext is zeroized on drop.
+fn open_bytes(
+    kek: &Zeroizing<[u8; 32]>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CoreError> {
+    let cipher = cipher_for(&kek)?;
+    let nonce = XNonce::try_from(nonce).map_err(|_| {
+        CoreError::Crypto(format!("AEAD nonce must be {NONCE_LEN} bytes").to_string())
+    })?;
+    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
+        CoreError::Crypto("the master passphrase is wrong or the envelope is damaged".to_string())
+    })?;
+    Ok(Zeroizing::new(plaintext))
+}

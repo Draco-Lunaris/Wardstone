@@ -18,6 +18,14 @@ zeroize = { workspace = true }
 # SysRng, the house pattern).
 rand = { workspace = true }
 # jsonb decode/encode for the audit_log details column (migration 003).
+# The master-passphrase KEK derivation (KeyEnvelope): argon2id is the
+# memory-hard KDF that makes off-box brute force against the sealed
+# envelopes meet the unlock-latency budget (~1 s at the shipped params).
+# Workspace pin; the same argon2 ws-auth uses for credentials.
+argon2 = { workspace = true }
+# The envelope file format carries base64 (standard) fields — the same
+# encoding idiom as the keystore envelope's JSON.
+base64 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

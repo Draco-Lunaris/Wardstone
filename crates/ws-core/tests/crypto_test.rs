@@ -1,112 +1,96 @@
-//! The secret-encryption helper: seal/open round-trip, tamper detection,
-//! key-file creation/loading, and the key file's mode (Plan 2 Task 2).
+//! KeyEnvelope tests: the operator master passphrase derives a KEK that
+//! seals sensitive files as inert ciphertext envelopes. No database — pure
+//! crypto + temp files.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ws_core::crypto::SecretBox;
+use ws_core::crypto::KeyEnvelope;
 use ws_core::error::CoreError;
 
-/// Per-test temp dir under `std::env::temp_dir()`, unique per test name and
-/// process id, with any previous run's leftovers swept away first.
-fn temp_dir(test_name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("ws-core-crypto-{test_name}-{}", std::process::id()));
+/// Low-cost KDF params: the production unlock targets ~1 s (argon2id with
+/// heavy memory); the tests assert the crypto, not the wall clock.
+fn cheap_params() -> ws_core::crypto::KdfParams {
+    ws_core::crypto::KdfParams {
+        m_cost: 8192,
+        t_cost: 2,
+        p_cost: 1,
+    }
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ws-core-envelope-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("temp dir create");
-    dir
+    fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{name}.envelope"))
 }
 
 #[test]
-fn seal_then_open_round_trips() {
-    let dir = temp_dir("roundtrip");
-    let key_path = dir.join("secret-encryption.key");
-    let secrets = SecretBox::create(&key_path).expect("create");
+fn envelope_roundtrip_opens_with_the_right_passphrase_only() {
+    let path = temp_path("roundtrip");
+    let plaintext = b"the-ca-master-key-bytes";
 
-    let (ciphertext, nonce) = secrets.seal(b"totp secret").expect("seal");
-    let plaintext = secrets.open(&ciphertext, &nonce).expect("open");
-    assert_eq!(plaintext.as_slice(), b"totp secret");
+    KeyEnvelope::write_envelope(
+        &path,
+        "a-long-correct-passphrase",
+        plaintext,
+        cheap_params(),
+    )
+    .expect("seal the envelope");
+
+    // The file carries NO plaintext: the sensitive bytes are absent from
+    // the on-disk form.
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains("the-ca-master-key-bytes"),
+        "the envelope file must not contain the plaintext"
+    );
+    assert!(raw.contains("\"ciphertext\""), "the envelope is structured");
+
+    // The right passphrase opens; a wrong one is a typed failure.
+    let opened = KeyEnvelope::open_envelope(&path, "a-long-correct-passphrase")
+        .expect("the right passphrase opens the envelope");
+    assert_eq!(&*opened, plaintext);
+
+    let err = KeyEnvelope::open_envelope(&path, "a-long-wrong-passphrase").unwrap_err();
+    assert!(
+        matches!(err, CoreError::Crypto(_)),
+        "a wrong passphrase is a typed crypto failure, got {err:?}"
+    );
 }
 
 #[test]
-fn tampered_ciphertext_is_a_typed_error() {
-    let dir = temp_dir("tamper");
-    let key_path = dir.join("secret-encryption.key");
-    let secrets = SecretBox::create(&key_path).expect("create");
+fn envelope_salts_are_fresh_per_write() {
+    let a = temp_path("salt-a");
+    let b = temp_path("salt-b");
+    KeyEnvelope::write_envelope(&a, "same-passphrase", b"same-bytes", cheap_params()).unwrap();
+    KeyEnvelope::write_envelope(&b, "same-passphrase", b"same-bytes", cheap_params()).unwrap();
 
-    let (mut ciphertext, nonce) = secrets.seal(b"sensitive").expect("seal");
-    ciphertext[0] ^= 0xff;
-    match secrets.open(&ciphertext, &nonce) {
-        Err(err) => assert!(matches!(err, CoreError::Crypto(_)), "got {err:?}"),
-        Ok(plaintext) => panic!("tampered ciphertext decrypted to {plaintext:?}"),
-    }
-
-    // A ciphertext under the wrong key has the same failure: a fresh
-    // key file decrypts nothing sealed by the original.
-    let other_path = dir.join("other.key");
-    let other = SecretBox::create(&other_path).expect("create other");
-    let (ciphertext, nonce) = secrets.seal(b"sensitive").expect("seal");
-    assert!(matches!(
-        other.open(&ciphertext, &nonce),
-        Err(CoreError::Crypto(_))
-    ));
+    let raw_a = fs::read_to_string(&a).unwrap();
+    let raw_b = fs::read_to_string(&b).unwrap();
+    assert_ne!(
+        raw_a, raw_b,
+        "two envelopes of the same plaintext must differ (fresh salt + nonce)"
+    );
 }
 
 #[test]
-fn create_then_load_round_trips_through_the_same_key() {
-    let dir = temp_dir("create_load");
-    let key_path = dir.join("secret-encryption.key");
-
-    let created = SecretBox::create(&key_path).expect("create");
-    let loaded = SecretBox::load(&key_path).expect("load");
-
-    // Whatever `create` sealed, `load` must be able to open: the two
-    // instances carry the very same key file's bytes.
-    let (ciphertext, nonce) = created.seal(b"shared key").expect("seal");
-    let plaintext = loaded.open(&ciphertext, &nonce).expect("open");
-    assert_eq!(plaintext.as_slice(), b"shared key");
+fn envelope_open_is_in_memory_only() {
+    let path = temp_path("zeroize");
+    KeyEnvelope::write_envelope(&path, "another-passphrase", b"payload", cheap_params()).unwrap();
+    let opened = KeyEnvelope::open_envelope(&path, "another-passphrase")
+        .expect("the right passphrase opens");
+    assert_eq!(&*opened, b"payload");
 }
 
 #[test]
-fn create_on_an_existing_key_file_reuses_it() {
-    let dir = temp_dir("reuse");
-    let key_path = dir.join("secret-encryption.key");
-
-    let first = SecretBox::create(&key_path).expect("create");
-    let again = SecretBox::create(&key_path).expect("create again");
-
-    // A second `create` must not mint a different key over the existing
-    // file: data sealed before the call stays decryptable.
-    let (ciphertext, nonce) = first.seal(b"before the second create").expect("seal");
-    let plaintext = again.open(&ciphertext, &nonce).expect("open");
-    assert_eq!(plaintext.as_slice(), b"before the second create");
-}
-
-#[test]
-fn key_file_mode_is_0600() {
-    let dir = temp_dir("mode");
-    let key_path = dir.join("secret-encryption.key");
-    SecretBox::create(&key_path).expect("create");
-
-    let mode = fs::metadata(&key_path)
-        .expect("key file exists")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600, "key file must be owner-only");
-}
-
-#[test]
-fn load_rejects_a_short_key_file() {
-    let dir = temp_dir("short");
-    let key_path = dir.join("secret-encryption.key");
-    fs::write(&key_path, [0u8; 16]).expect("write short key");
-
-    match SecretBox::load(&key_path) {
-        Err(err) => assert!(
-            matches!(err, CoreError::Config(_)),
-            "short key file must be a config error, got {err:?}"
-        ),
-        Ok(_) => panic!("a 16-byte key file must not load"),
-    }
+fn kek_derive_is_deterministic_per_salt_and_params() {
+    let a =
+        KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params()).unwrap();
+    let b =
+        KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params()).unwrap();
+    let c =
+        KeyEnvelope::derive_kek("passphrase-2", b"salt-salt-salt-salt", cheap_params()).unwrap();
+    assert_eq!(&*a, &*b, "same passphrase+salt+params derive the same KEK");
+    assert_ne!(&*a, &*c, "a different passphrase derives a different KEK");
 }
