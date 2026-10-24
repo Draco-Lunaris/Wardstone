@@ -136,6 +136,19 @@ The browser POSTs `{passphrase}` to `POST /unlock` on the ui:
    operator-driven already, and each unlock retires any credential that
    leaked since the previous one — including the compose bootstrap, which
    the first unlock thereby retires as dead weight).
+7. **Changing the master passphrase** (owner direction: rotation cadence
+   is user-managed, on demand): an authenticated, capability-gated route
+   accepts `{current, next}`. It verifies `current` by opening the master
+   envelope under the present KEK, derives the new KEK from `next` with a
+   fresh salt, and re-wraps **every** envelope (a crash-atomic sequence:
+   each file atomic, the params file replaced last, and a **generation
+   counter** per envelope so a partially-completed change is detected and
+   its completion re-offered at the next unlock — the entry of `current`
+   plus `next` again). Both generations stay openable during the mixed
+   window by trying the entered passphrase against each envelope's own
+   recorded salt; nothing becomes a silent public state. The route lives
+   in the unlocked UI's admin section; wrong `current` = the house typed
+   failure, no hint beyond that. Cadence: entirely the operator's.
 
 **Failure postures** (all loud, house style): wrong passphrase → unlock
 page re-renders with a typed error and no hint of *why* beyond that; KMS…
@@ -198,6 +211,12 @@ envelope's rotated password now dead): stop the stack, delete
 `db-credential.envelope` from the keys volume, set a fresh
 `WARDSTONE_DB_PASSWORD`, boot — the unlock flow re-seeds through the
 identical first-install path. The docs carry exactly this runbook.
+
+- **Passphrase change**: the route requires `current` + `next`; wrong
+  current is a typed failure; a completed change re-wraps every envelope
+  and the NEXT unlock uses only the new passphrase; a simulated crash
+  mid-change surfaces the incomplete-generation state at the next unlock
+  and the completion flow works (DB-gated where envelopes touch files).
 
 ## 9. Tests (TDD; each red watched)
 

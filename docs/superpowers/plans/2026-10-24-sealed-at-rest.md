@@ -88,6 +88,16 @@ unlock/init pages, the api answers `503 sealed`; the unlock POST (GCRA-limited) 
 - [ ] Red: harness tests — wrong passphrase flips nothing (typed error); correct flips both (the loopback relay covered); the relay nonce binds the one POST; DB-gated: rotation alters + re-seals + the old password stops connecting.
 - [ ] Green. Commit: `feat: the unlock handshake — derive, open, relay, rotate`
 
+### Task 4b: the master-passphrase change route (operator-managed rotation)
+
+**Files:**
+- Modify: `crates/ws-api/src/routes/mod.rs` + a `master_key.rs` route — `POST /api/v1/master-key {current, next}`, `ManageSystem`-gated, audited (`master_key_changed` — the audit row carries NO passphrases).
+- Modify: the envelope layer (Task 1) — a `generation` field per envelope; the change sequence: verify `current` → derive the new KEK (fresh salt) → re-wrap every envelope, each write atomic → the params record replaced last. The mixed-state recovery per spec §5.7 (the next unlock offers completion when the generation counter is off).
+- Modify: the ui admin surface — the SPA gains the change form (an authenticated admin section entry; the `unlocked` state carries the flag).
+
+- [ ] Red: wrong `current` = typed failure (nothing re-wrapped); happy path re-wraps all + the next unlock uses only `next`; a simulated mid-change crash (partial re-wrap) leaves the mixed state detected at unlock and completable. Watch each fail first.
+- [ ] Green. Commit: `feat: the master-passphrase change route (user-managed rotation)`
+
 ### Task 5: conversion + docs alignment + whole gates
 
 **Files:**
