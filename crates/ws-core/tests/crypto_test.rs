@@ -85,12 +85,15 @@ fn envelope_open_is_in_memory_only() {
 
 #[test]
 fn kek_derive_is_deterministic_per_salt_and_params() {
-    let a =
-        KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params()).unwrap();
-    let b =
-        KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params()).unwrap();
-    let c =
-        KeyEnvelope::derive_kek("passphrase-2", b"salt-salt-salt-salt", cheap_params()).unwrap();
+    let a = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
+        .unwrap()
+        .into_kek();
+    let b = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
+        .unwrap()
+        .into_kek();
+    let c = KeyEnvelope::derive_kek("passphrase-2", b"salt-salt-salt-salt", cheap_params())
+        .unwrap()
+        .into_kek();
     assert_eq!(&*a, &*b, "same passphrase+salt+params derive the same KEK");
     assert_ne!(&*a, &*c, "a different passphrase derives a different KEK");
 }

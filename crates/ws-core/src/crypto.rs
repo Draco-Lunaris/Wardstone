@@ -74,6 +74,13 @@ impl SecretBox {
         Ok(SecretBox { key })
     }
 
+    /// Construct from an ALREADY-UNWRAPPED key (the sealed-at-rest unlock
+    /// flow: the SecretBox key comes from its envelope under the operator
+    /// passphrase-KEK and lives zeroized in RAM).
+    pub fn from_key(key: Zeroizing<[u8; KEY_LEN]>) -> Self {
+        SecretBox { key }
+    }
+
     /// Guarantee a secret-encryption key exists: if the file is present,
     /// load and validate it (a second `create` must never mint a different
     /// key over data already sealed with the first); if it is absent,
@@ -244,17 +251,15 @@ pub const PROD_KDF_PARAMS: KdfParams = KdfParams {
 
 pub struct KeyEnvelope {
     kek: Zeroizing<[u8; 32]>,
+    salt: Vec<u8>,
+    params: KdfParams,
 }
 
 impl KeyEnvelope {
     /// Derive the KEK from the passphrase with the stored salt + params.
     /// Deterministic per (passphrase, salt, params) — the envelope's own
     /// salt means every write re-randomizes.
-    pub fn derive_kek(
-        passphrase: &str,
-        salt: &[u8],
-        params: KdfParams,
-    ) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+    pub fn derive_kek(passphrase: &str, salt: &[u8], params: KdfParams) -> Result<Self, CoreError> {
         use argon2::{Algorithm, Argon2, Params, Version};
         let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
             .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
@@ -262,7 +267,24 @@ impl KeyEnvelope {
         Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
             .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut())
             .map_err(|e| CoreError::Crypto(format!("the master-key derivation failed: {e}")))?;
-        Ok(kek)
+        Ok(Self {
+            kek,
+            salt: salt.to_vec(),
+            params,
+        })
+    }
+
+    /// The envelope's recorded salt: the unlock re-derivation reads it from
+    /// the envelope file itself; held here for wrap/unwrap callers.
+    pub fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+
+    /// The envelope's recorded KDF parameters: the passphrase-change flow
+    /// (Task 4b, the master-key rotation) re-wraps every envelope with the
+    /// SAME parameters but a fresh salt under the new passphrase.
+    pub fn params(&self) -> KdfParams {
+        self.params
     }
 
     /// Write a sealed envelope file for `plaintext` under the passphrase:
@@ -282,7 +304,7 @@ impl KeyEnvelope {
             CoreError::Crypto(format!("os entropy unavailable for the envelope salt: {e}"))
         })?;
         let kek = Self::derive_kek(passphrase, &salt, params)?;
-        let (ciphertext, nonce) = seal_bytes(&kek, plaintext)?;
+        let (ciphertext, nonce) = seal_bytes(&kek.kek, plaintext)?;
         let envelope = serde_json::json!({
             "version": ENVELOPE_VERSION,
             "kdf": "argon2id",
@@ -336,7 +358,7 @@ impl KeyEnvelope {
                 p_cost,
             },
         )?;
-        open_bytes(&kek, &nonce, &ciphertext)
+        open_bytes(&kek.kek, &nonce, &ciphertext)
     }
 
     /// The KEK as a 32-byte secret-encryption key: the SecretBox consumer
@@ -344,6 +366,12 @@ impl KeyEnvelope {
     /// drop.
     pub fn secrets(&self) -> Zeroizing<[u8; 32]> {
         self.kek.clone()
+    }
+
+    /// The KEK as its raw 32 bytes (for callers that re-wrap it into their
+    /// own custody handling, e.g. the keystore conversion).
+    pub fn into_kek(self) -> Zeroizing<[u8; 32]> {
+        self.kek
     }
 }
 

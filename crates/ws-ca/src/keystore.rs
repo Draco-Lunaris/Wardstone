@@ -94,9 +94,27 @@ struct Envelope {
     key_type: String,
 }
 
-/// The keys directory: owns the master KEK file and every CA key envelope.
+/// The keys directory: owns the master KEK and every CA key envelope.
 pub struct KeyStore {
     dir: PathBuf,
+    /// Master-key custody: `Sealed` while the operator has not unlocked,
+    /// the unlocked master (RAM-only) after the unlock handshake, or the
+    /// legacy file-read mode for volumes created before the sealed
+    /// design. Key operations answer [`CaError::Sealed`] while sealed.
+    master: MasterCustody,
+}
+
+/// Where the master key currently lives for THIS keystore handle.
+#[derive(Clone)]
+enum MasterCustody {
+    /// No master key is available in RAM: key operations refuse.
+    Sealed,
+    /// The legacy file-read mode: `master.key` exists as plaintext and is
+    /// read per operation (pre-sealing stores; the conversion migrates
+    /// away from it).
+    LegacyFile,
+    /// The unlocked master key, held zeroized in RAM.
+    Unlocked(Zeroizing<[u8; 32]>),
 }
 
 impl KeyStore {
@@ -127,6 +145,24 @@ impl KeyStore {
     /// warning: continuing with a permissive directory would hand the
     /// master KEK to every local user.
     pub fn open(dir: &Path) -> Result<Self, CaError> {
+        Self::with_mode(dir, MasterCustody::LegacyFile)
+    }
+
+    /// Open with NO master key in memory: every key operation answers
+    /// [`CaError::Sealed`] until an unlock supplies the master
+    /// ([`Self::open_unlocked`]).
+    pub fn open_sealed(dir: &Path) -> Result<Self, CaError> {
+        Self::with_mode(dir, MasterCustody::Sealed)
+    }
+
+    /// Open with the unlocked master key held zeroized in RAM (the
+    /// unlocked-at-rest design: the envelope was opened at the unlock
+    /// handshake; no master file is read here).
+    pub fn open_unlocked(dir: &Path, master: Zeroizing<[u8; 32]>) -> Result<Self, CaError> {
+        Self::with_mode(dir, MasterCustody::Unlocked(master))
+    }
+
+    fn with_mode(dir: &Path, master: MasterCustody) -> Result<Self, CaError> {
         if !dir.exists() {
             fs::create_dir_all(dir)?;
             #[cfg(unix)]
@@ -151,9 +187,19 @@ impl KeyStore {
                 set_permissions(&ca_dir, 0o700)?;
             }
         }
-        Ok(KeyStore {
+        let mut keystore = KeyStore {
             dir: dir.to_path_buf(),
-        })
+            master: MasterCustody::Sealed, // replaced by the caller's mode below
+        };
+        keystore.master = master;
+        Ok(keystore)
+    }
+
+    /// The master key bytes as currently held (the legacy file read, the
+    /// RAM custody, or a `Sealed` error for the locked state) — the test
+    /// pins that the unlocked-from-envelope bytes match the legacy ones.
+    pub fn master_key_bytes(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, CaError> {
+        self.read_master_key()
     }
 
     /// Path of the master KEK file (`<dir>/master.key`).
@@ -221,6 +267,9 @@ impl KeyStore {
         aad: &str,
         der_private_key: &[u8],
     ) -> Result<(), CaError> {
+        if matches!(self.master, MasterCustody::Sealed) {
+            return Err(CaError::Sealed);
+        }
         let kek = self.read_master_key()?;
         let wrap = cipher_for(kek.as_slice())?;
 
@@ -288,6 +337,13 @@ impl KeyStore {
     /// [`load_ca_key`](Self::load_ca_key) and
     /// [`load_setup_key`](Self::load_setup_key) alike.
     fn load_envelope(&self, path: &Path, aad: &str) -> Result<Zeroizing<Vec<u8>>, CaError> {
+        // Fail-closed BEFORE reading any envelope file: a sealed store
+        // refuses without disclosing whether the file even exists (the
+        // NotFound-vs-Sealed distinction would leak existence to a sealed
+        // caller).
+        if matches!(self.master, MasterCustody::Sealed) {
+            return Err(CaError::Sealed);
+        }
         let raw = match fs::read(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(CaError::NotFound),
@@ -381,6 +437,16 @@ impl KeyStore {
     /// called from operations that require a master key to exist, so
     /// "absent" means the store is inconsistent, not empty.
     fn read_master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, CaError> {
+        match &self.master {
+            MasterCustody::Unlocked(kek) => Ok(kek.clone()),
+            MasterCustody::Sealed => Err(CaError::Sealed),
+            MasterCustody::LegacyFile => self.read_legacy_master_key(),
+        }
+    }
+
+    /// The pre-sealing custody mode: the master KEK read per operation
+    /// from the plaintext `master.key` file (0600).
+    fn read_legacy_master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, CaError> {
         let raw = match fs::read(self.master_key_path()) {
             Ok(raw) => Zeroizing::new(raw),
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(CaError::Corrupt),
