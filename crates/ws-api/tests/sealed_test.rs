@@ -22,7 +22,7 @@ fn full_router() -> Router {
 #[tokio::test]
 async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
     let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
-        |_: &ws_api::sealed::UnlockRequest| Ok(full_router()),
+        |_: &ws_api::sealed::UnlockRequest| Box::pin(async move { Ok(full_router()) }),
     )));
     let router = sealed_router(api);
 
@@ -71,7 +71,7 @@ async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
 #[tokio::test]
 async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
     let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
-        |_: &ws_api::sealed::UnlockRequest| Ok(full_router()),
+        |_: &ws_api::sealed::UnlockRequest| Box::pin(async move { Ok(full_router()) }),
     )));
     let router = sealed_router(api);
 
@@ -130,13 +130,16 @@ async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
 async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
     let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
         |req: &ws_api::sealed::UnlockRequest| {
-            if req.passphrase == "the-master-passphrase" {
-                Ok(full_router())
-            } else {
-                Err(ws_api::error::ApiError::Unauthorized(
-                    "the master passphrase was refused".to_string(),
-                ))
-            }
+            let ok = req.passphrase == "the-master-passphrase";
+            Box::pin(async move {
+                if ok {
+                    Ok(full_router())
+                } else {
+                    Err(ws_api::error::ApiError::Unauthorized(
+                        "the master passphrase was refused".to_string(),
+                    ))
+                }
+            })
         },
     )));
     let router = sealed_router(api);

@@ -19,7 +19,9 @@ fn full_router() -> Router {
 
 #[tokio::test]
 async fn the_locked_door_serves_unlock_healthz_and_503s_the_rest() {
-    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str| Ok(full_router()))));
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
     let router = locked_router(ui, "ca.example.test");
 
     let page = router
@@ -74,7 +76,9 @@ async fn the_locked_door_serves_unlock_healthz_and_503s_the_rest() {
 
 #[tokio::test]
 async fn the_unlock_resumes_the_full_router_in_place() {
-    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str| Ok(full_router()))));
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
     let router = locked_router(ui, "ca.example.test");
 
     let unlock = router
@@ -114,11 +118,14 @@ async fn the_unlock_resumes_the_full_router_in_place() {
 #[tokio::test]
 async fn a_refused_unlock_leaves_the_door_locked() {
     let ui = Arc::new(SealedUi::new(Arc::new(|passphrase: &str| {
-        if passphrase == "the-master-passphrase" {
-            Ok(full_router())
-        } else {
-            Err("wrong".to_string())
-        }
+        let passphrase = passphrase.to_string();
+        Box::pin(async move {
+            if passphrase == "the-master-passphrase" {
+                Ok(full_router())
+            } else {
+                Err("wrong".to_string())
+            }
+        })
     })));
     let router = locked_router(ui, "ca.example.test");
 
