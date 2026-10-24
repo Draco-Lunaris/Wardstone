@@ -14,9 +14,13 @@ Today the keys volume holds **two plaintext root secrets** (`master.key` and
 `secret-encryption.key`) beside every byte they protect. One copy of the
 volume is the whole CA. After this design:
 
-1. The keys volume holds **no plaintext key material at all** — every key
-   file becomes an envelope the runtime opens **through the custody
-   provider**.
+1. The keys volume holds **no plaintext CA-custody key material** — the
+   master KEK, the SecretBox key, and every envelope they open live behind
+   the custody provider. The ONE deliberate plaintext exception is the JWT
+   session key pair: it is re-keyable at operator discretion with a cost
+   of "every session logs out" (its documented recovery is deletion, not
+   custody), so it stays a plaintext file — the docs state the exception
+   and its reasoning instead of claiming more than is true.
 2. **Tier 1** (the recommended production default): the custody provider is
    an **external KMS of record** — the reference implementation is
    **Vault transit** (self-hosted, homelab-realistic, network-uniform for
@@ -95,8 +99,11 @@ pub trait MasterKeyProvider: Send + Sync {
   `/v1/transit/encrypt/{key}` (plaintext = base64(DEK)), `unwrap_dek`
   POSTs `/v1/transit/decrypt/{key}`; the KEK never enters the process.
   Vault's transit endpoint is bounded (key never exported; audit inside
-  Vault). The token is the deployer's Vault-side secret, TTL-managed
-  server-side.
+  Vault). Token lifetime contract: on any 401/403 the client re-reads
+  `WARDSTONE_KMS_TOKEN_FILE` ONCE and retries — the operator's renewal
+  action is rotating that file (a long-TTL token or operator-managed
+  rotation; AppRole and periodic re-auth are out of the complexity
+  budget). A SECOND consecutive failure is the hard failure of §4.5.
 - Construction lives in the binary boot: provider chosen by env
   (`WARDSTONE_KMS_URL` present ⇒ Tier 1; else Tier 0 with a logged
   boundary warning).
@@ -117,20 +124,33 @@ OIDC reseal).
 ### 4.3 Boot-rotated DB credentials
 
 - New keys-volume file `db-credential.envelope` (wrapped by the provider).
-- **Setup/first-boot** (human present, exactly once): if the envelope is
-  absent AND a `POSTGRES_PASSWORD`-bootstrap connection is available, the
-  ui process generates 32 random bytes as the new DB password, connects
-  with the bootstrap credential, `ALTER ROLE wardstone PASSWORD '<new>'`,
-  writes the envelope, and stores NOTHING else. The compose `.env`
+- **Setup/first-boot** (human present, exactly once): seeding belongs to
+  the ui — the only process alive while no tenant exists. Before the
+  bootstrap commits, if `db-credential.envelope` is absent, the ui
+  generates 32 random bytes, connects with the bootstrap credential
+  (`WARDSTONE_DB_PASSWORD`, the compose `:?` var — its only consumer
+  after the db container's own init), `ALTER ROLE wardstone PASSWORD
+  '<random>'`, writes the envelope, stores NOTHING else. An api booting
+  into a not-yet-seeded install falls back to READ-ONLY unwrap
+  (if-else): envelope present → unwrap; absent → hard failure naming the
+  missing envelope and the ui's seeding duty — the bootstrap password is
+  never a standing api credential in Tier 1 (no silent fallback). The compose `.env`
   `WARDSTONE_DB_PASSWORD` thereby becomes a **bootstrap-only** value the
   operator may rotate-delete after setup (docs say so).
-- **Every subsequent boot** (both modes): unwrap the envelope via the
-  provider, connect with it, and (option-flag
-  `WARDSTONE_DB_ROTATE_ON_BOOT`, default **on** for Tier 1) generate a
-  fresh credential, `ALTER ROLE` with the CURRENT connection (already
-  authenticated), re-wrap, rewrite the envelope, continue. A stolen DB
-  credential therefore dies at the next restart even if the envelope
-  leaked.
+- **Every boot, and only in the `api` process**: `wardstone api` is the
+  SOLE rotator. The `ui` process never rotates — its boot unwraps the
+  credential read-only (two processes re-writing the DB credential at
+  once would leave the loser holding a password that a concurrent
+  rotation had just killed). The rotation runs under a new WARDST-family
+  advisory lock (`0x0057_4144_5354_0016`) with the envelope RE-READ under
+  the lock, so an api restart overlapping a redeploy cannot double-rotate:
+  the winner's state is the loser's input. With
+  `WARDSTONE_DB_ROTATE_ON_BOOT` set: unwrap the current credential,
+  connect, generate a fresh in-memory password, `ALTER ROLE`, re-wrap,
+  rewrite the envelope, continue. A stolen DB credential therefore dies
+  at the next api restart even if the envelope leaked. The `ui`'s
+  credential handling is unwrap-only and rotation-idempotent (it re-reads
+  the envelope whenever its pool re-authenticates).
 - `DATABASE_URL` semantics: Tier 0 keeps today's embedded-password URL
   (with the boot envelope taking precedence when present — the rotation
   flow owns the password from then on). Tier 1: `DATABASE_URL` MUST be
@@ -145,8 +165,9 @@ OIDC reseal).
 |---|---|---|
 | `WARDSTONE_KMS_URL` | 1 | Vault base URL (transit namespace included) |
 | `WARDSTONE_KMS_KEY_NAME` | 1 | The transit key name wardstone may use |
-| `WARDSTONE_KMS_TOKEN_FILE` | 1 | 0600 Vault token file (default: `keys/kms-token`) |
-| `WARDSTONE_DB_ROTATE_ON_BOOT` | 1 | default on; opt-out for air-gapped testing |
+| `WARDSTONE_KMS_TOKEN_FILE` | 1 | 0600 Vault token file — REQUIRED, operator-provisioned **outside the keys volume** (no default path; see §5) |
+| `WARDSTONE_KMS_CA_FILE` | 1 | optional PEM CA bundle for the KMS connection (self-hosted Vault usually serves from a private CA); default = system roots. `insecure-skip-verify` is deliberately ABSENT |
+| `WARDSTONE_DB_ROTATE_ON_BOOT` | both, default **off** | the api's boot rotation; the Tier-1 bundled fragment sets it `true` explicitly; External-variant DBs opt in only once the role holds `ALTER` rights — a failing `ALTER` is a hard boot failure, so the docs make the grant a prerequisite |
 | `DATABASE_URL` | 0 | today's URL (password embedded); Tier 1 forbids the password |
 | `WARDSTONE_DB_PASSWORD` | compose/bootstrap | the one-time bundled-Postgres init password |
 | `WARDSTONE_KEYS_DIR` | both | unchanged |
@@ -198,13 +219,20 @@ restore from a Tier 0 backup; documented as such.
   TTL guidance) + the `seal-to-provider` upgrade runbook.
 - `README.md`: the custody paragraph goes tier-aware.
 - `.env.example` at the repo root (commented per tier).
+- `docker/compose.tier1.yml` — an OVERRIDE FRAGMENT, not a second bundle:
+  password-less `DATABASE_URL`, the KMS env block, `ROTATE_ON_BOOT=true`.
+  The bundled `db` healthcheck switches to `pg_isready` (auth-independent
+  — a rotated credential would otherwise fail the old `PGPASSWORD=`
+  healthcheck and churn restarts). The default compose stays Tier-0
+  shaped for the quickstart; the README's Tier 1 runbook composes with
+  `-f docker/compose.yml -f docker/compose.tier1.yml`.
 
 ## 5. The boundary ledger after this design
 
 | Tier | Boundaries between an attacker and A1 (CA keys) |
 |---|---|
 | 0 | keys-volume copy (ONE) |
-| 1 | the KMS (policy + authn + network egress), the envelope files, the token TTL — **plus** the fact that a keys-volume copy alone is inert: decryption now requires the KMS. Cluster-portable: any node with KMS reach + the envelopes is an instance |
+| 1 | the KMS (policy + authn + network egress), the envelope files, the token TTL — **and** the operator-provisioned token living OUTSIDE the keys volume: a keys-volume copy alone is inert (decryption requires the KMS, and the credential to reach it is not on that volume). Cluster-portable: any node with KMS reach + the envelopes + the token is an instance |
 | 2 (future) | hardware residency of the signing key itself |
 
 The residual risk stated for Tier 1: the deployer's Vault deployment and
