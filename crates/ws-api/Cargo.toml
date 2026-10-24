@@ -11,6 +11,9 @@ axum = { workspace = true }
 # Service/layer plumbing for the access-log middleware (request/response
 # bodies are never touched by it).
 tower = { workspace = true }
+# The sealed shells' async build closures return BoxFuture (the unlock
+# constructs pools + routers asynchronously).
+futures-util = { workspace = true }
 # Response headers (Cache-Control: no-store on the secret-bearing
 # responses) applied by the router itself.
 tower-http = { workspace = true }

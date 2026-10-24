@@ -43,7 +43,11 @@ pub struct SealedApi {
     build: LockedBuild,
 }
 
-pub type LockedBuild = Arc<dyn Fn(&UnlockRequest) -> Result<Router, ApiError> + Send + Sync>;
+pub type LockedBuild = Arc<
+    dyn Fn(&UnlockRequest) -> futures_util::future::BoxFuture<'static, Result<Router, ApiError>>
+        + Send
+        + Sync,
+>;
 
 impl SealedApi {
     /// Build the sealed shell around `build`: main's closure receives the
@@ -66,7 +70,7 @@ impl SealedApi {
     /// The ONE unlock: runs the build closure with the delivered
     /// passphrase and swaps the full router in. Idempotent failure-safe:
     /// a failed build changes NOTHING, and the next unlock retries.
-    pub fn unlock(&self, passphrase: &str) -> Result<(), ApiError> {
+    pub async fn unlock(&self, passphrase: &str) -> Result<(), ApiError> {
         if self.is_unlocked() {
             return Err(ApiError::Conflict(
                 "the instance is already unlocked".to_string(),
@@ -75,7 +79,7 @@ impl SealedApi {
         let request = UnlockRequest {
             passphrase: passphrase.to_string(),
         };
-        let router = (self.build)(&request)?;
+        let router = (self.build)(&request).await?;
         *self.router.write().map_err(|_poisoned| {
             ApiError::Internal("the sealed api state is corrupted".to_string())
         })? = Some(Arc::new(router));
@@ -118,7 +122,7 @@ async fn unlock_handler(
     State(sealed): State<Arc<SealedApi>>,
     Json(body): Json<UnlockBody>,
 ) -> Response {
-    match sealed.unlock(&body.passphrase) {
+    match sealed.unlock(&body.passphrase).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({ "state": "unlocked" })),

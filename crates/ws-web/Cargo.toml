@@ -84,6 +84,9 @@ ws-api = { path = "../ws-api" }
 # The sealed mode's delegate fallback implements tower::Service over the
 # late-bound full router (and the test suites drive it with oneshot).
 tower = { workspace = true }
+# The sealed shells' async build closures return BoxFuture (the unlock
+# constructs pools + routers asynchronously).
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # Parsing the minted setup certificate in the tests (self-signedness,

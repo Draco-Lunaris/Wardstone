@@ -29,7 +29,9 @@ pub struct SealedUi {
     build: LockedWebBuild,
 }
 
-pub type LockedWebBuild = Arc<dyn Fn(&str) -> Result<Router, String> + Send + Sync>;
+pub type LockedWebBuild = Arc<
+    dyn Fn(&str) -> futures_util::future::BoxFuture<'static, Result<Router, String>> + Send + Sync,
+>;
 
 impl SealedUi {
     pub fn new(build: LockedWebBuild) -> Self {
@@ -43,11 +45,11 @@ impl SealedUi {
         self.router.read().map(|r| r.is_some()).unwrap_or(false)
     }
 
-    fn unlock(&self, passphrase: &str) -> Result<(), String> {
+    pub async fn unlock(&self, passphrase: &str) -> Result<(), String> {
         if self.is_unlocked() {
             return Err("already_unlocked".to_string());
         }
-        let router = (self.build)(passphrase)?;
+        let router = (self.build)(passphrase).await?;
         *self
             .router
             .write()
@@ -99,7 +101,7 @@ struct UnlockBody {
 }
 
 async fn unlock_handler(State((ui, _)): State<UiState>, Json(body): Json<UnlockBody>) -> Response {
-    match ui.unlock(&body.passphrase) {
+    match ui.unlock(&body.passphrase).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
