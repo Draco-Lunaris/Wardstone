@@ -188,7 +188,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
                 .burst_size(limit.burst)
                 .finish()
             {
-                Some(config) => new_account.layer(GovernorLayer::new(Arc::new(config))),
+                Some(config) => new_account.layer(
+                    GovernorLayer::new(Arc::new(config))
+                        .error_handler(crate::rate_limit::house_error_handler()),
+                ),
                 None => {
                     tracing::error!(
                         per_millis = limit.per_millis,
@@ -371,7 +374,8 @@ async fn new_account(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/new-account", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let jws = ws_acme::verify_jws(
         raw,
@@ -545,7 +549,8 @@ async fn account_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/acct/{account_thumb}", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     // Pre-resolve the kid synchronously (the verifier's resolver is a sync
     // closure): peek the UNVERIFIED protected header, parse the kid URL —
@@ -741,7 +746,8 @@ async fn account_orders(
         "{base}/acme/{}/acct/{orders_account_thumb}/orders",
         tenant.name
     );
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -795,7 +801,8 @@ async fn key_change(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/key-change", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     // Pre-resolve the outer's kid (the OLD account URL) synchronously, the
     // same way the account route does: peek the UNVERIFIED protected
@@ -1079,7 +1086,8 @@ async fn new_order(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/new-order", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1275,7 +1283,8 @@ async fn order_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
     let order_id =
@@ -1493,7 +1502,8 @@ async fn finalize_order(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}/finalize", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1759,7 +1769,8 @@ async fn download_certificate(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/orders/{order_id}/certificate", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, _payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
@@ -1867,7 +1878,8 @@ async fn revoke_cert(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/revoke-cert", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     // The cert-key PoP decline (settlement D7) fires BEFORE the
     // JWS-verifying prelude: an embedded jwk names no account, so the
@@ -2070,7 +2082,8 @@ async fn authz_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/authz/{authz_id}", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, _) = authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
     let authz_id =
@@ -2304,7 +2317,8 @@ async fn challenge_url(
     let tenant = resolve_tenant(&state, &tenant_name).await?;
     let base = public_base(&state)?;
     let expected_url = format!("{base}/acme/{}/chall/{challenge_id}", tenant.name);
-    let raw = &flattened_to_compact(&as_str(&raw)?)?;
+    let raw = flattened_to_compact(as_str(&raw)?)?;
+    let raw = raw.as_str();
 
     let (account, payload) =
         authenticate_kid_account(&state, &tenant, &base, &expected_url, raw).await?;
