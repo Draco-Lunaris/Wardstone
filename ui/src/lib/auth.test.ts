@@ -24,6 +24,7 @@ const ME: MeResponse = {
   display_name: "Ada Admin",
   role: "admin",
   mfa_enabled: true,
+  sealed_volume: false,
 };
 
 const MFA_ENVELOPE = {

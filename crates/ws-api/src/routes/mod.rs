@@ -15,6 +15,7 @@ pub mod cas;
 pub mod certificates;
 pub mod credentials;
 pub mod health;
+pub mod master_key;
 pub mod oidc;
 pub mod profiles;
 pub mod root_trust;
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         )
         .nest("/one-shot-tokens", credentials::one_shot_tokens_router())
         .nest("/tenants", tenants::router())
+        .nest("/master-key", master_key::router())
         .nest("/root-trust", root_trust::router())
         .nest("/oidc", oidc::router())
         // The ACME rows' operator-visibility window (Plan 4 Task 10):

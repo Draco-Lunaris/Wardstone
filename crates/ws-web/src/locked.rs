@@ -30,7 +30,9 @@ pub struct SealedUi {
 }
 
 pub type LockedWebBuild = Arc<
-    dyn Fn(&str) -> futures_util::future::BoxFuture<'static, Result<Router, String>> + Send + Sync,
+    dyn Fn(&str, Option<&str>) -> futures_util::future::BoxFuture<'static, Result<Router, String>>
+        + Send
+        + Sync,
 >;
 
 impl SealedUi {
@@ -45,11 +47,19 @@ impl SealedUi {
         self.router.read().map(|r| r.is_some()).unwrap_or(false)
     }
 
-    pub async fn unlock(&self, passphrase: &str) -> Result<(), String> {
+    /// The ONE unlock: `passphrase` is the volume's current one;
+    /// `next_passphrase` is present only on the mixed-state completion
+    /// (spec §5.7 — the page re-offers the interrupted change, and the
+    /// build closure converges the volume before it opens it).
+    pub async fn unlock(
+        &self,
+        passphrase: &str,
+        next_passphrase: Option<&str>,
+    ) -> Result<(), String> {
         if self.is_unlocked() {
             return Err("already_unlocked".to_string());
         }
-        let router = (self.build)(passphrase).await?;
+        let router = (self.build)(passphrase, next_passphrase).await?;
         *self
             .router
             .write()
@@ -90,19 +100,20 @@ pub async fn relay_unlock(api_base_url: &str, passphrase: &str) -> Result<(), St
 /// the instance is sealed; the delegate hands over to the full
 /// `web_router` the moment the unlock succeeds (no restart, no re-listen
 /// — the `resume` contract).
-pub fn locked_router(ui: Arc<SealedUi>, hostname: &str) -> Router {
+pub fn locked_router(ui: Arc<SealedUi>, keys_dir: &std::path::Path, hostname: &str) -> Router {
     let hostname = hostname.to_owned();
+    let keys_dir = keys_dir.to_path_buf();
     Router::new()
         .route("/", get(unlock_page))
         .route("/healthz", get(healthz))
         .route("/unlock", post(unlock_handler))
-        .with_state((ui.clone(), hostname))
+        .with_state((ui.clone(), keys_dir, hostname))
         .fallback_service(SealedWebDelegate { ui })
 }
 
-type UiState = (Arc<SealedUi>, String);
+type UiState = (Arc<SealedUi>, std::path::PathBuf, String);
 
-async fn healthz(State((ui, _)): State<UiState>) -> Response {
+async fn healthz(State((ui, _, _)): State<UiState>) -> Response {
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -112,8 +123,15 @@ async fn healthz(State((ui, _)): State<UiState>) -> Response {
         .into_response()
 }
 
-async fn unlock_page(State((_, hostname)): State<UiState>) -> Response {
-    let html = render_unlock_page(&hostname);
+async fn unlock_page(State((_, keys_dir, hostname)): State<UiState>) -> Response {
+    // The completion probe (spec §5.7): a crashed passphrase change
+    // leaves the envelope generations disagreeing, and the page
+    // re-offers the completion. A volume the scan cannot read renders
+    // the plain form — the POST then names the real condition.
+    let mixed = ws_core::crypto::scan_volume(&keys_dir)
+        .map(|scan| scan.mixed)
+        .unwrap_or(false);
+    let html = render_unlock_page(&hostname, mixed);
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
@@ -125,10 +143,20 @@ async fn unlock_page(State((_, hostname)): State<UiState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct UnlockBody {
     passphrase: String,
+    /// Present only on the mixed-state completion (the page offers it
+    /// when the envelope generations disagree).
+    #[serde(default)]
+    next_passphrase: Option<String>,
 }
 
-async fn unlock_handler(State((ui, _)): State<UiState>, Json(body): Json<UnlockBody>) -> Response {
-    match ui.unlock(&body.passphrase).await {
+async fn unlock_handler(
+    State((ui, _, _)): State<UiState>,
+    Json(body): Json<UnlockBody>,
+) -> Response {
+    match ui
+        .unlock(&body.passphrase, body.next_passphrase.as_deref())
+        .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -142,6 +170,30 @@ async fn unlock_handler(State((ui, _)): State<UiState>, Json(body): Json<UnlockB
             Json(serde_json::json!({
                 "error": { "code": "already_unlocked",
                     "message": "the instance is already unlocked" }
+            })),
+        )
+            .into_response(),
+        // The completion refusals (the build closure's volume-state
+        // conditions): the relayed body is what the operator reads on
+        // the unlock page, and a mixed volume must say "completion" —
+        // never a misleading "passphrase was refused".
+        Err(code) if code == "completion_required" => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "completion_required",
+                    "message": "the volume holds an unfinished passphrase change: \
+                                the completion needs the current passphrase and \
+                                the new one together" }
+            })),
+        )
+            .into_response(),
+        Err(code) if code == "no_completion_pending" => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "no_completion_pending",
+                    "message": "no completion is pending on this volume: unlock \
+                                without the new passphrase (the admin surface \
+                                changes it once unlocked)" }
             })),
         )
             .into_response(),
@@ -204,8 +256,34 @@ fn sealed_503() -> Response {
 
 /// The unlock page: server-rendered HTML (the SPA is sealed away, so the
 /// locked mode cannot depend on it — the same reasoning the setup page
-/// uses). One field, one button, no JavaScript beyond the POST.
-fn render_unlock_page(hostname: &str) -> String {
+/// uses). One field, one button, no JavaScript beyond the POST — and on
+/// a mixed volume (the crashed change's aftermath, probed at render
+/// time) the completion re-offer: the new-passphrase field joins the
+/// form and the copy names the condition (spec §5.7).
+fn render_unlock_page(hostname: &str, mixed: bool) -> String {
+    let (lede, extra_field, payload) = if mixed {
+        (
+            "A passphrase change did not finish — the disks still hold \
+             envelopes sealed under both passphrases. Enter the current \
+             passphrase and the new one together to complete the change \
+             and unlock.",
+            concat!(
+                r#"<label for="next-passphrase">New passphrase</label>"#,
+                "\n",
+                r#"<input id="next-passphrase" type="password" autocomplete="off" required>"#,
+            ),
+            "JSON.stringify({ passphrase: document.getElementById('passphrase').value, \
+             next_passphrase: document.getElementById('next-passphrase').value })",
+        )
+    } else {
+        (
+            "Enter the master passphrase to unlock this instance. Everything \
+             on its disks is inert until you do — that is the design, not an \
+             outage.",
+            "",
+            "JSON.stringify({ passphrase: document.getElementById('passphrase').value })",
+        )
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -223,10 +301,10 @@ button {{ margin-top: 1rem; padding: 0.6rem 1.4rem; font-size: 1rem; }}
 </head>
 <body>
 <h1>{hostname} is sealed</h1>
-<p>Enter the master passphrase to unlock this instance. Everything on its
-disks is inert until you do — that is the design, not an outage.</p>
+<p>{lede}</p>
 <form id="unlock-form">
 <input id="passphrase" type="password" autocomplete="off" required>
+{extra_field}
 <button type="submit">Unlock</button>
 </form>
 <div id="result"></div>
@@ -238,7 +316,7 @@ document.getElementById('unlock-form').addEventListener('submit', async (event) 
     const response = await fetch('/unlock', {{
       method: 'POST',
       headers: {{ 'content-type': 'application/json' }},
-      body: JSON.stringify({{ passphrase: document.getElementById('passphrase').value }}),
+      body: {payload},
     }});
     if (response.ok) {{
       window.location = '/';
@@ -256,6 +334,9 @@ document.getElementById('unlock-form').addEventListener('submit', async (event) 
 </body>
 </html>
 "#,
-        hostname = hostname
+        hostname = hostname,
+        lede = lede,
+        extra_field = extra_field,
+        payload = payload,
     )
 }

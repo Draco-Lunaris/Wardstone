@@ -498,6 +498,14 @@ impl AppState {
         state
     }
 
+    /// Whether this state serves an unlocked sealed volume: the `me`
+    /// response carries it so the SPA can gate its admin surface's
+    /// passphrase-change entry (the legacy file-read mode is not a
+    /// sealed volume).
+    pub fn sealed_volume(&self) -> bool {
+        matches!(self.key_custody, KeyCustody::Unlocked(_))
+    }
+
     /// The keystore handle for a CA-key operation, in this state's
     /// custody mode: the legacy file-read open for a plaintext volume,
     /// the unlocked RAM custody for a sealed instance. Opened per

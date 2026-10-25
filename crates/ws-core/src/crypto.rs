@@ -241,13 +241,21 @@ fn key_io_err(path: &Path, e: std::io::Error) -> CoreError {
 /// A wrong passphrase fails AEAD authentication and surfaces as
 /// [`CoreError::Crypto`] — never garbage output; a missing/malformed
 /// envelope is [`CoreError::Config`] where the path is the issue.
-pub const ENVELOPE_VERSION: u32 = 1;
+///
+/// Version 2 adds the `generation` counter (Task 4b, the master-passphrase
+/// change): every envelope names the passphrase epoch it was sealed in,
+/// so a change that crashed mid-re-wrap is DETECTED (the generations
+/// disagree) and its completion re-offered at the next unlock. Version-1
+/// files predate the counter; there are none in the wild (the sealed
+/// format ships with this change), so they refuse loudly instead of
+/// silently defaulting.
+pub const ENVELOPE_VERSION: u32 = 2;
 
 /// The production KDF parameters: argon2id at 256 MiB / 3 passes targets
 /// the ~1 s unlock latency budget while making off-box brute force meet
 /// real cost. The parameters travel INSIDE each envelope, so a deployed
 /// tuning change does not strand old envelopes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
     pub m_cost: u32,
     pub t_cost: u32,
@@ -330,11 +338,14 @@ impl KeyEnvelope {
         &self.salt
     }
 
-    /// Read an envelope file's stored salt + KDF parameters WITHOUT
-    /// opening it: the unlock's derive step needs them before the
-    /// passphrase is known to be right (the derive itself is the check).
-    /// A missing file is [`CoreError::Config`] naming the path.
-    pub fn read_kdf_params(path: &Path) -> Result<(Vec<u8>, KdfParams), CoreError> {
+    /// Read an envelope file's stored salt, KDF parameters, and generation
+    /// WITHOUT opening it: the unlock's derive step and the mixed-state
+    /// detection need them before the passphrase is known to be right
+    /// (the derive itself is the check). A missing file is
+    /// [`CoreError::Config`] naming the path; a file without a generation
+    /// is malformed — the counter is load-bearing for the change flow,
+    /// never an optional annotation.
+    pub fn read_kdf_state(path: &Path) -> Result<(Vec<u8>, KdfParams, u64), CoreError> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine;
         let raw = fs::read(path)
@@ -348,6 +359,9 @@ impl KeyEnvelope {
         let m_cost = envelope["m_cost"].as_u64().ok_or_else(missing)? as u32;
         let t_cost = envelope["t_cost"].as_u64().ok_or_else(missing)? as u32;
         let p_cost = envelope["p_cost"].as_u64().ok_or_else(missing)? as u32;
+        let generation = envelope["generation"]
+            .as_u64()
+            .ok_or_else(|| CoreError::Crypto("key envelope lacks a generation".to_string()))?;
         Ok((
             salt,
             KdfParams {
@@ -355,7 +369,16 @@ impl KeyEnvelope {
                 t_cost,
                 p_cost,
             },
+            generation,
         ))
+    }
+
+    /// The envelope's recorded generation: the passphrase epoch it was
+    /// sealed in. The unlock reads the volume's generations to detect a
+    /// change that crashed mid-re-wrap (they disagree); the change flow
+    /// advances them all by one.
+    pub fn read_generation(path: &Path) -> Result<u64, CoreError> {
+        Ok(Self::read_kdf_state(path)?.2)
     }
 
     /// The envelope's recorded KDF parameters: the passphrase-change flow
@@ -367,13 +390,17 @@ impl KeyEnvelope {
 
     /// Write a sealed envelope file for `plaintext` under the passphrase:
     /// a fresh OS-entropy salt, the derivation, and a crash-atomic 0600
-    /// write of the JSON form (version, KDF parameters, salt, nonce,
-    /// ciphertext — the plaintext's bytes appear NOWHERE in the file).
+    /// write of the JSON form (version, KDF parameters, generation, salt,
+    /// nonce, ciphertext — the plaintext's bytes appear NOWHERE in the
+    /// file). The generation names the passphrase epoch (the conversion
+    /// seals at 0, every completed change advances it by one, and the
+    /// per-unlock rotation re-seals at the SAME generation it read).
     pub fn write_envelope(
         path: &Path,
         passphrase: &str,
         plaintext: &[u8],
         params: KdfParams,
+        generation: u64,
     ) -> Result<(), CoreError> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine;
@@ -386,6 +413,7 @@ impl KeyEnvelope {
         let envelope = serde_json::json!({
             "version": ENVELOPE_VERSION,
             "kdf": "argon2id",
+            "generation": generation,
             "m_cost": params.m_cost,
             "t_cost": params.t_cost,
             "p_cost": params.p_cost,
@@ -453,6 +481,84 @@ impl KeyEnvelope {
     }
 }
 
+/// Re-wrap a volume's envelopes under a new master passphrase: the ONE
+/// operation behind both the change route and the unlock page's
+/// mixed-state completion (spec §5.7).
+///
+/// The generation counter is the whole trick. Every envelope names the
+/// passphrase epoch it was sealed in; the MASTER envelope — written
+/// last, the anchor rule — is always the volume's oldest, so a change
+/// that crashed mid-re-wrap leaves the volume openable under the
+/// passphrase the operator has been using all along: each envelope at
+/// the master's generation opens under `current`, each already-advanced
+/// one opens under `next`, and the re-wrap brings them all to one
+/// generation under `next` — deterministically, whichever file the
+/// crash interrupted.
+///
+/// All-or-nothing on the PASSPHRASE (every envelope is opened before
+/// any is written: a wrong `current` re-wraps nothing); crash-atomic
+/// per FILE (the envelope write's tmp+fsync+rename), so an IO death
+/// mid-write leaves a completable mixed volume — the state this
+/// function's mixed-window arm exists to finish. The master envelope is
+/// written LAST, preserving the anchor rule for the next crash.
+///
+/// Returns the generation the volume now sits at (the master's old
+/// generation + 1).
+pub fn rewrap_volume(
+    dir: &Path,
+    files: &[&str],
+    current: &str,
+    next: &str,
+) -> Result<u64, CoreError> {
+    if !files.contains(&MASTER_ENVELOPE_FILE) {
+        return Err(CoreError::Config(format!(
+            "the re-wrap list omits {MASTER_ENVELOPE_FILE} — a volume cannot change its \
+             passphrase without its anchor envelope"
+        )));
+    }
+    let master_generation = KeyEnvelope::read_generation(&dir.join(MASTER_ENVELOPE_FILE))?;
+    // Open everything first: a wrong `current` (or a wrong `next` against
+    // the mixed window's advanced files) must re-wrap nothing.
+    let mut opened = Vec::with_capacity(files.len());
+    for file in files {
+        let path = dir.join(file);
+        let (_, params, generation) = KeyEnvelope::read_kdf_state(&path)?;
+        let passphrase = if generation == master_generation {
+            current
+        } else if generation == master_generation + 1 {
+            next
+        } else {
+            return Err(CoreError::Crypto(format!(
+                "key envelope {file} holds generation {generation} against the volume's \
+                 {master_generation} — the volume is inconsistent and cannot be re-wrapped"
+            )));
+        };
+        let plaintext = KeyEnvelope::open_envelope(&path, passphrase)?;
+        opened.push((*file, plaintext, params));
+    }
+    // Re-wrap under `next` at the advanced generation, master LAST.
+    let advanced = master_generation + 1;
+    for (file, plaintext, params) in opened
+        .iter()
+        .filter(|(file, _, _)| *file != MASTER_ENVELOPE_FILE)
+    {
+        KeyEnvelope::write_envelope(&dir.join(file), next, plaintext, *params, advanced)?;
+    }
+    if let Some((_, plaintext, params)) = opened
+        .iter()
+        .find(|(file, _, _)| *file == MASTER_ENVELOPE_FILE)
+    {
+        KeyEnvelope::write_envelope(
+            &dir.join(MASTER_ENVELOPE_FILE),
+            next,
+            plaintext,
+            *params,
+            advanced,
+        )?;
+    }
+    Ok(advanced)
+}
+
 /// AEAD-seal bytes under a KEK (fresh entropy nonce; the tag appended).
 fn seal_bytes(
     kek: &Zeroizing<[u8; 32]>,
@@ -483,4 +589,47 @@ fn open_bytes(
         CoreError::Crypto("the master passphrase is wrong or the envelope is damaged".to_string())
     })?;
     Ok(Zeroizing::new(plaintext))
+}
+
+/// A sealed volume's scan: which envelope files exist, and whether
+/// their generations disagree — the mixed state a crashed passphrase
+/// change leaves behind.
+#[derive(Debug)]
+pub struct VolumeScan {
+    /// The envelope files present on the volume, master first.
+    pub present: Vec<&'static str>,
+    /// Whether any present envelope's generation disagrees with the
+    /// master anchor's.
+    pub mixed: bool,
+}
+
+/// Scan a sealed volume for its state. The MASTER envelope is the
+/// anchor: its generation is the volume's passphrase epoch, and every
+/// other present envelope must agree with it. An ABSENT envelope (the
+/// JWT pair before the fresh install's first unlock) joins no
+/// disagreement. A volume that cannot be read — no master envelope, a
+/// damaged header, a v1 envelope that predates the generation field —
+/// fails the scan loudly rather than misreading as clean; the callers
+/// render their plain refusal surfaces and let the unlock name the
+/// real condition.
+pub fn scan_volume(dir: &Path) -> Result<VolumeScan, CoreError> {
+    let anchor = KeyEnvelope::read_generation(&dir.join(MASTER_ENVELOPE_FILE))?;
+    let mut present = Vec::new();
+    let mut mixed = false;
+    for file in [
+        MASTER_ENVELOPE_FILE,
+        SECRET_ENVELOPE_FILE,
+        DB_CREDENTIAL_ENVELOPE_FILE,
+        JWT_ENVELOPE_FILE,
+    ] {
+        let path = dir.join(file);
+        if !path.exists() {
+            continue; // an absent envelope is the fresh-install shape
+        }
+        if file != MASTER_ENVELOPE_FILE && KeyEnvelope::read_generation(&path)? != anchor {
+            mixed = true;
+        }
+        present.push(file);
+    }
+    Ok(VolumeScan { present, mixed })
 }

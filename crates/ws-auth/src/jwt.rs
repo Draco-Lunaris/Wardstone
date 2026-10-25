@@ -328,11 +328,14 @@ fn assert_pair_usable(
 /// Write BOTH PEMs as ONE sealed envelope (`jwt-keys.envelope`): the pair
 /// travels under the operator's KeyEnvelope and exists on disk ONLY as
 /// inert ciphertext. The legacy plaintext pair's re-key-by-deletion
-/// recovery becomes a post-unlock operator action.
+/// recovery becomes a post-unlock operator action. The `generation` is
+/// the volume's passphrase epoch (the conversion seals at 0; a changed
+/// passphrase re-wraps this envelope at epoch + 1 like every other).
 pub fn write_sealed(
     path: &Path,
     passphrase: &str,
     keys: &JwtKeys,
+    generation: u64,
 ) -> Result<(), crate::error::AuthError> {
     let combined = serde_json::json!({
         "signing": keys.signing_key_pem.as_str(),
@@ -344,6 +347,7 @@ pub fn write_sealed(
         passphrase,
         combined.as_bytes(),
         ws_core::crypto::PROD_KDF_PARAMS,
+        generation,
     )
     .map_err(|e| crate::error::AuthError::Crypto(format!("jwt key envelope: {e}")))
 }
@@ -398,9 +402,13 @@ pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::erro
 /// (nothing ever minted one), so the pair is BORN sealed — no plaintext
 /// file is ever written. The minted pair is proven usable before it is
 /// sealed (the same probe the plaintext loader runs on what it writes).
+/// The mint stamps the volume's `generation` (the unlock reads it from
+/// the master envelope first), so a mid-change crash leaves no envelope
+/// from a foreign epoch.
 pub fn load_or_create_sealed(
     path: &Path,
     passphrase: &str,
+    generation: u64,
 ) -> Result<JwtKeys, crate::error::AuthError> {
     if path.exists() {
         return load_sealed(path, passphrase);
@@ -427,7 +435,7 @@ pub fn load_or_create_sealed(
         verification_key_pem,
         ttl_secs: DEFAULT_ACCESS_TTL_SECS,
     };
-    write_sealed(path, passphrase, &keys)?;
+    write_sealed(path, passphrase, &keys, generation)?;
     Ok(keys)
 }
 

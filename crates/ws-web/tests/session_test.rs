@@ -483,6 +483,7 @@ async fn ui_login_sets_cookie_and_me() {
         "display_name",
         "role",
         "mfa_enabled",
+        "sealed_volume",
     ]
     .into_iter()
     .map(str::to_owned)

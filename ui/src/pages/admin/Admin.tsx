@@ -1,7 +1,10 @@
-// The admin section's wrapper: three tabs (SSO provider, profiles, users)
-// gated section-level on the capabilities each tab's routes demand. The
-// server is the real boundary everywhere — this gating only hides what
-// would 403, per the Shell's Task 15 polish lesson.
+// The admin section's wrapper: four tabs (SSO provider, profiles, users,
+// master passphrase) gated section-level on the capabilities each tab's
+// routes demand — and the passphrase tab additionally on
+// `me.sealed_volume`, since a plaintext legacy volume has no
+// passphrase to change. The server is the real boundary everywhere —
+// this gating only hides what would 403, per the Shell's Task 15
+// polish lesson.
 
 import { useState } from "react";
 
@@ -9,22 +12,34 @@ import { useAuthState } from "../../lib/auth";
 import { hasCapability } from "../../lib/certs";
 import AdminProfiles from "./adminProfiles";
 import AdminUsers from "./adminUsers";
+import MasterPassphrase from "./MasterPassphrase";
 import OidcConfig from "./OidcConfig";
 
-type TabKey = "oidc" | "profiles" | "users";
+type TabKey = "oidc" | "profiles" | "users" | "passphrase";
 
-const TABS: Array<{ key: TabKey; label: string; caps: string[] }> = [
+/** `sealed: true` names the one tab that additionally requires
+ * `me.sealed_volume` — the master-passphrase change form exists only on
+ * a volume that actually serves unlocked-from-envelopes. */
+const TABS: Array<{
+  key: TabKey;
+  label: string;
+  caps: string[];
+  sealed?: boolean;
+}> = [
   { key: "oidc", label: "SSO provider (OIDC)", caps: ["manage_system"] },
   { key: "profiles", label: "Profiles", caps: ["read_profiles", "manage_profiles"] },
   { key: "users", label: "Users", caps: ["read_users", "manage_users"] },
+  { key: "passphrase", label: "Master passphrase", caps: ["manage_system"], sealed: true },
 ];
 
 export default function Admin() {
   const auth = useAuthState();
   const [tabKey, setTabKey] = useState<TabKey | null>(null);
 
-  const visible = TABS.filter((tab) =>
-    tab.caps.some((capability) => hasCapability(auth.me?.capabilities, capability)),
+  const visible = TABS.filter(
+    (tab) =>
+      tab.caps.some((capability) => hasCapability(auth.me?.capabilities, capability)) &&
+      (!tab.sealed || auth.me?.sealed_volume === true),
   );
   const active = visible.find((tab) => tab.key === tabKey) ?? visible[0];
 
@@ -64,6 +79,7 @@ export default function Admin() {
       {active.key === "oidc" && <OidcConfig />}
       {active.key === "profiles" && <AdminProfiles />}
       {active.key === "users" && <AdminUsers />}
+      {active.key === "passphrase" && <MasterPassphrase />}
     </main>
   );
 }

@@ -40,6 +40,10 @@ export interface MeResponse {
   display_name: string | null;
   role: string | null;
   mfa_enabled: boolean | null;
+  /** Whether the serving state is an unlocked sealed volume: the admin
+   * section gates its master-passphrase change form on it (a plaintext
+   * legacy volume has no passphrase to change). */
+  sealed_volume: boolean;
 }
 
 /** `GET /auth/ui/config`'s body: whether SSO is configured for login, and

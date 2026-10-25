@@ -116,6 +116,7 @@ describe("Login", () => {
             display_name: "Ada",
             role: "admin",
             mfa_enabled: true,
+            sealed_volume: false,
           });
         }
         throw new Error(`no mock route for ${method} ${url}`);
@@ -191,6 +192,7 @@ describe("Login", () => {
             display_name: "Ada",
             role: "admin",
             mfa_enabled: true,
+            sealed_volume: false,
           });
         }
         throw new Error(`no mock route for ${method} ${url}`);

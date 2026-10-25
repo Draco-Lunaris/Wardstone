@@ -248,14 +248,16 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
     let dir = temp_keys_dir("jwt-sealed-fresh");
     let envelope = dir.join("jwt-keys.envelope");
 
-    let minted = ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase").unwrap();
+    let minted =
+        ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase", 0).unwrap();
     assert!(
         !dir.join("jwt-signing-key.pem").exists() && !dir.join("jwt-verify-key.pem").exists(),
         "a fresh sealed install never writes the pair as plaintext"
     );
     assert!(envelope.exists(), "the fresh pair is sealed on disk");
 
-    let reloaded = ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase").unwrap();
+    let reloaded =
+        ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase", 0).unwrap();
     assert_eq!(
         reloaded.signing_key_pem, minted.signing_key_pem,
         "the second load returns the minted pair, not a fresh one"
@@ -265,7 +267,7 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
         "the second load returns the minted pair, not a fresh one"
     );
 
-    let refused = ws_auth::jwt::load_or_create_sealed(&envelope, "wrong");
+    let refused = ws_auth::jwt::load_or_create_sealed(&envelope, "wrong", 0);
     assert!(
         refused.is_err(),
         "a wrong passphrase must not mint over or open the existing envelope"

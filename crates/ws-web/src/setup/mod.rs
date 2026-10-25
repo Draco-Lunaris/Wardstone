@@ -762,6 +762,7 @@ pub async fn seal_keys_volume(
         passphrase,
         &master,
         PROD_KDF_PARAMS,
+        0,
     )
     .map_err(|e| CaError::Worker(format!("the master envelope: {e}")))?;
     std::fs::remove_file(&master_path).map_err(CaError::Io)?;
@@ -775,6 +776,7 @@ pub async fn seal_keys_volume(
             passphrase,
             &secret,
             PROD_KDF_PARAMS,
+            0,
         )
         .map_err(|e| CaError::Worker(format!("the secret-encryption envelope: {e}")))?;
         std::fs::remove_file(&secret_path).map_err(CaError::Io)?;
@@ -799,6 +801,7 @@ pub async fn seal_keys_volume(
                 verification_key_pem: verification,
                 ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
             },
+            0,
         )
         .map_err(|e| CaError::Worker(format!("the jwt envelope: {e}")))?;
         let _ = combined;
@@ -841,6 +844,7 @@ pub async fn seal_keys_volume(
         passphrase,
         fresh.as_bytes(),
         PROD_KDF_PARAMS,
+        0,
     )
     .map_err(|e| CaError::Worker(format!("the db credential envelope: {e}")))?;
 

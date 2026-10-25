@@ -372,12 +372,14 @@ async fn spawn_sealed_api(fixture: &Fixture) -> String {
             let url = url.clone();
             let config = config.clone();
             let passphrase = req.passphrase.clone();
+            let next_passphrase = req.next_passphrase.clone();
             Box::pin(async move {
                 ws_api::sealed::unlocked_router_from_envelopes(
                     &keys_dir,
                     &url,
                     &config,
                     &passphrase,
+                    next_passphrase.as_deref(),
                 )
                 .await
             })
@@ -553,6 +555,7 @@ async fn ui_login_admin(web: &Router) -> (Uuid, String) {
         "display_name",
         "role",
         "mfa_enabled",
+        "sealed_volume",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -731,6 +734,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &fixture.keys_dir.join(ws_web::setup::JWT_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
+        0,
     )
     .expect("mint the JWT pair straight into its envelope");
     assert!(

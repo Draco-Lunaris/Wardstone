@@ -268,32 +268,112 @@ async fn bootstrap_credential_connects() -> bool {
 /// credential BEFORE any rotation), the held advisory-lock connection,
 /// and a fresh keys directory.
 struct Fixture {
-    pool: sqlx::PgPool,
-    #[allow(dead_code)] // held for the whole body: serializes this suite
+    /// The suite's advisory-lock connection — also the DEDICATED
+    /// pre-rotation connection the restore runs over (the pool may
+    /// need a fresh connection at exactly the moment the password is
+    /// rotated; this one survives the rotation).
     advisory: sqlx::pool::PoolConnection<sqlx::Postgres>,
     keys_dir: std::path::PathBuf,
+    /// Whether a restore already verifiably landed (Drop's net skips).
+    role_restored: bool,
+    /// The panic-safe restore net (the reference implementation is
+    /// ws-web's setup_test; the binding rules live in CLAUDE.md).
+    net: RestoreNet,
 }
 
 impl Fixture {
     /// Restore the shared login role's password over the
-    /// pre-rotation connection (established connections survive the
-    /// rotation), BEFORE any assertion can panic. Idempotent.
-    async fn restore_role_password(&self) {
+    /// pre-rotation advisory connection (established connections
+    /// survive the rotation), BEFORE any post-rotation read or
+    /// assertion can panic. Idempotent.
+    async fn restore_role_password(&mut self) {
         sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
-            .execute(&self.pool)
+            .execute(&mut *self.advisory)
             .await
             .expect("restore the shared test role's password");
+        self.role_restored = true;
     }
 
     /// Restore the role and remove the keys directory.
-    async fn cleanup(&self) {
+    async fn cleanup(&mut self) {
         self.restore_role_password().await;
         let _ = std::fs::remove_dir_all(&self.keys_dir);
     }
 }
 
+/// The panic-safe restore net's channels: Drop cannot await, so a
+/// worker thread (its own little runtime, its OWN connection made while
+/// the shared credential is still valid — sqlx connections are
+/// runtime-affine) performs the ALTER on request. The reference
+/// implementation is `ws-web tests/setup_test.rs`'s `RestoreNet`.
+struct RestoreNet {
+    /// "please restore" — sent from Drop.
+    request: std::sync::mpsc::Sender<()>,
+    /// The worker's reply once the ALTER landed (Drop waits on it).
+    reply: std::sync::mpsc::Receiver<()>,
+}
+
+/// Spawn the restore net's worker thread. The connection is created
+/// immediately (the shared credential is valid now); the worker then
+/// parks on the request channel until the fixture drops.
+fn spawn_restore_net(url: &str) -> RestoreNet {
+    let (request, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, reply) = std::sync::mpsc::channel::<()>();
+    let url = url.to_owned();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let connected: Result<sqlx::PgConnection, sqlx::Error> =
+            runtime.block_on(sqlx::Connection::connect(&url));
+        let mut conn = match connected {
+            Ok(conn) => conn,
+            Err(_) => return, // the net is dead; Drop's send no-ops
+        };
+        if rx.recv().is_err() {
+            return;
+        }
+        runtime.block_on(async {
+            let _ = sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+                .execute(&mut conn)
+                .await;
+        });
+        let _ = tx.send(());
+    });
+    RestoreNet { request, reply }
+}
+
+/// The panic-safe half of the self-cleaning contract: a test that
+/// unwinds between its rotation and `cleanup()` would otherwise leave
+/// the shared role rotated, and every later suite fails at its first
+/// connect with a misleading `28P01` (exactly how the 2026-10-25 RED
+/// run poisoned sealed_test's siblings: the consistent-volume
+/// completion test ran a FULL unlock through the inert threading,
+/// rotated, then panicked at its `.err().expect()` — the deferred
+/// minor this port retires). Idempotent, and skipped entirely when a
+/// restore already verifiably landed.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.keys_dir);
+        if self.role_restored {
+            return;
+        }
+        // The net is one-shot: the request IS the fixture's last word.
+        let _ = self.net.request.send(());
+        let _ = self
+            .net
+            .reply
+            .recv_timeout(std::time::Duration::from_secs(15));
+    }
+}
+
 async fn fixture() -> Fixture {
-    let pool = ws_core::db::connect(&database_url())
+    let url = database_url();
+    let net = spawn_restore_net(&url);
+    let pool = ws_core::db::connect(&url)
         .await
         .expect("connect should succeed and apply the embedded migrations");
     let mut conn = pool
@@ -312,9 +392,10 @@ async fn fixture() -> Fixture {
     ));
     std::fs::create_dir_all(&keys_dir).expect("create the keys directory");
     Fixture {
-        pool,
         advisory: conn,
         keys_dir,
+        role_restored: false,
+        net,
     }
 }
 
@@ -330,6 +411,7 @@ fn mint_sealed_volume(keys_dir: &std::path::Path, passphrase: &str) {
         passphrase,
         &master,
         ws_core::crypto::PROD_KDF_PARAMS,
+        0,
     )
     .expect("mint the master envelope");
     let secret = [9u8; 32];
@@ -338,6 +420,7 @@ fn mint_sealed_volume(keys_dir: &std::path::Path, passphrase: &str) {
         passphrase,
         &secret,
         ws_core::crypto::PROD_KDF_PARAMS,
+        0,
     )
     .expect("mint the secret-encryption envelope");
     ws_core::crypto::KeyEnvelope::write_envelope(
@@ -345,6 +428,7 @@ fn mint_sealed_volume(keys_dir: &std::path::Path, passphrase: &str) {
         passphrase,
         b"wardstone",
         ws_core::crypto::PROD_KDF_PARAMS,
+        0,
     )
     .expect("mint the db-credential envelope");
 }
@@ -365,7 +449,7 @@ fn api_config(keys_dir: &std::path::Path) -> ws_api::state::ApiConfig {
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
 async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
     let _db = lock_db().await;
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     let url = database_url();
 
     let built = ws_api::sealed::unlocked_router_from_envelopes(
@@ -373,6 +457,7 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
         &url,
         &api_config(&fixture.keys_dir),
         "the-master-passphrase",
+        None,
     )
     .await;
     assert!(built.is_err(), "an unsealed volume has nothing to unlock");
@@ -399,7 +484,7 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
 async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
     let _db = lock_db().await;
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     mint_sealed_volume(&fixture.keys_dir, "the-master-passphrase");
     let url = database_url();
 
@@ -408,6 +493,7 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
         &url,
         &api_config(&fixture.keys_dir),
         "the-master-passphrase",
+        None,
     )
     .await
     .expect("the sealed volume unlocks");
@@ -469,7 +555,7 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
 #[ignore = "DB-gated: the sealed-volume world (role restored)"]
 async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
     let _db = lock_db().await;
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     mint_sealed_volume(&fixture.keys_dir, "the-master-passphrase");
     let url = database_url();
 
@@ -478,6 +564,7 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
         &url,
         &api_config(&fixture.keys_dir),
         "not-the-master-passphrase",
+        None,
     )
     .await;
     assert!(built.is_err(), "the wrong passphrase is refused");
@@ -503,5 +590,239 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
         &*current, b"wardstone",
         "the refused unlock leaves the sealed credential as it was"
     );
+    fixture.cleanup().await;
+}
+
+// --- Task 4b: the mixed-state completion at unlock ---
+
+/// A crashed passphrase change's aftermath, hand-minted: the
+/// db-credential envelope already re-wrapped under the NEXT passphrase
+/// at generation 1, the master + secret envelopes still at generation 0
+/// under the current one (master is written LAST — the anchor rule).
+/// The jwt envelope is deliberately ABSENT (the fresh-install shape):
+/// the completion re-wraps what exists, and the builder's normal
+/// mint-at-unlock then stamps the fresh pair at the advanced generation
+/// under the next passphrase.
+fn mint_mixed_volume(keys_dir: &std::path::Path, current: &str, next: &str) {
+    use ws_core::crypto::KeyEnvelope;
+    let params = ws_core::crypto::KdfParams {
+        m_cost: 8192,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        current,
+        &[7u8; 32],
+        params,
+        0,
+    )
+    .expect("mint the master envelope at the current generation");
+    KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::SECRET_ENVELOPE_FILE),
+        current,
+        &[9u8; 32],
+        params,
+        0,
+    )
+    .expect("mint the secret envelope at the current generation");
+    KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE),
+        next,
+        b"wardstone",
+        params,
+        1,
+    )
+    .expect("mint the advanced db-credential envelope");
+}
+
+/// The generation every standard envelope in `keys_dir` records — one
+/// value per envelope, or None where the file is absent.
+fn volume_generations(
+    keys_dir: &std::path::Path,
+) -> std::result::Result<Vec<(&'static str, Option<u64>)>, ws_core::error::CoreError> {
+    [
+        ws_core::crypto::MASTER_ENVELOPE_FILE,
+        ws_core::crypto::SECRET_ENVELOPE_FILE,
+        ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE,
+        ws_core::crypto::JWT_ENVELOPE_FILE,
+    ]
+    .iter()
+    .map(|file| {
+        let path = keys_dir.join(file);
+        if path.exists() {
+            Ok((
+                *file,
+                Some(ws_core::crypto::KeyEnvelope::read_generation(&path)?),
+            ))
+        } else {
+            Ok((*file, None))
+        }
+    })
+    .collect()
+}
+
+/// The completion flow the unlock page re-offers (spec §5.7): against a
+/// MIXED volume the operator re-enters the interrupted change's
+/// `current` + `next`, the builder converges the volume to one
+/// generation under `next`, and the unlock proceeds under `next` alone —
+/// the fresh JWT pair included, minted straight into its envelope at
+/// the ADVANCED generation.
+#[tokio::test]
+#[ignore = "DB-gated: rotates the shared login role (restored)"]
+async fn the_builder_completes_a_mixed_volume_at_unlock() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    mint_mixed_volume(
+        &fixture.keys_dir,
+        "the-master-passphrase",
+        "the-next-passphrase",
+    );
+    let url = database_url();
+
+    let router = ws_api::sealed::unlocked_router_from_envelopes(
+        &fixture.keys_dir,
+        &url,
+        &api_config(&fixture.keys_dir),
+        "the-master-passphrase",
+        Some("the-next-passphrase"),
+    )
+    .await
+    .expect("the mixed volume completes and unlocks");
+    let health = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("probe the built router");
+    assert_eq!(
+        health.status(),
+        StatusCode::OK,
+        "the completed unlock serves"
+    );
+
+    // The volume converged: every envelope — the minted JWT pair
+    // included — sits at generation 1 under the NEXT passphrase, and
+    // the retired current opens nothing.
+    for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
+        assert_eq!(generation, Some(1), "{file} advanced to generation 1");
+        let opened = ws_core::crypto::KeyEnvelope::open_envelope(
+            &fixture.keys_dir.join(file),
+            "the-next-passphrase",
+        )
+        .unwrap_or_else(|e| panic!("the next passphrase opens {file}: {e}"));
+        drop(opened);
+        let err = ws_core::crypto::KeyEnvelope::open_envelope(
+            &fixture.keys_dir.join(file),
+            "the-master-passphrase",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ws_core::error::CoreError::Crypto(_)),
+            "the retired passphrase no longer opens {file}"
+        );
+    }
+
+    fixture.cleanup().await;
+}
+
+/// A `next_passphrase` against a CONSISTENT volume is refused: the
+/// unlock must never become a hidden passphrase-change path, and the
+/// volume is left exactly as it was.
+#[tokio::test]
+#[ignore = "DB-gated: the sealed-volume world (role restored)"]
+async fn the_builder_refuses_a_completion_on_a_consistent_volume() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    mint_sealed_volume(&fixture.keys_dir, "the-master-passphrase");
+    let url = database_url();
+
+    let built = ws_api::sealed::unlocked_router_from_envelopes(
+        &fixture.keys_dir,
+        &url,
+        &api_config(&fixture.keys_dir),
+        "the-master-passphrase",
+        Some("a-next-passphrase"),
+    )
+    .await;
+    let err = built.expect_err("a consistent volume refuses the completion");
+    assert!(
+        err.to_string().to_lowercase().contains("no completion"),
+        "the refusal names the condition, got: {err}"
+    );
+    for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
+        let expected = if file == ws_core::crypto::JWT_ENVELOPE_FILE {
+            None
+        } else {
+            Some(0)
+        };
+        assert_eq!(generation, expected, "{file} is untouched");
+        if expected.is_some() {
+            ws_core::crypto::KeyEnvelope::open_envelope(
+                &fixture.keys_dir.join(file),
+                "the-master-passphrase",
+            )
+            .unwrap_or_else(|e| panic!("the refused completion leaves {file} openable: {e}"));
+        }
+    }
+    assert!(
+        bootstrap_credential_connects().await,
+        "the refused completion rotates nothing"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A mixed volume unlocked WITHOUT the completion is refused with the
+/// error that names the completion — the operator is never left
+/// guessing which of their two passphrases the instance wants.
+#[tokio::test]
+#[ignore = "DB-gated: the sealed-volume world (role restored)"]
+async fn the_builder_names_the_completion_a_mixed_volume_needs() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    mint_mixed_volume(
+        &fixture.keys_dir,
+        "the-master-passphrase",
+        "the-next-passphrase",
+    );
+    let url = database_url();
+
+    let built = ws_api::sealed::unlocked_router_from_envelopes(
+        &fixture.keys_dir,
+        &url,
+        &api_config(&fixture.keys_dir),
+        "the-master-passphrase",
+        None,
+    )
+    .await;
+    let err = built.expect_err("a bare unlock refuses a mixed volume");
+    assert!(
+        err.to_string().to_lowercase().contains("completion"),
+        "the refusal names the completion, got: {err}"
+    );
+    // Nothing converged and nothing rotated: the advanced envelope still
+    // opens under the NEXT passphrase, the anchor pair still under the
+    // current one.
+    ws_core::crypto::KeyEnvelope::open_envelope(
+        &fixture
+            .keys_dir
+            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE),
+        "the-next-passphrase",
+    )
+    .expect("the refused bare unlock re-wraps nothing (advanced file)");
+    ws_core::crypto::KeyEnvelope::open_envelope(
+        &fixture.keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+    )
+    .expect("the refused bare unlock re-wraps nothing (anchor file)");
+    assert!(
+        bootstrap_credential_connects().await,
+        "the refused bare unlock rotates nothing"
+    );
+
     fixture.cleanup().await;
 }

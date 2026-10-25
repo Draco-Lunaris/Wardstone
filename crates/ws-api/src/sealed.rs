@@ -32,9 +32,14 @@ use crate::error::ApiError;
 
 /// The master passphrase as delivered by the unlock relay. The api derives
 /// the KEK itself; the bytes are zeroized when this struct drops.
+/// `next_passphrase` is non-None ONLY on the mixed-state completion (a
+/// passphrase change that crashed mid-re-wrap): the unlock page re-offers
+/// the completion and the operator re-enters the same `current` + `next`
+/// pair (spec §5.7).
 #[derive(Debug)]
 pub struct UnlockRequest {
     pub passphrase: String,
+    pub next_passphrase: Option<String>,
 }
 
 /// A late-bound full router with the sealed shell.
@@ -68,18 +73,15 @@ impl SealedApi {
     }
 
     /// The ONE unlock: runs the build closure with the delivered
-    /// passphrase and swaps the full router in. Idempotent failure-safe:
+    /// request and swaps the full router in. Idempotent failure-safe:
     /// a failed build changes NOTHING, and the next unlock retries.
-    pub async fn unlock(&self, passphrase: &str) -> Result<(), ApiError> {
+    pub async fn unlock(&self, request: &UnlockRequest) -> Result<(), ApiError> {
         if self.is_unlocked() {
             return Err(ApiError::Conflict(
                 "the instance is already unlocked".to_string(),
             ));
         }
-        let request = UnlockRequest {
-            passphrase: passphrase.to_string(),
-        };
-        let router = (self.build)(&request).await?;
+        let router = (self.build)(request).await?;
         *self.router.write().map_err(|_poisoned| {
             ApiError::Internal("the sealed api state is corrupted".to_string())
         })? = Some(Arc::new(router));
@@ -117,11 +119,25 @@ pub fn sealed_router(sealed: Arc<SealedApi>) -> Router {
 /// fresh install can leave a JWT envelope behind that the real
 /// passphrase would no longer open (a poisoned pair would lock the
 /// instance out until an operator deleted the envelope by hand).
+///
+/// `next_passphrase` is the mixed-state completion (Task 4b, spec
+/// §5.7): when a passphrase change crashed mid-re-wrap the envelope
+/// generations disagree, and the unlock page re-offers the completion —
+/// the operator re-enters the interrupted change's `current` (the
+/// anchor still opens it; master is written LAST) plus the same `next`
+/// — and the builder converges the volume BEFORE building: the
+/// straggler envelopes (the master's generation, under `current`) and
+/// the advanced ones (under `next`) all re-wrap to one generation
+/// under `next`, and the unlock then proceeds under `next` alone. On a
+/// CONSISTENT volume a `next_passphrase` is refused — the unlock must
+/// never be a hidden passphrase-change path — and a mixed volume
+/// without one is refused with the error that names the completion.
 pub async fn unlocked_router_from_envelopes(
     keys_dir: &std::path::Path,
     database_url: &str,
     config: &crate::state::ApiConfig,
     passphrase: &str,
+    next_passphrase: Option<&str>,
 ) -> Result<Router, ApiError> {
     use ws_core::crypto::{
         substitute_db_password, KeyEnvelope, DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE,
@@ -131,7 +147,70 @@ pub async fn unlocked_router_from_envelopes(
 
     // The master envelope: the keystore's unwrapped custody. Its absence
     // IS the unsealed state (the boot predicate's other half) — there is
-    // nothing to unlock, and nothing may be written.
+    // nothing to unlock, and nothing may be written. Its generation is
+    // the volume's passphrase epoch: the rotation re-seals at it, the JWT
+    // mint stamps it, and a disagreement with the other envelopes is the
+    // mixed state a crashed passphrase change leaves behind.
+    let volume_generation = KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))?;
+
+    // The mixed-state completion (spec §5.7). Which envelopes the volume
+    // actually holds decides the state: the JWT envelope is absent until
+    // the first unlock mints it (fresh install), so the scan is over
+    // what EXISTS, not over the fixed four. A generation the file
+    // cannot name (a v1 envelope, a damaged header) fails loudly right
+    // here rather than misreading as a mixed volume.
+    let mut present: Vec<&'static str> = Vec::new();
+    for file in [
+        MASTER_ENVELOPE_FILE,
+        SECRET_ENVELOPE_FILE,
+        DB_CREDENTIAL_ENVELOPE_FILE,
+        JWT_ENVELOPE_FILE,
+    ] {
+        if keys_dir.join(file).exists() {
+            present.push(file);
+        }
+    }
+    let mut mixed = false;
+    for file in &present {
+        if KeyEnvelope::read_generation(&keys_dir.join(file))? != volume_generation {
+            mixed = true;
+        }
+    }
+    // The four states, one branch each. The completion converges the
+    // volume BEFORE anything else: `rewrap_volume` opens every present
+    // envelope first (a wrong `current` = zero writes, pinned in
+    // ws-core) and re-wraps them all — the master anchor LAST — to one
+    // advanced generation under `next`; the unlock then proceeds under
+    // `next` alone. A `next` on a consistent volume is refused (the
+    // unlock is never a hidden passphrase-change path), and a mixed
+    // volume without one is refused naming the completion (the
+    // operator is never left guessing which passphrase the instance
+    // wants).
+    let (passphrase, volume_generation) = match (mixed, next_passphrase) {
+        (true, Some(next)) => {
+            let advanced = ws_core::crypto::rewrap_volume(keys_dir, &present, passphrase, next)?;
+            (next, advanced)
+        }
+        (true, None) => {
+            return Err(ApiError::BadRequest {
+                code: "completion_required",
+                message: "the volume holds an unfinished passphrase change: the \
+                         completion needs the current passphrase and the new one \
+                         together"
+                    .to_string(),
+            });
+        }
+        (false, Some(_)) => {
+            return Err(ApiError::BadRequest {
+                code: "no_completion_pending",
+                message: "no completion is pending on this volume: unlock without \
+                          the new passphrase (the admin surface changes it once \
+                          unlocked)"
+                    .to_string(),
+            });
+        }
+        (false, None) => (passphrase, volume_generation),
+    };
     let master = KeyEnvelope::open_envelope(&keys_dir.join(MASTER_ENVELOPE_FILE), passphrase)?;
     let mut master_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
     master_bytes.copy_from_slice(&master);
@@ -169,6 +248,7 @@ pub async fn unlocked_router_from_envelopes(
         passphrase,
         fresh.as_bytes(),
         PROD_KDF_PARAMS,
+        volume_generation,
     )?;
     drop(pool);
     let pool = ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
@@ -176,7 +256,11 @@ pub async fn unlocked_router_from_envelopes(
     // the pair's only form — plaintext never exists on a sealed volume),
     // the sealed load on a converted one. LAST, per the order contract
     // above.
-    let jwt = ws_auth::jwt::load_or_create_sealed(&keys_dir.join(JWT_ENVELOPE_FILE), passphrase)?;
+    let jwt = ws_auth::jwt::load_or_create_sealed(
+        &keys_dir.join(JWT_ENVELOPE_FILE),
+        passphrase,
+        volume_generation,
+    )?;
     Ok(crate::router(crate::AppState::new_unlocked(
         pool,
         Arc::new(jwt),
@@ -232,13 +316,21 @@ async fn healthz(State(sealed): State<Arc<SealedApi>>) -> Response {
 #[derive(Debug, Deserialize)]
 struct UnlockBody {
     passphrase: String,
+    /// Present only on the mixed-state completion (the unlock page
+    /// re-offers it; a bare unlock POST never carries it).
+    #[serde(default)]
+    next_passphrase: Option<String>,
 }
 
 async fn unlock_handler(
     State(sealed): State<Arc<SealedApi>>,
     Json(body): Json<UnlockBody>,
 ) -> Response {
-    match sealed.unlock(&body.passphrase).await {
+    let request = UnlockRequest {
+        passphrase: body.passphrase,
+        next_passphrase: body.next_passphrase,
+    };
+    match sealed.unlock(&request).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({ "state": "unlocked" })),
@@ -248,6 +340,18 @@ async fn unlock_handler(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": { "code": "already_unlocked", "message": message }
+            })),
+        )
+            .into_response(),
+        // The completion refusals (the builder's two volume-state
+        // conditions): 409 with their own code — the relayed body is
+        // what the operator reads on the unlock page, and a mixed
+        // volume must say "completion", never a misleading
+        // "passphrase refused".
+        Err(ApiError::BadRequest { code, message }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": code, "message": message }
             })),
         )
             .into_response(),

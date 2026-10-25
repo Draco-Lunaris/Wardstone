@@ -106,6 +106,7 @@ fn conversion_wraps_the_legacy_master_and_deletes_the_plaintext() -> Result<(), 
         "the-operator-passphrase",
         &master,
         cheap_params(),
+        0,
     )
     .unwrap();
     fs::remove_file(dir.join("master.key")).unwrap();

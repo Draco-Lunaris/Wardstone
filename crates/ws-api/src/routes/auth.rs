@@ -416,6 +416,7 @@ async fn me(auth: AuthActor, State(state): State<AppState>) -> Result<Json<MeRes
         display_name: None,
         role: None,
         mfa_enabled: None,
+        sealed_volume: state.sealed_volume(),
     };
     if auth.actor_type == ActorType::User {
         let user = UserRepo::new()
@@ -443,6 +444,10 @@ pub struct MeResponse {
     pub display_name: Option<String>,
     pub role: Option<String>,
     pub mfa_enabled: Option<bool>,
+    /// Whether the serving state is an unlocked sealed volume: the SPA
+    /// gates its admin surface's passphrase-change entry on it (the
+    /// legacy plaintext world carries `false`).
+    pub sealed_volume: bool,
 }
 
 /// The TOTP mutation bodies (`activate`/`deactivate` verify a code).
