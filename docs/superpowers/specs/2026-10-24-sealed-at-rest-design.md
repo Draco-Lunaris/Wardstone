@@ -39,7 +39,7 @@ possesses its keys in RAM; a sealed instance has nothing.**
 | CA keys + sub-CA keys + the setup-key slot | plaintext plaintext `master.key` beside XChaCha envelopes | one **KEK envelope** (the master key itself sealed) + the envelopes as-is | `master.envelope` — the wrapped KEK |
 | SecretBox key (TOTP + OIDC secrets) | plaintext `secret-encryption.key` | sealed | `secret-encryption.envelope` |
 | DB credential | `DATABASE_URL` plaintext password in env ×2 services + recorded container configs | the credential is **generated in memory at unlock, rotated per unlock/first-boot**, and persisted **only as an envelope** | `db-credential.envelope` |
-| JWT signing PEM | plaintext file | sealed (re-key semantics preserved: re-keying remains "delete both files" *post-unlock* by operator action) | `jwt-keys.envelope` |
+| JWT signing PEM | plaintext file | sealed (**mint-at-unlock**: a fresh install never writes the plaintext pair — the first unlock mints straight into the envelope; re-key recovery is "delete `jwt-keys.envelope`", and the next unlock mints a fresh pair with every outstanding token invalid) | `jwt-keys.envelope` |
 | OIDC client secret / TOTP secrets | sealed under SecretBox | unchanged mechanism; SecretBox's own key now comes from its envelope above | — |
 
 Deliberately out of scope: the TLS **leaf/server certificates** (public

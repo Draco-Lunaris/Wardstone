@@ -20,6 +20,17 @@
 # (the ws-api process keeps serving while the ui process restarts onto a
 # re-issued leaf, and vice versa).
 #
+# Sealed at rest (the shipped volume contract): once the first-run setup
+# converts the keys volume, every key lives only in passphrase-sealed
+# envelopes and the database credential is rotated at EVERY unlock — no
+# long-term secret sits in either service's environment. On a sealed
+# volume both processes boot LOCKED: the ui serves its unlock page (and
+# /healthz), the api serves /api/v1/healthz and the internal unlock
+# endpoint; the master passphrase, entered once at the ui, relays to the
+# api and both surfaces resume in place. The healthchecks below are
+# LIVENESS by contract — every boot state answers 200 with a state
+# field, so a correctly-locked instance is never churned.
+#
 # Usage:
 #
 #   WARDSTONE_SERVER_HOSTNAME=ca.example.test \
@@ -75,18 +86,27 @@ services:
   ws-web:
     image: ${WARDSTONE_IMAGE:-wardstone:latest}
     container_name: wardstone-ui
-    # REQUIRED, not a convenience: the ui process deliberately SELF-EXITS
-    # with exit code 0 once the setup flow commits the tenant (the setup
-    # POST answers `{"restart": true}` and the process follows through so
-    # the next boot serves the CA-issued leaf instead of the setup
-    # certificate). Only a restart policy actually brings it back.
-    # `no` would leave a freshly set-up instance dead on the floor.
+    # The restart policy covers the ordinary events — host reboot, crash,
+    # image redeploy — and the sealed boot. The first-run setup does NOT
+    # self-exit (the resume contract: the listener swaps onto the
+    # CA-issued leaf in place and answers `{"resume": true}`), and every
+    # later boot starts LOCKED, serving the unlock page until the
+    # operator's passphrase. `no` would strand the instance after a
+    # reboot.
     restart: unless-stopped
     command: ["wardstone", "ui"]
     environment:
-      # The single Postgres URL both processes share. In the Bundled
-      # variant it points at the `db` service below; the External variant
-      # replaces this with the operator's own database (docker/README.md).
+      # The Postgres URL. The ui is the SEEDING consumer: this password —
+      # the compose bootstrap credential, the same single
+      # WARDSTONE_DB_PASSWORD the `db` service is built from — is read
+      # only by the first-run boot, whose setup transaction seeds the
+      # tenant. The conversion that ends setup rotates the database
+      # role's password, retiring this credential for good; every later
+      # ui boot is sealed and substitutes the CURRENT credential from the
+      # db-credential envelope into this URL, never reading the env
+      # password again. In the Bundled variant it points at the `db`
+      # service below; the External variant replaces this with the
+      # operator's own database (docker/README.md).
       DATABASE_URL: postgres://wardstone:${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}@db:5432/wardstone
       # The keystore directory: master KEK, CA key envelopes, the setup
       # slot, the JWT key pair, and the secret-encryption key file all
@@ -125,6 +145,18 @@ services:
       # upstream, and the ui process is the one operators watch.
       ws-api:
         condition: service_started
+    healthcheck:
+      # Liveness only (the sealed-at-rest contract): the locked router
+      # answers 200 + {"state":"sealed"|"unlocked"} before the unlock,
+      # the full door 200 + {"state":"serving"} after — every phase is a
+      # healthy phase, so the check must never gate on readiness. `-k`
+      # because the serving certificate is always this instance's own
+      # (the setup certificate pre-config, the CA-issued leaf after) and
+      # never chains to a store curl trusts.
+      test: ["CMD", "curl", "-skf", "https://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - internal
     logging:
@@ -139,7 +171,14 @@ services:
     restart: unless-stopped
     command: ["wardstone", "api"]
     environment:
-      DATABASE_URL: postgres://wardstone:${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}@db:5432/wardstone
+      # Password-less BY CONTRACT (sealed at rest): no database
+      # credential exists in this process's environment at all. The api
+      # boots as the sealed shell — on a fresh volume the absent password
+      # is itself the boot signal — and the unlock relay (the ui, after
+      # the operator's passphrase) opens the db-credential envelope,
+      # rotates the role's password, and connects with the fresh value.
+      # This URL names only the ROLE and host to authenticate as.
+      DATABASE_URL: postgres://wardstone@db:5432/wardstone
       WARDSTONE_KEYS_DIR: /var/lib/wardstone/keys
       WARDSTONE_SERVER_HOSTNAME: ${WARDSTONE_SERVER_HOSTNAME:?set WARDSTONE_SERVER_HOSTNAME (the certificate SAN, e.g. ca.example.test)}
       # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
@@ -179,6 +218,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      # Liveness only (the sealed-at-rest contract): 200 + {"state":...}
+      # in BOTH phases — the sealed shell answers before the unlock, the
+      # full REST surface after. Never a readiness gate; a sealed
+      # instance is a state, not an outage.
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/api/v1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - internal
     logging:
@@ -211,20 +259,18 @@ services:
       # directory is what the image's own guidance asks for.
       - wardstone-pgdata:/var/lib/postgresql
     healthcheck:
-      # `pg_isready` alone reports "accepting connections" before the init
-      # scripts have finished, so the check also runs a real query against
-      # the database the services use. The password comes from the
-      # container's own `POSTGRES_PASSWORD` (a compose `$$` keeps the
-      # expansion inside the container, where healthcheck processes run
-      # with the configured env; the image's entrypoint unsets POSTGRES_*
-      # only in the server process it execs). TCP, not the unix socket:
-      # the socket is governed by peer authentication, which this client
-      # does not satisfy.
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -h 127.0.0.1 -U wardstone -d wardstone && PGPASSWORD=$${POSTGRES_PASSWORD} psql -h 127.0.0.1 -U wardstone -d wardstone -c 'SELECT 1' >/dev/null",
-        ]
+      # `pg_isready` over TCP, deliberately auth-INDEPENDENT: the sealed
+      # world rotates the `wardstone` role's password at every unlock
+      # (spec §5.6), so any check authenticating with the compose-known
+      # `POSTGRES_PASSWORD` would start failing the moment the first
+      # setup commits — and a healthcheck must never depend on a
+      # credential the product exists to retire. TCP, not the unix
+      # socket: readiness for the services means the final server
+      # accepting TCP, which the image's entrypoint only reaches after
+      # its init phase (pg_isready against a temporarily-started
+      # init server never sees the port). No init scripts ride this
+      # bundle, so "accepting connections" on the TCP port IS ready.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "wardstone", "-d", "wardstone"]
       interval: 5s
       timeout: 5s
       retries: 24

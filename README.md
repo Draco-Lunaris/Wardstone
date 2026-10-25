@@ -25,7 +25,8 @@ with every private key stored encrypted-at-rest outside the database.
   [ACME for machines](#acme-for-machines)).
 - **Web UI** — a first-run setup wizard that mints the tenant, root CA,
   admin, and the built-in profiles from one form, then swaps the
-  self-signed setup certificate for a CA-issued leaf on restart.
+  self-signed setup certificate for a CA-issued leaf in place (no
+  restart) and seals every key under the master passphrase you set.
 - **Accounts and auth** — local accounts (argon2id), TOTP multi-factor,
   generic OIDC single sign-on, role-based capabilities, service API
   tokens, and one-shot pull tokens for scripted certificate retrieval.
@@ -55,9 +56,10 @@ The first two variables are required by design — an unset hostname would
 serve the setup certificate with a placeholder SAN, and an unset password
 would make the bundled Postgres guessable. **`WARDSTONE_DB_PASSWORD` is a
 bootstrap-only value**: it initializes the bundled database and seeds the
-first credential, and the first unlock of the instance retires it (a fresh
-in-memory credential is rotated into place and sealed under your master
-passphrase). The image publish requires the GitHub package to be public
+ui's seeding boot, and setup retires it as a login credential for good
+(the conversion rotates the database role's password under your master
+passphrase, and every unlock rotates it again). The image publish requires
+the GitHub package to be public
 (or an existing `docker login ghcr.io`).
 `WARDSTONE_IMAGE=wardstone:latest` is the default when you build locally.
 
@@ -166,20 +168,22 @@ The short list every operator should know; the full manual — variants,
 SSO setup, rate-limiter placement, image contract, recovery procedures —
 is [`docker/README.md`](docker/README.md).
 
-- **Keep `restart: unless-stopped` on `ws-web`.** The setup flow ends
-  with a deliberate clean exit (code 0) and relies on the restart policy
-  to return on the CA-issued leaf; the same policy carries every TLS
-  re-issue.
+- **Keep `restart: unless-stopped` on `ws-web`.** Setup completes with an
+  in-place resume (the listener swaps onto the CA-issued leaf, no exit);
+  the policy is what carries the stack through host reboots, crashes, and
+  redeploys — every restart lands the instance on the unlock page, where
+  the master passphrase resumes it.
 - **Never `docker compose down -v`** against an instance you care about:
   it deletes the keys volume along with the database volume. Plain `down`
   keeps both named volumes.
-- **Lost or broken JWT key files are a loud stop, not a heal.** The
+- **Lost or broken JWT key material is a loud stop, not a heal.** The
   processes refuse to silently re-key (that would invalidate every
-  outstanding token while looking normal); the documented recovery
-  removes both `jwt-*.pem` files with the services stopped and restarts.
-  Since the pair is validated as a *pair* at load, a mixed one (e.g. from
-  two processes racing on a fresh volume) now fails the boot with the
-  same recovery hint instead of issuing tokens nothing can verify.
+  outstanding token while looking normal). On a sealed volume the pair
+  lives only in `jwt-keys.envelope`: the documented recovery removes that
+  one envelope with the services stopped, and the next unlock mints a
+  fresh pair straight into a new one — every outstanding token is
+  invalid, everyone logs in again (the legacy pre-conversion path and its
+  pair-validation failure are in [`docker/README.md`](docker/README.md)).
 - **Verify with `docker compose config`** before an upgrade; the compose
   file is the deployment contract.
 
