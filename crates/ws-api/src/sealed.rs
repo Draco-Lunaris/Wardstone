@@ -141,7 +141,7 @@ pub async fn unlocked_router_from_envelopes(
 ) -> Result<Router, ApiError> {
     use ws_core::crypto::{
         substitute_db_password, KeyEnvelope, DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE,
-        MASTER_ENVELOPE_FILE, PROD_KDF_PARAMS, SECRET_ENVELOPE_FILE,
+        MASTER_ENVELOPE_FILE, SECRET_ENVELOPE_FILE,
     };
     use zeroize::Zeroizing;
 
@@ -227,29 +227,19 @@ pub async fn unlocked_router_from_envelopes(
     let current = KeyEnvelope::open_envelope(&db_credential_path, passphrase)?;
     let connect_url = substitute_db_password(database_url, &String::from_utf8_lossy(&current));
     let pool = ws_core::db::connect(&connect_url).await?;
-    // The rotation (spec §5.6): a fresh in-memory credential, ALTER over
-    // the just-opened connection, re-seal. Postgres accepts no bind
-    // parameters in utility statements, so the statement interpolates:
-    // the role is the one the URL authenticates as (validated to the
-    // conservative identifier shape) and the credential is hex by
-    // construction — quote-doubled anyway, so the safety is local rather
-    // than resting on a distant generator's charset.
-    let role = db_role_of(database_url)?;
-    let fresh = ws_core::crypto::random_hex(32)?;
-    sqlx::query(&format!(
-        "ALTER USER {role} PASSWORD '{}'",
-        fresh.replace('\'', "''")
-    ))
-    .execute(&pool)
-    .await
-    .map_err(ws_core::error::CoreError::Database)?;
-    KeyEnvelope::write_envelope(
+    // The rotation (spec §5.6): the shared step
+    // ([`ws_core::crypto::rotate_db_credential`]) — fresh in-memory
+    // credential, ALTER over the just-opened connection, re-seal at the
+    // volume's generation.
+    let role = ws_core::crypto::db_role_of(database_url)?;
+    let fresh = ws_core::crypto::rotate_db_credential(
+        &pool,
+        &role,
         &db_credential_path,
         passphrase,
-        fresh.as_bytes(),
-        PROD_KDF_PARAMS,
         volume_generation,
-    )?;
+    )
+    .await?;
     drop(pool);
     let pool = ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
     // The JWT pair: mint-at-unlock on a fresh install (the envelope is
@@ -268,36 +258,6 @@ pub async fn unlocked_router_from_envelopes(
         Zeroizing::new(master_bytes),
         secret_box,
     )))
-}
-
-/// The login role a `DATABASE_URL` authenticates as — the role whose
-/// password the unlock rotation ALTERs. Validated to the strict
-/// alphanumeric+underscore shape (the interpolation counterpart of the
-/// conversion's own check); a URL with no `userinfo@` names no role to
-/// rotate.
-fn db_role_of(url: &str) -> Result<String, ApiError> {
-    let Some(scheme_end) = url.find("://") else {
-        return Err(ApiError::Internal(
-            "the database URL is not a URL".to_string(),
-        ));
-    };
-    let auth_start = scheme_end + 3;
-    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
-        return Err(ApiError::Internal(
-            "the database URL carries no login role to rotate".to_string(),
-        ));
-    };
-    let user_end = url[auth_start..at]
-        .rfind(':')
-        .map(|i| i + auth_start)
-        .unwrap_or(at);
-    let role = &url[auth_start..user_end];
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(ApiError::Internal(format!(
-            "the database URL's login role {role:?} is not a safe identifier"
-        )));
-    }
-    Ok(role.to_string())
 }
 
 /// Liveness is unconditional: a sealed instance answers 200 with its

@@ -322,13 +322,21 @@ healthcheck's business).
 
 **Converting an existing (pre-sealing) install** — the first boot after
 upgrading shows the initialization page instead of the unlock page when
-plaintext key files are found: set your master passphrase there, and the
-conversion wraps every plaintext file into an envelope **and deletes the
-plaintext originals**. Verify before you convert that your backups of the
-keys volume are current: after conversion those backups open nothing
-until they are made again *from the unlocked instance* — inert backups are
-the feature, but a passphrase lost with no unlocked backup is a
-re-issued-identities restart, not a restored one.
+plaintext key files are found: set your master passphrase there (entered
+twice; it seals every key on the instance and cannot be recovered), and
+the conversion wraps every plaintext file into an envelope **and deletes
+the plaintext originals**. The conversion connects with the ui's
+`DATABASE_URL` credential — on the Bundled variant that is
+`WARDSTONE_DB_PASSWORD`, which must still match the database's live
+password — and rotates it away under the master passphrase in the same
+step. The instance then resumes in place on the same listener (the
+certificate swaps onto the CA-issued leaf, the ui relays the unlock to
+the api once), and every later boot starts on the unlock page. Verify
+before you convert that your backups of the keys volume are current:
+after conversion those backups open nothing until they are made again
+*from the unlocked instance* — inert backups are the feature, but a
+passphrase lost with no unlocked backup is a re-issued-identities
+restart, not a restored one.
 
 **Changing the master passphrase** — in the unlocked UI's admin section:
 enter the current passphrase and the new one; every envelope re-wraps
@@ -336,6 +344,32 @@ under a fresh key and the change is audited. A partially-completed change
 (the process dies mid-rotation) leaves envelopes across two generations
 that BOTH open with THEIR passphrases — the next unlock offers to finish
 the change; nothing sits in a silent mixed state.
+
+**Lost database credential (the recovery runbook).** The database password
+is random, rotated at every unlock, and shown nowhere — but its loss
+costs nothing but a deliberate reset, because the credential's envelope
+is the ONE file on the keys volume whose absence the unlock flow is built
+to heal. The reset happens on the database side first (the environment's
+value only ever reaches a database that accepts it):
+
+1. `docker compose -f docker/compose.yml stop ws-web ws-api`, then reset
+   the login role's password on the database to a fresh value you choose —
+   the bundled db takes a local-socket ALTER that needs no old password:
+   `docker compose -f docker/compose.yml exec -T db psql -U wardstone -d
+   wardstone -c "ALTER USER wardstone PASSWORD '<fresh>';"`
+   (an external database means your own superuser).
+2. Put that same fresh value in the environment (`WARDSTONE_DB_PASSWORD`
+   in `.env` — the ui's `DATABASE_URL` is built from it) and remove the
+   envelope from the keys volume: `docker run --rm -v wardstone-keys:/keys
+   alpine rm /keys/db-credential.envelope`.
+3. `docker compose -f docker/compose.yml up -d`, then unlock.
+
+The unlock flow re-seeds through the identical first-install path: the ui
+connects with the fresh bootstrap value, mints a random replacement, and
+seals it under the master passphrase; the api then rotates it again at its
+own unlock, exactly as on a healthy volume — the value from steps 1–2 was
+a single-boot credential and is already retired. No other key material is
+touched and the master passphrase is unchanged.
 
 **Lost or broken JWT key material is a hard stop, with a recovery that costs
 every session.** The processes deliberately do NOT heal it by re-keying on

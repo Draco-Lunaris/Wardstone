@@ -33,6 +33,7 @@
 //! socket address attached to every request (`ConnectInfo`, Task 12's
 //! per-IP limiter's key input).
 
+pub mod init;
 pub mod locked;
 pub mod proxy;
 pub mod session;
@@ -261,6 +262,8 @@ pub fn rustls_server_config(
 /// from its first bind (the ephemeral sealed certificate) and the unlock
 /// closure reloads it with the CA-issued leaf in place — the resume
 /// contract's TLS half (no re-listen, no restart).
+pub type TlsReloadConfig = axum_server::tls_rustls::RustlsConfig;
+
 pub fn reloadable_tls_config(
     cert_pem: &str,
     key_der: &[u8],

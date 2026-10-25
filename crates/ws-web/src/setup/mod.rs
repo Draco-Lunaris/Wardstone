@@ -813,46 +813,60 @@ pub async fn seal_keys_volume(
         }
     }
 
-    // The DB credential rotation: fresh random, ALTER over the bootstrap
-    // connection, seal. The env's embedded password retires here. Postgres
-    // accepts no bind parameters in utility statements (`ALTER … PASSWORD
-    // $1` is a syntax error), so the statement interpolates both parts:
-    // the role is validated to the conservative identifier shape, and the
-    // credential is hex by construction — quote-doubled anyway, so the
-    // safety is local rather than resting on a distant generator's
-    // charset.
-    if db_role.is_empty()
-        || !db_role
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(CaError::Worker(format!(
-            "the db role name {db_role:?} is not a safe identifier"
-        )));
-    }
-    let fresh = ws_core::crypto::random_hex(32)
-        .map_err(|e| CaError::Worker(format!("the db rotation entropy: {e}")))?;
-    sqlx::query(&format!(
-        "ALTER USER {db_role} PASSWORD '{}'",
-        fresh.replace('\'', "''")
-    ))
-    .execute(pool)
-    .await
-    .map_err(|e| CaError::Worker(format!("the db rotation: {e}")))?;
-    KeyEnvelope::write_envelope(
+    // The DB credential rotation (the shared step,
+    // [`ws_core::crypto::rotate_db_credential`]): fresh random, ALTER
+    // over the bootstrap connection, seal at the volume's zeroth
+    // generation. The env's embedded password retires here.
+    ws_core::crypto::rotate_db_credential(
+        pool,
+        db_role,
         &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
         passphrase,
-        fresh.as_bytes(),
-        PROD_KDF_PARAMS,
         0,
     )
-    .map_err(|e| CaError::Worker(format!("the db credential envelope: {e}")))?;
+    .await
+    .map_err(|e| CaError::Worker(format!("the db rotation: {e}")))?;
 
     tracing::info!(
         "the keys volume is sealed: every plaintext original is gone and the \
          instance boots locked from now on"
     );
     Ok(())
+}
+
+/// The recovery re-seed (the sealed-at-rest spec's documented runbook):
+/// an operator who lost the database credential deletes
+/// `db-credential.envelope` from the keys volume, sets a fresh bootstrap
+/// password in the env, and reboots — the ui's unlock build lands here,
+/// because the envelope's absence is the one thing that distinguishes
+/// recovery from every healthy boot. The step is the identical
+/// first-install one (the shared
+/// [`ws_core::crypto::rotate_db_credential`]): connect with the recovery
+/// URL's fresh credential, mint a random replacement, ALTER the login
+/// role to it, seal at the volume's generation. Returns the fresh
+/// credential so the caller connects with it (the api rotates again at
+/// its own unlock, exactly as on a healthy volume).
+pub async fn reseed_db_credential(
+    keys_dir: &Path,
+    passphrase: &str,
+    database_url: &str,
+    generation: u64,
+) -> Result<String, CaError> {
+    let role = ws_core::crypto::db_role_of(database_url)
+        .map_err(|e| CaError::Worker(format!("the recovery URL: {e}")))?;
+    let pool = sqlx::PgPool::connect(database_url)
+        .await
+        .map_err(|e| CaError::Worker(format!("the recovery connection: {e}")))?;
+    let sealed = ws_core::crypto::rotate_db_credential(
+        &pool,
+        &role,
+        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+        passphrase,
+        generation,
+    )
+    .await;
+    pool.close().await;
+    sealed.map_err(|e| CaError::Worker(format!("the db re-seed: {e}")))
 }
 
 /// The sealed-at-rest envelope names, re-exported from ws-core's single

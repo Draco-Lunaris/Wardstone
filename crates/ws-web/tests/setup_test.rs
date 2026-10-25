@@ -1119,3 +1119,306 @@ async fn a_fixture_dropped_mid_rotation_restores_the_shared_role() {
     // this in cleanup was deliberately dropped).
     sweep_tenant(&pool, setup::DEFAULT_TENANT_NAME).await;
 }
+
+/// The upgrade conversion (Task 5): a legacy volume — the plaintext
+/// master, secret, and JWT pair on the keys directory, a live database
+/// whose role still authenticates with the env password — lands on the
+/// INIT page, converts through its POST (envelopes minted, plaintext
+/// deleted, the DB credential rotated so the old password stops
+/// working), serves the full surface on the same listener, and a
+/// REBOOTED door over the converted volume is the UNLOCK page: the
+/// volume is sealed now, and the operator's passphrase opens it.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_legacy_volume_converts_and_the_reboot_lands_sealed() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // The pre-sealing layout (the upgrade runbook's starting state).
+    let keys_dir = fixture.keys_dir.clone();
+    std::fs::create_dir_all(&keys_dir).unwrap();
+    std::fs::write(keys_dir.join("master.key"), b"the-legacy-master-bytes").unwrap();
+    std::fs::write(
+        keys_dir.join(ws_api::state::SECRET_KEY_FILE),
+        b"the-legacy-secret-bytes",
+    )
+    .unwrap();
+    std::fs::write(
+        keys_dir.join("jwt-signing-key.pem"),
+        b"the legacy signing pem",
+    )
+    .unwrap();
+    std::fs::write(
+        keys_dir.join("jwt-verify-key.pem"),
+        b"the legacy verify pem",
+    )
+    .unwrap();
+
+    // The build closure proves the passphrase OPENS the converted volume
+    // — it reads the master envelope and checks the wrapped bytes round-
+    // trip — then hands back the full surface (the in-place resume).
+    let proof_router =
+        || axum::Router::new().route("/proof", axum::routing::get(|| async { "converted" }));
+    let opening_ui = |keys_dir: std::path::PathBuf| {
+        std::sync::Arc::new(ws_web::locked::SealedUi::new(std::sync::Arc::new(
+            move |passphrase: &str, _: Option<&str>| {
+                let keys_dir = keys_dir.clone();
+                let passphrase = passphrase.to_owned();
+                Box::pin(async move {
+                    let master = ws_core::crypto::KeyEnvelope::open_envelope(
+                        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+                        &passphrase,
+                    )
+                    .map_err(|e| format!("the converted volume did not open: {e}"))?;
+                    if master.as_slice() != b"the-legacy-master-bytes" {
+                        return Err("the wrapped bytes did not round-trip".to_owned());
+                    }
+                    Ok(proof_router())
+                })
+            },
+        )))
+    };
+    let ui = opening_ui(keys_dir.clone());
+    let init = ws_web::init::init_router(ui, &keys_dir, &database_url(), HOSTNAME);
+
+    // The INIT page, not the unlock page: the volume is unsealed.
+    let page = init
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let init_page_status = page.status();
+    let init_page_html = body_string(page).await;
+
+    // The conversion: the real seal_keys_volume runs against the
+    // fixture's database (the rotation lands), and the door swaps to the
+    // full surface on the same listener.
+    let converted = init
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-conversion-passphrase",
+                        "repeat": "the-conversion-passphrase",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let converted_status = converted.status();
+
+    let served = init
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/proof")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let served_status = served.status();
+
+    // The rotation's evidence, captured BEFORE the restore: a FRESH
+    // connection with the env's now-retired password must be refused.
+    // (The fixture's own pool predates the rotation — its established
+    // connections survive — so the probe needs a fresh connect.)
+    let bootstrap_dead = sqlx::PgPool::connect(&database_url())
+        .await
+        .map(|_| false)
+        .unwrap_or(true);
+
+    // The conversion rotated the shared role: restore it over the
+    // fixture's dedicated connection BEFORE any later pool read.
+    fixture.restore_role_password().await;
+
+    // The volume's file state, captured before the cleanup removes the
+    // keys directory.
+    let envelopes_exist = [
+        ws_core::crypto::MASTER_ENVELOPE_FILE,
+        ws_core::crypto::SECRET_ENVELOPE_FILE,
+        ws_core::crypto::JWT_ENVELOPE_FILE,
+        ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE,
+    ]
+    .iter()
+    .all(|file| keys_dir.join(file).exists());
+    let plaintext_gone = [
+        "master.key",
+        ws_api::state::SECRET_KEY_FILE,
+        "jwt-signing-key.pem",
+        "jwt-verify-key.pem",
+    ]
+    .iter()
+    .all(|file| !keys_dir.join(file).exists());
+
+    // The REBOOT: a fresh door over the converted volume is the unlock
+    // page — the volume derives as sealed now — and the same passphrase
+    // unlocks it.
+    let reboot_ui = opening_ui(keys_dir.clone());
+    let reboot = ws_web::locked::locked_router(reboot_ui, &keys_dir, HOSTNAME);
+
+    let reboot_page = reboot
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let reboot_page_status = reboot_page.status();
+    let reboot_page_html = body_string(reboot_page).await;
+
+    let unlocked = reboot
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "the-conversion-passphrase" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unlocked_status = unlocked.status();
+
+    let reboot_served = reboot
+        .oneshot(
+            Request::builder()
+                .uri("/proof")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let reboot_served_status = reboot_served.status();
+
+    fixture.cleanup().await;
+
+    assert_eq!(init_page_status, StatusCode::OK);
+    assert!(
+        init_page_html.contains("holds unsealed key files"),
+        "the INIT page names the volume's condition"
+    );
+    assert_eq!(
+        converted_status,
+        StatusCode::OK,
+        "the conversion POST succeeds"
+    );
+    assert_eq!(
+        served_status,
+        StatusCode::OK,
+        "the full surface serves in place"
+    );
+    assert!(envelopes_exist, "the conversion mints every envelope");
+    assert!(
+        plaintext_gone,
+        "the conversion deletes every plaintext original"
+    );
+    assert!(
+        bootstrap_dead,
+        "the conversion's rotation retires the env password"
+    );
+    assert_eq!(reboot_page_status, StatusCode::OK);
+    assert!(
+        reboot_page_html.contains("is sealed")
+            && !reboot_page_html.contains("holds unsealed key files"),
+        "the rebooted door is the unlock page: the volume is sealed now"
+    );
+    assert_eq!(
+        unlocked_status,
+        StatusCode::OK,
+        "the rebooted volume unlocks"
+    );
+    assert_eq!(
+        reboot_served_status,
+        StatusCode::OK,
+        "the rebooted door serves the full surface after the unlock"
+    );
+}
+
+/// The recovery runbook (spec §8): a re-initialized db volume leaves the
+/// sealed credential envelope pointing at a dead password. The
+/// operator's documented move — stop the stack, delete
+/// `db-credential.envelope`, set a fresh `WARDSTONE_DB_PASSWORD`, boot —
+/// must land on an unlock that RE-SEEDS: the ui's build mints a fresh
+/// credential over the recovery URL's connection, ALTERs the role to
+/// it, and seals it at the volume's generation, so the relayed api
+/// unlock finds a live envelope again.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // A sealed volume whose db-credential envelope is gone (the
+    // runbook's starting state).
+    let keys_dir = fixture.keys_dir.clone();
+    std::fs::create_dir_all(&keys_dir).unwrap();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+        b"the-master-bytes",
+        ws_core::crypto::PROD_KDF_PARAMS,
+        0,
+    )
+    .unwrap();
+    assert!(!keys_dir
+        .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        .exists());
+
+    // The re-seed: over the recovery URL's connection (the fresh
+    // bootstrap the operator set), a fresh credential is minted, the
+    // role ALTER'd to it, and the envelope sealed at the volume's
+    // generation.
+    let fresh = setup::reseed_db_credential(&keys_dir, "the-master-passphrase", &database_url(), 0)
+        .await
+        .expect("the recovery re-seed succeeds");
+
+    // The envelope is back, sealed under the volume's passphrase at the
+    // volume's generation, and holds exactly the fresh credential.
+    let resealed = ws_core::crypto::KeyEnvelope::open_envelope(
+        &keys_dir.join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE),
+        "the-master-passphrase",
+    )
+    .expect("the re-seeded envelope opens with the volume passphrase");
+    assert_eq!(
+        String::from_utf8_lossy(&resealed).into_owned(),
+        fresh.clone(),
+        "the re-sealed envelope holds exactly the fresh credential"
+    );
+    assert_eq!(
+        ws_core::crypto::KeyEnvelope::read_generation(
+            &keys_dir.join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        )
+        .unwrap(),
+        0,
+        "the re-seal lands at the volume's generation"
+    );
+
+    // The rotation is real: the recovery URL's credential no longer
+    // connects, the fresh one does.
+    let old_dead = sqlx::PgPool::connect(&database_url())
+        .await
+        .map(|_| false)
+        .unwrap_or(true);
+    let fresh_connects = sqlx::PgPool::connect(&format!(
+        "postgres://wardstone:{fresh}@localhost:5432/wardstone_test"
+    ))
+    .await
+    .is_ok();
+
+    fixture.restore_role_password().await;
+    fixture.cleanup().await;
+
+    assert!(
+        old_dead,
+        "the re-seed's rotation retires the recovery URL's credential"
+    );
+    assert!(fresh_connects, "the fresh credential connects");
+}

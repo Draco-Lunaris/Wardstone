@@ -108,7 +108,10 @@ pub fn locked_router(ui: Arc<SealedUi>, keys_dir: &std::path::Path, hostname: &s
         .route("/healthz", get(healthz))
         .route("/unlock", post(unlock_handler))
         .with_state((ui.clone(), keys_dir, hostname))
-        .fallback_service(SealedWebDelegate { ui })
+        .fallback_service(SealedWebDelegate {
+            ui: ui.clone(),
+            refusal: sealed_503,
+        })
 }
 
 type UiState = (Arc<SealedUi>, std::path::PathBuf, String);
@@ -210,10 +213,12 @@ async fn unlock_handler(
 
 /// The 503 delegate: sealed, everything except the mounted routes above
 /// refuses; unlocked, the full web router answers (a clone shares the
-/// state by design).
+/// state by design). The refusal body is the door's own — the unlock
+/// door names the seal, the INIT door names the conversion.
 #[derive(Clone)]
-struct SealedWebDelegate {
-    ui: Arc<SealedUi>,
+pub(crate) struct SealedWebDelegate {
+    pub(crate) ui: Arc<SealedUi>,
+    pub(crate) refusal: fn() -> Response,
 }
 
 impl Service<Request<Body>> for SealedWebDelegate {
@@ -230,20 +235,23 @@ impl Service<Request<Body>> for SealedWebDelegate {
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        // The fn pointer copies out of `self` so the refusal future
+        // borrows nothing (the `Future` must be `'static`).
+        let refusal = self.refusal;
         match self.ui.router.read() {
             Ok(guard) => match guard.as_ref() {
                 Some(router) => {
                     let mut service = Router::clone(router);
                     Box::pin(Service::call(&mut service, request))
                 }
-                None => Box::pin(async { Ok(sealed_503()) }),
+                None => Box::pin(async move { Ok(refusal()) }),
             },
-            Err(_) => Box::pin(async { Ok(sealed_503()) }),
+            Err(_) => Box::pin(async move { Ok(refusal()) }),
         }
     }
 }
 
-fn sealed_503() -> Response {
+pub(crate) fn sealed_503() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({

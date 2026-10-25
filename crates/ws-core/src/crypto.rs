@@ -307,6 +307,78 @@ pub fn substitute_db_password(url: &str, password: &str) -> String {
     }
 }
 
+/// The login role a `DATABASE_URL` authenticates as — the role whose
+/// password the rotation ALTERs. Validated to the strict
+/// alphanumeric+underscore shape (the interpolation counterpart of
+/// [`rotate_db_credential`]'s own check); a URL with no `userinfo@`
+/// names no role to rotate. The one home for the parse: the api's
+/// per-unlock rotation, the INIT conversion, and the ui's recovery
+/// re-seed all speak this exact shape.
+pub fn db_role_of(url: &str) -> Result<String, CoreError> {
+    let Some(scheme_end) = url.find("://") else {
+        return Err(CoreError::Config(
+            "the database URL is not a URL".to_string(),
+        ));
+    };
+    let auth_start = scheme_end + 3;
+    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
+        return Err(CoreError::Config(
+            "the database URL carries no login role to rotate".to_string(),
+        ));
+    };
+    let user_end = url[auth_start..at]
+        .rfind(':')
+        .map(|i| i + auth_start)
+        .unwrap_or(at);
+    let role = &url[auth_start..user_end];
+    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(CoreError::Config(format!(
+            "the database URL's login role {role:?} is not a safe identifier"
+        )));
+    }
+    Ok(role.to_string())
+}
+
+/// Mint a fresh database login credential, ALTER `role` to it over an
+/// already-authenticated connection, and seal it under the volume's
+/// passphrase — the ONE home for the rotation step the setup
+/// conversion, the api's per-unlock rotation, and the ui's recovery
+/// re-seed all share. Postgres accepts no bind parameters in utility
+/// statements (`ALTER … PASSWORD $1` is a syntax error), so the
+/// statement interpolates both parts: the role is validated to the
+/// conservative identifier shape, and the credential is hex by
+/// construction — quote-doubled anyway, so the safety is local rather
+/// than resting on a distant generator's charset. Returns the fresh
+/// credential so the caller can reconnect with it.
+pub async fn rotate_db_credential(
+    executor: impl sqlx::PgExecutor<'_>,
+    role: &str,
+    envelope_path: &Path,
+    passphrase: &str,
+    generation: u64,
+) -> Result<String, CoreError> {
+    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(CoreError::Config(format!(
+            "the db login role name {role:?} is not a safe identifier"
+        )));
+    }
+    let fresh = random_hex(32)?;
+    sqlx::query(&format!(
+        "ALTER USER {role} PASSWORD '{}'",
+        fresh.replace('\'', "''")
+    ))
+    .execute(executor)
+    .await?;
+    KeyEnvelope::write_envelope(
+        envelope_path,
+        passphrase,
+        fresh.as_bytes(),
+        PROD_KDF_PARAMS,
+        generation,
+    )?;
+    Ok(fresh)
+}
+
 pub struct KeyEnvelope {
     kek: Zeroizing<[u8; 32]>,
     salt: Vec<u8>,

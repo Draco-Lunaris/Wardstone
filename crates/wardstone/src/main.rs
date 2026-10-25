@@ -489,166 +489,226 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
     let reload_handle = tls_config.clone();
 
-    let keys_dir = cfg.keys_dir.clone();
-    let database_url = cfg.database_url.clone();
-    let api_url = cfg.api_url.clone();
-    let hostname_for_router = hostname.clone();
-    let bind = cfg.bind;
-    let session_ttl = ws_web::DEFAULT_SESSION_TTL;
-    let rate_limit = cfg.web_rate_limit;
-
-    let build: ws_web::locked::LockedWebBuild =
-        std::sync::Arc::new(move |passphrase: &str, next_passphrase: Option<&str>| {
-            let keys_dir = keys_dir.clone();
-            let database_url = database_url.clone();
-            let api_url = api_url.clone();
-            let hostname = hostname_for_router.clone();
-            let reload = reload_handle.clone();
-            let passphrase = passphrase.to_string();
-            let next_passphrase = next_passphrase.map(str::to_string);
-            futures_util::future::FutureExt::boxed(async move {
-                let err = |msg: String| msg; // the ui's build reports strings
-                                             // The mixed-state completion (spec §5.7), the same arm the
-                                             // api builder runs: a crashed passphrase change leaves the
-                                             // envelope generations disagreeing, the page re-offered the
-                                             // completion, and the volume converges BEFORE anything
-                                             // opens. The ui converges it and proceeds under the new
-                                             // passphrase — the relay then carries the EFFECTIVE one
-                                             // alone, so the api unlocks a volume that is already clean
-                                             // (relaying the pair would trip the api's
-                                             // no_completion_pending refusal).
-                let scan = ws_core::crypto::scan_volume(&keys_dir)
-                    .map_err(|e| err(format!("the volume scan: {e}")))?;
-                let passphrase = match (scan.mixed, next_passphrase) {
-                    (true, Some(next)) => {
-                        ws_core::crypto::rewrap_volume(
-                            &keys_dir,
-                            &scan.present,
-                            &passphrase,
-                            &next,
-                        )
-                        .map_err(|e| err(format!("the volume completion: {e}")))?;
-                        next
-                    }
-                    (true, None) => {
-                        return Err(err("completion_required".to_string()));
-                    }
-                    (false, Some(_)) => {
-                        return Err(err("no_completion_pending".to_string()));
-                    }
-                    (false, None) => passphrase,
-                };
-                // The master envelope: the keystore's unwrapped custody.
-                let master = ws_core::crypto::KeyEnvelope::open_envelope(
-                    &keys_dir.join(MASTER_ENVELOPE_FILE),
-                    &passphrase,
-                )
-                .map_err(|e| err(format!("the master envelope: {e}")))?;
-                let mut master_bytes = [0u8; 32];
-                master_bytes.copy_from_slice(&master);
-                let keystore = ws_ca::keystore::KeyStore::open_unlocked(
-                    &keys_dir,
-                    Zeroizing::new(master_bytes),
-                )
-                .map_err(|e| err(format!("the keystore: {e}")))?;
-
-                // The ui's own pool: the db credential (read-only unwrap
-                // per the spec — the api rotates, the ui re-reads).
-                let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
-                let connect_url = match ws_core::crypto::KeyEnvelope::open_envelope(
-                    &db_credential_path,
-                    &passphrase,
-                ) {
-                    Ok(current) => {
-                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
-                    }
-                    Err(ws_core::error::CoreError::Config(_)) => database_url.clone(),
-                    Err(other) => return Err(err(format!("the db credential: {other}"))),
-                };
-                let pool = ws_core::db::connect(&connect_url)
-                    .await
-                    .map_err(|e| err(format!("the database: {e}")))?;
-
-                // Relay the unlock to the api: one POST, best-effort with
-                // a logged verdict (the api may be seeding, a redeploy
-                // racer, or already unlocked — every one of those is the
-                // spec's documented fallback, never a ui failure).
-                if let Err(e) = ws_web::locked::relay_unlock(&api_url, &passphrase).await {
-                    tracing::warn!(
-                        error = %e,
-                        "the api unlock relay did not complete; the api logs its own state"
-                    );
-                }
-
-                // The serving leaf with the unlocked keystore: the same
-                // walk the unsealed boot performs, then the in-place TLS
-                // reload onto the CA-issued leaf.
-                let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
-                    .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
-                    .await
-                    .map_err(|e| err(format!("the tenant lookup: {e}")))?
-                    .ok_or_else(|| err("the default tenant vanished mid-unlock".to_string()))?;
-                let certs = ws_core::repo::certificate_repo::CertificateRepo::new()
-                    .list_by_tenant(&pool, tenant.id, 0, 500)
-                    .await
-                    .map_err(|e| err(format!("the certificate listing: {e}")))?;
-                let leaf = resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))
-                    .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
-                match leaf {
-                    Some((leaf_row, key_der)) => {
-                        let key_pem = pkcs8_pem_of(&key_der);
-                        reload
-                            .reload_from_pem(
-                                leaf_row.cert_pem.clone().into_bytes(),
-                                key_pem.clone().into_bytes(),
-                            )
-                            .await
-                            .map_err(|e| err(format!("the TLS reload: {e}")))?;
-                        tracing::info!(
-                            certificate_id = %leaf_row.id,
-                            subject = %leaf_row.subject,
-                            "the TLS listener resumed onto the CA-issued leaf"
-                        );
-                    }
-                    None => {
-                        // The torn state keeps the sealed certificate: the
-                        // operator reaches the recovery flow next.
-                        tracing::warn!(
-                            "no active serving leaf after unlock; the sealed \
-                             certificate keeps serving"
-                        );
-                    }
-                }
-
-                ws_web::web_router(
-                    pool,
-                    keys_dir,
-                    String::new(),
-                    hostname,
-                    // The unlock's own TLS reload already happened above (the
-                    // sealed certificate gave way to the CA-issued leaf); the
-                    // setup surface cannot exist on a sealed boot — a sealed
-                    // volume implies setup committed — so there is nothing for
-                    // a setup commit to swap here.
-                    None,
-                    &api_url,
-                    session_ttl,
-                    rate_limit,
-                )
-                .await
-                .map_err(|e| err(format!("the web router: {e}")))
-            })
-        });
-
+    let build = unlocked_web_build(&cfg, &hostname, reload_handle);
     let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
     let router = ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname);
     tracing::info!(
         hostname = %hostname,
         fingerprint = %sealed_fingerprint,
-        bind = %bind,
+        bind = %cfg.bind,
         "serving the sealed front door: enter the master passphrase to continue"
     );
-    Ok(ws_web::serve_tls_with_config(bind, tls_config, router).await?)
+    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
+}
+
+/// The conversion boot (the sealed-at-rest design's `LegacyConversion`
+/// state): a volume that still holds plaintext key files never serves
+/// the app — it lands on the INIT page over the same ephemeral
+/// locked-mode certificate the sealed boot uses (no key material is
+/// read at boot, even though the plaintext is still there: the
+/// conversion is the one thing this boot does with it). The POST
+/// converts the volume, the shared build closure hands the SAME
+/// listener to the full unlocked surface (reloading it onto the
+/// CA-issued leaf), and every later boot starts sealed on the unlock
+/// page.
+async fn run_ui_legacy_conversion(cfg: BootConfig) -> Result<(), BootError> {
+    let hostname = cfg
+        .server_hostname
+        .clone()
+        .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned());
+    let (sealed_pem, sealed_key, sealed_fingerprint) =
+        ws_web::setup::tls::sealed_certificate(&hostname)?;
+    let sealed_key = Zeroizing::new(sealed_key);
+    let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
+    let reload_handle = tls_config.clone();
+
+    let build = unlocked_web_build(&cfg, &hostname, reload_handle);
+    let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
+    let router = ws_web::init::init_router(ui, &cfg.keys_dir, &cfg.database_url, &hostname);
+    tracing::info!(
+        hostname = %hostname,
+        fingerprint = %sealed_fingerprint,
+        bind = %cfg.bind,
+        "the volume holds plaintext key files: serving the one-time \
+         conversion page"
+    );
+    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
+}
+
+/// The web build both locked doors hand their `SealedUi` (the sealed
+/// boot's unlock and the conversion boot's POST): it converges a mixed
+/// volume when the completion pair rides along, opens the envelopes,
+/// builds the ui's pool from the sealed DB credential, relays the
+/// passphrase to the api (best-effort, logged), reloads the listener
+/// onto the CA-issued leaf, and returns the full web router. On the
+/// sealed boot the volume implies setup committed; on the conversion
+/// boot a tenantless volume falls through to the setup page the full
+/// router conditionally mounts — either way there is no setup-commit
+/// TLS swap to wire here.
+fn unlocked_web_build(
+    cfg: &BootConfig,
+    hostname: &str,
+    reload: ws_web::TlsReloadConfig,
+) -> ws_web::locked::LockedWebBuild {
+    let keys_dir = cfg.keys_dir.clone();
+    let database_url = cfg.database_url.clone();
+    let api_url = cfg.api_url.clone();
+    let hostname = hostname.to_owned();
+    let session_ttl = ws_web::DEFAULT_SESSION_TTL;
+    let rate_limit = cfg.web_rate_limit;
+
+    std::sync::Arc::new(move |passphrase: &str, next_passphrase: Option<&str>| {
+        let keys_dir = keys_dir.clone();
+        let database_url = database_url.clone();
+        let api_url = api_url.clone();
+        let hostname = hostname.clone();
+        let reload = reload.clone();
+        let passphrase = passphrase.to_string();
+        let next_passphrase = next_passphrase.map(str::to_string);
+        futures_util::future::FutureExt::boxed(async move {
+            let err = |msg: String| msg; // the ui's build reports strings
+                                         // The mixed-state completion (spec §5.7), the same arm the
+                                         // api builder runs: a crashed passphrase change leaves the
+                                         // envelope generations disagreeing, the page re-offered the
+                                         // completion, and the volume converges BEFORE anything
+                                         // opens. The ui converges it and proceeds under the new
+                                         // passphrase — the relay then carries the EFFECTIVE one
+                                         // alone, so the api unlocks a volume that is already clean
+                                         // (relaying the pair would trip the api's
+                                         // no_completion_pending refusal).
+            let scan = ws_core::crypto::scan_volume(&keys_dir)
+                .map_err(|e| err(format!("the volume scan: {e}")))?;
+            let passphrase = match (scan.mixed, next_passphrase) {
+                (true, Some(next)) => {
+                    ws_core::crypto::rewrap_volume(&keys_dir, &scan.present, &passphrase, &next)
+                        .map_err(|e| err(format!("the volume completion: {e}")))?;
+                    next
+                }
+                (true, None) => {
+                    return Err(err("completion_required".to_string()));
+                }
+                (false, Some(_)) => {
+                    return Err(err("no_completion_pending".to_string()));
+                }
+                (false, None) => passphrase,
+            };
+            // The master envelope: the keystore's unwrapped custody.
+            let master = ws_core::crypto::KeyEnvelope::open_envelope(
+                &keys_dir.join(MASTER_ENVELOPE_FILE),
+                &passphrase,
+            )
+            .map_err(|e| err(format!("the master envelope: {e}")))?;
+            let mut master_bytes = [0u8; 32];
+            master_bytes.copy_from_slice(&master);
+            let keystore =
+                ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, Zeroizing::new(master_bytes))
+                    .map_err(|e| err(format!("the keystore: {e}")))?;
+
+            // The ui's own pool: the db credential (read-only unwrap
+            // per the spec — the api rotates, the ui re-reads). One
+            // exception: the recovery runbook (spec §8) — an operator
+            // who lost the credential deletes the envelope, sets a
+            // fresh bootstrap password, and reboots; the envelope's
+            // absence is the ONLY thing distinguishing that boot, so
+            // this arm re-seals it through the identical first-install
+            // step (the shared rotation) before anything connects.
+            let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
+            let connect_url =
+                match ws_core::crypto::KeyEnvelope::open_envelope(&db_credential_path, &passphrase)
+                {
+                    Ok(current) => {
+                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
+                    }
+                    Err(ws_core::error::CoreError::Config(_)) => {
+                        let generation = ws_core::crypto::KeyEnvelope::read_generation(
+                            &keys_dir.join(MASTER_ENVELOPE_FILE),
+                        )
+                        .map_err(|e| err(format!("the recovery generation: {e}")))?;
+                        let fresh = ws_web::setup::reseed_db_credential(
+                            &keys_dir,
+                            &passphrase,
+                            &database_url,
+                            generation,
+                        )
+                        .await
+                        .map_err(|e| err(format!("the db re-seed: {e}")))?;
+                        substitute_db_password(&database_url, &fresh)
+                    }
+                    Err(other) => return Err(err(format!("the db credential: {other}"))),
+                };
+            let pool = ws_core::db::connect(&connect_url)
+                .await
+                .map_err(|e| err(format!("the database: {e}")))?;
+
+            // Relay the unlock to the api: one POST, best-effort with
+            // a logged verdict (the api may be seeding, a redeploy
+            // racer, or already unlocked — every one of those is the
+            // spec's documented fallback, never a ui failure).
+            if let Err(e) = ws_web::locked::relay_unlock(&api_url, &passphrase).await {
+                tracing::warn!(
+                    error = %e,
+                    "the api unlock relay did not complete; the api logs its own state"
+                );
+            }
+
+            // The serving leaf with the unlocked keystore: the same
+            // walk the unsealed boot performs, then the in-place TLS
+            // reload onto the CA-issued leaf.
+            let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+                .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
+                .await
+                .map_err(|e| err(format!("the tenant lookup: {e}")))?
+                .ok_or_else(|| err("the default tenant vanished mid-unlock".to_string()))?;
+            let certs = ws_core::repo::certificate_repo::CertificateRepo::new()
+                .list_by_tenant(&pool, tenant.id, 0, 500)
+                .await
+                .map_err(|e| err(format!("the certificate listing: {e}")))?;
+            let leaf = resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))
+                .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
+            match leaf {
+                Some((leaf_row, key_der)) => {
+                    let key_pem = pkcs8_pem_of(&key_der);
+                    reload
+                        .reload_from_pem(
+                            leaf_row.cert_pem.clone().into_bytes(),
+                            key_pem.clone().into_bytes(),
+                        )
+                        .await
+                        .map_err(|e| err(format!("the TLS reload: {e}")))?;
+                    tracing::info!(
+                        certificate_id = %leaf_row.id,
+                        subject = %leaf_row.subject,
+                        "the TLS listener resumed onto the CA-issued leaf"
+                    );
+                }
+                None => {
+                    // The torn state keeps the sealed certificate: the
+                    // operator reaches the recovery flow next.
+                    tracing::warn!(
+                        "no active serving leaf after unlock; the sealed \
+                         certificate keeps serving"
+                    );
+                }
+            }
+
+            ws_web::web_router(
+                pool,
+                keys_dir,
+                String::new(),
+                hostname,
+                // The unlock's own TLS reload already happened above (the
+                // ephemeral certificate gave way to the CA-issued leaf); no
+                // setup commit ever swaps on a locked door — see the
+                // function's doc for the two boots' reasoning.
+                None,
+                &api_url,
+                session_ttl,
+                rate_limit,
+            )
+            .await
+            .map_err(|e| err(format!("the web router: {e}")))
+        })
+    })
 }
 
 /// A PKCS#8 DER private key as the PEM form rustls's reload takes (the
@@ -673,6 +733,13 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     // operator's master passphrase — no key material at boot.
     if sealed_instance(&cfg.keys_dir) {
         return run_ui_sealed(cfg).await;
+    }
+    // The legacy volume (the upgrade conversion): plaintext key files
+    // land on the one-time conversion page instead of the app — the
+    // tenant-existence check below never runs for a volume that must
+    // convert first (the design's keys-directory-only derivation).
+    if ws_web::init::legacy_volume(&cfg.keys_dir) {
+        return run_ui_legacy_conversion(cfg).await;
     }
     let pool = ws_core::db::connect(&cfg.database_url).await?;
     // The JWT keys are the process-lifecycle boot step the brief pins:
@@ -1309,6 +1376,51 @@ mod tests {
         assert!(
             sealed_instance(&dir),
             "master.envelope marks the sealed state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy-volume predicate (spec §5): ANY pre-sealing plaintext
+    /// file — the master key, the secret-encryption key, or either JWT
+    /// PEM (a torn pair included) — lands the boot on the INIT
+    /// conversion page; a clean volume (fresh install) and a sealed
+    /// volume do not.
+    #[test]
+    fn legacy_volume_reads_the_plaintext_predicate() {
+        for file in [
+            "master.key",
+            "secret-encryption.key",
+            "jwt-signing-key.pem",
+            "jwt-verify-key.pem",
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("ws-legacy-predicate-{file}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(
+                !ws_web::init::legacy_volume(&dir),
+                "a clean dir is not a legacy volume"
+            );
+            std::fs::write(dir.join(file), b"legacy plaintext").unwrap();
+            assert!(
+                ws_web::init::legacy_volume(&dir),
+                "{file} marks the legacy conversion state"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A sealed volume is not a legacy volume by the file set alone:
+        // the boot checks the sealed predicate FIRST, so even a torn
+        // conversion's leftover plaintext (sealed envelope + a stray
+        // file) boots sealed — the unlock path, not the INIT page.
+        let dir =
+            std::env::temp_dir().join(format!("ws-legacy-predicate-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MASTER_ENVELOPE_FILE), b"{}").unwrap();
+        assert!(
+            !ws_web::init::legacy_volume(&dir),
+            "master.envelope means sealed, not legacy"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

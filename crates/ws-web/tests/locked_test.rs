@@ -407,3 +407,283 @@ async fn the_unlock_refusal_names_no_completion_pending() {
         "the body names the condition, got: {body}"
     );
 }
+
+/// The pre-sealing keys layout (the upgrade conversion's input): the
+/// master key, the secret-encryption key, and the JWT pair, all
+/// plaintext in the keys directory. The contents are arbitrary for the
+/// conversion itself — the INIT page wraps whatever bytes are there.
+fn mint_legacy_volume(keys_dir: &std::path::Path) {
+    std::fs::write(keys_dir.join("master.key"), b"the-legacy-master-bytes").unwrap();
+    std::fs::write(
+        keys_dir.join(ws_api::state::SECRET_KEY_FILE),
+        b"the-legacy-secret-bytes",
+    )
+    .unwrap();
+    std::fs::write(
+        keys_dir.join("jwt-signing-key.pem"),
+        b"the legacy signing pem",
+    )
+    .unwrap();
+    std::fs::write(
+        keys_dir.join("jwt-verify-key.pem"),
+        b"the legacy verify pem",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_init_door_serves_the_conversion_page_and_healthz() {
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-page");
+    mint_legacy_volume(&keys);
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
+        "ca.example.test",
+    );
+
+    let page = router
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(page.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("ca.example.test holds unsealed key files"),
+        "the init page names the instance and its condition"
+    );
+    assert!(
+        html.contains("one-time conversion"),
+        "the init page names the conversion"
+    );
+    assert!(
+        html.contains("cannot be recovered"),
+        "the init page warns the passphrase is unrecoverable"
+    );
+    assert!(
+        html.contains(r#"id="passphrase""#) && html.contains(r#"id="repeat-passphrase""#),
+        "the init page asks for the passphrase twice"
+    );
+
+    let health = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(health.into_body(), 1 << 10)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains(r#""state":"uninitialized""#),
+        "the health surface reports the uninitialized conversion state"
+    );
+
+    let refused = router
+        .oneshot(
+            Request::builder()
+                .uri("/the-full-surface")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn an_empty_or_mismatched_init_passpair_is_refused_before_the_conversion() {
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-refusals");
+    mint_legacy_volume(&keys);
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
+        "ca.example.test",
+    );
+
+    let refused = |payload: serde_json::Value| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/init")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let empty = refused(serde_json::json!({ "passphrase": "", "repeat": "" })).await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(empty.into_body(), 1 << 10)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "passphrase_required");
+
+    let mismatched = refused(serde_json::json!({
+        "passphrase": "the-master-passphrase",
+        "repeat": "something-else",
+    }))
+    .await;
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(mismatched.into_body(), 1 << 10)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "passphrase_mismatch");
+
+    // Neither refusal touched the volume: the plaintext is still there.
+    assert!(
+        keys.join("master.key").exists(),
+        "the refusals convert nothing"
+    );
+    assert!(
+        !keys.join(ws_core::crypto::MASTER_ENVELOPE_FILE).exists(),
+        "the refusals seal nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_init_post_skips_the_conversion_when_the_volume_is_already_sealed() {
+    // A retry after a conversion whose unlock step failed: the volume is
+    // sealed now (there is no master.key left to convert), and the POST
+    // must fall through to the plain unlock instead of failing on the
+    // missing plaintext.
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-sealed-skip");
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+        b"the-master-bytes",
+        cheap_params(),
+        0,
+    )
+    .unwrap();
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
+        "ca.example.test",
+    );
+
+    let converted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "repeat": "the-master-passphrase",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        converted.status(),
+        StatusCode::OK,
+        "the already-sealed volume skips the conversion and unlocks"
+    );
+
+    let after = router
+        .oneshot(
+            Request::builder()
+                .uri("/the-full-surface")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_failed_conversion_keeps_the_door_up_and_names_the_reason() {
+    // An unreachable database: the conversion cannot rotate the DB
+    // credential, so the POST must fail with the reason and leave the
+    // plaintext volume untouched (the operator fixes the database and
+    // retries — the page is still up).
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-failed");
+    mint_legacy_volume(&keys);
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@127.0.0.1:1/wardstone",
+        "ca.example.test",
+    );
+
+    let failed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "repeat": "the-master-passphrase",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(failed.into_body(), 1 << 10)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["code"], "conversion_failed",
+        "the body names the condition, got: {body}"
+    );
+
+    assert!(
+        keys.join("master.key").exists(),
+        "the failed conversion deleted nothing"
+    );
+    assert!(
+        !keys.join(ws_core::crypto::MASTER_ENVELOPE_FILE).exists(),
+        "the failed conversion sealed nothing"
+    );
+
+    let page = router
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK, "the door still serves");
+}
