@@ -384,7 +384,13 @@ async fn spawn_sealed_api(fixture: &Fixture) -> String {
                 .await
             })
         });
-    let app = ws_api::sealed::sealed_router(Arc::new(ws_api::sealed::SealedApi::new(build)));
+    let app = ws_api::sealed::sealed_router(
+        Arc::new(ws_api::sealed::SealedApi::new(
+            build,
+            fixture.keys_dir.clone(),
+        )),
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the loopback sealed-api listener");
@@ -409,6 +415,7 @@ async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Rou
         HOSTNAME.to_string(),
         None, // no listener to swap in the router suites
         api_base,
+        database_url(),
         Arc::new(SessionStore::new(
             ws_web::DEFAULT_SESSION_TTL,
             ws_web::DEFAULT_IDLE_EVICTION,
@@ -681,6 +688,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         hostname: HOSTNAME.to_string(),
         tls_reload: None,
         api_base_url: "http://127.0.0.1:9".to_string(),
+        database_url: database_url(),
     });
     let fields = SetupFields {
         admin_username: "admin".to_string(),
@@ -984,6 +992,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )

@@ -136,6 +136,12 @@ pub struct SetupState {
     /// api booted as the sealed shell and only the relay brings its
     /// full surface up).
     pub api_base_url: String,
+    /// The instance's `DATABASE_URL`: its login role is the one the
+    /// setup commit's conversion rotates (the External variant — a URL
+    /// that does not use the compose default role must rotate ITS
+    /// role). The same `db_role_of` derivation the INIT door and the
+    /// api's unlock builder use.
+    pub database_url: String,
 }
 
 /// The setup page (GET) and the setup submit (POST) at [`SETUP_ROUTE`].
@@ -831,6 +837,118 @@ pub async fn seal_keys_volume(
         "the keys volume is sealed: every plaintext original is gone and the \
          instance boots locked from now on"
     );
+    Ok(())
+}
+
+/// Finish a crashed conversion (the final review's F3, the per-file
+/// contract spec §3 pins): [`seal_keys_volume`] seals the volume file
+/// by file, and a crash mid-arm leaves two windows per family — an
+/// envelope that landed while its plaintext original was never
+/// deleted, or a plaintext that never wrapped at all. The sealed
+/// boot's unlock heals both under the just-proven passphrase: the
+/// envelope is authoritative (its presence deletes the stray
+/// plaintext), an unwrapped plaintext wraps at the master envelope's
+/// generation and deletes, and the JWT pair heals as ONE unit — a torn
+/// pair seals as-is and the sealed loader refuses it loudly
+/// (`ws_auth::jwt::load_sealed`'s pair probe), the documented re-key
+/// runbook, never a silent boot on a key whose tokens fail their own
+/// verification. Idempotent: a clean volume heals as a no-op.
+///
+/// The DB credential has no heal arm: its plaintext never lived on the
+/// volume (the compose env held it) — the §8 recovery runbook's re-seed
+/// owns that window. A volume WITHOUT the master envelope is the
+/// unsealed shape the INIT conversion door owns; the heal refuses it
+/// rather than sealing anything against a generation it cannot name.
+pub fn heal_keys_volume(keys_dir: &Path, passphrase: &str) -> Result<(), CaError> {
+    let generation =
+        ws_core::crypto::KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))
+            .map_err(|e| CaError::Worker(format!("the heal's anchor: {e}")))?;
+
+    // The master family: the sealed boot's predicate guarantees the
+    // envelope, so a leftover plaintext is a stray delete.
+    let master_plaintext = keys_dir.join("master.key");
+    if master_plaintext.exists() {
+        std::fs::remove_file(&master_plaintext).map_err(CaError::Io)?;
+        tracing::warn!("heal: a stray master key plaintext was deleted beside its envelope");
+    }
+
+    heal_one(
+        passphrase,
+        generation,
+        &keys_dir.join(ws_api::state::SECRET_KEY_FILE),
+        &keys_dir.join(SECRET_ENVELOPE_FILE),
+    )?;
+
+    // The JWT pair: one envelope, two plaintexts, one decision.
+    let signing = keys_dir.join("jwt-signing-key.pem");
+    let verify = keys_dir.join("jwt-verify-key.pem");
+    if signing.exists() || verify.exists() {
+        if keys_dir.join(JWT_ENVELOPE_FILE).exists() {
+            for file in [&signing, &verify] {
+                if file.exists() {
+                    std::fs::remove_file(file).map_err(CaError::Io)?;
+                    tracing::warn!("heal: a stray jwt plaintext was deleted beside its envelope");
+                }
+            }
+        } else {
+            let signing_pem = std::fs::read_to_string(&signing).unwrap_or_default();
+            let verification_pem = std::fs::read_to_string(&verify).unwrap_or_default();
+            ws_auth::jwt::write_sealed(
+                &keys_dir.join(JWT_ENVELOPE_FILE),
+                passphrase,
+                &ws_auth::jwt::JwtKeys {
+                    signing_key_pem: signing_pem,
+                    verification_key_pem: verification_pem,
+                    ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
+                },
+                generation,
+            )
+            .map_err(|e| CaError::Worker(format!("the heal's jwt envelope: {e}")))?;
+            for file in [&signing, &verify] {
+                if file.exists() {
+                    std::fs::remove_file(file).map_err(CaError::Io)?;
+                }
+            }
+            tracing::warn!("heal: an unwrapped jwt pair was sealed at the volume's generation");
+        }
+    }
+    Ok(())
+}
+
+/// One plaintext/envelope family's heal window: the envelope is
+/// authoritative — present, it wins and the stray plaintext dies;
+/// absent, the plaintext wraps at the volume's generation and the
+/// original is deleted.
+fn heal_one(
+    passphrase: &str,
+    generation: u64,
+    plaintext: &Path,
+    envelope: &Path,
+) -> Result<(), CaError> {
+    if envelope.exists() {
+        if plaintext.exists() {
+            std::fs::remove_file(plaintext).map_err(CaError::Io)?;
+            tracing::warn!(
+                "heal: a stray plaintext was deleted beside its envelope: {}",
+                plaintext.display()
+            );
+        }
+    } else if plaintext.exists() {
+        let bytes = std::fs::read(plaintext).map_err(CaError::Io)?;
+        ws_core::crypto::KeyEnvelope::write_envelope(
+            envelope,
+            passphrase,
+            &bytes,
+            ws_core::crypto::PROD_KDF_PARAMS,
+            generation,
+        )
+        .map_err(|e| CaError::Worker(format!("the heal's envelope: {e}")))?;
+        std::fs::remove_file(plaintext).map_err(CaError::Io)?;
+        tracing::warn!(
+            "heal: an unwrapped plaintext was sealed at the volume's generation: {}",
+            plaintext.display()
+        );
+    }
     Ok(())
 }
 

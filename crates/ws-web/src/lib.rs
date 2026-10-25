@@ -54,6 +54,57 @@ use ws_ca::error::CaError;
 use session::relay::relay_router;
 use session::store::SessionStore;
 
+/// Mount the per-IP GCRA on a credential sub-router (spec §5.1: the
+/// unlock and conversion POSTs are credential surfaces — wrong
+/// passphrases cost argon2 memory-hard compute AND a bucket credit,
+/// with the house defaults the auth surface shares). The ONE home for
+/// the mount: the `/auth/ui` relay routes, the locked door's
+/// `POST /unlock`, and the INIT door's `POST /init` all pass through
+/// here, keyed on the connected socket the TLS listener attaches
+/// (`ConnectInfo`; the tests inject the same extension).
+pub(crate) fn gcra<S>(
+    router: Router<S>,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+    surface: &str,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match rate_limit {
+        Some(limit) => {
+            // `finish()` fails only on a zero burst or period (both
+            // caller-configured; the binary refuses a zero at boot, so
+            // this skip branch is unreachable from `run_ui`). The router
+            // constructor cannot be fallible — mirroring ws-api, a broken
+            // number is a LOUDLY-LOGGED skip of the layer, never a panic
+            // at boot.
+            match tower_governor::governor::GovernorConfigBuilder::<
+                tower_governor::key_extractor::PeerIpKeyExtractor,
+                _,
+            >::default()
+            .per_millisecond(limit.per_millis)
+            .burst_size(limit.burst)
+            .finish()
+            {
+                Some(config) => router.layer(tower_governor::GovernorLayer::new(
+                    std::sync::Arc::new(config),
+                )),
+                None => {
+                    tracing::error!(
+                        per_millis = limit.per_millis,
+                        burst = limit.burst,
+                        "invalid rate-limit configuration on {surface}: per_millis and \
+                         burst must be positive; the {surface} routes run WITHOUT rate \
+                         limiting"
+                    );
+                    router
+                }
+            }
+        }
+        None => router,
+    }
+}
+
 pub use proxy::{acme_router, api_router, api_router_with_auth_limit};
 pub use setup::{
     run_setup, setup_router, setup_unmounted_router, tenant_exists, SetupFields, SetupState,
@@ -110,6 +161,7 @@ pub async fn web_router(
     hostname: String,
     tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
+    database_url: String,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -121,6 +173,7 @@ pub async fn web_router(
         hostname,
         tls_reload,
         api_base_url,
+        database_url,
         store,
         rate_limit,
     )
@@ -148,6 +201,7 @@ pub async fn web_router_with_store(
     hostname: String,
     tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
+    database_url: String,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -166,6 +220,7 @@ pub async fn web_router_with_store(
             hostname,
             tls_reload,
             api_base_url: api_base_url.to_owned(),
+            database_url,
         }))
     } else {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())

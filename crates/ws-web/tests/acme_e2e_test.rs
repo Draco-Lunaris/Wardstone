@@ -644,6 +644,7 @@ async fn env() -> Env {
         E2E_DOMAIN.to_owned(),
         None, // no listener to swap in the router suites
         &api_base,
+        database_url(),
         store,
         None, // the front-door limiters key on ConnectInfo, absent for a oneshot
     )

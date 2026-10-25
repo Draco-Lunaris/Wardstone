@@ -22,7 +22,7 @@ async fn the_locked_door_serves_unlock_healthz_and_503s_the_rest() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Ok(full_router()) })
     })));
-    let router = locked_router(ui, &temp_keys("door"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("door"), "ca.example.test", None);
 
     let page = router
         .clone()
@@ -79,7 +79,7 @@ async fn the_unlock_resumes_the_full_router_in_place() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Ok(full_router()) })
     })));
-    let router = locked_router(ui, &temp_keys("resume"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("resume"), "ca.example.test", None);
 
     let unlock = router
         .clone()
@@ -129,7 +129,7 @@ async fn a_refused_unlock_leaves_the_door_locked() {
             })
         },
     )));
-    let router = locked_router(ui, &temp_keys("refusal-door"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("refusal-door"), "ca.example.test", None);
 
     let refused = router
         .clone()
@@ -227,7 +227,7 @@ async fn the_unlock_page_offers_the_completion_on_a_mixed_volume() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Ok(full_router()) })
     })));
-    let router = locked_router(ui, &keys_dir, "ca.example.test");
+    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
 
     let page = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -271,7 +271,7 @@ async fn the_unlock_page_stays_a_single_field_on_a_consistent_volume() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Ok(full_router()) })
     })));
-    let router = locked_router(ui, &keys_dir, "ca.example.test");
+    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
 
     let page = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -310,7 +310,7 @@ async fn a_next_passphrase_reaches_the_build_closure() {
             })
         },
     )));
-    let router = locked_router(ui, &temp_keys("relay-closure"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("relay-closure"), "ca.example.test", None);
 
     let unlock = router
         .clone()
@@ -348,7 +348,7 @@ async fn the_unlock_refusal_names_the_completion_required() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Err("completion_required".to_string()) })
     })));
-    let router = locked_router(ui, &temp_keys("refusal-mixed"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("refusal-mixed"), "ca.example.test", None);
 
     let refused = router
         .oneshot(
@@ -382,7 +382,7 @@ async fn the_unlock_refusal_names_no_completion_pending() {
     let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
         Box::pin(async move { Err("no_completion_pending".to_string()) })
     })));
-    let router = locked_router(ui, &temp_keys("refusal-clean"), "ca.example.test");
+    let router = locked_router(ui, &temp_keys("refusal-clean"), "ca.example.test", None);
 
     let refused = router
         .oneshot(
@@ -443,6 +443,7 @@ async fn the_init_door_serves_the_conversion_page_and_healthz() {
         &keys,
         "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
         "ca.example.test",
+        None,
     );
 
     let page = router
@@ -515,6 +516,7 @@ async fn an_empty_or_mismatched_init_passpair_is_refused_before_the_conversion()
         &keys,
         "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
         "ca.example.test",
+        None,
     );
 
     let refused = |payload: serde_json::Value| {
@@ -588,6 +590,7 @@ async fn the_init_post_skips_the_conversion_when_the_volume_is_already_sealed() 
         &keys,
         "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
         "ca.example.test",
+        None,
     );
 
     let converted = router
@@ -642,6 +645,7 @@ async fn a_failed_conversion_keeps_the_door_up_and_names_the_reason() {
         &keys,
         "postgres://wardstone:wardstone@127.0.0.1:1/wardstone",
         "ca.example.test",
+        None,
     );
 
     let failed = router
@@ -686,4 +690,289 @@ async fn a_failed_conversion_keeps_the_door_up_and_names_the_reason() {
         .await
         .unwrap();
     assert_eq!(page.status(), StatusCode::OK, "the door still serves");
+}
+
+#[tokio::test]
+async fn the_unlocked_root_redirects_to_the_login_not_the_stale_form() {
+    // G3 (the final review): the locked door registers "/" exactly, and
+    // the unlock POST's own success script sends the operator to "/" —
+    // so an unlocked process must not serve the passphrase form there
+    // forever. Spec §3: "The operator is then routed to the normal
+    // login."
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let router = locked_router(ui, &temp_keys("root-redirect"), "ca.example.test", None);
+
+    let unlock = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlock.status(), StatusCode::OK);
+
+    let root = router
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        root.status(),
+        StatusCode::SEE_OTHER,
+        "the unlocked root redirects instead of serving the stale form"
+    );
+    assert_eq!(
+        root.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login"),
+        "the operator is routed to the normal login"
+    );
+}
+
+#[tokio::test]
+async fn the_converted_root_redirects_to_the_login_not_the_init_page() {
+    // G3's INIT-door half: after the conversion + unlock succeed, the
+    // same listener must not keep telling the operator the volume
+    // "holds unsealed key files" at "/" — they are routed to the login.
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-root-redirect");
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+        b"the-master-bytes",
+        cheap_params(),
+        0,
+    )
+    .unwrap();
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
+        "ca.example.test",
+        None,
+    );
+
+    let converted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "repeat": "the-master-passphrase",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(converted.status(), StatusCode::OK);
+
+    let root = router
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        root.status(),
+        StatusCode::SEE_OTHER,
+        "the converted root redirects instead of serving the init page"
+    );
+    assert_eq!(
+        root.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/login"),
+        "the operator is routed to the normal login"
+    );
+}
+
+/// Burst of 1 with a refill period far longer than any test run — the
+/// ui_rate_limit_test idiom: the FIRST request from an IP spends the
+/// whole bucket and every later one inside the window is 429.
+const ONE_SHOT: Option<ws_api::AuthRateLimit> = Some(ws_api::AuthRateLimit {
+    per_millis: 60_000,
+    burst: 1,
+});
+
+fn peer(port: u16) -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+#[tokio::test]
+async fn the_unlock_post_is_rate_limited_per_ip() {
+    // F1 (the final review): spec §5.1 — the unlock route is a
+    // credential surface; wrong passphrases cost argon2 compute AND a
+    // bucket credit. The GCRA layer mounts on the locked door itself,
+    // keyed on the connected socket exactly like the auth surface's.
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let router = locked_router(ui, &temp_keys("unlock-limit"), "ca.example.test", ONE_SHOT);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .extension(peer(50001))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "wrong" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        first.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the first attempt reaches the handler and costs its bucket credit"
+    );
+
+    let second = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .extension(peer(50001))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "wrong" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the bucket is spent: the second rapid attempt never reaches the handler"
+    );
+}
+
+#[tokio::test]
+async fn the_init_post_is_rate_limited_per_ip() {
+    // F1's INIT-door half: the conversion POST SETS the master
+    // passphrase — the most sensitive credential the instance has — so
+    // the same per-IP GCRA mounts on it too.
+    let ui = Arc::new(SealedUi::new(Arc::new(|_: &str, _: Option<&str>| {
+        Box::pin(async move { Ok(full_router()) })
+    })));
+    let keys = temp_keys("init-limit");
+    let router = ws_web::init::init_router(
+        ui,
+        &keys,
+        "postgres://wardstone:wardstone@db.invalid:5432/wardstone",
+        "ca.example.test",
+        ONE_SHOT,
+    );
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .extension(peer(50002))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "wrong",
+                        "repeat": "mismatched",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::BAD_REQUEST,
+        "the first attempt reaches the handler (a real validation refusal)"
+    );
+
+    let second = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/init")
+                .extension(peer(50002))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "wrong",
+                        "repeat": "mismatched",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the bucket is spent: the second rapid attempt never reaches the handler"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_unlocks_serialize_instead_of_double_building() {
+    // F4 (the final review): the unlock is check-then-build with no
+    // serialization, so two racing unlocks both build — and on the api
+    // side both would rotate the DB credential, which can strand it.
+    // The second must wait and refuse with already_unlocked, never
+    // reaching the build.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let ui = Arc::new(SealedUi::new(Arc::new(move |_: &str, _: Option<&str>| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok(full_router())
+        })
+    })));
+    let (a, b) = tokio::join!(ui.unlock("p", None), ui.unlock("p", None));
+    let succeeded = usize::from(a.is_ok()) + usize::from(b.is_ok());
+    assert_eq!(succeeded, 1, "exactly one unlock may build");
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "the losing unlock never reaches the build"
+    );
+}
+
+#[tokio::test]
+async fn the_relay_mints_the_one_time_nonce_before_the_post() {
+    // F2's ui half: the relay POST must carry a nonce minted into the
+    // shared keys volume — the api refuses the internal unlock without
+    // it (spec §10), so the mint happens BEFORE the POST leaves this
+    // process. A dead endpoint pins the order: the transport refuses,
+    // and the claim file is already there.
+    let keys = temp_keys("relay-mint");
+    let err =
+        ws_web::locked::relay_unlock(&keys, "http://127.0.0.1:9/", "the-master-passphrase").await;
+    assert!(
+        err.is_err(),
+        "the dead endpoint refuses the relay transport"
+    );
+    assert!(
+        keys.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
+        "the one-time nonce is minted before the POST leaves"
+    );
+    let _ = std::fs::remove_dir_all(&keys);
 }

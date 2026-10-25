@@ -389,6 +389,15 @@ pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::erro
             "the jwt key envelope payload lacks the verification key".to_string(),
         )
     })?;
+    // The pair probe (F9, the final review): the same check the
+    // plaintext loader runs (`assert_pair_usable`). Sealing must not
+    // launder a broken pair — a conversion that sealed a torn volume
+    // (one empty half) or an envelope whose halves came from different
+    // pairs refuses HERE, at the load, with the re-key hint, never
+    // boots with a key whose tokens fail their own verification on
+    // first use.
+    let dir = path.parent().unwrap_or(path);
+    assert_pair_usable(signing, verification, dir)?;
     Ok(JwtKeys {
         signing_key_pem: signing.to_string(),
         verification_key_pem: verification.to_string(),

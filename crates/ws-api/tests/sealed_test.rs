@@ -31,12 +31,24 @@ fn full_router() -> Router {
     Router::new().route("/api/v1/full", get(|| async { "the full surface" }))
 }
 
+/// A fresh keys volume for the relay-nonce claim (F2): each test mints
+/// its own, so the one-time consume never crosses tests.
+fn nonce_keys(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ws-api-sealed-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[tokio::test]
 async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
-    let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
-        |_: &ws_api::sealed::UnlockRequest| Box::pin(async move { Ok(full_router()) }),
-    )));
-    let router = sealed_router(api);
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
+            Box::pin(async move { Ok(full_router()) })
+        }),
+        nonce_keys("healthz"),
+    ));
+    let router = sealed_router(api, None);
 
     let health = router
         .clone()
@@ -82,10 +94,14 @@ async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
 
 #[tokio::test]
 async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
-    let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
-        |_: &ws_api::sealed::UnlockRequest| Box::pin(async move { Ok(full_router()) }),
-    )));
-    let router = sealed_router(api);
+    let keys = nonce_keys("swap");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
+            Box::pin(async move { Ok(full_router()) })
+        }),
+        keys.clone(),
+    ));
+    let router = sealed_router(api, None);
 
     let unlock = router
         .clone()
@@ -95,7 +111,11 @@ async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
                 .uri("/api/internal/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -140,8 +160,9 @@ async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
 
 #[tokio::test]
 async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
-    let api = std::sync::Arc::new(SealedApi::new(std::sync::Arc::new(
-        |req: &ws_api::sealed::UnlockRequest| {
+    let keys = nonce_keys("wrong-pass");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
             let ok = req.passphrase == "the-master-passphrase";
             Box::pin(async move {
                 if ok {
@@ -152,10 +173,14 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
                     ))
                 }
             })
-        },
-    )));
-    let router = sealed_router(api);
+        }),
+        keys.clone(),
+    ));
+    let router = sealed_router(api, None);
 
+    // Every POST carries a freshly minted claim (the consume is spent
+    // even when the passphrase then fails), so each refusal below is
+    // the PASSPHRASE's, not the nonce's.
     let refused = router
         .clone()
         .oneshot(
@@ -164,7 +189,11 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
                 .uri("/api/internal/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "passphrase": "wrong" }).to_string(),
+                    serde_json::json!({
+                        "passphrase": "wrong",
+                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -199,7 +228,11 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
                 .uri("/api/internal/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -215,7 +248,11 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
                 .uri("/api/internal/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -825,4 +862,313 @@ async fn the_builder_names_the_completion_a_mixed_volume_needs() {
     );
 
     fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_internal_unlock_post_is_rate_limited_per_ip() {
+    // F1 (the final review): the internal unlock endpoint is the same
+    // credential surface the public /unlock is — anything that can
+    // reach the api's listener must spend a GCRA bucket credit per
+    // attempt, exactly like the auth routes (spec §5.1's budget shared
+    // across the credential surfaces).
+    let keys = nonce_keys("rate-limit");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
+            let ok = req.passphrase == "the-master-passphrase";
+            Box::pin(async move {
+                if ok {
+                    Ok(full_router())
+                } else {
+                    Err(ws_api::error::ApiError::Unauthorized(
+                        "the master passphrase was refused".to_string(),
+                    ))
+                }
+            })
+        }),
+        keys.clone(),
+    ));
+    let one_shot = Some(ws_api::AuthRateLimit {
+        per_millis: 60_000,
+        burst: 1,
+    });
+    let router = sealed_router(api, one_shot);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50003,
+                ))))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "wrong",
+                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::UNAUTHORIZED,
+        "the first attempt reaches the handler and costs its bucket credit"
+    );
+
+    let second = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50003,
+                ))))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "wrong" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the bucket is spent: the second rapid attempt never reaches the handler"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_unlocks_serialize_instead_of_double_building() {
+    // F4's api half: the builder rotates the DB credential at EVERY
+    // unlock, so two racing builds each ALTER + re-seal — an
+    // interleaving strands the credential into the recovery runbook
+    // through nothing but a double-click. The second unlock must wait
+    // on the first and refuse, never reaching the build.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let keys = nonce_keys("concurrent");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(move |req: &ws_api::sealed::UnlockRequest| {
+            let ok = req.passphrase == "the-master-passphrase";
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                if ok {
+                    Ok(full_router())
+                } else {
+                    Err(ws_api::error::ApiError::Unauthorized(
+                        "the master passphrase was refused".to_string(),
+                    ))
+                }
+            })
+        }),
+        keys.clone(),
+    ));
+    let req = ws_api::sealed::UnlockRequest {
+        passphrase: "the-master-passphrase".to_string(),
+        next_passphrase: None,
+        nonce: ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+    };
+    let a = api.unlock(&req);
+    let b = api.unlock(&req);
+    let (a, b) = tokio::join!(a, b);
+    let succeeded = usize::from(a.is_ok()) + usize::from(b.is_ok());
+    assert_eq!(succeeded, 1, "exactly one unlock may build");
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "the losing unlock never reaches the build"
+    );
+    assert!(
+        !keys.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
+        "the winner consumed the one-time claim exactly once"
+    );
+}
+
+#[tokio::test]
+async fn the_internal_unlock_consumes_the_one_time_volume_nonce() {
+    // F2 (the final review): spec §10 — the ui→api unlock call must not
+    // be replayable by anything else on the internal network. The relay
+    // mints a one-time nonce into the shared keys volume and the POST
+    // carries it; the api refuses a POST without the matching claim,
+    // and the matching consume deletes it — a captured POST is dead
+    // after the real unlock.
+    let keys = nonce_keys("nonce");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
+            Box::pin(async move { Ok(full_router()) })
+        }),
+        keys.clone(),
+    ));
+    let router = sealed_router(api, None);
+
+    // No nonce: refused even with the passphrase the build accepts.
+    let bare = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bare.status(),
+        StatusCode::UNAUTHORIZED,
+        "a POST without the volume's nonce is refused"
+    );
+    let health = axum::body::to_bytes(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        1 << 10,
+    )
+    .await
+    .unwrap();
+    assert!(
+        String::from_utf8_lossy(&health).contains(r#""state":"sealed""#),
+        "the refused POST unlocked nothing"
+    );
+
+    // The minted nonce unlocks — and consumes the claim.
+    let nonce = ws_core::crypto::mint_relay_nonce(&keys).expect("mint the relay nonce");
+    let ok = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": nonce,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "the minted nonce unlocks");
+    assert!(
+        !keys.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
+        "the successful unlock consumed the claim"
+    );
+
+    // The replay: the same captured POST is dead — the claim is gone.
+    let replay = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": nonce,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        replay.status(),
+        StatusCode::OK,
+        "the replayed POST cannot unlock again"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_nonce_is_refused_while_the_live_claim_unlocks() {
+    // F2's supersede half: each relay mint REPLACES the claim, so a
+    // nonce captured from an earlier relay attempt is dead the moment
+    // the ui re-offers the form — the api compares against the file,
+    // not against history.
+    let keys = nonce_keys("stale");
+    let api = std::sync::Arc::new(SealedApi::new(
+        std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
+            let ok = req.passphrase == "the-master-passphrase";
+            Box::pin(async move {
+                if ok {
+                    Ok(full_router())
+                } else {
+                    Err(ws_api::error::ApiError::Unauthorized(
+                        "the master passphrase was refused".to_string(),
+                    ))
+                }
+            })
+        }),
+        keys.clone(),
+    ));
+    let router = sealed_router(api, None);
+
+    let stale = ws_core::crypto::mint_relay_nonce(&keys).expect("mint");
+    let live = ws_core::crypto::mint_relay_nonce(&keys).expect("re-mint supersedes");
+    assert_ne!(stale, live);
+    let refused = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": stale,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::UNAUTHORIZED,
+        "the superseded nonce is refused"
+    );
+    let ok = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/internal/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "passphrase": "the-master-passphrase",
+                        "nonce": live,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "the live claim unlocks");
 }

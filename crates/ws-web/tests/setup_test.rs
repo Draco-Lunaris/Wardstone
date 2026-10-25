@@ -191,6 +191,7 @@ fn setup_state(fixture: &Fixture) -> SetupState {
         // relay finds a closed port and logs its WARN — the modeled
         // best-effort path, never a failed setup.
         api_base_url: "http://127.0.0.1:9".to_string(),
+        database_url: database_url(),
     }
 }
 
@@ -719,6 +720,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -757,8 +759,9 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         fixture.keys_dir.clone(),
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
-        None, // no listener to swap in the router suites
-        "http://127.0.0.1:9",
+        None,                 // no listener to swap in the router suites
+        "http://127.0.0.1:9", // intentionally nothing listens here
+        database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -942,6 +945,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -1179,7 +1183,7 @@ async fn a_legacy_volume_converts_and_the_reboot_lands_sealed() {
         )))
     };
     let ui = opening_ui(keys_dir.clone());
-    let init = ws_web::init::init_router(ui, &keys_dir, &database_url(), HOSTNAME);
+    let init = ws_web::init::init_router(ui, &keys_dir, &database_url(), HOSTNAME, None);
 
     // The INIT page, not the unlock page: the volume is unsealed.
     let page = init
@@ -1261,7 +1265,7 @@ async fn a_legacy_volume_converts_and_the_reboot_lands_sealed() {
     // page — the volume derives as sealed now — and the same passphrase
     // unlocks it.
     let reboot_ui = opening_ui(keys_dir.clone());
-    let reboot = ws_web::locked::locked_router(reboot_ui, &keys_dir, HOSTNAME);
+    let reboot = ws_web::locked::locked_router(reboot_ui, &keys_dir, HOSTNAME, None);
 
     let reboot_page = reboot
         .clone()
@@ -1421,4 +1425,68 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
         "the re-seed's rotation retires the recovery URL's credential"
     );
     assert!(fresh_connects, "the fresh credential connects");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn the_setup_commit_rotates_the_urls_login_role_not_a_constant() {
+    // F5 (the final review): the External deployment variant — a
+    // DATABASE_URL whose login role is not the compose default. The
+    // rotation must derive its target from the URL (the same
+    // db_role_of derivation the INIT door and the api's unlock builder
+    // use); a hardcoded role would ALTER the compose default and leave
+    // the URL's real role stranded on its bootstrap password. A URL
+    // naming a nonexistent role pins the derivation from the refusal
+    // side: the rotation fails naming THAT role, the anchor never
+    // lands (the master is written last, so the volume stays
+    // convertible), and the real role keeps its bootstrap password.
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let mut state = setup_state(&fixture);
+    let real = state.database_url.clone();
+    state.database_url = real.replacen("://wardstone:", "://wardstone_missing:", 1);
+    let fields = test_fields();
+    let router = setup::setup_router(state);
+
+    let response = post_setup(router, &fields).await;
+    let status = response.status();
+    let body = body_string(response).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the conversion refuses when the URL's role cannot rotate: {body}"
+    );
+    assert!(
+        body.contains("wardstone_missing"),
+        "the rotation targeted the URL's login role, not a compile-time          constant: {body}"
+    );
+    // The true crash-window shape (the master seals FIRST, the DB
+    // rotation rides LAST): the volume is sealed but the DB-credential
+    // envelope never landed — the §8 recovery state the unlock's
+    // re-seed arm exists to heal.
+    assert!(
+        fixture
+            .keys_dir
+            .join(ws_core::crypto::MASTER_ENVELOPE_FILE)
+            .exists(),
+        "the master envelope seals before the rotation runs"
+    );
+    assert!(
+        !fixture.keys_dir.join("master.key").exists(),
+        "the plaintext master is gone: the volume is sealed"
+    );
+    assert!(
+        !fixture
+            .keys_dir
+            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+            .exists(),
+        "the refused rotation leaves no DB-credential envelope: the \
+         recovery state the unlock's re-seed arm heals"
+    );
+    // The real role keeps its bootstrap password — nothing rotated.
+    sqlx::PgPool::connect(&real)
+        .await
+        .expect("the real login role is untouched by the refused rotation");
+    fixture.restore_role_password().await;
+    fixture.cleanup().await;
 }

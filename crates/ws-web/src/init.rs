@@ -51,15 +51,26 @@ pub fn init_router(
     keys_dir: &Path,
     database_url: &str,
     hostname: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Router {
     let hostname = hostname.to_owned();
     let keys_dir = keys_dir.to_path_buf();
     let database_url = database_url.to_owned();
+    let state = (ui.clone(), keys_dir, database_url, hostname);
+    // The conversion POST SETS the master passphrase — the most
+    // sensitive credential the instance has — so it carries the same
+    // per-IP GCRA the unlock route does (spec §5.1's shared budget).
+    let init = crate::gcra(
+        Router::new().route("/init", post(init_handler)),
+        rate_limit,
+        "/init",
+    )
+    .with_state(state.clone());
     Router::new()
         .route("/", get(init_page))
         .route("/healthz", get(init_healthz))
-        .route("/init", post(init_handler))
-        .with_state((ui.clone(), keys_dir, database_url, hostname))
+        .with_state(state)
+        .merge(init)
         .fallback_service(SealedWebDelegate {
             ui,
             refusal: unsealed_503,
@@ -76,7 +87,14 @@ async fn init_healthz(State((ui, _, _, _)): State<InitState>) -> Response {
         .into_response()
 }
 
-async fn init_page(State((_, _, _, hostname)): State<InitState>) -> Response {
+async fn init_page(State((ui, _, _, hostname)): State<InitState>) -> Response {
+    // Once the conversion + unlock succeed, the same listener must not
+    // keep telling the operator the volume "holds unsealed key files"
+    // at "/" — they are routed to the normal login (the final review's
+    // G3, the INIT door's half).
+    if ui.is_unlocked() {
+        return axum::response::Redirect::to("/login").into_response();
+    }
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],

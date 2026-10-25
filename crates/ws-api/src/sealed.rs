@@ -35,17 +35,28 @@ use crate::error::ApiError;
 /// `next_passphrase` is non-None ONLY on the mixed-state completion (a
 /// passphrase change that crashed mid-re-wrap): the unlock page re-offers
 /// the completion and the operator re-enters the same `current` + `next`
-/// pair (spec §5.7).
+/// pair (spec §5.7). `nonce` is the relay's one-time claim (spec §10,
+/// the final review's F2): minted into the shared keys volume by the ui
+/// process, consumed by the unlock itself — a captured POST is dead.
 #[derive(Debug)]
 pub struct UnlockRequest {
     pub passphrase: String,
     pub next_passphrase: Option<String>,
+    pub nonce: String,
 }
 
-/// A late-bound full router with the sealed shell.
+/// A late-bound full router with the sealed shell. The unlock is
+/// serialized (the final review's F4): the builder rotates the DB
+/// credential at EVERY unlock, and two racing builds would each ALTER +
+/// re-seal — an interleaving can strand the credential into the
+/// recovery runbook. The mutex spans the whole check→build→swap window
+/// AND the relay-nonce consume, so the claim's check+delete is atomic
+/// against a concurrent replay of the same POST.
 pub struct SealedApi {
     router: RwLock<Option<Arc<Router>>>,
     build: LockedBuild,
+    keys_dir: std::path::PathBuf,
+    unlock_window: tokio::sync::Mutex<()>,
 }
 
 pub type LockedBuild = Arc<
@@ -55,14 +66,18 @@ pub type LockedBuild = Arc<
 >;
 
 impl SealedApi {
-    /// Build the sealed shell around `build`: main's closure receives the
-    /// unlock request and returns the FULL router (pool + migrations +
-    /// `ws_api::router`), or a typed failure if the envelopes or the DB
-    /// refuse.
-    pub fn new(build: LockedBuild) -> Self {
+    /// Build the sealed shell around `build` and the shared `keys_dir`
+    /// (the compose volume both processes mount): main's closure
+    /// receives the unlock request and returns the FULL router (pool +
+    /// migrations + `ws_api::router`), or a typed failure if the
+    /// envelopes or the DB refuse. The keys dir is the relay nonce's
+    /// claim home — the unlock consumes the claim file itself.
+    pub fn new(build: LockedBuild, keys_dir: std::path::PathBuf) -> Self {
         SealedApi {
             router: RwLock::new(None),
             build,
+            keys_dir,
+            unlock_window: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -72,10 +87,25 @@ impl SealedApi {
         self.router.read().map(|r| r.is_some()).unwrap_or(false)
     }
 
-    /// The ONE unlock: runs the build closure with the delivered
-    /// request and swaps the full router in. Idempotent failure-safe:
-    /// a failed build changes NOTHING, and the next unlock retries.
+    /// The ONE unlock: consumes the request's one-time relay nonce, runs
+    /// the build closure, and swaps the full router in. Idempotent
+    /// failure-safe: a failed build changes NOTHING, and the next unlock
+    /// retries. The guard spans consume, check, build, and swap — a
+    /// racing replay of the same POST waits its turn and finds the claim
+    /// already consumed; a racing second unlock never reaches the
+    /// rotation.
     pub async fn unlock(&self, request: &UnlockRequest) -> Result<(), ApiError> {
+        let _window = self.unlock_window.lock().await;
+        // The one-time claim (spec §10), consumed INSIDE the serialized
+        // window so the check+delete is one atomic step: a concurrent
+        // replay of the same POST cannot also consume it. The refusal is
+        // the generic shape — the network attacker learns nothing about
+        // WHICH part of the relay was wrong. A consumed nonce is spent
+        // even when the passphrase then fails: the ui's next relay
+        // attempt mints a fresh claim, so the operator's retry is
+        // unaffected while a captured POST dies at its first use.
+        ws_core::crypto::consume_relay_nonce(&self.keys_dir, &request.nonce)
+            .map_err(|e| ApiError::Unauthorized(format!("the relay nonce: {e}")))?;
         if self.is_unlocked() {
             return Err(ApiError::Conflict(
                 "the instance is already unlocked".to_string(),
@@ -91,12 +121,50 @@ impl SealedApi {
 
 /// The sealed api's server router: the health surface, the internal
 /// unlock endpoint, and the delegate fallback into the full router once
-/// unlocked. Served by `main` in place of the plain full router.
-pub fn sealed_router(sealed: Arc<SealedApi>) -> Router {
+/// unlocked. Served by `main` in place of the plain full router. The
+/// internal unlock POST carries the per-IP GCRA (spec §5.1: it is the
+/// same credential surface the public unlock route is, on the same
+/// house budget — anything that can reach this listener spends a
+/// bucket credit per guess).
+pub fn sealed_router(sealed: Arc<SealedApi>, rate_limit: Option<crate::AuthRateLimit>) -> Router {
+    let unlock = match rate_limit {
+        Some(limit) => {
+            // The auth.rs idiom verbatim: `finish()` fails only on a zero
+            // burst or period (both caller-configured); a broken number is
+            // a loudly-logged skip, never a panic.
+            match tower_governor::governor::GovernorConfigBuilder::<
+                tower_governor::key_extractor::PeerIpKeyExtractor,
+                _,
+            >::default()
+            .per_millisecond(limit.per_millis)
+            .burst_size(limit.burst)
+            .finish()
+            {
+                Some(config) => Router::new()
+                    .route("/api/internal/unlock", post(unlock_handler))
+                    .with_state(sealed.clone())
+                    .layer(tower_governor::GovernorLayer::new(Arc::new(config))),
+                None => {
+                    tracing::error!(
+                        per_millis = limit.per_millis,
+                        burst = limit.burst,
+                        "invalid unlock rate-limit configuration: per_millis and burst must \
+                         be positive; the internal unlock route runs WITHOUT rate limiting"
+                    );
+                    Router::new()
+                        .route("/api/internal/unlock", post(unlock_handler))
+                        .with_state(sealed.clone())
+                }
+            }
+        }
+        None => Router::new()
+            .route("/api/internal/unlock", post(unlock_handler))
+            .with_state(sealed.clone()),
+    };
     Router::new()
         .route("/api/v1/healthz", get(healthz))
-        .route("/api/internal/unlock", post(unlock_handler))
         .with_state(sealed.clone())
+        .merge(unlock)
         .fallback_service(SealedDelegate {
             api: sealed.clone(),
         })
@@ -280,6 +348,11 @@ struct UnlockBody {
     /// re-offers it; a bare unlock POST never carries it).
     #[serde(default)]
     next_passphrase: Option<String>,
+    /// The relay's one-time volume claim (spec §10): minted by the ui's
+    /// relay, consumed by the unlock. Absent or wrong on any POST that
+    /// did not come through the volume holder's relay.
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 async fn unlock_handler(
@@ -289,6 +362,7 @@ async fn unlock_handler(
     let request = UnlockRequest {
         passphrase: body.passphrase,
         next_passphrase: body.next_passphrase,
+        nonce: body.nonce.unwrap_or_default(),
     };
     match sealed.unlock(&request).await {
         Ok(()) => (

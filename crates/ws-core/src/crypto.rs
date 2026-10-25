@@ -141,6 +141,41 @@ pub fn random_hex(len: usize) -> Result<String, CoreError> {
     Ok(hex::encode(bytes))
 }
 
+/// Mint a fresh one-time relay nonce into the keys volume (the final
+/// review's F2, spec §10: the ui→api unlock call must not be replayable
+/// by anything else on the internal network). Writing this file IS the
+/// claim — only a volume holder can mint — and each mint REPLACES the
+/// previous claim, so a nonce captured from an earlier relay attempt is
+/// dead the moment the ui re-offers the form. The file is owner-only
+/// and crash-atomic like every other volume write; it is never sealed
+/// (it must be readable while the instance is locked, and it carries
+/// no long-lived secret).
+pub fn mint_relay_nonce(keys_dir: &Path) -> Result<String, CoreError> {
+    let nonce = random_hex(32)?;
+    write_private(&keys_dir.join(RELAY_NONCE_FILE), nonce.as_bytes())?;
+    Ok(nonce)
+}
+
+/// Consume the relay nonce: `Ok(())` only when `nonce` matches the
+/// volume's claim, and the match DELETES the file — one use, so a
+/// captured POST is dead after the real unlock. A mismatch or a missing
+/// claim is a typed refusal that leaves the file alone; the real
+/// holder's next relay mints a fresh claim anyway. The nonce is 256
+/// bits of OS entropy, not a long-lived secret — a plain comparison.
+/// The CALLER serializes the check+delete (the api's unlock window):
+/// two concurrent same-nonce POSTs must not both consume one claim.
+pub fn consume_relay_nonce(keys_dir: &Path, nonce: &str) -> Result<(), CoreError> {
+    let claim = keys_dir.join(RELAY_NONCE_FILE);
+    let expected = fs::read_to_string(&claim).map_err(|e| key_io_err(&claim, e))?;
+    if expected != nonce {
+        return Err(CoreError::Crypto(
+            "the relay nonce does not match the volume's claim".to_string(),
+        ));
+    }
+    fs::remove_file(&claim).map_err(|e| key_io_err(&claim, e))?;
+    Ok(())
+}
+
 /// Build an XChaCha20-Poly1305 cipher from the 32-byte key.
 ///
 /// The transient `Key` copy is zeroized the moment the cipher has taken
@@ -283,6 +318,11 @@ pub const SECRET_ENVELOPE_FILE: &str = "secret-encryption.envelope";
 /// The CURRENT database credential: rotated and re-sealed at every
 /// unlock, so a leaked credential dies at the next one.
 pub const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
+/// The one-time relay nonce's claim file (spec §10): the ui process
+/// mints it into the shared keys volume and the api consumes it on the
+/// internal unlock POST — a volume sibling, never sealed itself (it
+/// must be readable while the instance is locked).
+pub const RELAY_NONCE_FILE: &str = "relay-nonce";
 
 /// Substitute `password` into `url`'s `://user:password@host` authority —
 /// inserting a `:password` when the URL carries none (the api's

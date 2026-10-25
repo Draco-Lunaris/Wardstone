@@ -310,6 +310,7 @@ async fn env(ttl: Duration) -> TestEnv {
         "ui.relay.test".to_owned(),
         None, // no listener to swap in the router suites
         &api_base,
+        database_url(),
         store.clone(),
         None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter
     )

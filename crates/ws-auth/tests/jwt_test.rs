@@ -273,3 +273,42 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
         "a wrong passphrase must not mint over or open the existing envelope"
     );
 }
+
+#[test]
+fn a_mixed_sealed_pair_fails_the_load_loudly() {
+    // F9 (the final review): the sealed loader must run the same pair
+    // probe the plaintext loader runs (`assert_pair_usable` — the
+    // sign-a-probe/verify roundtrip). An envelope whose halves came
+    // from different pairs — a conversion that sealed a torn volume, or
+    // any later corruption — must refuse at the LOAD with the re-key
+    // hint, never boot with a key whose tokens fail their own
+    // verification on first use.
+    let pair_a = ws_auth::jwt::load_or_create_sealed(
+        &temp_keys_dir("jwt-sealed-mixed-a").join("jwt-keys.envelope"),
+        "the-master-passphrase",
+        0,
+    )
+    .unwrap();
+    let pair_b = ws_auth::jwt::load_or_create_sealed(
+        &temp_keys_dir("jwt-sealed-mixed-b").join("jwt-keys.envelope"),
+        "the-master-passphrase",
+        0,
+    )
+    .unwrap();
+    let mixed = ws_auth::jwt::JwtKeys {
+        signing_key_pem: pair_a.signing_key_pem,
+        verification_key_pem: pair_b.verification_key_pem,
+        ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
+    };
+    let dir = temp_keys_dir("jwt-sealed-mixed-pair");
+    fs::create_dir_all(&dir).unwrap();
+    let envelope = dir.join("jwt-keys.envelope");
+    ws_auth::jwt::write_sealed(&envelope, "the-master-passphrase", &mixed, 0).unwrap();
+
+    let err = ws_auth::jwt::load_sealed(&envelope, "the-master-passphrase")
+        .expect_err("the mixed sealed pair must refuse the load");
+    assert!(
+        err.to_string().contains("mixed or invalid"),
+        "the refusal names the pair probe, not a downstream token failure: {err}"
+    );
+}

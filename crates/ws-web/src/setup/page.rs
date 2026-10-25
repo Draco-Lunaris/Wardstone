@@ -56,13 +56,15 @@ pub async fn submit_setup(
     // passphrase-sealed envelopes, the DB credential rotates under the
     // same passphrase, and the plaintext originals are DELETED — the
     // volume is inert from here on and every future boot is locked.
-    crate::setup::seal_keys_volume(
-        &keys_dir,
-        &fields.master_passphrase,
-        &state.pool,
-        "wardstone",
-    )
-    .await?;
+    // The rotation's target is the URL's login role (F5, the External
+    // variant): a DATABASE_URL that does not use the compose default
+    // must rotate ITS role, or the next boot's connect strands the
+    // real one on its bootstrap password. The same derivation the INIT
+    // door and the api's unlock builder use.
+    let db_role = ws_core::crypto::db_role_of(&state.database_url)
+        .map_err(|e| ws_ca::error::CaError::Worker(format!("the database URL: {e}")))?;
+    crate::setup::seal_keys_volume(&keys_dir, &fields.master_passphrase, &state.pool, &db_role)
+        .await?;
     drop(keystore);
 
     // The resume contract: the listener swaps onto the CA-issued leaf IN
@@ -100,7 +102,7 @@ pub async fn submit_setup(
     // api's restart plus its own unlock — the operator's setup result
     // never depends on it.
     if let Err(reason) =
-        crate::locked::relay_unlock(&state.api_base_url, &fields.master_passphrase).await
+        crate::locked::relay_unlock(&keys_dir, &state.api_base_url, &fields.master_passphrase).await
     {
         tracing::warn!(
             error = %reason,

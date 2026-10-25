@@ -411,3 +411,48 @@ fn scan_volume_fails_loudly_when_it_cannot_read_the_volume() {
     .unwrap();
     ws_core::crypto::scan_volume(&dir).expect_err("a damaged envelope fails the scan loudly");
 }
+
+#[test]
+fn relay_nonce_is_single_use_and_lives_only_in_the_volume() {
+    // F2 (the final review): spec §10 — the ui→api unlock relay must
+    // not be replayable by anything else on the internal network. The
+    // one-time nonce is a claim FILE in the shared keys volume: only a
+    // volume holder can mint it, the api refuses an internal unlock
+    // POST whose nonce does not match the file, and the matching
+    // consume deletes the file — a captured POST is dead after the
+    // real unlock, while the ui's next relay mints a fresh claim.
+    let dir = temp_volume("relay-nonce");
+    let nonce = ws_core::crypto::mint_relay_nonce(&dir).expect("mint the relay nonce");
+    assert_eq!(nonce.len(), 64, "random_hex(32) is 64 hex characters");
+    let claim = dir.join(ws_core::crypto::RELAY_NONCE_FILE);
+    assert_eq!(
+        fs::read_to_string(&claim).expect("the claim lands in the volume"),
+        nonce,
+        "the file IS the claim the api compares against"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&claim).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the claim file is owner-only"
+        );
+    }
+    // A fresh mint replaces the claim: the previous nonce is dead even
+    // before the api ever consumes it.
+    let fresh = ws_core::crypto::mint_relay_nonce(&dir).expect("re-mint");
+    assert_ne!(fresh, nonce, "each mint is a fresh claim");
+    assert!(ws_core::crypto::consume_relay_nonce(&dir, &nonce).is_err());
+    assert!(
+        claim.exists(),
+        "a refused nonce keeps the claim for its holder"
+    );
+    // The matching nonce consumes the claim: the one-time semantics.
+    ws_core::crypto::consume_relay_nonce(&dir, &fresh).expect("consume the live nonce");
+    assert!(!claim.exists(), "the successful match deletes the claim");
+    assert!(
+        ws_core::crypto::consume_relay_nonce(&dir, &fresh).is_err(),
+        "a consumed nonce cannot replay"
+    );
+}

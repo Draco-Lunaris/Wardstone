@@ -491,7 +491,7 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
 
     let build = unlocked_web_build(&cfg, &hostname, reload_handle);
     let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
-    let router = ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname);
+    let router = ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname, cfg.web_rate_limit);
     tracing::info!(
         hostname = %hostname,
         fingerprint = %sealed_fingerprint,
@@ -524,7 +524,13 @@ async fn run_ui_legacy_conversion(cfg: BootConfig) -> Result<(), BootError> {
 
     let build = unlocked_web_build(&cfg, &hostname, reload_handle);
     let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
-    let router = ws_web::init::init_router(ui, &cfg.keys_dir, &cfg.database_url, &hostname);
+    let router = ws_web::init::init_router(
+        ui,
+        &cfg.keys_dir,
+        &cfg.database_url,
+        &hostname,
+        cfg.web_rate_limit,
+    );
     tracing::info!(
         hostname = %hostname,
         fingerprint = %sealed_fingerprint,
@@ -600,6 +606,14 @@ fn unlocked_web_build(
             .map_err(|e| err(format!("the master envelope: {e}")))?;
             let mut master_bytes = [0u8; 32];
             master_bytes.copy_from_slice(&master);
+            // The crashed-conversion heal (F3, spec §3's per-file
+            // contract): the conversion seals file by file, and a crash
+            // mid-arm strands a plaintext beside its envelope (or
+            // unwrapped). The passphrase just proved itself against the
+            // master — the authenticated moment to converge the volume
+            // before anything else opens. Idempotent on a clean volume.
+            ws_web::setup::heal_keys_volume(&keys_dir, &passphrase)
+                .map_err(|e| err(format!("the volume heal: {e}")))?;
             let keystore =
                 ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, Zeroizing::new(master_bytes))
                     .map_err(|e| err(format!("the keystore: {e}")))?;
@@ -644,7 +658,7 @@ fn unlocked_web_build(
             // a logged verdict (the api may be seeding, a redeploy
             // racer, or already unlocked — every one of those is the
             // spec's documented fallback, never a ui failure).
-            if let Err(e) = ws_web::locked::relay_unlock(&api_url, &passphrase).await {
+            if let Err(e) = ws_web::locked::relay_unlock(&keys_dir, &api_url, &passphrase).await {
                 tracing::warn!(
                     error = %e,
                     "the api unlock relay did not complete; the api logs its own state"
@@ -702,6 +716,7 @@ fn unlocked_web_build(
                 // function's doc for the two boots' reasoning.
                 None,
                 &api_url,
+                database_url,
                 session_ttl,
                 rate_limit,
             )
@@ -779,6 +794,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
             hostname,
             Some(tls_config.clone()),
             &cfg.api_url,
+            cfg.database_url.clone(),
             ws_web::DEFAULT_SESSION_TTL,
             cfg.web_rate_limit,
         )
@@ -859,6 +875,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         // CA-issued leaf.
         None,
         &cfg.api_url,
+        cfg.database_url.clone(),
         ws_web::DEFAULT_SESSION_TTL,
         cfg.web_rate_limit,
     )
@@ -954,6 +971,10 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let keys_dir = cfg.keys_dir.clone();
     let database_url = cfg.database_url.clone();
     let config = api_config_from(&cfg);
+    // Hoisted before the closure moves `config`: the sealed router's
+    // limiter is the same configured budget (spec §5.1's internal
+    // surface).
+    let auth_rate_limit = config.auth_rate_limit;
 
     let build: ws_api::sealed::LockedBuild =
         std::sync::Arc::new(move |req: &ws_api::sealed::UnlockRequest| {
@@ -974,8 +995,8 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
             })
         });
 
-    let api = std::sync::Arc::new(ws_api::sealed::SealedApi::new(build));
-    let app = ws_api::sealed::sealed_router(api);
+    let api = std::sync::Arc::new(ws_api::sealed::SealedApi::new(build, cfg.keys_dir.clone()));
+    let app = ws_api::sealed::sealed_router(api, auth_rate_limit);
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(
         bind = %cfg.bind,

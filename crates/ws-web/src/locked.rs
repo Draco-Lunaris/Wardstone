@@ -23,10 +23,16 @@ use tower::Service;
 
 /// The late-bound full web router: `None` while sealed; swapped in by the
 /// unlock. `main` supplies the build closure (it owns the config: the keys
-/// dir, the api base URL, the session TTL, the rate limits).
+/// dir, the api base URL, the session TTL, the rate limits). The unlock
+/// is serialized: check-then-build with no lock would let two racing
+/// POSTs both run the build (the final review's F4 — the api side of the
+/// same race double-rotates the DB credential), so the mutex spans the
+/// whole check→build→swap window and the second unlock waits its turn
+/// and refuses.
 pub struct SealedUi {
     router: RwLock<Option<Arc<Router>>>,
     build: LockedWebBuild,
+    unlock_window: tokio::sync::Mutex<()>,
 }
 
 pub type LockedWebBuild = Arc<
@@ -40,6 +46,7 @@ impl SealedUi {
         SealedUi {
             router: RwLock::new(None),
             build,
+            unlock_window: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -56,6 +63,10 @@ impl SealedUi {
         passphrase: &str,
         next_passphrase: Option<&str>,
     ) -> Result<(), String> {
+        // The serialized window (F4): the guard spans check, build, and
+        // swap — a racing second unlock waits here, then sees the
+        // already-swapped router and refuses without building.
+        let _window = self.unlock_window.lock().await;
         if self.is_unlocked() {
             return Err("already_unlocked".to_string());
         }
@@ -68,19 +79,38 @@ impl SealedUi {
     }
 }
 
-/// Relay the unlock to the api process ONCE (spec §5): a plain POST of
-/// the passphrase over the compose-internal channel — the same trust
+/// Relay the unlock to the api process ONCE (spec §5): a POST of the
+/// passphrase over the compose-internal channel — the same trust
 /// domain the api's own plaintext HTTP occupies. Best-effort BY DESIGN:
 /// the api may be seeding a fresh install, a redeploy racer, or already
 /// unlocked; every one of those is the spec's documented fallback, and
 /// the CALLER logs the verdict — the relay never fails the ui's own
 /// unlock.
-pub async fn relay_unlock(api_base_url: &str, passphrase: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+///
+/// The POST carries the volume's one-time nonce (spec §10, the final
+/// review's F2): minted into `keys_dir` right here — only a volume
+/// holder can write the claim — and consumed by the api's unlock, so a
+/// captured POST is dead after the real one. Each relay attempt mints
+/// afresh, which makes a superseded attempt's nonce dead too. The
+/// client is BOUNDED (the final review's F8, the proxy's numbers): a
+/// hung api fails the relay in bounded time instead of hanging the
+/// operator's unlock POST forever.
+pub async fn relay_unlock(
+    keys_dir: &std::path::Path,
+    api_base_url: &str,
+    passphrase: &str,
+) -> Result<(), String> {
+    let nonce =
+        ws_core::crypto::mint_relay_nonce(keys_dir).map_err(|e| format!("the relay nonce: {e}"))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("the relay transport: {e}"))?;
     let response = client
         .post(format!("{api_base_url}/api/internal/unlock"))
         .header("content-type", "application/json")
-        .body(serde_json::json!({ "passphrase": passphrase }).to_string())
+        .body(serde_json::json!({ "passphrase": passphrase, "nonce": nonce }).to_string())
         .send()
         .await
         .map_err(|e| format!("the relay transport: {e}"))?;
@@ -100,14 +130,26 @@ pub async fn relay_unlock(api_base_url: &str, passphrase: &str) -> Result<(), St
 /// the instance is sealed; the delegate hands over to the full
 /// `web_router` the moment the unlock succeeds (no restart, no re-listen
 /// — the `resume` contract).
-pub fn locked_router(ui: Arc<SealedUi>, keys_dir: &std::path::Path, hostname: &str) -> Router {
+pub fn locked_router(
+    ui: Arc<SealedUi>,
+    keys_dir: &std::path::Path,
+    hostname: &str,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
     let hostname = hostname.to_owned();
     let keys_dir = keys_dir.to_path_buf();
+    let state = (ui.clone(), keys_dir, hostname);
+    let unlock = crate::gcra(
+        Router::new().route("/unlock", post(unlock_handler)),
+        rate_limit,
+        "/unlock",
+    )
+    .with_state(state.clone());
     Router::new()
         .route("/", get(unlock_page))
         .route("/healthz", get(healthz))
-        .route("/unlock", post(unlock_handler))
-        .with_state((ui.clone(), keys_dir, hostname))
+        .with_state(state)
+        .merge(unlock)
         .fallback_service(SealedWebDelegate {
             ui: ui.clone(),
             refusal: sealed_503,
@@ -126,7 +168,15 @@ async fn healthz(State((ui, _, _)): State<UiState>) -> Response {
         .into_response()
 }
 
-async fn unlock_page(State((_, keys_dir, hostname)): State<UiState>) -> Response {
+async fn unlock_page(State((ui, keys_dir, hostname)): State<UiState>) -> Response {
+    // The unlocked process must not keep serving the passphrase form at
+    // "/": the unlock POST's own success script sends the operator here,
+    // and the spec routes them to the normal login instead (the final
+    // review's G3 — the exact "/" registration outranks the fallback
+    // delegate for the process's whole life).
+    if ui.is_unlocked() {
+        return axum::response::Redirect::to("/login").into_response();
+    }
     // The completion probe (spec §5.7): a crashed passphrase change
     // leaves the envelope generations disagreeing, and the page
     // re-offers the completion. A volume the scan cannot read renders
