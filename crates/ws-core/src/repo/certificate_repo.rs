@@ -157,9 +157,14 @@ impl CertificateRepo {
     }
 
     /// A tenant's certificates, one page at a time, latest expiry first
-    /// (`not_after` DESC), LIMIT/OFFSET paging (`offset = page *
-    /// page_size`) through the shared [`crate::repo::paging`] helper
-    /// (clamped page size).
+    /// (`not_after` DESC, `id` as the tiebreaker), LIMIT/OFFSET paging
+    /// (`offset = page * page_size`) through the shared
+    /// [`crate::repo::paging`] helper (clamped page size). The
+    /// tiebreaker is load-bearing, not cosmetic: equal-`not_after` rows
+    /// (two certificates from one issuance run share the expiry tick)
+    /// would otherwise come back in unspecified order — an unstable
+    /// listing AND a page-boundary hazard, where a tie row can appear
+    /// on two pages or neither.
     pub async fn list_by_tenant(
         &self,
         executor: impl PgExecutor<'_>,
@@ -172,7 +177,7 @@ impl CertificateRepo {
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
              revoked_at, revocation_reason, revocation_detail, source, created_at \
-             FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC \
+             FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC, id \
              LIMIT $2 OFFSET $3",
         )
         .bind(tenant_id)

@@ -2889,7 +2889,14 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
             .collect()
     };
 
-    assert_eq!(ids(&unfiltered), vec![a_id, b_id], "no filter lists both");
+    // The listing contract ties on `not_after` by `id` (equal-expiry
+    // rows keep a stable order across calls and pages), so the expected
+    // order is the two random UUIDs sorted — never the insertion order,
+    // which the unspecified pre-tiebreak order only matched by luck
+    // (the flake the 2026-10-25 full run caught).
+    let mut both = vec![a_id, b_id];
+    both.sort();
+    assert_eq!(ids(&unfiltered), both, "no filter lists both");
     assert_eq!(
         ids(&by_status),
         vec![a_id],
