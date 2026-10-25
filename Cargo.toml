@@ -36,8 +36,22 @@ der = { version = "0.8.2" }
 # Crypto: envelope encryption (XChaCha20-Poly1305 DEK under master KEK)
 chacha20poly1305 = { version = "0.11.0" }
 rand = { version = "0.10.3" }
+# argon2 0.6 is pinned for its externally-supplied-memory API:
+# `hash_password_into_with_memory`/`fill_memory` take `impl AsMut<[Block]>`,
+# which is what lets ws-secmem run every argon2 pass inside a pre-locked
+# `memfd_secret` slot instead of a fresh heap allocation (ws-auth's password
+# hashing and the master-key KDF both borrow those slots). `Block` is a
+# 1 KiB `#[repr(align(64))]` value, so m_cost KiB == one block per KiB.
 argon2 = { version = "0.6.0" }
+# Volatile, non-elidable wipes. ws-secmem leans on `Zeroize for [u8]` to wipe
+# arena buffers and argon2 slots on drop; the compiler must not optimise
+# those stores away, which a plain `fill(0)` permits.
 zeroize = { version = "1.9.1" }
+# Raw syscall bindings for ws-secmem: memfd_secret(2) (syscall 447 — no libc
+# wrapper exists, so it goes through `syscall(SYS_memfd_secret, …)`),
+# mmap/madvise, prctl(PR_SET_DUMPABLE), and get/setrlimit for the core-dump
+# and memlock budgets. Already resolved in the lock transitively.
+libc = { version = "0.2.191" }
 base64 = { version = "0.23.1" }
 # RSA key generation: rcgen's default ring backend can parse and sign RSA
 # keys but cannot generate them (rcgen::Error::KeyGenerationUnavailable), so

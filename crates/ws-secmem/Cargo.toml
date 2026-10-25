@@ -1,0 +1,20 @@
+[package]
+name = "ws-secmem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# memfd_secret(2)/mmap/mlock/prctl/setrlimit: the whole crate is a thin,
+# audited wrapper over these syscalls, so the raw libc bindings are a direct
+# dependency rather than a transitive one.
+libc = { workspace = true }
+# argon2::Block is the unit the locked KDF/password slots hand out, so the
+# slot API is typed in argon2's own vocabulary (see slots.rs).
+argon2 = { workspace = true }
+# Volatile, non-elidable wipes of arena buffers and argon2 slots on drop.
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }

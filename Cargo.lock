@@ -3863,6 +3863,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ws-secmem"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "libc",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "ws-web"
 version = "0.1.0"
 dependencies = [
