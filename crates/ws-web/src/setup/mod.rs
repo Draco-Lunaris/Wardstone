@@ -137,10 +137,10 @@ pub struct SetupState {
     /// full surface up).
     pub api_base_url: String,
     /// The instance's `DATABASE_URL`: its login role is the one the
-    /// setup commit's conversion rotates (the External variant — a URL
+    /// setup commit's seal rotates (the External variant — a URL
     /// that does not use the compose default role must rotate ITS
-    /// role). The same `db_role_of` derivation the INIT door and the
-    /// api's unlock builder use.
+    /// role). The same `db_role_of` derivation the api's unlock
+    /// builder uses.
     pub database_url: String,
 }
 
@@ -740,7 +740,7 @@ fn map_core(err: ws_core::error::CoreError) -> CaError {
     }
 }
 
-/// The one-time conversion (the sealed-at-rest design's fresh-install
+/// The setup seal (the sealed-at-rest design's fresh-install
 /// path): wrap every plaintext key file on the keys volume into
 /// passphrase-sealed envelopes and DELETE the originals — the next boot
 /// derives from the state predicate that the volume is sealed. Per-file
@@ -840,7 +840,7 @@ pub async fn seal_keys_volume(
     Ok(())
 }
 
-/// Finish a crashed conversion (the final review's F3, the per-file
+/// Finish a crashed seal (the final review's F3, the per-file
 /// contract spec §3 pins): [`seal_keys_volume`] seals the volume file
 /// by file, and a crash mid-arm leaves two windows per family — an
 /// envelope that landed while its plaintext original was never
@@ -856,9 +856,10 @@ pub async fn seal_keys_volume(
 ///
 /// The DB credential has no heal arm: its plaintext never lived on the
 /// volume (the compose env held it) — the §8 recovery runbook's re-seed
-/// owns that window. A volume WITHOUT the master envelope is the
-/// unsealed shape the INIT conversion door owns; the heal refuses it
-/// rather than sealing anything against a generation it cannot name.
+/// owns that window. A volume WITHOUT the master envelope never reaches
+/// the unlock (the boot serves it the setup page, or refuses it beside
+/// a tenant); the heal refuses it rather than sealing anything against
+/// a generation it cannot name.
 pub fn heal_keys_volume(keys_dir: &Path, passphrase: &str) -> Result<(), CaError> {
     let generation =
         ws_core::crypto::KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))

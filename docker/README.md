@@ -51,7 +51,7 @@ passphrase first** (it seals every key on the instance, is stored nowhere,
 and cannot be recovered: keep it in your password manager), then the admin
 username and password, default domain, optional admin CIDRs, and the
 server hostname. A successful POST answers
-`{"status": "ok", "resume": true}`: the conversion wraps every key file
+`{"status": "ok", "resume": true}`: the seal wraps every key file
 into a passphrase-sealed envelope, rotates the database credential under
 the same passphrase, and the ui **resumes in place** — the listener swaps
 onto the CA-issued `web-server` leaf over the same 8443 port, no restart,
@@ -72,11 +72,10 @@ The External variant is the same file with the Postgres service removed and
 3. Replace both services' `DATABASE_URL` with your own connection URL —
    and keep the sealed-at-rest asymmetry the shipped file models: the
    **ui's** URL carries a login role and password (the bootstrap
-   credential for the seeding boot; setup's conversion rotates the role's
+   credential for the seeding boot; setup's seal rotates the role's
    password away), while the **api's** URL stays password-less (role and
-   host only). A password-carrying api URL is not a convenience: on a
-   fresh volume it flips the api onto the legacy unsealed boot (the
-   pre-sealing behavior), which is exactly what the sealed model retires.
+   host only). A password-carrying api URL is refused at boot: the api's
+   credential lives only in the sealed keys volume.
    The role, database, and extensions Wardstone requires are created by
    the migrations on first connect, not by an image entrypoint.
 4. Drop `WARDSTONE_DB_PASSWORD` from the required variables — it was only
@@ -270,8 +269,9 @@ that image is:
    the container user — never world-readable, never root-owned.
 3. `wardstone-keys` is a named volume mounted at `/var/lib/wardstone/keys`
    on **both** Wardstone services. Whichever process boots first finds a
-   complete volume: on a legacy (pre-sealing) volume the `ui` process
-   creates the JWT key pair if absent, and on a sealed volume the pair
+   complete volume: before setup the `ui` process creates the JWT key
+   pair if absent (setup's seal wraps it and deletes the plaintext), and
+   on a sealed volume the pair
    mints at the FIRST UNLOCK — straight into its envelope, so plaintext
    never exists (the `api` process reads the pair for token signing after
    its own unlock).
@@ -295,7 +295,7 @@ Compose-level:
 | Variable                  | Required | Meaning |
 |---------------------------|----------|---------|
 | `WARDSTONE_SERVER_HOSTNAME` | yes (`:?`) | Interpolated into both services |
-| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' **bootstrap** password: initializes the database and seeds the ui's seeding boot. Setup's conversion rotates the `wardstone` role's password under the master passphrase, retiring this value as a login credential for good (the db's own healthcheck is auth-independent for exactly this reason) — it remains required only because the bundled `db` service and the fresh-install ui are built from it |
+| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' **bootstrap** password: initializes the database and seeds the ui's seeding boot. Setup's seal rotates the `wardstone` role's password under the master passphrase, retiring this value as a login credential for good (the db's own healthcheck is auth-independent for exactly this reason) — it remains required only because the bundled `db` service and the fresh-install ui are built from it |
 | `WARDSTONE_IMAGE`           | no (default `wardstone:latest`) | Override the image; the e2e harness points it at a local build |
 | `WARDSTONE_PUBLIC_URL`      | no (default `https://$WARDSTONE_SERVER_HOSTNAME`) | The ACME URL base; override when certbot reaches the front door on a non-standard port or a different public name |
 
@@ -320,23 +320,13 @@ policy never churns a sealed instance; the database's own healthcheck is
 `pg_isready` (auth-independent — the rotated credential is none of the
 healthcheck's business).
 
-**Converting an existing (pre-sealing) install** — the first boot after
-upgrading shows the initialization page instead of the unlock page when
-plaintext key files are found: set your master passphrase there (entered
-twice; it seals every key on the instance and cannot be recovered), and
-the conversion wraps every plaintext file into an envelope **and deletes
-the plaintext originals**. The conversion connects with the ui's
-`DATABASE_URL` credential — on the Bundled variant that is
-`WARDSTONE_DB_PASSWORD`, which must still match the database's live
-password — and rotates it away under the master passphrase in the same
-step. The instance then resumes in place on the same listener (the
-certificate swaps onto the CA-issued leaf, the ui relays the unlock to
-the api once), and every later boot starts on the unlock page. Verify
-before you convert that your backups of the keys volume are current:
-after conversion those backups open nothing until they are made again
-*from the unlocked instance* — inert backups are the feature, but a
-passphrase lost with no unlocked backup is a re-issued-identities
-restart, not a restored one.
+**An interrupted setup** — setup commits the tenant, then seals the keys
+volume. A crash between the two leaves a tenant beside an unsealed volume,
+and the `ui` refuses to boot it (`the keys volume is not sealed but the
+default tenant exists`) rather than serve the app on plaintext keys. There
+is nothing to keep on an instance that never finished setup: remove both
+volumes (`docker compose -f docker/compose.yml down -v`) and run setup
+again.
 
 **Changing the master passphrase** — in the unlocked UI's admin section:
 enter the current passphrase and the new one; every envelope re-wraps
@@ -390,14 +380,6 @@ token while looking perfectly normal.
   The next unlock mints a fresh pair **straight into a new envelope** —
   plaintext never exists on the volume — and **every outstanding access
   and refresh token is now invalid**; every user must log in again.
-- **On a legacy (pre-conversion) volume**: the pair is still
-  `jwt-signing-key.pem` / `jwt-verify-key.pem`, validated as a *pair* at
-  load — a mixed one fails the boot with this recovery hint instead of
-  issuing tokens nothing can verify. Remove BOTH pem files with the
-  services stopped and restart; both are re-created on the next boot with
-  the same every-token-invalid cost. (Converting the install retires this
-  path: the conversion deletes the pems and the envelope world above
-  takes over.)
 
 **Rate limiting is always-on across the credential surfaces, keyed per
 client IP, tunable — but the coverage is never optional.** The `api`

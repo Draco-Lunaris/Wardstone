@@ -117,3 +117,34 @@ fn api_without_required_environment_lists_the_missing_names() {
         "the error must name every missing variable, got: {text}"
     );
 }
+
+/// `api` with a password in its DATABASE_URL: refused at boot, before any
+/// database or keys-directory access. The compose contract keeps the api's
+/// URL password-less — its credential lives only in the sealed envelope —
+/// so a password there is a misconfiguration, never a boot path (G5).
+#[test]
+fn api_refuses_a_password_bearing_database_url() {
+    let keys = std::env::temp_dir().join(format!("ws-cli-api-pw-{}", std::process::id()));
+    std::fs::create_dir_all(&keys).expect("create the scratch keys dir");
+    let output = wardstone()
+        .arg("api")
+        .env(
+            "DATABASE_URL",
+            "postgres://wardstone:secret@127.0.0.1:1/wardstone",
+        )
+        .env("WARDSTONE_KEYS_DIR", &keys)
+        .env("WARDSTONE_BIND", "127.0.0.1:0")
+        .output()
+        .expect("run `wardstone api` with a password-bearing URL");
+    let _ = std::fs::remove_dir_all(&keys);
+    assert!(
+        !output.status.success(),
+        "a password-bearing api URL must exit non-zero, got {:?}",
+        output.status.code()
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("password-less"),
+        "the refusal must name the password-less contract, got: {text}"
+    );
+}

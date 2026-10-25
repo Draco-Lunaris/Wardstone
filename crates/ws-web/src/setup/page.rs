@@ -52,15 +52,15 @@ pub async fn submit_setup(
     let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir)?;
     let (leaf_pem, leaf_key_der) = run_setup(&fields, &state.pool, &mut keystore).await?;
 
-    // The one-time conversion: every plaintext key file wraps into
+    // The seal: every plaintext key file wraps into
     // passphrase-sealed envelopes, the DB credential rotates under the
     // same passphrase, and the plaintext originals are DELETED — the
     // volume is inert from here on and every future boot is locked.
     // The rotation's target is the URL's login role (F5, the External
     // variant): a DATABASE_URL that does not use the compose default
     // must rotate ITS role, or the next boot's connect strands the
-    // real one on its bootstrap password. The same derivation the INIT
-    // door and the api's unlock builder use.
+    // real one on its bootstrap password. The same derivation the
+    // api's unlock builder uses.
     let db_role = ws_core::crypto::db_role_of(&state.database_url)
         .map_err(|e| ws_ca::error::CaError::Worker(format!("the database URL: {e}")))?;
     crate::setup::seal_keys_volume(&keys_dir, &fields.master_passphrase, &state.pool, &db_role)
