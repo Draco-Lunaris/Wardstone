@@ -81,10 +81,14 @@ ws-ca = { path = "../ws-ca" }
 # the config values the setup page collects (domain, keys dir, admin
 # CIDRs — `ws_api::state::ApiConfig`).
 ws-api = { path = "../ws-api" }
+# The sealed mode's delegate fallback implements tower::Service over the
+# late-bound full router (and the test suites drive it with oneshot).
+tower = { workspace = true }
+# The sealed shells' async build closures return BoxFuture (the unlock
+# constructs pools + routers asynchronously).
+futures-util = { workspace = true }
 
 [dev-dependencies]
-# In-process request driving (`oneshot`) for the setup router.
-tower = { workspace = true }
 # Parsing the minted setup certificate in the tests (self-signedness,
 # SAN, DER fingerprint checks).
 x509-parser = { workspace = true }

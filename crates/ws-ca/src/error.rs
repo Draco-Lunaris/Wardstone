@@ -44,6 +44,12 @@ pub enum CaError {
     /// "missing", but must never auto-recover from "corrupt".
     #[error("no key envelope for the requested CA")]
     NotFound,
+    /// The keystore holds NO master key in memory: the instance is sealed
+    /// and the operator has not performed the unlock. Key operations
+    /// refuse until then (the sealed-at-rest design) — a sealed store can
+    /// never silently serve or mint key material.
+    #[error("the instance is sealed: unlock before performing key operations")]
+    Sealed,
     /// Key or certificate generation failed inside `rcgen`.
     #[error("certificate generation error: {0}")]
     Rcgen(#[from] rcgen::Error),

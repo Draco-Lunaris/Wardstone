@@ -41,9 +41,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::PeerIpKeyExtractor;
-use tower_governor::GovernorLayer;
 use uuid::Uuid;
 
 use crate::proxy::{csrf_refusal, proxy_client, ProxyError};
@@ -95,33 +92,7 @@ pub fn relay_router(
         // serving — because it is applied to the relay sub-router before
         // the composition merges it.
         .with_state(state);
-    match rate_limit {
-        Some(limit) => {
-            // `finish()` fails only on a zero burst or period (both
-            // caller-configured; the binary refuses a zero at boot, so
-            // this skip branch is unreachable from `run_ui`). The router
-            // constructor cannot be fallible — mirroring ws-api, a broken
-            // number is a LOUDLY-LOGGED skip of the layer, never a panic
-            // at boot.
-            match GovernorConfigBuilder::<PeerIpKeyExtractor, _>::default()
-                .per_millisecond(limit.per_millis)
-                .burst_size(limit.burst)
-                .finish()
-            {
-                Some(config) => router.layer(GovernorLayer::new(std::sync::Arc::new(config))),
-                None => {
-                    tracing::error!(
-                        per_millis = limit.per_millis,
-                        burst = limit.burst,
-                        "invalid UI auth rate-limit configuration: per_millis and burst must \
-                         be positive; the /auth/ui routes run WITHOUT rate limiting"
-                    );
-                    router
-                }
-            }
-        }
-        None => router,
-    }
+    crate::gcra(router, rate_limit, "/auth/ui")
 }
 
 /// The relayed ws-api login body (the same shape ws-api's `LoginBody`

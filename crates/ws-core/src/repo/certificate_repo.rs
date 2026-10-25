@@ -157,9 +157,14 @@ impl CertificateRepo {
     }
 
     /// A tenant's certificates, one page at a time, latest expiry first
-    /// (`not_after` DESC), LIMIT/OFFSET paging (`offset = page *
-    /// page_size`) through the shared [`crate::repo::paging`] helper
-    /// (clamped page size).
+    /// (`not_after` DESC, `id` as the tiebreaker), LIMIT/OFFSET paging
+    /// (`offset = page * page_size`) through the shared
+    /// [`crate::repo::paging`] helper (clamped page size). The
+    /// tiebreaker is load-bearing, not cosmetic: equal-`not_after` rows
+    /// (two certificates from one issuance run share the expiry tick)
+    /// would otherwise come back in unspecified order — an unstable
+    /// listing AND a page-boundary hazard, where a tie row can appear
+    /// on two pages or neither.
     pub async fn list_by_tenant(
         &self,
         executor: impl PgExecutor<'_>,
@@ -172,7 +177,7 @@ impl CertificateRepo {
             "SELECT id, tenant_id, ca_id, profile_name, profile_revision_id, subject, serial, \
              serial_hex, san_dns, san_ips, key_type, not_before, not_after, cert_pem, status, \
              revoked_at, revocation_reason, revocation_detail, source, created_at \
-             FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC \
+             FROM certificates WHERE tenant_id = $1 ORDER BY not_after DESC, id \
              LIMIT $2 OFFSET $3",
         )
         .bind(tenant_id)
@@ -220,9 +225,13 @@ impl CertificateRepo {
     }
 
     /// The tenant's certificates through a composed filter, one page at a
-    /// time, latest expiry first (`not_after` DESC, same as
-    /// [`CertificateRepo::list_by_tenant`]), LIMIT/OFFSET paging through
-    /// the shared [`crate::repo::paging`] helper.
+    /// time, latest expiry first (`not_after` DESC with the `id`
+    /// tiebreaker — same as [`CertificateRepo::list_by_tenant`], and
+    /// load-bearing here for the same reason: one issuance run's
+    /// certificates share the midnight-anchored expiry tick, so without
+    /// the tiebreak the page order among them is whatever the plan
+    /// yields), LIMIT/OFFSET paging through the shared
+    /// [`crate::repo::paging`] helper.
     ///
     /// The WHERE clause composes ONLY the filter fields that are `Some`
     /// (`tenant_id` is always present); every value binds as a parameter —
@@ -275,7 +284,7 @@ impl CertificateRepo {
             next += 1;
         }
         sql.push_str(&format!(
-            " ORDER BY not_after DESC LIMIT ${next} OFFSET ${}",
+            " ORDER BY not_after DESC, id LIMIT ${next} OFFSET ${}",
             next + 1
         ));
 

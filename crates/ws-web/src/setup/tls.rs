@@ -84,6 +84,50 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
     Ok((certificate.pem(), fingerprint))
 }
 
+/// The SEALED-MODE certificate: the same mint as
+/// [`setup_certificate`] (ECDSA P-256, the operator's browser is the
+/// consumer, the same pins) but EPHEMERAL — no keystore access (the
+/// instance is sealed; no key material exists in this process yet), no
+/// setup-slot write, and a validity of hours: the certificate lives only
+/// long enough for the operator to read the unlock page and enter the
+/// master passphrase, after which the TLS reload presents the real leaf.
+/// The fingerprint returns for the unlock page's out-of-band hint.
+pub fn sealed_certificate(san: &str) -> Result<(String, Vec<u8>, String), CaError> {
+    let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
+
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "Wardstone Sealed");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![san_type(san)?];
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![RcgensEku::ServerAuth];
+    params.serial_number = Some(setup_serial()?);
+    // Hours, not the week the setup page gets: the sealed certificate
+    // must only outlive the unlock form.
+    let now = Utc::now();
+    let not_before = now - chrono::Duration::hours(1);
+    let not_after = now + chrono::Duration::hours(12);
+    params.not_before = date_time_ymd(
+        not_before.year(),
+        not_before.month() as u8,
+        not_before.day() as u8,
+    );
+    params.not_after = date_time_ymd(
+        not_after.year(),
+        not_after.month() as u8,
+        not_after.day() as u8,
+    );
+
+    let certificate = params.self_signed(&key_pair)?;
+    let fingerprint = hex::encode(Sha256::digest(certificate.der().as_ref()));
+    Ok((certificate.pem(), private_key_der.to_vec(), fingerprint))
+}
+
 /// The SAN from `san`: an IP address becomes an `iPAddress`, anything else
 /// a DNS name (the ws-api issuance path's convention).
 fn san_type(san: &str) -> Result<rcgen::SanType, CaError> {

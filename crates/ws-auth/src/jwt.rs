@@ -325,6 +325,129 @@ fn assert_pair_usable(
     Ok(())
 }
 
+/// Write BOTH PEMs as ONE sealed envelope (`jwt-keys.envelope`): the pair
+/// travels under the operator's KeyEnvelope and exists on disk ONLY as
+/// inert ciphertext. The legacy plaintext pair's re-key-by-deletion
+/// recovery becomes a post-unlock operator action. The `generation` is
+/// the volume's passphrase epoch (the conversion seals at 0; a changed
+/// passphrase re-wraps this envelope at epoch + 1 like every other).
+pub fn write_sealed(
+    path: &Path,
+    passphrase: &str,
+    keys: &JwtKeys,
+    generation: u64,
+) -> Result<(), crate::error::AuthError> {
+    let combined = serde_json::json!({
+        "signing": keys.signing_key_pem.as_str(),
+        "verification": keys.verification_key_pem,
+    })
+    .to_string();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        path,
+        passphrase,
+        combined.as_bytes(),
+        ws_core::crypto::PROD_KDF_PARAMS,
+        generation,
+    )
+    .map_err(|e| crate::error::AuthError::Crypto(format!("jwt key envelope: {e}")))
+}
+
+/// Open the sealed pair from `path` with the passphrase.
+///
+/// A torn PAIR (one plaintext file present, or an envelope whose stored
+/// JSON lost one half) is the same typed torn-state failure as ever —
+/// sealing never heals what the loader refuses.
+pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::error::AuthError> {
+    let opened =
+        ws_core::crypto::KeyEnvelope::open_envelope(path, passphrase).map_err(|e| match e {
+            ws_core::error::CoreError::Crypto(m) if m.contains("master passphrase") => {
+                crate::error::AuthError::Crypto(
+                    "the master passphrase is wrong for the jwt key envelope".to_string(),
+                )
+            }
+            ws_core::error::CoreError::Config(m) | ws_core::error::CoreError::Crypto(m) => {
+                crate::error::AuthError::Config(format!(
+                    "jwt key envelope {}: {}",
+                    path.display(),
+                    m
+                ))
+            }
+            _ => crate::error::AuthError::Crypto(format!("jwt key envelope open failed: {e}")),
+        })?;
+    let body: serde_json::Value = serde_json::from_slice(&opened).map_err(|_| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload is not valid JSON".to_string(),
+        )
+    })?;
+    let signing = body["signing"].as_str().ok_or_else(|| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload lacks the signing key".to_string(),
+        )
+    })?;
+    let verification = body["verification"].as_str().ok_or_else(|| {
+        crate::error::AuthError::Crypto(
+            "the jwt key envelope payload lacks the verification key".to_string(),
+        )
+    })?;
+    // The pair probe (F9, the final review): the same check the
+    // plaintext loader runs (`assert_pair_usable`). Sealing must not
+    // launder a broken pair — a conversion that sealed a torn volume
+    // (one empty half) or an envelope whose halves came from different
+    // pairs refuses HERE, at the load, with the re-key hint, never
+    // boots with a key whose tokens fail their own verification on
+    // first use.
+    let dir = path.parent().unwrap_or(path);
+    assert_pair_usable(signing, verification, dir)?;
+    Ok(JwtKeys {
+        signing_key_pem: signing.to_string(),
+        verification_key_pem: verification.to_string(),
+        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
+    })
+}
+
+/// The sealed boot's load-or-create: open the envelope when it exists;
+/// mint a fresh pair IN RAM and seal it as the envelope when it does
+/// not. A fresh password-less install has no plaintext pair to convert
+/// (nothing ever minted one), so the pair is BORN sealed — no plaintext
+/// file is ever written. The minted pair is proven usable before it is
+/// sealed (the same probe the plaintext loader runs on what it writes).
+/// The mint stamps the volume's `generation` (the unlock reads it from
+/// the master envelope first), so a mid-change crash leaves no envelope
+/// from a foreign epoch.
+pub fn load_or_create_sealed(
+    path: &Path,
+    passphrase: &str,
+    generation: u64,
+) -> Result<JwtKeys, crate::error::AuthError> {
+    if path.exists() {
+        return load_sealed(path, passphrase);
+    }
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if !dir.exists() {
+        fs::create_dir_all(&dir).map_err(|e| {
+            AuthError::Config(format!(
+                "cannot create JWT key directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        force_mode(&dir, 0o700)?;
+    }
+    let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
+    assert_pair_usable(&signing_key_pem, &verification_key_pem, &dir)?;
+    let keys = JwtKeys {
+        signing_key_pem,
+        verification_key_pem,
+        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
+    };
+    write_sealed(path, passphrase, &keys, generation)?;
+    Ok(keys)
+}
+
 /// Sign the given claims as a compact EdDSA JWT.
 pub fn issue_access_token(claims: &AccessClaims, keys: &JwtKeys) -> Result<String, AuthError> {
     let key = EncodingKey::from_ed_pem(keys.signing_key_pem.as_bytes())

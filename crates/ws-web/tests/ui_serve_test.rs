@@ -577,3 +577,40 @@ async fn unmounted_setup_routes_are_explicit_404s_over_the_fallback() {
         "the SPA fallback still serves other client routes"
     );
 }
+
+/// # The full front door's liveness (the sealed-at-rest compose contract)
+///
+/// The compose healthchecks hit each process's own `/healthz`, and the
+/// contract is liveness ONLY: always 200 with a state field, on every
+/// boot state. The locked router owns the route in the sealed lifecycle
+/// (`sealed`/`unlocked`); the UNSEALED front door (this composition —
+/// the DB-free core that rides every `web_router` build plus the SPA
+/// fallback) must answer it too, with `serving`. The route is load-bearing
+/// against the fallback: left unrouted, `GET /healthz` is
+/// extension-less, so the SPA catch-all would answer 200 + `index.html` —
+/// a live-looking answer to a healthcheck that says nothing.
+#[tokio::test]
+async fn healthz_answers_liveness_json_not_the_spa_fallback() {
+    let response = composed_router()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "liveness is unconditional on the full front door"
+    );
+    let bytes = body(response).await;
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("the healthz body is JSON, not the SPA document");
+    assert_eq!(
+        json.get("state").and_then(serde_json::Value::as_str),
+        Some("serving"),
+        "the state field names the full door's phase"
+    );
+}

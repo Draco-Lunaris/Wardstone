@@ -125,6 +125,10 @@ tower = { version = "0.5.3", features = ["util"] }
 
 # tower-http for security/response headers on the ws-api router.
 tower-http = { version = "0.6.11", features = ["set-header"] }
+# The sealed shells' async build closures return BoxFuture (ws-api, ws-web);
+# resolved transitively already via the async stack — the direct pin keeps
+# the closure signature stable.
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 
 # GCRA rate limiting (ws-api's public auth routes): the house's rate-limit
 # runtime. Version aligned to tower_governor 0.8.0's requirement (it pulls

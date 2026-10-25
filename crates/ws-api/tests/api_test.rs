@@ -208,6 +208,44 @@ impl Fixture {
 /// insert the tenant + admin user, mint the admin access token, and build
 /// the router.
 async fn fixture() -> Fixture {
+    let (pool, advisory, tenant_id, admin_id) = fixture_base().await;
+
+    let keys_dir = std::env::temp_dir().join(format!(
+        "ws-api-test-keys-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
+    keystore.ensure_master_key().expect("ensure master key");
+    // The TOTP/OIDC secret-encryption envelope key (created at setup).
+    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
+        .expect("create the secret-encryption key");
+    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+
+    let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
+    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), config);
+    let router = ws_api::router(state.clone());
+
+    Fixture {
+        state,
+        router,
+        pool,
+        tenant_id,
+        admin_id,
+        advisory: Some(advisory),
+        keys_dir,
+        extra_tenants: Mutex::new(Vec::new()),
+    }
+}
+
+/// The fixture's shared base: the pool, the advisory lock, and the tenant
+/// + admin the route tests authenticate as.
+async fn fixture_base() -> (
+    PgPool,
+    sqlx::pool::PoolConnection<sqlx::Postgres>,
+    Uuid,
+    Uuid,
+) {
     let pool = connect(&database_url())
         .await
         .expect("connect should succeed and apply the embedded migrations");
@@ -228,20 +266,74 @@ async fn fixture() -> Fixture {
     let admin_id = Uuid::new_v4();
     insert_user(&pool, tenant_id, admin_id, "admin", Role::Admin).await;
 
+    (pool, advisory, tenant_id, admin_id)
+}
+
+/// The sealed-at-rest test world: the keys directory holds the FOUR
+/// passphrase envelopes (cheap KDF parameters — the tests assert the
+/// change flow, not the argon2 wall clock) and the state serves as the
+/// unlock built it, RAM custody over the volume. The master-key route
+/// is the consumer; nothing here rotates the database role (the change
+/// re-seals the CURRENT credential — rotation stays the unlock's).
+async fn sealed_fixture() -> Fixture {
+    let (pool, advisory, tenant_id, admin_id) = fixture_base().await;
+
     let keys_dir = std::env::temp_dir().join(format!(
-        "ws-api-test-keys-{}-{}",
+        "ws-api-test-sealed-{}-{}",
         std::process::id(),
         Uuid::new_v4()
     ));
-    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
-    keystore.ensure_master_key().expect("ensure master key");
-    // The TOTP/OIDC secret-encryption envelope key (created at setup).
-    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
-        .expect("create the secret-encryption key");
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    std::fs::create_dir_all(&keys_dir).expect("create the keys dir");
+
+    let cheap_params = ws_core::crypto::KdfParams {
+        m_cost: 8192,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    const PASSPHRASE: &str = "the-current-master-passphrase";
+    let master = [7u8; 32];
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        PASSPHRASE,
+        &master,
+        cheap_params,
+        0,
+    )
+    .expect("mint the master envelope");
+    let secret = [9u8; 32];
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::SECRET_ENVELOPE_FILE),
+        PASSPHRASE,
+        &secret,
+        cheap_params,
+        0,
+    )
+    .expect("mint the secret-encryption envelope");
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE),
+        PASSPHRASE,
+        b"the-current-db-credential",
+        cheap_params,
+        0,
+    )
+    .expect("mint the db-credential envelope");
+    // The JWT pair mints straight into its envelope — the fresh-install
+    // production shape (no plaintext pair ever exists on a sealed volume).
+    let jwt = ws_auth::jwt::load_or_create_sealed(
+        &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        PASSPHRASE,
+        0,
+    )
+    .expect("mint the JWT pair into its envelope");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), config);
+    let state = AppState::new_unlocked(
+        pool.clone(),
+        std::sync::Arc::new(jwt),
+        config,
+        zeroize::Zeroizing::new(master),
+        ws_core::crypto::SecretBox::from_key(zeroize::Zeroizing::new(secret)),
+    );
     let router = ws_api::router(state.clone());
 
     Fixture {
@@ -1634,6 +1726,12 @@ async fn capability_table_refusal_matrix() {
             Some(json!({"name": "", "domain": ""})),
             Capability::ManageSystem,
         ),
+        (
+            "POST",
+            "/api/v1/master-key".into(),
+            Some(json!({"current": "a-current", "next": "a-next"})),
+            Capability::ManageSystem,
+        ),
     ];
 
     let no_caps = api_token(&fx, &[]).await;
@@ -1771,6 +1869,10 @@ async fn login_refresh_logout_lifecycle() {
     let me: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(me["actor_type"], "user");
     assert_eq!(me["username"], "operator");
+    assert_eq!(
+        me["sealed_volume"], false,
+        "the legacy file-read state is not a sealed volume, got: {me}"
+    );
 
     // Refresh rotates: the new pair works, the OLD refresh token is dead.
     let res = post_json(
@@ -2889,7 +2991,35 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
             .collect()
     };
 
-    assert_eq!(ids(&unfiltered), vec![a_id, b_id], "no filter lists both");
+    // The listing contract orders by `not_after DESC` and ties on `id`
+    // (equal-expiry rows keep a stable order across calls and pages).
+    // The expectation is computed by parsing the LISTING'S OWN rows —
+    // never a string compare of RFC 3339 (fractional digits of
+    // differing lengths invert: ".98Z" vs ".987Z") and never a bare id
+    // sort. The mints do NOT have distinct expiries to fall back on:
+    // one profile's leaves share the midnight-anchored validity window,
+    // so both mint in this test at the SAME `not_after` and the id
+    // tiebreak is the whole order — which is exactly what the 2026-10-25
+    // full-run flake was (the filtered query lacked the tiebreak and
+    // Postgres was free to hand the tied rows back in heap order).
+    let expected: Vec<Uuid> = {
+        let mut rows: Vec<(DateTime<Utc>, Uuid)> = unfiltered
+            .as_array()
+            .expect("the unfiltered list is a JSON array")
+            .iter()
+            .map(|row| {
+                (
+                    DateTime::parse_from_rfc3339(row["not_after"].as_str().unwrap())
+                        .expect("the row's not_after is RFC 3339")
+                        .with_timezone(&Utc),
+                    row["id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        rows.into_iter().map(|(_, id)| id).collect()
+    };
+    assert_eq!(ids(&unfiltered), expected, "no filter lists both");
     assert_eq!(
         ids(&by_status),
         vec![a_id],
@@ -4762,4 +4892,161 @@ async fn ui_acme_rest_capability_gates_and_unknown_404s() {
     assert_eq!(nogrant_deactivate, StatusCode::FORBIDDEN);
     assert_eq!(admin_unknown_status, StatusCode::NOT_FOUND);
     assert_eq!(admin_unknown_code, "not_found");
+}
+
+// --- Task 4b: the master-passphrase change route ---
+
+/// The four standard envelopes, one home for the change tests' opens.
+const SEALED_VOLUME_FILES: [&str; 4] = [
+    ws_core::crypto::MASTER_ENVELOPE_FILE,
+    ws_core::crypto::SECRET_ENVELOPE_FILE,
+    ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE,
+    ws_core::crypto::JWT_ENVELOPE_FILE,
+];
+
+#[tokio::test]
+async fn master_key_change_rewraps_the_volume_and_audits() {
+    let mut fx = sealed_fixture().await;
+    let token = api_token(&fx, &[Capability::ManageSystem]).await;
+
+    let res = post_json(
+        &fx,
+        "/api/v1/master-key",
+        Some(&token),
+        json!({
+            "current": "the-current-master-passphrase",
+            "next": "the-next-master-passphrase",
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "the change succeeds");
+    let body = json_body(res, 4096).await;
+    assert_eq!(
+        body["generation"], 1,
+        "the response names the new generation"
+    );
+
+    // Every envelope now opens under the NEXT passphrase only, at the
+    // advanced generation — the change re-wraps the whole volume or
+    // nothing.
+    for file in SEALED_VOLUME_FILES {
+        let opened = ws_core::crypto::KeyEnvelope::open_envelope(
+            &fx.keys_dir.join(file),
+            "the-next-master-passphrase",
+        )
+        .unwrap_or_else(|e| panic!("the next passphrase opens {file}: {e}"));
+        assert_eq!(
+            ws_core::crypto::KeyEnvelope::read_generation(&fx.keys_dir.join(file)).unwrap(),
+            1,
+            "{file} advanced to generation 1"
+        );
+        let err = ws_core::crypto::KeyEnvelope::open_envelope(
+            &fx.keys_dir.join(file),
+            "the-current-master-passphrase",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ws_core::error::CoreError::Crypto(_)),
+            "the retired passphrase no longer opens {file}"
+        );
+        let _ = opened;
+    }
+    // The retired passphrase no longer opens the JWT pair's SEALED form
+    // either — the envelope above is the pair's only home.
+    let jwt_err = ws_auth::jwt::load_sealed(
+        &fx.keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        "the-current-master-passphrase",
+    )
+    .unwrap_err();
+    assert!(
+        jwt_err.to_string().contains("crypto"),
+        "the retired passphrase refuses the JWT envelope: {jwt_err}"
+    );
+
+    // The audit row: one `master_key_changed` under the acting tenant,
+    // carrying the generation and NO passphrase material.
+    let (count, details): (i64, serde_json::Value) =
+        sqlx::query_as("SELECT count(*), details FROM audit_log WHERE tenant_id = $1 AND action = 'master_key_changed' GROUP BY details")
+            .bind(fx.tenant_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("the change wrote its audit row");
+    assert_eq!(count, 1, "exactly one master_key_changed row");
+    assert_eq!(details["generation"], 1, "the row carries the generation");
+    assert!(
+        !details.to_string().contains("passphrase"),
+        "the audit row carries no passphrase material: {details}"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn master_key_change_refuses_a_wrong_current_and_touches_nothing() {
+    let mut fx = sealed_fixture().await;
+    let token = api_token(&fx, &[Capability::ManageSystem]).await;
+
+    let res = post_json(
+        &fx,
+        "/api/v1/master-key",
+        Some(&token),
+        json!({
+            "current": "a-wrong-current-passphrase",
+            "next": "the-next-master-passphrase",
+        }),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a wrong current is a typed 400"
+    );
+    let body = json_body(res, 4096).await;
+    assert_eq!(
+        body["error"]["code"], "wrong_passphrase",
+        "the failure's machine code names the passphrase, nothing else: {body}"
+    );
+
+    for file in SEALED_VOLUME_FILES {
+        ws_core::crypto::KeyEnvelope::open_envelope(
+            &fx.keys_dir.join(file),
+            "the-current-master-passphrase",
+        )
+        .unwrap_or_else(|e| panic!("a refused change leaves {file} untouched: {e}"));
+        assert_eq!(
+            ws_core::crypto::KeyEnvelope::read_generation(&fx.keys_dir.join(file)).unwrap(),
+            0,
+            "a refused change advances nothing in {file}"
+        );
+    }
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM audit_log WHERE tenant_id = $1 AND action = 'master_key_changed'",
+    )
+    .bind(fx.tenant_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .unwrap();
+    assert!(row.is_none(), "a refused change writes no audit row");
+
+    fx.cleanup().await;
+}
+
+/// `me` names the sealed volume (Task 4b): the SPA gates its admin
+/// change-form entry on the flag, so the unlocked state — the state
+/// the sealed instance's unlock built — carries it, and the legacy
+/// file-read state does not.
+#[tokio::test]
+async fn me_names_the_sealed_volume_for_the_spa() {
+    let mut fx = sealed_fixture().await;
+    let token = api_token(&fx, &[Capability::ManageSystem]).await;
+
+    let res = get_bearer(&fx, "/api/v1/auth/me", &token).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let me = json_body(res, 4096).await;
+    assert_eq!(
+        me["sealed_volume"], true,
+        "the unlocked state carries the sealed-volume flag, got: {me}"
+    );
+
+    fx.cleanup().await;
 }

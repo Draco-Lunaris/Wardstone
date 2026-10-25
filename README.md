@@ -25,7 +25,8 @@ with every private key stored encrypted-at-rest outside the database.
   [ACME for machines](#acme-for-machines)).
 - **Web UI** — a first-run setup wizard that mints the tenant, root CA,
   admin, and the built-in profiles from one form, then swaps the
-  self-signed setup certificate for a CA-issued leaf on restart.
+  self-signed setup certificate for a CA-issued leaf in place (no
+  restart) and seals every key under the master passphrase you set.
 - **Accounts and auth** — local accounts (argon2id), TOTP multi-factor,
   generic OIDC single sign-on, role-based capabilities, service API
   tokens, and one-shot pull tokens for scripted certificate retrieval.
@@ -53,17 +54,31 @@ docker compose -f docker/compose.yml up -d
 
 The first two variables are required by design — an unset hostname would
 serve the setup certificate with a placeholder SAN, and an unset password
-would make the bundled Postgres guessable. The image publish requires the
-GitHub package to be public (or an existing `docker login ghcr.io`).
+would make the bundled Postgres guessable. **`WARDSTONE_DB_PASSWORD` is a
+bootstrap-only value**: it initializes the bundled database and seeds the
+ui's seeding boot, and setup retires it as a login credential for good
+(the conversion rotates the database role's password under your master
+passphrase, and every unlock rotates it again). The image publish requires
+the GitHub package to be public
+(or an existing `docker login ghcr.io`).
 `WARDSTONE_IMAGE=wardstone:latest` is the default when you build locally.
 
 **First run.** Browse `https://<host>:8443/`, accept the freshly minted
 self-signed setup certificate (its SHA-256 fingerprint is displayed on
-the page for out-of-band verification), and fill the setup form: admin
-username and password, default domain, optional admin CIDRs, and the
-server hostname. On success the UI process exits cleanly and its restart
-policy brings it back serving the CA-issued TLS leaf. Sign in with the
-admin account you just created — `POST /setup` now returns 404 forever.
+the page for out-of-band verification), and fill the setup form: **set
+your master passphrase** (the key that seals every sensitive file on the
+instance — it exists nowhere on any disk, and it is not recoverable,
+store it in your password manager), then the admin username and password,
+default domain, optional admin CIDRs, and the server hostname. The UI
+process **resumes in place** serving the CA-issued TLS leaf — no restart,
+no re-typing. Sign in with the admin account you just created — `POST
+/setup` now returns 404 forever.
+
+**Sealed boots.** Every container restart returns the instance to the
+locked page: enter your master passphrase on it and the instance resumes
+where it left off. While sealed the database is unreachable, the keys are
+ciphertext on disk, and the only thing the front door serves is the
+unlock page — that is the design, not an outage.
 
 **First certificate.** Two paths, both open on the same instance:
 
@@ -153,20 +168,22 @@ The short list every operator should know; the full manual — variants,
 SSO setup, rate-limiter placement, image contract, recovery procedures —
 is [`docker/README.md`](docker/README.md).
 
-- **Keep `restart: unless-stopped` on `ws-web`.** The setup flow ends
-  with a deliberate clean exit (code 0) and relies on the restart policy
-  to return on the CA-issued leaf; the same policy carries every TLS
-  re-issue.
+- **Keep `restart: unless-stopped` on `ws-web`.** Setup completes with an
+  in-place resume (the listener swaps onto the CA-issued leaf, no exit);
+  the policy is what carries the stack through host reboots, crashes, and
+  redeploys — every restart lands the instance on the unlock page, where
+  the master passphrase resumes it.
 - **Never `docker compose down -v`** against an instance you care about:
   it deletes the keys volume along with the database volume. Plain `down`
   keeps both named volumes.
-- **Lost or broken JWT key files are a loud stop, not a heal.** The
+- **Lost or broken JWT key material is a loud stop, not a heal.** The
   processes refuse to silently re-key (that would invalidate every
-  outstanding token while looking normal); the documented recovery
-  removes both `jwt-*.pem` files with the services stopped and restarts.
-  Since the pair is validated as a *pair* at load, a mixed one (e.g. from
-  two processes racing on a fresh volume) now fails the boot with the
-  same recovery hint instead of issuing tokens nothing can verify.
+  outstanding token while looking normal). On a sealed volume the pair
+  lives only in `jwt-keys.envelope`: the documented recovery removes that
+  one envelope with the services stopped, and the next unlock mints a
+  fresh pair straight into a new one — every outstanding token is
+  invalid, everyone logs in again (the legacy pre-conversion path and its
+  pair-validation failure are in [`docker/README.md`](docker/README.md)).
 - **Verify with `docker compose config`** before an upgrade; the compose
   file is the deployment contract.
 
@@ -218,9 +235,22 @@ docker build -f docker/Dockerfile -t wardstone:local .
 ## Security
 
 Key handling, issuance flows, and the web UI are security-sensitive by
-nature; the design treats them accordingly (encrypted key envelopes, no
-forwarded-for trust, challenge verification computed server-side, tokens
-never in browser state, migrations that enforce tenancy in the schema).
+nature; the design treats them accordingly. The headline control is
+**sealed at rest**: every sensitive file on the instance (the CA key
+envelopes, the session-key pair, the second-factor seals, the database
+credential) is ciphertext under a key derived from **your master
+passphrase** — entered at the HTTPS front door when you unlock the
+instance, existing nowhere on any disk. A sealed instance is correctly
+unhealthy while locked; the disk copy of a running instance is inert
+until unlocked; a database copy carries no plaintext secrets. The stated
+residuals, plainly: a **host-root** attacker on the running instance
+reads unlocked memory (no software defends that); a **stolen passphrase**
+defeats the seal (keep it in your password manager, not on the same
+machine); and **losing the passphrase** loses the instance — its
+identities are re-issued from the offline root you control. Further
+hardening habits (no forwarded-for trust, server-computed challenge
+verification, tokens never in browser state, tenancy enforced in the
+schema) ride along underneath.
 Please report potential vulnerabilities privately through GitHub's
 private vulnerability reporting rather than a public issue.
 

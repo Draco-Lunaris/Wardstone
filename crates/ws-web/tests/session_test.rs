@@ -308,7 +308,9 @@ async fn env(ttl: Duration) -> TestEnv {
         keys_dir.clone(),
         "relay-fingerprint".to_owned(),
         "ui.relay.test".to_owned(),
+        None, // no listener to swap in the router suites
         &api_base,
+        database_url(),
         store.clone(),
         None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter
     )
@@ -482,6 +484,7 @@ async fn ui_login_sets_cookie_and_me() {
         "display_name",
         "role",
         "mfa_enabled",
+        "sealed_volume",
     ]
     .into_iter()
     .map(str::to_owned)

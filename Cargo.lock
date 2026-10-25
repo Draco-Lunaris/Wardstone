@@ -3354,7 +3354,9 @@ name = "wardstone"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "chrono",
+ "futures-util",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
@@ -3763,6 +3765,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "futures-util",
  "governor",
  "hex",
  "hickory-resolver",
@@ -3785,6 +3788,7 @@ dependencies = [
  "ws-auth",
  "ws-ca",
  "ws-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -3843,8 +3847,11 @@ dependencies = [
 name = "ws-core"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "base64 0.23.1",
  "chacha20poly1305",
  "chrono",
+ "hex",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -3863,6 +3870,7 @@ dependencies = [
  "axum-server",
  "base64 0.23.1",
  "chrono",
+ "futures-util",
  "hex",
  "include_dir",
  "jsonwebtoken",

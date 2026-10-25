@@ -31,7 +31,6 @@ use uuid::Uuid;
 use ws_auth::error::AuthError;
 use ws_auth::jwt::{issue_access_token, AccessClaims};
 use ws_auth::refresh::{authenticate_refresh_token, issue_refresh_token, rotate_refresh_token};
-use ws_core::crypto::SecretBox;
 use ws_core::models::rbac::{Actor, ActorType, AuthMethod, Role};
 use ws_core::models::tenant::Tenant;
 use ws_core::models::user::UserModel;
@@ -253,7 +252,7 @@ async fn verify_totp_of_user(
             "the account has mfa enabled but carries no stored secret".to_string(),
         ));
     };
-    let secret_box = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+    let secret_box = state.secret_box()?;
     let secret = secret_box
         .open(&encrypted, &nonce)
         .map_err(ApiError::from)?;
@@ -417,6 +416,7 @@ async fn me(auth: AuthActor, State(state): State<AppState>) -> Result<Json<MeRes
         display_name: None,
         role: None,
         mfa_enabled: None,
+        sealed_volume: state.sealed_volume(),
     };
     if auth.actor_type == ActorType::User {
         let user = UserRepo::new()
@@ -444,6 +444,10 @@ pub struct MeResponse {
     pub display_name: Option<String>,
     pub role: Option<String>,
     pub mfa_enabled: Option<bool>,
+    /// Whether the serving state is an unlocked sealed volume: the SPA
+    /// gates its admin surface's passphrase-change entry on it (the
+    /// legacy plaintext world carries `false`).
+    pub sealed_volume: bool,
 }
 
 /// The TOTP mutation bodies (`activate`/`deactivate` verify a code).
@@ -477,7 +481,7 @@ async fn totp_enroll(
     let secret = ws_auth::mfa_totp::generate_secret().map_err(ApiError::from)?;
     let provisioning_uri =
         ws_auth::mfa_totp::provisioning_uri(TOTP_ISSUER, &user.username, &secret);
-    let secret_box = SecretBox::load(&state.secret_key_path()).map_err(ApiError::from)?;
+    let secret_box = state.secret_box()?;
     let (encrypted, nonce) = secret_box.seal(secret.as_bytes()).map_err(ApiError::from)?;
 
     let mut tx = state.pool.begin().await?;

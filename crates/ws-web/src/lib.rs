@@ -33,6 +33,8 @@
 //! socket address attached to every request (`ConnectInfo`, Task 12's
 //! per-IP limiter's key input).
 
+pub mod init;
+pub mod locked;
 pub mod proxy;
 pub mod session;
 pub mod setup;
@@ -51,6 +53,57 @@ use ws_ca::error::CaError;
 
 use session::relay::relay_router;
 use session::store::SessionStore;
+
+/// Mount the per-IP GCRA on a credential sub-router (spec §5.1: the
+/// unlock and conversion POSTs are credential surfaces — wrong
+/// passphrases cost argon2 memory-hard compute AND a bucket credit,
+/// with the house defaults the auth surface shares). The ONE home for
+/// the mount: the `/auth/ui` relay routes, the locked door's
+/// `POST /unlock`, and the INIT door's `POST /init` all pass through
+/// here, keyed on the connected socket the TLS listener attaches
+/// (`ConnectInfo`; the tests inject the same extension).
+pub(crate) fn gcra<S>(
+    router: Router<S>,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+    surface: &str,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match rate_limit {
+        Some(limit) => {
+            // `finish()` fails only on a zero burst or period (both
+            // caller-configured; the binary refuses a zero at boot, so
+            // this skip branch is unreachable from `run_ui`). The router
+            // constructor cannot be fallible — mirroring ws-api, a broken
+            // number is a LOUDLY-LOGGED skip of the layer, never a panic
+            // at boot.
+            match tower_governor::governor::GovernorConfigBuilder::<
+                tower_governor::key_extractor::PeerIpKeyExtractor,
+                _,
+            >::default()
+            .per_millisecond(limit.per_millis)
+            .burst_size(limit.burst)
+            .finish()
+            {
+                Some(config) => router.layer(tower_governor::GovernorLayer::new(
+                    std::sync::Arc::new(config),
+                )),
+                None => {
+                    tracing::error!(
+                        per_millis = limit.per_millis,
+                        burst = limit.burst,
+                        "invalid rate-limit configuration on {surface}: per_millis and \
+                         burst must be positive; the {surface} routes run WITHOUT rate \
+                         limiting"
+                    );
+                    router
+                }
+            }
+        }
+        None => router,
+    }
+}
 
 pub use proxy::{acme_router, api_router, api_router_with_auth_limit};
 pub use setup::{
@@ -94,12 +147,21 @@ pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
 /// that run `web_router` pass `None` (no limiter — an in-process
 /// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
 /// the same reason ws-api's tests disable its layer).
+///
+/// `tls_reload` is the listener's reloadable TLS config — the handle the
+/// SETUP branch's commit swaps onto the CA-issued leaf in place (the
+/// resume contract). It matters only while the setup surface mounts (no
+/// tenant yet): the binary passes `Some(clone)` on that boot path and
+/// `None` on the others; tests pass `None` (no listener to swap).
+#[allow(clippy::too_many_arguments)]
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
+    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
+    database_url: String,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -109,7 +171,9 @@ pub async fn web_router(
         keys_dir,
         fingerprint,
         hostname,
+        tls_reload,
         api_base_url,
+        database_url,
         store,
         rate_limit,
     )
@@ -129,12 +193,15 @@ pub async fn web_router(
 /// (`POST /acme/{tenant}/new-account`, the one unauthenticated ACME
 /// mutator — see [`proxy::acme_router`]; see [`web_router`] and
 /// [`session_router_with_store`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
+    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
+    database_url: String,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -151,6 +218,9 @@ pub async fn web_router_with_store(
             keys_dir,
             fingerprint,
             hostname,
+            tls_reload,
+            api_base_url: api_base_url.to_owned(),
+            database_url,
         }))
     } else {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())
@@ -169,7 +239,8 @@ pub async fn web_router_with_store(
 /// `rate_limit`), and the `/acme` proxy (its ENROLLMENT route
 /// limiter-scoped per the SAME value — the one unauthenticated ACME
 /// mutator, per-IP limited at this edge because ws-api's per-IP bucket
-/// collapses behind the proxy; the rest of `/acme` forwards unlimited)
+/// collapses behind the proxy; the rest of `/acme` forwards unlimited),
+/// and the `/healthz` liveness route (see the route's own comment)
 /// merged — every web-fronted route EXCEPT the setup surface and the SPA
 /// fallback, which need the tenant check. Public so the rate-limit suite
 /// can drive the COMPOSED stack (relay AND proxy in one router, the
@@ -195,6 +266,18 @@ pub fn session_router_with_store(
         .merge(relay)
         .merge(api)
         .merge(acme_router(api_base_url, rate_limit))
+        // Liveness, the compose contract: always 200 with a state field,
+        // never a readiness gate — a correctly-locked service is never
+        // restart-churned by its own healthcheck. The locked router owns
+        // the route in the sealed lifecycle (`sealed`/`unlocked`); this
+        // one answers the UNSEALED boot. It must be a real route, not a
+        // fallback catch: left unrouted, the extension-less GET would
+        // fall through to the SPA document, answering a live-looking 200
+        // + `index.html` that says nothing.
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "state": "serving" })) }),
+        )
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
@@ -230,6 +313,36 @@ pub fn rustls_server_config(
 /// (cert: the `certificates` row, key: the envelope under the
 /// certificate's id) after setup — a process restart, not a hot reload,
 /// is the TLS switch between the two.
+/// A RELOADABLE TLS config: the sealed ui's listener holds one of these
+/// from its first bind (the ephemeral sealed certificate) and the unlock
+/// closure reloads it with the CA-issued leaf in place — the resume
+/// contract's TLS half (no re-listen, no restart).
+pub type TlsReloadConfig = axum_server::tls_rustls::RustlsConfig;
+
+pub fn reloadable_tls_config(
+    cert_pem: &str,
+    key_der: &[u8],
+) -> Result<axum_server::tls_rustls::RustlsConfig, CaError> {
+    let config = rustls_server_config(cert_pem, key_der)?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(config),
+    ))
+}
+
+/// Serve `router` under a caller-held RELOADABLE TLS config (the sealed
+/// boot binds with the ephemeral certificate; the unlock closure reloads
+/// the same listener onto the CA-issued leaf).
+pub async fn serve_tls_with_config(
+    addr: SocketAddr,
+    config: axum_server::tls_rustls::RustlsConfig,
+    router: Router,
+) -> Result<(), CaError> {
+    axum_server::tls_rustls::bind_rustls(addr, config)
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .map_err(CaError::Io)
+}
+
 pub async fn serve_tls(
     addr: SocketAddr,
     router: Router,
