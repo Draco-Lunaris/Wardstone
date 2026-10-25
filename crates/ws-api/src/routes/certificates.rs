@@ -246,18 +246,13 @@ async fn issue_attempt(
     let ca = choose_ca(&state.pool, actor.tenant_id).await?;
 
     // The transaction: the shared issuance core below, committed once
-    // (the write-side contract).
+    // (the write-side contract). The keystore opens through the state's
+    // custody — legacy file mode on a plaintext volume, the unlocked
+    // RAM custody on a sealed instance.
+    let keystore = state.keystore()?;
     let mut tx = state.pool.begin().await?;
     let Some(response) = issue_in_tx(
-        &mut tx,
-        &state.config.keys_dir,
-        &profile,
-        &ca,
-        &revision,
-        body,
-        actor,
-        cert_id,
-        audit_id,
+        &mut tx, keystore, &profile, &ca, &revision, body, actor, cert_id, audit_id,
     )
     .await?
     else {
@@ -316,7 +311,7 @@ async fn issue_attempt(
 #[allow(clippy::too_many_arguments)]
 async fn issue_in_tx(
     exec: &mut sqlx::PgConnection,
-    keys_dir: &std::path::Path,
+    keystore: KeyStore,
     profile: &ProfileModel,
     ca: &CaModel,
     revision: &ProfileRevisionModel,
@@ -385,10 +380,10 @@ async fn issue_in_tx(
     // Signing is synchronous and CPU-bound (RSA key generation on the
     // key-generation path), so it runs inside `tokio::task::spawn_blocking`
     // — a slow keygen must not stall the runtime's worker threads. The
-    // keystore is opened inside the task; the transaction stays open
+    // keystore custody moves into the task; the transaction stays open
     // meanwhile (a slow signing merely extends the transaction).
     let signed = spawn_signing(
-        keys_dir,
+        keystore,
         ca,
         revision,
         body.subject_cn.trim(),
@@ -476,10 +471,11 @@ async fn issue_in_tx(
     }))
 }
 
-/// The CPU-bound signing leg, run inside `spawn_blocking`: open the
-/// keystore, load the CA's key, and — when no CSR was supplied — mint a
-/// fresh leaf key of the profile's pinned type and wrap it in a CSR. The
-/// private-key PEM is present ONLY on the key-generation path.
+/// The CPU-bound signing leg, run inside `spawn_blocking`: load the
+/// CA's key through the caller's keystore custody, and — when no CSR
+/// was supplied — mint a fresh leaf key of the profile's pinned type
+/// and wrap it in a CSR. The private-key PEM is present ONLY on the
+/// key-generation path.
 struct SignOutcome {
     issued: IssuedLeaf,
     private_key_pem: Option<String>,
@@ -487,7 +483,7 @@ struct SignOutcome {
 
 /// Spawn the blocking signing leg and map its typed failure to `ApiError`.
 async fn spawn_signing(
-    keys_dir: &std::path::Path,
+    keystore: KeyStore,
     ca: &CaModel,
     revision: &ProfileRevisionModel,
     subject_cn: &str,
@@ -495,13 +491,11 @@ async fn spawn_signing(
     csr_pem: Option<String>,
     serial: u128,
 ) -> Result<SignOutcome, ApiError> {
-    let keys_dir = keys_dir.to_path_buf();
     let ca = ca.clone();
     let revision = revision.clone();
     let subject_cn = subject_cn.to_string();
     let sans = sans.to_vec();
     tokio::task::spawn_blocking(move || {
-        let keystore = KeyStore::open(&keys_dir).map_err(ApiError::from)?;
         let ca_key_der = keystore.load_ca_key(&ca.id).map_err(ApiError::from)?;
 
         let (csr_pem, private_key_pem) = match csr_pem {
@@ -846,17 +840,11 @@ pub async fn pull_certificate(
         // The shared issuance core on the claim-and-certificate
         // transaction: the CAS collapsing to zero rows — or any later
         // failure — rolls the transaction back, and the token claimed IN
-        // it stays claimable.
+        // it stays claimable. The keystore opens through the state's
+        // custody before the transaction begins.
+        let keystore = state.keystore()?;
         let Some(response) = issue_in_tx(
-            &mut tx,
-            &state.config.keys_dir,
-            &profile,
-            &ca,
-            &revision,
-            &issued,
-            &actor,
-            cert_id,
-            audit_id,
+            &mut tx, keystore, &profile, &ca, &revision, &issued, &actor, cert_id, audit_id,
         )
         .await?
         else {

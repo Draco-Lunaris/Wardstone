@@ -237,3 +237,37 @@ fn racing_creators_serialize_into_one_consistent_pair() {
     assert_eq!(disk.signing_key_pem, first.signing_key_pem);
     assert_eq!(disk.verification_key_pem, first.verification_key_pem);
 }
+
+/// The fresh-install arm of the sealed boot: with no envelope on the
+/// volume (a password-less fresh install has no plaintext pair either —
+/// nothing ever minted one), the load-or-create SEALED form mints the
+/// pair in RAM, seals it as the envelope, and never writes plaintext.
+/// The second call loads the very same pair back.
+#[test]
+fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
+    let dir = temp_keys_dir("jwt-sealed-fresh");
+    let envelope = dir.join("jwt-keys.envelope");
+
+    let minted = ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase").unwrap();
+    assert!(
+        !dir.join("jwt-signing-key.pem").exists() && !dir.join("jwt-verify-key.pem").exists(),
+        "a fresh sealed install never writes the pair as plaintext"
+    );
+    assert!(envelope.exists(), "the fresh pair is sealed on disk");
+
+    let reloaded = ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase").unwrap();
+    assert_eq!(
+        reloaded.signing_key_pem, minted.signing_key_pem,
+        "the second load returns the minted pair, not a fresh one"
+    );
+    assert_eq!(
+        reloaded.verification_key_pem, minted.verification_key_pem,
+        "the second load returns the minted pair, not a fresh one"
+    );
+
+    let refused = ws_auth::jwt::load_or_create_sealed(&envelope, "wrong");
+    assert!(
+        refused.is_err(),
+        "a wrong passphrase must not mint over or open the existing envelope"
+    );
+}

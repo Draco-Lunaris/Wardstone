@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use ws_ca::ca::{certificate_validity, create_root, create_sub_ca, CaLifetime, CaSpec, CreatedCa};
-use ws_ca::keystore::KeyStore;
 use ws_core::models::ca::{CaModel, KeyType};
 use ws_core::models::rbac::Capability;
 use ws_core::repo::audit_repo::AuditRepo;
@@ -147,11 +146,13 @@ async fn create_ca(
     };
 
     // The mint (including RSA key generation) is CPU-bound and
-    // synchronous: `spawn_blocking`. The keystore is opened inside the
-    // task; for a sub-CA the parent's key envelope is loaded there too.
-    let keys_dir = state.config.keys_dir.clone();
+    // synchronous: `spawn_blocking`. The keystore custody moves into the
+    // task (legacy file mode on a plaintext volume, the unlocked RAM
+    // custody on a sealed instance); for a sub-CA the parent's key
+    // envelope is loaded there too.
+    let keystore = state.keystore()?;
     let created = tokio::task::spawn_blocking(move || -> Result<CreatedCa, ApiError> {
-        let mut keystore = KeyStore::open(&keys_dir).map_err(ApiError::from)?;
+        let mut keystore = keystore;
         let created = match &parent {
             Some(parent) => {
                 let parent_key_der = keystore.load_ca_key(&parent.id).map_err(ApiError::from)?;
@@ -264,7 +265,7 @@ async fn export_ca_key(
         .reason
         .unwrap_or_else(|| "operator backup export".to_string());
 
-    let keystore = KeyStore::open(&state.config.keys_dir).map_err(ApiError::from)?;
+    let keystore = state.keystore()?;
     let key_der = keystore.load_ca_key(&ca.id).map_err(ApiError::from)?;
     let key_pem = pem_from_der("PRIVATE KEY", &key_der);
 

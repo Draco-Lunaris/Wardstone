@@ -97,3 +97,28 @@ fn kek_derive_is_deterministic_per_salt_and_params() {
     assert_eq!(&*a, &*b, "same passphrase+salt+params derive the same KEK");
     assert_ne!(&*a, &*c, "a different passphrase derives a different KEK");
 }
+
+/// The DB-URL password substitution replaces exactly the password and
+/// leaves everything else byte-identical — and inserts a password into a
+/// URL that carried none (the api's password-less compose contract).
+#[test]
+fn db_password_substitution_is_surgical() {
+    let url = "postgres://wardstone:old-secret@db:5432/wardstone";
+    let substituted = ws_core::crypto::substitute_db_password(url, "new-credential");
+    assert_eq!(
+        substituted, "postgres://wardstone:new-credential@db:5432/wardstone",
+        "only the password changes"
+    );
+    let bare = "postgres://wardstone@db:5432/wardstone";
+    assert_eq!(
+        ws_core::crypto::substitute_db_password(bare, "inserted"),
+        "postgres://wardstone:inserted@db:5432/wardstone",
+        "a password-less URL gains one"
+    );
+    let weird = "not-a-url";
+    assert_eq!(
+        ws_core::crypto::substitute_db_password(weird, "x"),
+        weird,
+        "a non-URL passes through"
+    );
+}

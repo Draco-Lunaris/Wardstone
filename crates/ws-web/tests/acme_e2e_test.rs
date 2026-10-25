@@ -642,6 +642,7 @@ async fn env() -> Env {
         keys_dir.clone(),
         "e2e-fingerprint".to_owned(),
         E2E_DOMAIN.to_owned(),
+        None, // no listener to swap in the router suites
         &api_base,
         store,
         None, // the front-door limiters key on ConnectInfo, absent for a oneshot

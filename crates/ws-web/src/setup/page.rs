@@ -50,13 +50,70 @@ pub async fn submit_setup(
 
     let keys_dir = state.keys_dir;
     let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir)?;
-    run_setup(&fields, &state.pool, &mut keystore).await?;
+    let (leaf_pem, leaf_key_der) = run_setup(&fields, &state.pool, &mut keystore).await?;
+
+    // The one-time conversion: every plaintext key file wraps into
+    // passphrase-sealed envelopes, the DB credential rotates under the
+    // same passphrase, and the plaintext originals are DELETED — the
+    // volume is inert from here on and every future boot is locked.
+    crate::setup::seal_keys_volume(
+        &keys_dir,
+        &fields.master_passphrase,
+        &state.pool,
+        "wardstone",
+    )
+    .await?;
+    drop(keystore);
+
+    // The resume contract: the listener swaps onto the CA-issued leaf IN
+    // PLACE — no restart, no re-listen. The operator continues straight
+    // to the login on the same connection.
+    if let Some(reload) = state.tls_reload.clone() {
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode(&*leaf_key_der);
+        let mut key_pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+        let mut rest = body.as_str();
+        while !rest.is_empty() {
+            let (line, tail) = rest.split_at(rest.len().min(64));
+            key_pem.push_str(line);
+            key_pem.push('\n');
+            rest = tail;
+        }
+        key_pem.push_str("-----END PRIVATE KEY-----\n");
+        reload
+            .reload_from_pem(leaf_pem.into_bytes(), key_pem.into_bytes())
+            .await
+            .map_err(|e| {
+                SubmitError::Setup(ws_ca::error::CaError::Worker(format!(
+                    "the TLS resume failed: {e}"
+                )))
+            })?;
+        tracing::info!("the listener resumed onto the CA-issued leaf in place");
+    }
+
+    // The fresh-install flow's api half (the compose contract): the api
+    // process booted as the sealed shell — its password-less
+    // DATABASE_URL leaves it nothing to build a pool from — and this one
+    // relay is the event that brings its full surface up. Best-effort BY
+    // DESIGN (spec §5): a relay that does not land leaves the api sealed,
+    // the logged verdict names it, and the documented recovery is the
+    // api's restart plus its own unlock — the operator's setup result
+    // never depends on it.
+    if let Err(reason) =
+        crate::locked::relay_unlock(&state.api_base_url, &fields.master_passphrase).await
+    {
+        tracing::warn!(
+            error = %reason,
+            "the setup commit's api unlock relay did not land; the api stays \
+             sealed until its restart and unlock"
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "restart": true,
-        "message": "Wardstone is configured. The UI process must restart now to serve \
-                    TLS from the CA-issued certificate; it will come back on its own.",
+        "resume": true,
+        "message": "Wardstone is configured and sealed: the master passphrase you set \
+                    unlocks every future start of this instance. Continue to the login.",
         "hostname": fields.server_hostname,
     })))
 }
@@ -94,6 +151,16 @@ impl IntoResponse for SubmitError {
 /// The server-side form checks (matching `run_setup`'s own policy) so a
 /// blank field is a 400 for the form user, not a 500 from the bootstrap.
 fn validate(fields: &SetupFields) -> Result<(), String> {
+    // The master passphrase: required, confirmed. The page warns it is
+    // not recoverable — the validation refuses blanks and mismatches with
+    // the same 400 shape as every other field.
+    if fields.master_passphrase.trim().is_empty() {
+        return Err("a master passphrase is required: it seals every key on this              instance and is not recoverable"
+            .to_string());
+    }
+    if fields.master_passphrase != fields.master_passphrase_confirm {
+        return Err("the master passphrase and its confirmation do not match".to_string());
+    }
     let required = [
         ("admin_username", fields.admin_username.as_str()),
         ("admin_password", fields.admin_password.as_str()),
@@ -131,6 +198,8 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
   event.preventDefault();
   const form = event.target;
   const payload = {
+    master_passphrase: form.master_passphrase.value,
+    master_passphrase_confirm: form.master_passphrase_confirm.value,
     admin_username: form.admin_username.value,
     admin_password: form.admin_password.value,
     default_domain: form.default_domain.value,
@@ -153,12 +222,12 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
       const login = document.createElement('a');
       login.href = location.origin + '/';
       login.textContent = 'open the operator login';
-      note.textContent = 'Setup complete. This server is restarting on its CA-issued certificate — ' +
-        'give it a few seconds, then ' + body.message + ' ';
+      note.textContent = 'Setup complete. This instance is sealed — ' + body.message + ' ';
       note.appendChild(login);
       note.insertAdjacentText('beforeend',
         ' Log in with the admin account you just created. Expect one more ' +
-        'certificate warning on the new leaf, and accept it once.');
+        'certificate warning on the new leaf, and accept it once: from now on ' +
+        'every restart of this instance shows the sealed page first.');
     } else {
       note.textContent = body.error || 'Setup failed';
       note.style.color = '#a11';
@@ -194,7 +263,15 @@ fn render(fingerprint: &str, hostname: &str) -> String {
              instance, verify its SHA-256 fingerprint out of band:</p>\n",
             "<code class=\"fingerprint\">{fingerprint}</code>\n",
             "<form id=\"setup-form\">\n",
-            "<label for=\"admin_username\">Admin username</label>\n",
+            "<p class=\"hint\"><strong>Set the master passphrase.</strong> It seals every key on this \
+     instance — the CA keys, the database credential, the session keys — into ciphertext that only \
+     this passphrase opens. It is stored nowhere and <strong>cannot be recovered</strong>: keep it in \
+     your password manager. Every future start of this instance asks for it.</p>\n",
+    "<label for=\"master_passphrase\">Master passphrase (seals every key; not recoverable)</label>\n",
+    "<input id=\"master_passphrase\" name=\"master_passphrase\" type=\"password\" autocomplete=\"new-password\" required>\n",
+    "<label for=\"master_passphrase_confirm\">Confirm the master passphrase</label>\n",
+    "<input id=\"master_passphrase_confirm\" name=\"master_passphrase_confirm\" type=\"password\" autocomplete=\"new-password\" required>\n",
+    "<label for=\"admin_username\">Admin username</label>\n",
             "<input id=\"admin_username\" name=\"admin_username\" autocomplete=\"username\" required>\n",
             "<label for=\"admin_password\">Admin password</label>\n",
             "<input id=\"admin_password\" name=\"admin_password\" type=\"password\" autocomplete=\"new-password\" required>\n",

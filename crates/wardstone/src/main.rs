@@ -21,7 +21,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 use ws_ca::error::CaError;
@@ -51,14 +50,6 @@ const DEFAULT_RATE_BURST: u32 = 20;
 /// UI's own leaf on `web-server`, and an operator re-issue of the server
 /// leaf naturally rides the same built-in profile.
 const SERVING_LEAF_PROFILE: &str = "web-server";
-
-/// How often the setup watcher re-checks for a completed setup.
-const SETUP_WATCH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How long the watcher waits after the first sight of the tenant before
-/// exiting: the setup POST's `restart: true` response (whose bootstrap
-/// committed that tenant) must reach the operator's browser first.
-const SETUP_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// The boot contract, read from the environment — the SAME contract for
 /// both modes.
@@ -466,7 +457,7 @@ fn rate_limit_from(
 ///   its SHA-256 fingerprint displayed on the page), with the setup
 ///   routes mounted ([`ws_web::web_router`] performs the mount check
 ///   itself). A completion watcher exits the process with a success code
-///   once setup commits the tenant (see [`setup_watch`]).
+///   once setup commits the tenant (the in-place TLS resume).
 /// - tenant with an active `web-server` leaf: the CA-issued leaf — the
 ///   certificates row's PEM plus the key envelope under the certificate
 ///   id (the leaf is a first-class issuance: `load_ca_key(cert.id)`).
@@ -599,6 +590,12 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
                 keys_dir,
                 String::new(),
                 hostname,
+                // The unlock's own TLS reload already happened above (the
+                // sealed certificate gave way to the CA-issued leaf); the
+                // setup surface cannot exist on a sealed boot — a sealed
+                // volume implies setup committed — so there is nothing for
+                // a setup commit to swap here.
+                None,
                 &api_url,
                 session_ttl,
                 rate_limit,
@@ -669,21 +666,22 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
             "no tenant yet: serving the first-run setup page over the \
              self-signed setup certificate"
         );
-        // Watch for a completed setup: only `run_setup` creates the
-        // default tenant, so its first appearance IS the `restart: true`
-        // signal the setup POST documents.
-        tokio::spawn(setup_watch(pool.clone()));
+        // The reloadable listener: the setup commit swaps onto the
+        // CA-issued leaf IN PLACE (the resume contract — the sealed design
+        // removed the self-exit restart, so there is no setup watcher).
+        let tls_config = ws_web::reloadable_tls_config(&cert_pem, &key)?;
         let router = ws_web::web_router(
             pool,
             cfg.keys_dir.clone(),
             fingerprint,
             hostname,
+            Some(tls_config.clone()),
             &cfg.api_url,
             ws_web::DEFAULT_SESSION_TTL,
             cfg.web_rate_limit,
         )
         .await?;
-        return serve_ui(cfg, router, &cert_pem, &key).await;
+        return Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?);
     }
 
     // Configured instance: resolve the CA-issued leaf (the controller
@@ -754,6 +752,10 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         cfg.keys_dir.clone(),
         fingerprint,
         hostname,
+        // A configured instance has no setup surface to swap a listener
+        // for — the boot's own certificate (above) is already the
+        // CA-issued leaf.
+        None,
         &cfg.api_url,
         ws_web::DEFAULT_SESSION_TTL,
         cfg.web_rate_limit,
@@ -774,40 +776,6 @@ async fn serve_ui(
     Ok(ws_web::serve_tls(cfg.bind, router, cert_pem, key_der).await?)
 }
 
-/// The setup-completion watcher: only [`ws_web::run_setup`] creates the
-/// default tenant, so its first appearance is the moment the setup POST
-/// has done its work and the process should restart onto the CA-issued
-/// leaf. The choice is stated in code HERE rather than in the HTTP layer:
-/// the POST response's `"restart": true` documents the contract for the
-/// operator, and the compose service's `restart: unless-stopped` brings
-/// the process back on the next invocation of this function's caller —
-/// which then resolves the leaf at boot.
-///
-/// A transient DB outage mid-watch is logged and retried: killing the
-/// only listener over a hiccup would be worse than a late exit.
-async fn setup_watch(pool: sqlx::PgPool) {
-    loop {
-        tokio::time::sleep(SETUP_WATCH_INTERVAL).await;
-        match ws_web::tenant_exists(&pool).await {
-            Ok(true) => {
-                tracing::info!(
-                    "setup completed: exiting with a success code so the \
-                     service manager brings the process back serving the \
-                     CA-issued certificate"
-                );
-                // Let the POST response reach the operator's browser
-                // before the exit tears down the connection.
-                tokio::time::sleep(SETUP_EXIT_GRACE).await;
-                std::process::exit(0);
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!("setup watch: tenant check failed, retrying: {err}");
-            }
-        }
-    }
-}
-
 /// The `api` mode: ws-api's REST router served DIRECTLY as plain HTTP —
 /// the compose service publishes no ports for it to the LAN; ws-web's
 /// proxy is the only path in from there.
@@ -817,12 +785,10 @@ async fn setup_watch(pool: sqlx::PgPool) {
 /// ws-api's `GovernorLayer` per-IP rate limiting actually effective (its
 /// key extractor is the peer IP; without `ConnectInfo` the layer would
 /// see none).
-/// The sealed-at-rest envelope file names on the keys volume (the
-/// design's state predicate: `master.envelope` present ⇒ the instance
-/// is sealed at boot).
-const MASTER_ENVELOPE_FILE: &str = "master.envelope";
-const JWT_ENVELOPE_FILE: &str = "jwt-keys.envelope";
-const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
+/// The sealed-at-rest envelope file names on the keys volume, from
+/// ws-core's single home for the contract (the design's state predicate:
+/// `master.envelope` present ⇒ the instance is sealed at boot).
+use ws_core::crypto::{substitute_db_password, DB_CREDENTIAL_ENVELOPE_FILE, MASTER_ENVELOPE_FILE};
 
 /// Keys-directory-only state derivation (spec §3): `master.envelope`
 /// present → the instance boots sealed and waits for the unlock relay.
@@ -830,25 +796,23 @@ fn sealed_instance(keys_dir: &std::path::Path) -> bool {
     keys_dir.join(MASTER_ENVELOPE_FILE).exists()
 }
 
-/// Substitute the password portion of a `postgres://user:pass@…` URL,
-/// leaving user/host/port/db untouched. Inserts a password when the URL
-/// carries none. The URL that reaches here is operator-supplied env; the
-/// substitution never logs the result.
-fn substitute_db_password(url: &str, password: &str) -> String {
+/// Does the operator-supplied DATABASE_URL carry a password? The
+/// password-less compose contract (the api's env holds no credential at
+/// all — everything credential-shaped lives in the sealed envelopes):
+/// a password-less URL on an unsealed volume is the fresh-install
+/// signal; the api can build no pool at boot and comes up as the sealed
+/// shell instead, waiting for the setup commit's relay. The parsing
+/// mirrors [`substitute_db_password`]'s: the password is whatever
+/// follows the last `:` in the `://…@` authority.
+fn db_url_has_password(url: &str) -> bool {
     let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
+        return false;
     };
     let auth_start = scheme_end + 3;
     let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
-        return url.to_string();
+        return false;
     };
-    match url[auth_start..at].rfind(':') {
-        Some(colon_rel) => {
-            let colon_abs = auth_start + colon_rel;
-            format!("{}{}{}", &url[..=colon_abs], password, &url[at..])
-        }
-        None => format!("{}:{}{}", &url[..at], password, &url[at..]),
-    }
+    url[auth_start..at].rfind(':').is_some()
 }
 
 /// The api's [`ws_api::ApiConfig`] from the boot env — shared by both the
@@ -879,9 +843,11 @@ fn api_config_from(cfg: &BootConfig) -> ws_api::ApiConfig {
 
 /// The sealed api boot: the process binds its listener immediately (the
 /// health surface answers `200 sealed`) and waits for the ui's unlock
-/// relay. The build closure opens the envelopes, rotates the DB credential
-/// (unconditionally, every unlock — a leaked credential dies at the next
-/// unlock), and swaps the FULL `ws_api::router` in.
+/// relay. The build closure is the ws-api builder
+/// ([`ws_api::sealed::unlocked_router_from_envelopes`]): it opens the
+/// envelopes, rotates the DB credential (unconditionally, every unlock —
+/// a leaked credential dies at the next unlock), and swaps the FULL
+/// `ws_api::router` in over RAM custody.
 async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let keys_dir = cfg.keys_dir.clone();
     let database_url = cfg.database_url.clone();
@@ -894,49 +860,13 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
             let config = config.clone();
             let passphrase = req.passphrase.clone();
             futures_util::future::FutureExt::boxed(async move {
-                // The JWT pair: sealed under the passphrase.
-                let jwt = ws_auth::jwt::load_sealed(&keys_dir.join(JWT_ENVELOPE_FILE), &passphrase)
-                    .map_err(ws_api::error::ApiError::from)?;
-                // The DB credential: the envelope holds the CURRENT one; a
-                // fresh install (envelope absent) connects with the env's
-                // bootstrap credential.
-                let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
-                let connect_url = match ws_core::crypto::KeyEnvelope::open_envelope(
-                    &db_credential_path,
+                ws_api::sealed::unlocked_router_from_envelopes(
+                    &keys_dir,
+                    &database_url,
+                    &config,
                     &passphrase,
-                ) {
-                    Ok(current) => {
-                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
-                    }
-                    Err(ws_core::error::CoreError::Config(_)) => database_url.clone(),
-                    Err(other) => {
-                        return Err(ws_api::error::ApiError::from(other));
-                    }
-                };
-                let pool = ws_core::db::connect(&connect_url).await?;
-                // The rotation (spec §5.6): a fresh in-memory credential,
-                // ALTER over the just-opened connection, re-seal. A leaked
-                // credential (including the compose bootstrap) dies here.
-                let fresh = ws_core::crypto::random_hex(32)?;
-                sqlx::query("ALTER USER wardstone PASSWORD $1")
-                    .bind(&fresh)
-                    .execute(&pool)
-                    .await
-                    .map_err(ws_core::error::CoreError::Database)?;
-                ws_core::crypto::KeyEnvelope::write_envelope(
-                    &db_credential_path,
-                    &passphrase,
-                    fresh.as_bytes(),
-                    ws_core::crypto::PROD_KDF_PARAMS,
-                )?;
-                drop(pool);
-                let pool =
-                    ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
-                Ok(ws_api::router(ws_api::AppState::new(
-                    pool,
-                    std::sync::Arc::new(jwt),
-                    config,
-                )))
+                )
+                .await
             })
         });
 
@@ -955,9 +885,12 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
 }
 
 async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
-    // The sealed instance: the envelopes exist, so the process waits for
-    // the unlock relay instead of touching any key material at boot.
-    if sealed_instance(&cfg.keys_dir) {
+    // The sealed shell serves whenever the volume is sealed OR the env
+    // carries no database credential (the compose contract: the api's
+    // DATABASE_URL is password-less, so a fresh install — no envelopes
+    // yet — has nothing to build a pool from; the setup commit's relay
+    // performs the unlock that brings the full surface up).
+    if sealed_instance(&cfg.keys_dir) || !db_url_has_password(&cfg.database_url) {
         return run_api_sealed(cfg).await;
     }
     let pool = ws_core::db::connect(&cfg.database_url).await?;
@@ -1326,31 +1259,6 @@ mod tests {
             source: "manual".to_owned(),
             created_at: Utc::now() - Duration::minutes(minutes_ago),
         }
-    }
-
-    /// The DB-URL password substitution replaces exactly the password and
-    /// leaves everything else byte-identical — and inserts a password into
-    /// a URL that carried none.
-    #[test]
-    fn db_password_substitution_is_surgical() {
-        let url = "postgres://wardstone:old-secret@db:5432/wardstone";
-        let substituted = substitute_db_password(url, "new-credential");
-        assert_eq!(
-            substituted, "postgres://wardstone:new-credential@db:5432/wardstone",
-            "only the password changes"
-        );
-        let bare = "postgres://wardstone@db:5432/wardstone";
-        assert_eq!(
-            substitute_db_password(bare, "inserted"),
-            "postgres://wardstone:inserted@db:5432/wardstone",
-            "a password-less URL gains one"
-        );
-        let weird = "not-a-url";
-        assert_eq!(
-            substitute_db_password(weird, "x"),
-            weird,
-            "a non-URL passes through"
-        );
     }
 
     /// The sealed-instance predicate: `master.envelope` present ⇒ sealed.

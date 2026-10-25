@@ -3788,6 +3788,7 @@ dependencies = [
  "ws-auth",
  "ws-ca",
  "ws-core",
+ "zeroize",
 ]
 
 [[package]]

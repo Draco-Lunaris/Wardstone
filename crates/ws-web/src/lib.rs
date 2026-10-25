@@ -95,11 +95,19 @@ pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
 /// that run `web_router` pass `None` (no limiter — an in-process
 /// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
 /// the same reason ws-api's tests disable its layer).
+///
+/// `tls_reload` is the listener's reloadable TLS config — the handle the
+/// SETUP branch's commit swaps onto the CA-issued leaf in place (the
+/// resume contract). It matters only while the setup surface mounts (no
+/// tenant yet): the binary passes `Some(clone)` on that boot path and
+/// `None` on the others; tests pass `None` (no listener to swap).
+#[allow(clippy::too_many_arguments)]
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
+    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -110,6 +118,7 @@ pub async fn web_router(
         keys_dir,
         fingerprint,
         hostname,
+        tls_reload,
         api_base_url,
         store,
         rate_limit,
@@ -130,11 +139,13 @@ pub async fn web_router(
 /// (`POST /acme/{tenant}/new-account`, the one unauthenticated ACME
 /// mutator — see [`proxy::acme_router`]; see [`web_router`] and
 /// [`session_router_with_store`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn web_router_with_store(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
+    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
     api_base_url: &str,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -152,6 +163,8 @@ pub async fn web_router_with_store(
             keys_dir,
             fingerprint,
             hostname,
+            tls_reload,
+            api_base_url: api_base_url.to_owned(),
         }))
     } else {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())
@@ -170,7 +183,8 @@ pub async fn web_router_with_store(
 /// `rate_limit`), and the `/acme` proxy (its ENROLLMENT route
 /// limiter-scoped per the SAME value — the one unauthenticated ACME
 /// mutator, per-IP limited at this edge because ws-api's per-IP bucket
-/// collapses behind the proxy; the rest of `/acme` forwards unlimited)
+/// collapses behind the proxy; the rest of `/acme` forwards unlimited),
+/// and the `/healthz` liveness route (see the route's own comment)
 /// merged — every web-fronted route EXCEPT the setup surface and the SPA
 /// fallback, which need the tenant check. Public so the rate-limit suite
 /// can drive the COMPOSED stack (relay AND proxy in one router, the
@@ -196,6 +210,18 @@ pub fn session_router_with_store(
         .merge(relay)
         .merge(api)
         .merge(acme_router(api_base_url, rate_limit))
+        // Liveness, the compose contract: always 200 with a state field,
+        // never a readiness gate — a correctly-locked service is never
+        // restart-churned by its own healthcheck. The locked router owns
+        // the route in the sealed lifecycle (`sealed`/`unlocked`); this
+        // one answers the UNSEALED boot. It must be a real route, not a
+        // fallback catch: left unrouted, the extension-less GET would
+        // fall through to the SPA document, answering a live-looking 200
+        // + `index.html` that says nothing.
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "state": "serving" })) }),
+        )
 }
 
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired

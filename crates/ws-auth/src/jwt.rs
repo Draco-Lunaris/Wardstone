@@ -392,6 +392,45 @@ pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::erro
     })
 }
 
+/// The sealed boot's load-or-create: open the envelope when it exists;
+/// mint a fresh pair IN RAM and seal it as the envelope when it does
+/// not. A fresh password-less install has no plaintext pair to convert
+/// (nothing ever minted one), so the pair is BORN sealed — no plaintext
+/// file is ever written. The minted pair is proven usable before it is
+/// sealed (the same probe the plaintext loader runs on what it writes).
+pub fn load_or_create_sealed(
+    path: &Path,
+    passphrase: &str,
+) -> Result<JwtKeys, crate::error::AuthError> {
+    if path.exists() {
+        return load_sealed(path, passphrase);
+    }
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if !dir.exists() {
+        fs::create_dir_all(&dir).map_err(|e| {
+            AuthError::Config(format!(
+                "cannot create JWT key directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        force_mode(&dir, 0o700)?;
+    }
+    let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
+    assert_pair_usable(&signing_key_pem, &verification_key_pem, &dir)?;
+    let keys = JwtKeys {
+        signing_key_pem,
+        verification_key_pem,
+        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
+    };
+    write_sealed(path, passphrase, &keys)?;
+    Ok(keys)
+}
+
 /// Sign the given claims as a compact EdDSA JWT.
 pub fn issue_access_token(claims: &AccessClaims, keys: &JwtKeys) -> Result<String, AuthError> {
     let key = EncodingKey::from_ed_pem(keys.signing_key_pem.as_bytes())

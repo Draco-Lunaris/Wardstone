@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use ws_acme::NonceStore;
 use ws_auth::jwt::JwtKeys;
+use ws_ca::keystore::{KeyStore, MASTER_KEY_LEN};
+use ws_core::crypto::SecretBox;
+use zeroize::Zeroizing;
 
 use crate::routes::acme::{
     ChallengeFetch, FailingFetcher, FailingTxtResolver, Http01Fetcher, TxtResolver,
@@ -420,11 +423,45 @@ pub struct AppState {
     /// disable does not reach it); spends one credit per authenticated
     /// ACME POST where the account resolves.
     pub acme_accounts: AcmeAccountLimiter,
+    /// The CA-keystore custody the routes open key operations through
+    /// (the sealed-at-rest design): the legacy file-read mode for
+    /// plaintext volumes, or the unlocked master held zeroized in RAM
+    /// for a sealed instance's post-unlock service — the routes never
+    /// touch the sealed-at-rest files themselves.
+    key_custody: KeyCustody,
+    /// The secret-encryption custody for the TOTP/OIDC routes: the
+    /// legacy per-request file read, or the RAM-unlocked box the sealed
+    /// unlock opened from its envelope.
+    secret_custody: SecretCustody,
+}
+
+/// Where the CA-keystore master lives for THIS state.
+#[derive(Clone)]
+enum KeyCustody {
+    /// The pre-sealing mode: `master.key` is read from the keys
+    /// directory per operation.
+    LegacyFile,
+    /// The sealed instance's post-unlock service: the master opened
+    /// from its envelope at the unlock handshake, held zeroized in RAM.
+    Unlocked(Zeroizing<[u8; MASTER_KEY_LEN]>),
+}
+
+/// Where the secret-encryption key lives for THIS state.
+#[derive(Clone)]
+enum SecretCustody {
+    /// The pre-sealing mode: the plaintext file under the keys
+    /// directory is read per operation.
+    File,
+    /// The sealed instance's post-unlock service: the box built
+    /// (`SecretBox::from_key`) from the envelope the unlock opened.
+    Unlocked(SecretBox),
 }
 
 impl AppState {
     /// Build the state from the pool, the JWT key pair, and the config;
-    /// the mutable-by-product stores start empty.
+    /// the mutable-by-product stores start empty. The custodies default
+    /// to the legacy file-read modes (a plaintext volume — or a test
+    /// world — serves exactly as before).
     pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
         let acme_accounts = AcmeAccountLimiter::new(config.acme.acme_account_limit);
         AppState {
@@ -436,6 +473,57 @@ impl AppState {
             nonces: Arc::new(NonceStore::new()),
             verification: VerificationDeps::production(),
             acme_accounts,
+            key_custody: KeyCustody::LegacyFile,
+            secret_custody: SecretCustody::File,
+        }
+    }
+
+    /// Build the state for the sealed instance's post-unlock service:
+    /// the CA-keystore master and the secret-encryption key arrive
+    /// ALREADY UNWRAPPED from their envelopes (the unlock handshake
+    /// opened them; they live zeroized in RAM for the process's life).
+    /// The routes reach both through the state instead of the
+    /// sealed-at-rest files — a converted volume has no plaintext for
+    /// them to read.
+    pub fn new_unlocked(
+        pool: PgPool,
+        jwt: Arc<JwtKeys>,
+        config: ApiConfig,
+        master: Zeroizing<[u8; MASTER_KEY_LEN]>,
+        secret_box: SecretBox,
+    ) -> Self {
+        let mut state = Self::new(pool, jwt, config);
+        state.key_custody = KeyCustody::Unlocked(master);
+        state.secret_custody = SecretCustody::Unlocked(secret_box);
+        state
+    }
+
+    /// The keystore handle for a CA-key operation, in this state's
+    /// custody mode: the legacy file-read open for a plaintext volume,
+    /// the unlocked RAM custody for a sealed instance. Opened per
+    /// operation (a directory probe and mode check), exactly as the
+    /// routes always have.
+    pub fn keystore(&self) -> Result<KeyStore, crate::error::ApiError> {
+        match &self.key_custody {
+            KeyCustody::LegacyFile => {
+                KeyStore::open(&self.config.keys_dir).map_err(crate::error::ApiError::from)
+            }
+            KeyCustody::Unlocked(master) => {
+                KeyStore::open_unlocked(&self.config.keys_dir, Zeroizing::new(**master))
+                    .map_err(crate::error::ApiError::from)
+            }
+        }
+    }
+
+    /// The secret-encryption box for a TOTP/OIDC operation: the RAM
+    /// custody when a sealed unlock supplied it, the plaintext file
+    /// read otherwise.
+    pub fn secret_box(&self) -> Result<SecretBox, crate::error::ApiError> {
+        match &self.secret_custody {
+            SecretCustody::Unlocked(box_) => Ok(box_.clone()),
+            SecretCustody::File => {
+                SecretBox::load(&self.secret_key_path()).map_err(crate::error::ApiError::from)
+            }
         }
     }
 

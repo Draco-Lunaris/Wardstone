@@ -54,6 +54,9 @@ ws-auth = { path = "../ws-auth" }
 # The CA engine: CSR validation, leaf signing, CA creation, keystore, the
 # serial allocator, leaf-key generation.
 ws-ca = { path = "../ws-ca" }
+# The unlocked custody's master-key type (Zeroizing<[u8; 32]> held in
+# RAM for the sealed instance's post-unlock service).
+zeroize = { workspace = true }
 # The ACME (RFC 8555) JOSE floor: JWS verification for the protocol's POST
 # bodies, the anti-replay nonce store, and RFC 7638 account-key
 # thumbprints (Plan 4 Task 4; mounted by the Task 5 /acme routes).

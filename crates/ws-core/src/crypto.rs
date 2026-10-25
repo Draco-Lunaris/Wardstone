@@ -35,6 +35,7 @@ const NONCE_LEN: usize = 24;
 
 /// Holds the 32-byte secret-encryption key (zeroized on drop) and seals
 /// secrets under fresh XChaCha20-Poly1305 nonces.
+#[derive(Clone)]
 pub struct SecretBox {
     key: Zeroizing<[u8; KEY_LEN]>,
 }
@@ -259,6 +260,44 @@ pub const PROD_KDF_PARAMS: KdfParams = KdfParams {
     t_cost: 3,
     p_cost: 1,
 };
+
+/// The sealed-volume file names — ONE home for the contract every process
+/// shares (the binary's boot predicate, ws-web's setup conversion, and
+/// ws-api's unlock builder all speak these exact names). They live here,
+/// beside the envelope format itself, because ws-core is the one crate
+/// all three consumers can see; re-exported where the historical homes
+/// were (ws-web's setup module) so callers keep their paths.
+pub const MASTER_ENVELOPE_FILE: &str = "master.envelope";
+/// The JWT signing/verification pair, sealed as one JSON body.
+pub const JWT_ENVELOPE_FILE: &str = "jwt-keys.envelope";
+/// The secret-encryption key (the TOTP/OIDC SecretBox).
+pub const SECRET_ENVELOPE_FILE: &str = "secret-encryption.envelope";
+/// The CURRENT database credential: rotated and re-sealed at every
+/// unlock, so a leaked credential dies at the next one.
+pub const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
+
+/// Substitute `password` into `url`'s `://user:password@host` authority —
+/// inserting a `:password` when the URL carries none (the api's
+/// password-less compose contract). The one home for the parsing: the
+/// binary's boot rule, the ui's credential unwrap, the api's unlock
+/// rotation, and the tests all speak this exact shape. A URL with no
+/// `userinfo@` comes back unchanged (the caller's error to raise).
+pub fn substitute_db_password(url: &str, password: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let auth_start = scheme_end + 3;
+    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
+        return url.to_string();
+    };
+    match url[auth_start..at].rfind(':') {
+        Some(colon_rel) => {
+            let colon_abs = auth_start + colon_rel;
+            format!("{}{}{}", &url[..=colon_abs], password, &url[at..])
+        }
+        None => format!("{}:{}{}", &url[..at], password, &url[at..]),
+    }
+}
 
 pub struct KeyEnvelope {
     kek: Zeroizing<[u8; 32]>,

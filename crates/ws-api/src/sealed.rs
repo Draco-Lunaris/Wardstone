@@ -100,6 +100,122 @@ pub fn sealed_router(sealed: Arc<SealedApi>) -> Router {
         })
 }
 
+/// The production build closure's body — the one construct every sealed
+/// api process (and the e2e world) unlocks through: open the volume's
+/// three envelopes, rotate the database credential unconditionally (spec
+/// §5.6 — a leaked credential, including the compose bootstrap, dies at
+/// the next unlock), mint-or-load the JWT pair sealed under the
+/// passphrase, and return the FULL router over RAM custody
+/// ([`crate::AppState::new_unlocked`]) — the converted volume holds no
+/// plaintext for the file mode to read.
+///
+/// The ORDER is the security contract. The three envelope opens come
+/// first: a volume without them is not sealed, and an unlock against it
+/// is refused with zero side effects. The JWT pair mints LAST, only
+/// once the passphrase is proven against existing sealed material — so
+/// neither a wrong passphrase nor a compose-internal race against a
+/// fresh install can leave a JWT envelope behind that the real
+/// passphrase would no longer open (a poisoned pair would lock the
+/// instance out until an operator deleted the envelope by hand).
+pub async fn unlocked_router_from_envelopes(
+    keys_dir: &std::path::Path,
+    database_url: &str,
+    config: &crate::state::ApiConfig,
+    passphrase: &str,
+) -> Result<Router, ApiError> {
+    use ws_core::crypto::{
+        substitute_db_password, KeyEnvelope, DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE,
+        MASTER_ENVELOPE_FILE, PROD_KDF_PARAMS, SECRET_ENVELOPE_FILE,
+    };
+    use zeroize::Zeroizing;
+
+    // The master envelope: the keystore's unwrapped custody. Its absence
+    // IS the unsealed state (the boot predicate's other half) — there is
+    // nothing to unlock, and nothing may be written.
+    let master = KeyEnvelope::open_envelope(&keys_dir.join(MASTER_ENVELOPE_FILE), passphrase)?;
+    let mut master_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
+    master_bytes.copy_from_slice(&master);
+    // The secret-encryption key: same treatment (the TOTP/OIDC
+    // SecretBox's key, held zeroized in RAM for the process's life).
+    let secret = KeyEnvelope::open_envelope(&keys_dir.join(SECRET_ENVELOPE_FILE), passphrase)?;
+    let mut secret_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
+    secret_bytes.copy_from_slice(&secret);
+    let secret_box = ws_core::crypto::SecretBox::from_key(Zeroizing::new(secret_bytes));
+    // The DB credential: the envelope holds the CURRENT one. Required
+    // too — the conversion mints it, and the password-less compose URL
+    // this process carries cannot connect with anything else.
+    let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
+    let current = KeyEnvelope::open_envelope(&db_credential_path, passphrase)?;
+    let connect_url = substitute_db_password(database_url, &String::from_utf8_lossy(&current));
+    let pool = ws_core::db::connect(&connect_url).await?;
+    // The rotation (spec §5.6): a fresh in-memory credential, ALTER over
+    // the just-opened connection, re-seal. Postgres accepts no bind
+    // parameters in utility statements, so the statement interpolates:
+    // the role is the one the URL authenticates as (validated to the
+    // conservative identifier shape) and the credential is hex by
+    // construction — quote-doubled anyway, so the safety is local rather
+    // than resting on a distant generator's charset.
+    let role = db_role_of(database_url)?;
+    let fresh = ws_core::crypto::random_hex(32)?;
+    sqlx::query(&format!(
+        "ALTER USER {role} PASSWORD '{}'",
+        fresh.replace('\'', "''")
+    ))
+    .execute(&pool)
+    .await
+    .map_err(ws_core::error::CoreError::Database)?;
+    KeyEnvelope::write_envelope(
+        &db_credential_path,
+        passphrase,
+        fresh.as_bytes(),
+        PROD_KDF_PARAMS,
+    )?;
+    drop(pool);
+    let pool = ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
+    // The JWT pair: mint-at-unlock on a fresh install (the envelope is
+    // the pair's only form — plaintext never exists on a sealed volume),
+    // the sealed load on a converted one. LAST, per the order contract
+    // above.
+    let jwt = ws_auth::jwt::load_or_create_sealed(&keys_dir.join(JWT_ENVELOPE_FILE), passphrase)?;
+    Ok(crate::router(crate::AppState::new_unlocked(
+        pool,
+        Arc::new(jwt),
+        config.clone(),
+        Zeroizing::new(master_bytes),
+        secret_box,
+    )))
+}
+
+/// The login role a `DATABASE_URL` authenticates as — the role whose
+/// password the unlock rotation ALTERs. Validated to the strict
+/// alphanumeric+underscore shape (the interpolation counterpart of the
+/// conversion's own check); a URL with no `userinfo@` names no role to
+/// rotate.
+fn db_role_of(url: &str) -> Result<String, ApiError> {
+    let Some(scheme_end) = url.find("://") else {
+        return Err(ApiError::Internal(
+            "the database URL is not a URL".to_string(),
+        ));
+    };
+    let auth_start = scheme_end + 3;
+    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
+        return Err(ApiError::Internal(
+            "the database URL carries no login role to rotate".to_string(),
+        ));
+    };
+    let user_end = url[auth_start..at]
+        .rfind(':')
+        .map(|i| i + auth_start)
+        .unwrap_or(at);
+    let role = &url[auth_start..user_end];
+    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(ApiError::Internal(format!(
+            "the database URL's login role {role:?} is not a safe identifier"
+        )));
+    }
+    Ok(role.to_string())
+}
+
 /// Liveness is unconditional: a sealed instance answers 200 with its
 /// current state so compose never churns a correctly-locked service
 /// (threat-model decision: locked is a state, not a crash).

@@ -41,6 +41,7 @@ use sqlx::PgPool;
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use x509_parser::pem::parse_x509_pem;
+use zeroize::Zeroizing;
 
 use ws_ca::keystore::KeyStore;
 use ws_core::db::connect;
@@ -159,6 +160,8 @@ fn test_fields() -> SetupFields {
         default_domain: "wardstone.test".to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
         server_hostname: LEAF_HOSTNAME.to_string(),
+        master_passphrase: "the-master-passphrase".to_string(),
+        master_passphrase_confirm: "the-master-passphrase".to_string(),
     }
 }
 
@@ -169,6 +172,11 @@ struct Fixture {
     keys_dir: PathBuf,
     #[allow(dead_code)] // held for the whole body: serializes this suite
     advisory: Option<PoolConnection<sqlx::Postgres>>,
+    /// Set once a role restore has verifiably landed; the panic-safe
+    /// [`Drop`] net skips then.
+    role_restored: bool,
+    /// The panic-safe restore worker (see [`RestoreNet`]).
+    net: RestoreNet,
 }
 
 /// The state the setup handlers need, from the fixture.
@@ -178,14 +186,50 @@ fn setup_state(fixture: &Fixture) -> SetupState {
         keys_dir: fixture.keys_dir.clone(),
         fingerprint: PAGE_FINGERPRINT.to_string(),
         hostname: HOSTNAME.to_string(),
+        tls_reload: None,
+        // No api process exists in this suite's world: the setup commit's
+        // relay finds a closed port and logs its WARN — the modeled
+        // best-effort path, never a failed setup.
+        api_base_url: "http://127.0.0.1:9".to_string(),
     }
 }
 
 impl Fixture {
-    /// Delete every row this test created, release the advisory lock, and
-    /// remove the keys directory. Runs BEFORE the assertions so a failing
-    /// assert can never leave rows behind (the self-cleaning contract).
+    /// Restore the shared login role's password over the fixture's
+    /// DEDICATED pre-rotation connection (established connections
+    /// survive the conversion's rotation; the POOL may need a fresh
+    /// connection at exactly the moment the password is rotated — the
+    /// `28P01` that poisoned the 2026-10-25 full run). Idempotent.
+    /// Called after every successful POST (before any post-rotation DB
+    /// read), again by [`Fixture::cleanup`], and once more by the
+    /// [`Drop`] net if a panic skipped both.
+    async fn restore_role_password(&mut self) {
+        let Some(conn) = self.advisory.as_mut() else {
+            // The advisory connection is only ever released at the very
+            // end of cleanup, after this restore — unreachable.
+            panic!("the advisory connection must be held through the restore");
+        };
+        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+            .execute(&mut **conn)
+            .await
+            .expect("restore the shared test role's password");
+        self.role_restored = true;
+    }
+
+    /// Delete every row this test created, restore the shared login
+    /// role's password, release the advisory lock, and remove the keys
+    /// directory. Runs BEFORE the assertions so a failing assert can
+    /// never leave rows behind (the self-cleaning contract). The role
+    /// restore is part of that contract: a successful setup POST runs
+    /// the conversion, which rotates the `wardstone` login role's
+    /// password — and every suite on this shared server connects as
+    /// `wardstone:wardstone`, so a role left rotated breaks the next
+    /// suite at its very first connect. The reset is idempotent for the
+    /// tests that never reach the seal. The restore runs FIRST so the
+    /// sweep below — over the pool — can never need a fresh connection
+    /// while the password is rotated.
     async fn cleanup(&mut self) {
+        self.restore_role_password().await;
         sweep_tenant(&self.pool, setup::DEFAULT_TENANT_NAME).await;
         if let Some(mut conn) = self.advisory.take() {
             release_advisory(&mut conn, ADVISORY_KEY).await;
@@ -194,10 +238,96 @@ impl Fixture {
     }
 }
 
+/// The panic-safe restore net's worker: a dedicated thread whose own
+/// little runtime owns a connection made AT FIXTURE TIME — sqlx
+/// connections are runtime-affine (the socket registers with the
+/// reactor that created it), so the Drop-time ALTER can never run over
+/// a connection made on the test's runtime from a fresh one; it would
+/// hang on a socket that runtime cannot wake. The fixture-built
+/// connection is made while the bootstrap credential is still valid,
+/// and established connections survive the rotation, so it can still
+/// ALTER when Drop asks — the only moment the restore is actually
+/// needed. Best-effort by design: if the worker's connect failed, the
+/// channel's receiver is gone and the Drop-time send is a no-op (the
+/// manual `sudo -u postgres psql` reset remains the documented
+/// last resort).
+struct RestoreNet {
+    /// "please restore" — sent from Drop.
+    request: std::sync::mpsc::Sender<()>,
+    /// The worker's reply once the ALTER landed (Drop waits on it).
+    reply: std::sync::mpsc::Receiver<()>,
+}
+
+/// Spawn the restore net's worker thread. The connection is created
+/// immediately (the bootstrap credential is valid now); the worker then
+/// parks on the request channel until the fixture drops.
+fn spawn_restore_net(url: &str) -> RestoreNet {
+    let (request, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, reply) = std::sync::mpsc::channel::<()>();
+    let url = url.to_owned();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        // Phase 1: the worker's own connection, on the worker's own
+        // runtime, while the bootstrap credential is still valid.
+        let connected: Result<sqlx::PgConnection, sqlx::Error> =
+            runtime.block_on(sqlx::Connection::connect(&url));
+        let mut conn = match connected {
+            Ok(conn) => conn,
+            Err(_) => return, // the net is dead; Drop's send no-ops
+        };
+        // Phase 2: park until the fixture asks (blocking is fine here —
+        // this runtime has nothing else to run). Dropping the fixture
+        // without a request (cleanup restored) drops the sender, this
+        // recv errs, and the worker exits.
+        if rx.recv().is_err() {
+            return;
+        }
+        // Phase 3: the restore, over the connection this runtime made.
+        runtime.block_on(async {
+            let _ = sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+                .execute(&mut conn)
+                .await;
+        });
+        let _ = tx.send(());
+    });
+    RestoreNet { request, reply }
+}
+
+/// The panic-safe half of the self-cleaning contract: a test that
+/// unwinds between its POST's rotation and `cleanup()` would otherwise
+/// leave the shared role rotated, and every later test — this suite's
+/// siblings included — fails at its first connect with a misleading
+/// `28P01` (the 2026-10-25 full-run cascade: one post-rotation query
+/// failure poisoned five sibling tests). Drop cannot await, so the
+/// restore runs on the worker above, joined with a timeout (a hung
+/// worker is leaked and reaped at process exit rather than hanging the
+/// unwinding test). Idempotent, and skipped entirely when a restore
+/// already verifiably landed.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.keys_dir);
+        if self.role_restored {
+            return;
+        }
+        // The net is one-shot: the request IS the fixture's last word.
+        let _ = self.net.request.send(());
+        let _ = self
+            .net
+            .reply
+            .recv_timeout(std::time::Duration::from_secs(15));
+    }
+}
+
 /// Build the fixture: connect, take the advisory lock, sweep stale rows,
-/// and create a fresh keys directory.
+/// create a fresh keys directory, and arm the panic-safe restore net.
 async fn fixture() -> Fixture {
-    let pool = connect(&database_url())
+    let url = database_url();
+    let pool = connect(&url)
         .await
         .expect("connect should succeed and apply the embedded migrations");
     let advisory = lock_advisory(&pool, ADVISORY_KEY).await;
@@ -210,11 +340,14 @@ async fn fixture() -> Fixture {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
+    let net = spawn_restore_net(&url);
 
     Fixture {
         pool,
         keys_dir,
         advisory: Some(advisory),
+        role_restored: false,
+        net,
     }
 }
 
@@ -290,6 +423,12 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
 
     let response = post_setup(router, &fields).await;
     assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+
+    // The conversion rotated the shared role: restore it over the
+    // fixture's dedicated connection BEFORE any post-rotation DB read —
+    // the pool may need a fresh connection, which the rotated password
+    // would refuse (the 28P01 self-defeat of the 2026-10-25 full run).
+    fixture.restore_role_password().await;
 
     // Capture everything BEFORE the cleanup, then assert afterwards.
     let pool = fixture.pool.clone();
@@ -380,16 +519,46 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         }
         None => String::new(),
     };
-    let key_store = KeyStore::open(&fixture.keys_dir).expect("reopen the keystore");
-    let root_key_loaded = key_store.load_ca_key(&ca_id).is_ok();
+    // The sealed-volume contract: the conversion wraps every plaintext
+    // original into passphrase envelopes and deletes the originals, so
+    // the legacy file-read store must refuse on this volume now — and
+    // the passphrase-opened store must load the very same keys.
+    let legacy_refused = KeyStore::open(&fixture.keys_dir)
+        .and_then(|store| store.load_ca_key(&ca_id).map(|_| ()))
+        .is_err();
+    let unlocked_store = {
+        let master = ws_core::crypto::KeyEnvelope::open_envelope(
+            &fixture.keys_dir.join(setup::MASTER_ENVELOPE_FILE),
+            &fields.master_passphrase,
+        )
+        .expect("open the master envelope with the setup passphrase");
+        let mut master_bytes = [0u8; 32];
+        master_bytes.copy_from_slice(&master);
+        KeyStore::open_unlocked(&fixture.keys_dir, Zeroizing::new(master_bytes))
+            .expect("open the unlocked store")
+    };
+    let root_key_loaded = unlocked_store.load_ca_key(&ca_id).is_ok();
     let leaf_key_loaded = certs
         .first()
-        .map(|row| key_store.load_ca_key(&row.0).is_ok())
+        .map(|row| unlocked_store.load_ca_key(&row.0).is_ok())
         .unwrap_or(false);
     let secret_key_exists = fixture
         .keys_dir
         .join(ws_api::state::SECRET_KEY_FILE)
         .exists();
+    // The envelopes this volume actually holds: master (the keystore
+    // minted it), secret-encryption (run_setup minted it), and the DB
+    // credential (the rotation always seals one). The JWT pair is the
+    // api process's to mint — no api runs in this test's world, so the
+    // conversion correctly leaves no jwt envelope behind; the e2e suite
+    // pins that arm where the api actually shares the volume.
+    let envelopes_exist = [
+        setup::MASTER_ENVELOPE_FILE,
+        "secret-encryption.envelope",
+        setup::DB_CREDENTIAL_ENVELOPE_FILE,
+    ]
+    .iter()
+    .all(|name| fixture.keys_dir.join(name).exists());
 
     fixture.cleanup().await;
 
@@ -404,7 +573,22 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         "the setup root must be the browser-universal ECDSA P-256 default \
          (an Ed25519 root cannot be trusted by Chromium-family browsers)"
     );
-    assert!(root_key_loaded, "the root's key envelope must load");
+    assert!(
+        root_key_loaded,
+        "the root's key loads under the master passphrase"
+    );
+    assert!(
+        legacy_refused,
+        "the legacy file-read store must refuse on a converted volume"
+    );
+    assert!(
+        envelopes_exist,
+        "the conversion mints the envelopes for everything on the volume"
+    );
+    assert!(
+        !secret_key_exists,
+        "the conversion deletes the plaintext secret-encryption key"
+    );
 
     let (admin_name, admin_hash) = admin.expect("setup creates the admin user");
     assert_eq!(admin_name, "admin");
@@ -458,7 +642,10 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         leaf_revision.is_some(),
         "the leaf records its profile revision"
     );
-    assert!(leaf_key_loaded, "the leaf's key envelope must load");
+    assert!(
+        leaf_key_loaded,
+        "the leaf's key loads under the master passphrase"
+    );
 
     let leaf_pem_parsed = parse_x509_pem(leaf_pem.as_bytes())
         .expect("the leaf certificate is valid PEM")
@@ -512,11 +699,6 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         audit_actions.iter().any(|action| action == "cert_issued"),
         "the server leaf issuance is audited"
     );
-
-    assert!(
-        secret_key_exists,
-        "the secret-encryption key file must exist before any user can enrol"
-    );
 }
 
 /// Run setup through the front-door composition: while no tenant exists
@@ -535,6 +717,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         fixture.keys_dir.clone(),
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
+        None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -574,6 +757,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         fixture.keys_dir.clone(),
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
+        None, // no listener to swap in the router suites
         "http://127.0.0.1:9",
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -756,6 +940,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         fixture.keys_dir.clone(),
         PAGE_FINGERPRINT.to_string(),
         HOSTNAME.to_string(),
+        None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -791,6 +976,10 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         StatusCode::OK,
         "a hostname the web-server profile permits completes the setup"
     );
+
+    // The conversion rotated the shared role: restore before the
+    // post-rotation reads below (the pool needs fresh connections).
+    fixture.restore_role_password().await;
 
     // Capture before cleanup (the self-cleaning contract).
     let pool = fixture.pool.clone();
@@ -844,6 +1033,11 @@ async fn setup_completed_audit_row_written() {
     let response = post_setup(router, &fields).await;
     assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
 
+    // The conversion rotated the shared role: restore before the audit
+    // reads below (the audit query needs a second pooled connection —
+    // this exact ordering was the 2026-10-25 full-run failure).
+    fixture.restore_role_password().await;
+
     let pool = fixture.pool.clone();
     let tenant_id: Option<uuid::Uuid> =
         sqlx::query_scalar("SELECT id FROM tenants WHERE name = $1")
@@ -891,4 +1085,37 @@ async fn setup_completed_audit_row_written() {
         }),
         "the details carry the submitted domain and admin CIDRs"
     );
+}
+
+/// The panic-safe half of the self-cleaning contract, verified
+/// deterministically. A test body that unwinds between its POST's
+/// rotation and `cleanup()` leaves the shared `wardstone` role rotated;
+/// every LATER test then fails at its very first connect with a
+/// misleading `28P01` (the 2026-10-25 full-run cascade: one post-rotation
+/// query failure poisoned five sibling tests and every suite after).
+/// `drop(fixture)` runs exactly the Drop an unwind runs — no cleanup, no
+/// restore — and the fresh bootstrap-credential connect afterwards is the
+/// proof the net restored the role on the way down.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_fixture_dropped_mid_rotation_restores_the_shared_role() {
+    let _db = lock_db().await;
+    let fixture = fixture().await;
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &test_fields()).await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+
+    // The deliberate unwind shape: the conversion has rotated the role,
+    // cleanup never runs, and Drop fires mid-window.
+    drop(fixture);
+
+    // The proof: a fresh bootstrap-credential connect succeeds — the
+    // net restored the role before the fence released.
+    let pool = connect(&database_url())
+        .await
+        .expect("the dropped fixture restored the shared role");
+    // The leaked world's rows: the POST created the setup tenant; sweep
+    // it so the NEXT test starts clean (the fixture that would have done
+    // this in cleanup was deliberately dropped).
+    sweep_tenant(&pool, setup::DEFAULT_TENANT_NAME).await;
 }

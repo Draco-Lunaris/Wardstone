@@ -30,7 +30,7 @@
 pub mod page;
 pub mod tls;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use sqlx::PgPool;
@@ -96,6 +96,17 @@ pub struct SetupFields {
     /// The server's own hostname: the SAN of the CA-issued leaf that
     /// replaces the setup certificate at the end of setup.
     pub server_hostname: String,
+    /// The operator's master passphrase (entered twice on the page; the
+    /// handler refuses a mismatch or a blank). At commit the setup flow
+    /// wraps every plaintext key file into a passphrase-sealed envelope,
+    /// rotates the DB credential under it, and DELETES the plaintext
+    /// originals — the next boot is sealed and this passphrase is its
+    /// unlock key. It exists on no disk and is not recoverable; the page
+    /// says so.
+    #[serde(default)]
+    pub master_passphrase: String,
+    #[serde(default)]
+    pub master_passphrase_confirm: String,
 }
 
 /// The state the setup handlers need: the pool, the keys directory (the
@@ -115,6 +126,16 @@ pub struct SetupState {
     /// The hostname the setup certificate carries (`WARDSTONE_SERVER_HOSTNAME`
     /// or [`tls::PLACEHOLDER_SAN`]).
     pub hostname: String,
+    /// The reloadable TLS config: the setup commit swaps the listener onto
+    /// the CA-issued leaf IN PLACE (the resume contract — the sealed design
+    /// removed the self-exit restart, so this is how the leaf takes over).
+    /// `None` in the tests (no listener to swap).
+    pub tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
+    /// The compose-internal api base URL: the setup commit relays the
+    /// unlock to the api process once (the fresh-install flow — the
+    /// api booted as the sealed shell and only the relay brings its
+    /// full surface up).
+    pub api_base_url: String,
 }
 
 /// The setup page (GET) and the setup submit (POST) at [`SETUP_ROUTE`].
@@ -199,7 +220,7 @@ pub async fn run_setup(
     fields: &SetupFields,
     pool: &PgPool,
     keystore: &mut KeyStore,
-) -> Result<(), CaError> {
+) -> Result<(String, Zeroizing<Vec<u8>>), CaError> {
     ensure_fields(fields)?;
 
     keystore.ensure_master_key()?;
@@ -553,11 +574,10 @@ pub async fn run_setup(
     tx.commit().await?;
 
     tracing::info!(
-        "first-run setup complete; the UI process must restart to serve the CA-issued \
-         certificate for {}",
+        "first-run setup complete; the CA-issued certificate for {} is live",
         fields.server_hostname
     );
-    Ok(())
+    Ok((issued.cert_pem.clone(), leaf_key_der))
 }
 
 /// Whether the form's `server_hostname` — the SAN of the leaf the CA will
@@ -713,3 +733,127 @@ fn map_core(err: ws_core::error::CoreError) -> CaError {
         other => CaError::Worker(format!("setup: {other}")),
     }
 }
+
+/// The one-time conversion (the sealed-at-rest design's fresh-install
+/// path): wrap every plaintext key file on the keys volume into
+/// passphrase-sealed envelopes and DELETE the originals — the next boot
+/// derives from the state predicate that the volume is sealed. Per-file
+/// (each present plaintext wraps independently); the JWT pair wraps as
+/// ONE envelope (the loader's torn-pair contract is preserved: a torn
+/// pair wraps as-is and the sealed load refuses it loudly, exactly as the
+/// plaintext one did).
+///
+/// The DB credential rotation rides along: the fresh random password is
+/// ALTER'd over the just-used bootstrap connection and sealed — the
+/// bootstrap (and the env's `WARDSTONE_DB_PASSWORD`) retires here.
+pub async fn seal_keys_volume(
+    keys_dir: &Path,
+    passphrase: &str,
+    pool: &PgPool,
+    db_role: &str,
+) -> Result<(), CaError> {
+    use ws_core::crypto::{KeyEnvelope, PROD_KDF_PARAMS};
+
+    // The master KEK: read the plaintext, wrap, delete.
+    let master_path = keys_dir.join("master.key");
+    let master = std::fs::read(&master_path).map_err(CaError::Io)?;
+    KeyEnvelope::write_envelope(
+        &keys_dir.join(MASTER_ENVELOPE_FILE),
+        passphrase,
+        &master,
+        PROD_KDF_PARAMS,
+    )
+    .map_err(|e| CaError::Worker(format!("the master envelope: {e}")))?;
+    std::fs::remove_file(&master_path).map_err(CaError::Io)?;
+
+    // The SecretBox key: same treatment.
+    let secret_path = keys_dir.join(ws_api::state::SECRET_KEY_FILE);
+    if secret_path.exists() {
+        let secret = std::fs::read(&secret_path).map_err(CaError::Io)?;
+        KeyEnvelope::write_envelope(
+            &keys_dir.join(SECRET_ENVELOPE_FILE),
+            passphrase,
+            &secret,
+            PROD_KDF_PARAMS,
+        )
+        .map_err(|e| CaError::Worker(format!("the secret-encryption envelope: {e}")))?;
+        std::fs::remove_file(&secret_path).map_err(CaError::Io)?;
+    }
+
+    // The JWT pair: one envelope holding the combined JSON form.
+    let signing_path = keys_dir.join("jwt-signing-key.pem");
+    let verify_path = keys_dir.join("jwt-verify-key.pem");
+    if signing_path.exists() || verify_path.exists() {
+        let signing = std::fs::read_to_string(&signing_path).unwrap_or_default();
+        let verification = std::fs::read_to_string(&verify_path).unwrap_or_default();
+        let combined = serde_json::json!({
+            "signing": signing,
+            "verification": verification,
+        })
+        .to_string();
+        ws_auth::jwt::write_sealed(
+            &keys_dir.join(JWT_ENVELOPE_FILE),
+            passphrase,
+            &ws_auth::jwt::JwtKeys {
+                signing_key_pem: signing,
+                verification_key_pem: verification,
+                ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
+            },
+        )
+        .map_err(|e| CaError::Worker(format!("the jwt envelope: {e}")))?;
+        let _ = combined;
+        if signing_path.exists() {
+            std::fs::remove_file(&signing_path).map_err(CaError::Io)?;
+        }
+        if verify_path.exists() {
+            std::fs::remove_file(&verify_path).map_err(CaError::Io)?;
+        }
+    }
+
+    // The DB credential rotation: fresh random, ALTER over the bootstrap
+    // connection, seal. The env's embedded password retires here. Postgres
+    // accepts no bind parameters in utility statements (`ALTER … PASSWORD
+    // $1` is a syntax error), so the statement interpolates both parts:
+    // the role is validated to the conservative identifier shape, and the
+    // credential is hex by construction — quote-doubled anyway, so the
+    // safety is local rather than resting on a distant generator's
+    // charset.
+    if db_role.is_empty()
+        || !db_role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(CaError::Worker(format!(
+            "the db role name {db_role:?} is not a safe identifier"
+        )));
+    }
+    let fresh = ws_core::crypto::random_hex(32)
+        .map_err(|e| CaError::Worker(format!("the db rotation entropy: {e}")))?;
+    sqlx::query(&format!(
+        "ALTER USER {db_role} PASSWORD '{}'",
+        fresh.replace('\'', "''")
+    ))
+    .execute(pool)
+    .await
+    .map_err(|e| CaError::Worker(format!("the db rotation: {e}")))?;
+    KeyEnvelope::write_envelope(
+        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+        passphrase,
+        fresh.as_bytes(),
+        PROD_KDF_PARAMS,
+    )
+    .map_err(|e| CaError::Worker(format!("the db credential envelope: {e}")))?;
+
+    tracing::info!(
+        "the keys volume is sealed: every plaintext original is gone and the \
+         instance boots locked from now on"
+    );
+    Ok(())
+}
+
+/// The sealed-at-rest envelope names, re-exported from ws-core's single
+/// home for the volume contract (the setup flow writes them; every
+/// process's boot and unlock reads them).
+pub use ws_core::crypto::{
+    DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE, MASTER_ENVELOPE_FILE, SECRET_ENVELOPE_FILE,
+};

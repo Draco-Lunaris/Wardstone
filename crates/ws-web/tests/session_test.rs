@@ -308,6 +308,7 @@ async fn env(ttl: Duration) -> TestEnv {
         keys_dir.clone(),
         "relay-fingerprint".to_owned(),
         "ui.relay.test".to_owned(),
+        None, // no listener to swap in the router suites
         &api_base,
         store.clone(),
         None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter

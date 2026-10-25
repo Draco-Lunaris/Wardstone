@@ -49,8 +49,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CaError;
 
-/// Master KEK length in bytes (XChaCha20-Poly1305 key size).
-const MASTER_KEY_LEN: usize = 32;
+/// Master KEK length in bytes (XChaCha20-Poly1305 key size). Public
+/// because the unlocked custody crosses crate boundaries: `ws-api`'s
+/// AppState carries the unwrapped master in RAM for the sealed
+/// instance's post-unlock service.
+pub const MASTER_KEY_LEN: usize = 32;
 /// Per-key DEK length in bytes (XChaCha20-Poly1305 key size).
 const DEK_LEN: usize = 32;
 /// XChaCha20-Poly1305 extended-nonce length in bytes.
