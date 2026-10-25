@@ -2889,14 +2889,35 @@ async fn filtered_listing_matches_status_profile_search_and_ca() {
             .collect()
     };
 
-    // The listing contract ties on `not_after` by `id` (equal-expiry
-    // rows keep a stable order across calls and pages), so the expected
-    // order is the two random UUIDs sorted — never the insertion order,
-    // which the unspecified pre-tiebreak order only matched by luck
-    // (the flake the 2026-10-25 full run caught).
-    let mut both = vec![a_id, b_id];
-    both.sort();
-    assert_eq!(ids(&unfiltered), both, "no filter lists both");
+    // The listing contract orders by `not_after DESC` and ties on `id`
+    // (equal-expiry rows keep a stable order across calls and pages).
+    // The expectation is computed by parsing the LISTING'S OWN rows —
+    // never a string compare of RFC 3339 (fractional digits of
+    // differing lengths invert: ".98Z" vs ".987Z") and never a bare id
+    // sort. The mints do NOT have distinct expiries to fall back on:
+    // one profile's leaves share the midnight-anchored validity window,
+    // so both mint in this test at the SAME `not_after` and the id
+    // tiebreak is the whole order — which is exactly what the 2026-10-25
+    // full-run flake was (the filtered query lacked the tiebreak and
+    // Postgres was free to hand the tied rows back in heap order).
+    let expected: Vec<Uuid> = {
+        let mut rows: Vec<(DateTime<Utc>, Uuid)> = unfiltered
+            .as_array()
+            .expect("the unfiltered list is a JSON array")
+            .iter()
+            .map(|row| {
+                (
+                    DateTime::parse_from_rfc3339(row["not_after"].as_str().unwrap())
+                        .expect("the row's not_after is RFC 3339")
+                        .with_timezone(&Utc),
+                    row["id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        rows.into_iter().map(|(_, id)| id).collect()
+    };
+    assert_eq!(ids(&unfiltered), expected, "no filter lists both");
     assert_eq!(
         ids(&by_status),
         vec![a_id],

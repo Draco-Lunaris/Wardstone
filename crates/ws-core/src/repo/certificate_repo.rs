@@ -225,9 +225,13 @@ impl CertificateRepo {
     }
 
     /// The tenant's certificates through a composed filter, one page at a
-    /// time, latest expiry first (`not_after` DESC, same as
-    /// [`CertificateRepo::list_by_tenant`]), LIMIT/OFFSET paging through
-    /// the shared [`crate::repo::paging`] helper.
+    /// time, latest expiry first (`not_after` DESC with the `id`
+    /// tiebreaker — same as [`CertificateRepo::list_by_tenant`], and
+    /// load-bearing here for the same reason: one issuance run's
+    /// certificates share the midnight-anchored expiry tick, so without
+    /// the tiebreak the page order among them is whatever the plan
+    /// yields), LIMIT/OFFSET paging through the shared
+    /// [`crate::repo::paging`] helper.
     ///
     /// The WHERE clause composes ONLY the filter fields that are `Some`
     /// (`tenant_id` is always present); every value binds as a parameter —
@@ -280,7 +284,7 @@ impl CertificateRepo {
             next += 1;
         }
         sql.push_str(&format!(
-            " ORDER BY not_after DESC LIMIT ${next} OFFSET ${}",
+            " ORDER BY not_after DESC, id LIMIT ${next} OFFSET ${}",
             next + 1
         ));
 
