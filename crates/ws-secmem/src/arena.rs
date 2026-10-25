@@ -56,9 +56,12 @@ struct Mapping {
 }
 
 // SAFETY: a `Mapping` is an owned address range plus the descriptor that backs
-// it; it has no interior mutability of its own. Every mutable view into the
-// range is handed out under the arena's or a slot set's lock, so moving the
-// mapping between threads and sharing `&Mapping` cannot create a data race.
+// it. The raw pointer is the only reason it is not `Send`/`Sync` already;
+// nothing reads or writes the range through the `Mapping` itself. Views into
+// the range are handed out exclusively by the arena and the slot sets, which
+// reserve disjoint sub-ranges under their own locks and do not hand the same
+// sub-range to two holders, so sharing a `Mapping` across threads cannot
+// create aliasing or a data race.
 unsafe impl Send for Mapping {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for Mapping {}
@@ -79,9 +82,17 @@ impl Mapping {
     /// Maps `len` bytes of secret memory, excludes them from core dumps, and
     /// proves the range behaves as memory before anything secret is put in it.
     fn new(len: usize) -> Result<Self, SecMemError> {
-        // SAFETY: `memfd_secret` takes only a flags word. glibc ships no
+        // `O_CLOEXEC`, not `MFD_CLOEXEC`: close-on-exec is the point (nothing
+        // this process execs may inherit a handle on the secret pool), but
+        // `memfd_secret` is not `memfd_create` — its flags word accepts
+        // `O_CLOEXEC` alone and rejects `MFD_CLOEXEC` (0x1) with `EINVAL`.
+        // Verified on this kernel; `fcntl(F_GETFD)` then reports `FD_CLOEXEC`.
+        //
+        // SAFETY: `memfd_secret` takes only a flags word, passed at the full
+        // `c_long` width the variadic `syscall` ABI requires. glibc ships no
         // wrapper for it, hence the raw syscall.
-        let raw = unsafe { libc::syscall(libc::SYS_memfd_secret, 0 as libc::c_uint) };
+        let raw =
+            unsafe { libc::syscall(libc::SYS_memfd_secret, libc::c_long::from(libc::O_CLOEXEC)) };
         if raw < 0 {
             return Err(SecMemError::SecretMemUnavailable { errno: errno() });
         }
@@ -110,10 +121,11 @@ impl Mapping {
         let base = match NonNull::new(base) {
             Some(base) if base.as_ptr() != libc::MAP_FAILED => base.cast::<u8>(),
             // `mmap` is where the kernel charges a secret-memory mapping
-            // against RLIMIT_MEMLOCK, so this is the lock failing — the
-            // explicit budget check in `harden` already rejected a limit that
-            // is plainly too small, so reaching here means something else in
-            // the process consumed the budget first.
+            // against RLIMIT_MEMLOCK (and where it would refuse an
+            // unsupportable mapping outright), so a failure here is the pool
+            // failing to be locked. The errno is carried through rather than
+            // interpreted: EAGAIN is the budget, ENOMEM the host, EINVAL a
+            // mapping the kernel will not make at all.
             _ => return Err(SecMemError::MlockFailed { errno: errno() }),
         };
 
@@ -148,18 +160,29 @@ impl Mapping {
     /// the slots hand out initialised memory.
     fn probe(&self) -> Result<(), SecMemError> {
         let page = page_size().min(self.len);
-        // SAFETY: the range is inside the mapping and nothing else can hold a
-        // view into it — the pool is not published until `build` returns.
-        let whole = unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) };
 
-        let pattern: Vec<u8> = (0..page).map(|i| (i % 251) as u8).collect();
-        whole[..page].copy_from_slice(&pattern);
-        if whole[..page] != pattern[..] {
-            // errno 0: the syscalls all succeeded, but the range does not
-            // behave as memory, so the mapping cannot be trusted with secrets.
-            return Err(SecMemError::SecretMemUnavailable { errno: 0 });
+        // Both halves are volatile. A plain store-then-load pair over memory
+        // the compiler can see is dead code it is entitled to delete, which
+        // would leave the probe asserting nothing in a release build — the
+        // only build that matters here.
+        for offset in 0..page {
+            let byte = (offset % 251) as u8;
+            // SAFETY: `offset < page <= len`, the range is inside the mapping,
+            // and nothing else can hold a view into it — the pool is not
+            // published until `build` returns.
+            unsafe { ptr::write_volatile(self.base.as_ptr().add(offset), byte) };
+        }
+        for offset in 0..page {
+            let want = (offset % 251) as u8;
+            // SAFETY: as above.
+            let got = unsafe { ptr::read_volatile(self.base.as_ptr().add(offset)) };
+            if got != want {
+                return Err(SecMemError::ProbeFailed { offset });
+            }
         }
 
+        // SAFETY: as above, over the whole mapping.
+        let whole = unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) };
         // A plain memset, not a volatile wipe: nothing secret has ever been in
         // this pool yet, so there is nothing an optimiser could elide that
         // matters. Volatile wipes are for `SecretBuf`/`SlotGuard` drops, where
@@ -167,6 +190,12 @@ impl Mapping {
         // boot time.
         whole.fill(0);
         Ok(())
+    }
+
+    /// The backing descriptor, for the close-on-exec test only.
+    #[cfg(test)]
+    fn raw_fd(&self) -> libc::c_int {
+        self._fd.as_raw_fd()
     }
 
     /// Pointer to byte `offset` of the mapping.
@@ -280,22 +309,19 @@ impl Pool {
         // pool smaller than the slots that are then carved out of it.
         let kdf_total = kdf_slot.saturating_mul(spec.kdf_slots);
         let hash_total = hash_slot.saturating_mul(spec.hash_slots);
+        // Offset of the arena: the slots come first, the arena takes the tail.
+        let slots_total = kdf_total.saturating_add(hash_total);
         // The mapping is page-granular: `mmap` rounds its length up to a page
         // and a mapping past the end of the descriptor would fault with
         // SIGBUS, so the descriptor is sized to the rounded length too.
-        let len = align_up(
-            kdf_total
-                .saturating_add(hash_total)
-                .saturating_add(arena_len),
-            page_size(),
-        );
+        let len = align_up(slots_total.saturating_add(arena_len), page_size());
 
         // Before the mapping, so an operator sees the limit and not an EAGAIN.
         crate::harden::check_memlock_budget(len)?;
 
         let map = Mapping::new(len)?;
         Ok(Pool {
-            arena: Arena::new(kdf_total + hash_total, arena_len),
+            arena: Arena::new(slots_total, arena_len),
             kdf: SlotSet::new(0, kdf_slot, spec.kdf_slots),
             hash: SlotSet::new(kdf_total, hash_slot, spec.hash_slots),
             map,
@@ -309,6 +335,15 @@ impl Pool {
 
     pub(crate) fn arena_free(&self) -> usize {
         self.arena.free_bytes()
+    }
+
+    /// The descriptor flags of the pool's `memfd_secret` fd, for the
+    /// close-on-exec test. Read-only, and it exposes no secret memory.
+    #[cfg(test)]
+    pub(crate) fn fd_flags(&self) -> libc::c_int {
+        // SAFETY: `F_GETFD` only reads the descriptor's flags and takes no
+        // further argument; the descriptor is owned by this mapping.
+        unsafe { libc::fcntl(self.map.raw_fd(), libc::F_GETFD) }
     }
 
     pub(crate) fn alloc(self: &Arc<Self>, len: usize) -> Result<SecretBuf, SecMemError> {
@@ -383,9 +418,32 @@ impl Drop for SecretBuf {
     }
 }
 
+/// `SecretBuf` must stay `Send + Sync`: secrets are handed between tokio
+/// worker threads and held in shared state. It is a compile error if a future
+/// field (a `Cell`, an `Rc`, a bare `*mut`) takes that away.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SecretBuf>();
+    assert_send_sync::<crate::SecMem>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pool_descriptor_is_close_on_exec() {
+        // A real pool, so the assertion is about the descriptor the pool
+        // actually runs on rather than a fixture.
+        let pool = Pool::build(crate::PRODUCTION_POOL).expect("the pool must build on this host");
+        let flags = pool.fd_flags();
+        assert!(flags >= 0, "fcntl(F_GETFD) failed: {flags}");
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "the secret-memory descriptor must not survive an exec"
+        );
+    }
 
     fn arena() -> Arena {
         Arena::new(0, 1024)

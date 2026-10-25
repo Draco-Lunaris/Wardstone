@@ -75,6 +75,13 @@ impl SlotSet {
 /// An exclusive lease on one argon2 slot.
 ///
 /// Dropping it wipes whatever was handed out and wakes the next waiter.
+///
+/// Acquiring one **blocks the calling OS thread** on a `Condvar`, which an
+/// async runtime cannot see or work around; async callers must acquire and use
+/// the guard inside `tokio::task::spawn_blocking`. A guard held across an
+/// `.await` would also keep a scarce slot out of circulation for as long as
+/// that future is parked, so it is meant to live for exactly one synchronous
+/// argon2 call.
 pub struct SlotGuard<'a> {
     pool: &'a Pool,
     kind: SlotKind,

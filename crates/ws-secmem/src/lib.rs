@@ -113,11 +113,23 @@ pub enum SecMemError {
     )]
     MemlockTooSmall { have: u64, need: u64 },
 
+    /// The memlock limit could not be read at all.
+    #[error(
+        "the memlock limit could not be read (getrlimit(RLIMIT_MEMLOCK)): {0}; Wardstone will not map secrets it cannot prove will stay in RAM"
+    )]
+    MemlockUnreadable(#[source] io::Error),
+
     /// The pool could not be locked into RAM.
     #[error(
-        "the secret pool could not be locked into RAM (errno {errno}): the memlock budget passed its own check, so another mapping in this process is already holding it"
+        "the secret pool could not be mapped and locked into RAM (errno {errno}): the memlock limit was large enough when checked a moment earlier, so the cause lies elsewhere — another mapping in this process holding part of the budget, the host being out of lockable memory, or a mapping the kernel refuses outright"
     )]
     MlockFailed { errno: i32 },
+
+    /// The mapping does not behave as memory.
+    #[error(
+        "the secret pool failed its read-back probe at byte {offset}: the mapping was created but does not hold what is written to it, so it cannot be trusted with secrets"
+    )]
+    ProbeFailed { offset: usize },
 
     /// The arena is full. It never spills to the heap.
     #[error(
@@ -169,11 +181,20 @@ impl SecMem {
     }
 
     /// Leases the KDF slot, blocking until it is free.
+    ///
+    /// **Blocks the calling OS thread**, not just the current task: the wait is
+    /// a `Condvar`, invisible to an async runtime. An async caller must reach
+    /// this through `tokio::task::spawn_blocking` — argon2 itself is a
+    /// multi-hundred-millisecond CPU burn that belongs there regardless.
     pub fn kdf_slot(&self) -> SlotGuard<'_> {
         SlotGuard::acquire(&self.pool, SlotKind::Kdf)
     }
 
     /// Leases a password-hash slot, blocking until one is free.
+    ///
+    /// **Blocks the calling OS thread** — see [`SecMem::kdf_slot`]. With two
+    /// slots and one login burst, the third concurrent hash waits here, so
+    /// calling this on a runtime worker thread would stall unrelated requests.
     pub fn hash_slot(&self) -> SlotGuard<'_> {
         SlotGuard::acquire(&self.pool, SlotKind::Hash)
     }
@@ -200,6 +221,22 @@ static GATE: Mutex<()> = Mutex::new(());
 ///
 /// Every binary mode and every test binary calls this before touching a
 /// secret.
+///
+/// # Process-wide side effects
+///
+/// This is not a constructor; it changes the process permanently:
+///
+/// - `RLIMIT_CORE` becomes 0/0. The hard limit too, so nothing later can raise
+///   it back.
+/// - `PR_SET_DUMPABLE` becomes 0. Beyond stopping `ptrace` attach and core
+///   dumps, this hands `/proc/self/{mem,environ,maps,smaps,pagemap,…}` to
+///   `root:root` with mode 0600 for the rest of the process's life, so an
+///   unprivileged process can no longer open its own. Anything that needs to
+///   read those files must open them **before** calling `init`
+///   (`/proc/self/status` stays 0444 and readable). Code that shells out is
+///   unaffected: the child is a new process.
+/// - 400 MiB of secret memory is mapped and faulted in, so RSS and the
+///   process's `VmLck` both rise by the pool size and stay there.
 ///
 /// # Errors
 ///
@@ -275,6 +312,9 @@ mod tests {
                 need: 419_430_400,
             }
             .to_string(),
+            SecMemError::MemlockUnreadable(io::Error::from_raw_os_error(libc::EINVAL)).to_string(),
+            SecMemError::MlockFailed { errno: 11 }.to_string(),
+            SecMemError::ProbeFailed { offset: 4095 }.to_string(),
             SecMemError::ArenaFull { requested: 64 }.to_string(),
             SecMemError::SlotTooSmall.to_string(),
         ];

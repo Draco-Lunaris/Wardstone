@@ -45,10 +45,10 @@ pub(crate) fn check_memlock_budget(need: usize) -> Result<(), SecMemError> {
     };
     // SAFETY: `limit` is a live, correctly typed out-parameter.
     if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
-        return Err(SecMemError::MemlockTooSmall {
-            have: 0,
-            need: need as u64,
-        });
+        // Distinct from a limit that is merely too small: the limit is
+        // unknown, which is a different thing for an operator to chase than a
+        // limit of zero would be.
+        return Err(SecMemError::MemlockUnreadable(io::Error::last_os_error()));
     }
 
     let have: u64 = limit.rlim_cur;

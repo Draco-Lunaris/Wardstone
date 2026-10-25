@@ -140,6 +140,16 @@ fn a_blocked_memfd_secret_is_refused_by_name() {
     );
 }
 
+/// Same name, visibly skipped rather than silently absent: the BPF program
+/// above hard-codes `AUDIT_ARCH_X86_64` and syscall number 447, so the fixture
+/// — not the behaviour under test — is what is architecture-bound.
+#[test]
+#[cfg(not(target_arch = "x86_64"))]
+#[ignore = "seccomp fixture is x86_64-only"]
+fn a_blocked_memfd_secret_is_refused_by_name() {
+    unimplemented!("port the seccomp fixture to this architecture");
+}
+
 #[test]
 fn a_full_protection_set_boots() {
     let output = run(&mut probe());
