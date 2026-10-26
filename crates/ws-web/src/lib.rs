@@ -33,7 +33,6 @@
 //! socket address attached to every request (`ConnectInfo`, Task 12's
 //! per-IP limiter's key input).
 
-pub mod init;
 pub mod locked;
 pub mod proxy;
 pub mod session;
@@ -55,12 +54,11 @@ use session::relay::relay_router;
 use session::store::SessionStore;
 
 /// Mount the per-IP GCRA on a credential sub-router (spec §5.1: the
-/// unlock and conversion POSTs are credential surfaces — wrong
+/// unlock and setup POSTs are credential surfaces — wrong
 /// passphrases cost argon2 memory-hard compute AND a bucket credit,
 /// with the house defaults the auth surface shares). The ONE home for
-/// the mount: the `/auth/ui` relay routes, the locked door's
-/// `POST /unlock`, and the INIT door's `POST /init` all pass through
-/// here, keyed on the connected socket the TLS listener attaches
+/// the mount: the `/auth/ui` relay routes and the locked door's
+/// `POST /unlock` pass through here, keyed on the connected socket the TLS listener attaches
 /// (`ConnectInfo`; the tests inject the same extension).
 pub(crate) fn gcra<S>(
     router: Router<S>,

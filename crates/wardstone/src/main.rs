@@ -27,8 +27,6 @@ use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_core::error::CoreError;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
-use ws_core::repo::certificate_repo::CertificateRepo;
-use ws_core::repo::tenant_repo::TenantRepo;
 use zeroize::Zeroizing;
 
 /// The listen address when `WARDSTONE_BIND` is unset (the brief's pin).
@@ -501,56 +499,13 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
 }
 
-/// The conversion boot (the sealed-at-rest design's `LegacyConversion`
-/// state): a volume that still holds plaintext key files never serves
-/// the app — it lands on the INIT page over the same ephemeral
-/// locked-mode certificate the sealed boot uses (no key material is
-/// read at boot, even though the plaintext is still there: the
-/// conversion is the one thing this boot does with it). The POST
-/// converts the volume, the shared build closure hands the SAME
-/// listener to the full unlocked surface (reloading it onto the
-/// CA-issued leaf), and every later boot starts sealed on the unlock
-/// page.
-async fn run_ui_legacy_conversion(cfg: BootConfig) -> Result<(), BootError> {
-    let hostname = cfg
-        .server_hostname
-        .clone()
-        .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned());
-    let (sealed_pem, sealed_key, sealed_fingerprint) =
-        ws_web::setup::tls::sealed_certificate(&hostname)?;
-    let sealed_key = Zeroizing::new(sealed_key);
-    let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
-    let reload_handle = tls_config.clone();
-
-    let build = unlocked_web_build(&cfg, &hostname, reload_handle);
-    let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
-    let router = ws_web::init::init_router(
-        ui,
-        &cfg.keys_dir,
-        &cfg.database_url,
-        &hostname,
-        cfg.web_rate_limit,
-    );
-    tracing::info!(
-        hostname = %hostname,
-        fingerprint = %sealed_fingerprint,
-        bind = %cfg.bind,
-        "the volume holds plaintext key files: serving the one-time \
-         conversion page"
-    );
-    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
-}
-
-/// The web build both locked doors hand their `SealedUi` (the sealed
-/// boot's unlock and the conversion boot's POST): it converges a mixed
-/// volume when the completion pair rides along, opens the envelopes,
-/// builds the ui's pool from the sealed DB credential, relays the
-/// passphrase to the api (best-effort, logged), reloads the listener
-/// onto the CA-issued leaf, and returns the full web router. On the
-/// sealed boot the volume implies setup committed; on the conversion
-/// boot a tenantless volume falls through to the setup page the full
-/// router conditionally mounts — either way there is no setup-commit
-/// TLS swap to wire here.
+/// The web build the sealed boot hands its `SealedUi`: it converges a
+/// mixed volume when the completion pair rides along, opens the
+/// envelopes, builds the ui's pool from the sealed DB credential, relays
+/// the passphrase to the api (best-effort, logged), reloads the listener
+/// onto the CA-issued leaf, and returns the full web router. A sealed
+/// volume implies setup committed, so there is no setup-commit TLS swap
+/// to wire here.
 fn unlocked_web_build(
     cfg: &BootConfig,
     hostname: &str,
@@ -606,8 +561,8 @@ fn unlocked_web_build(
             .map_err(|e| err(format!("the master envelope: {e}")))?;
             let mut master_bytes = [0u8; 32];
             master_bytes.copy_from_slice(&master);
-            // The crashed-conversion heal (F3, spec §3's per-file
-            // contract): the conversion seals file by file, and a crash
+            // The crashed-seal heal (F3, spec §3's per-file
+            // contract): the setup seal goes file by file, and a crash
             // mid-arm strands a plaintext beside its envelope (or
             // unwrapped). The passphrase just proved itself against the
             // master — the authenticated moment to converge the volume
@@ -665,8 +620,8 @@ fn unlocked_web_build(
                 );
             }
 
-            // The serving leaf with the unlocked keystore: the same
-            // walk the unsealed boot performs, then the in-place TLS
+            // The serving leaf with the unlocked keystore
+            // ([`resolve_serving_leaf`]'s walk), then the in-place TLS
             // reload onto the CA-issued leaf.
             let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
                 .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
@@ -749,13 +704,6 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     if sealed_instance(&cfg.keys_dir) {
         return run_ui_sealed(cfg).await;
     }
-    // The legacy volume (the upgrade conversion): plaintext key files
-    // land on the one-time conversion page instead of the app — the
-    // tenant-existence check below never runs for a volume that must
-    // convert first (the design's keys-directory-only derivation).
-    if ws_web::init::legacy_volume(&cfg.keys_dir) {
-        return run_ui_legacy_conversion(cfg).await;
-    }
     let pool = ws_core::db::connect(&cfg.database_url).await?;
     // The JWT keys are the process-lifecycle boot step the brief pins:
     // they exist (or are created) before anything is served — on a virgin
@@ -802,97 +750,16 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         return Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?);
     }
 
-    // Configured instance: resolve the CA-issued leaf (the controller
-    // ruling: by its certificates row + `load_ca_key(cert.id)`).
-    let tenant = TenantRepo::new()
-        .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
-        .await?
-        .ok_or_else(|| {
-            BootError::Config(
-                "the default tenant existed at the boot check but vanished before \
-                 the leaf resolution (concurrent modification at boot?)"
-                    .to_owned(),
-            )
-        })?;
-    let certs = CertificateRepo::new()
-        .list_by_tenant(&pool, tenant.id, 0, 500)
-        .await?;
-
-    let leaf = match resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))? {
-        Some((leaf, ca_key)) => {
-            tracing::info!(
-                certificate_id = %leaf.id,
-                serial = %leaf.serial_hex,
-                subject = %leaf.subject,
-                bind = %cfg.bind,
-                "serving TLS from the CA-issued server leaf"
-            );
-            // The setup routes are not mounted once the tenant exists, so
-            // the fingerprint argument is inert — the empty string keeps
-            // that inertness readable at the router call below.
-            Some((leaf.cert_pem.clone(), ca_key, String::new()))
-        }
-        None => {
-            // The pinned torn state: the setup bootstrap committed (the
-            // tenant and everything else exist) but the leaf issuance
-            // transaction never did — no active web-server certificate
-            // row. Keep SERVING on a fresh setup certificate; record the
-            // decision in the log (the choice must be visible).
-            tracing::warn!(
-                bind = %cfg.bind,
-                "the default tenant exists but no active web-server \
-                 certificate row was found (typical cause: a crash between \
-                 the setup commit and the leaf issuance); falling back to a \
-                 freshly minted setup certificate so TLS keeps serving — \
-                 recovery is operator-initiated: log in and re-issue the \
-                 server leaf via the API"
-            );
-            let (cert_pem, fingerprint) =
-                ws_web::setup::tls::setup_certificate(&mut keystore, &hostname)?;
-            let key = keystore.load_setup_key()?;
-            Some((cert_pem, key, fingerprint))
-        }
-    };
-    let (cert_pem, key_der, fingerprint) = match leaf {
-        Some(triple) => triple,
-        None => {
-            return Err(BootError::Config(
-                "the serving-certificate resolution found nothing to serve".to_owned(),
-            ))
-        }
-    };
-
-    // No setup routes exist once the tenant does — `web_router` unmounts
-    // them itself; the proxy is what the UI serves (and on the fallback
-    // path it is how the operator reaches the recovery flow).
-    let router = ws_web::web_router(
-        pool,
-        cfg.keys_dir.clone(),
-        fingerprint,
-        hostname,
-        // A configured instance has no setup surface to swap a listener
-        // for — the boot's own certificate (above) is already the
-        // CA-issued leaf.
-        None,
-        &cfg.api_url,
-        cfg.database_url.clone(),
-        ws_web::DEFAULT_SESSION_TTL,
-        cfg.web_rate_limit,
-    )
-    .await?;
-    serve_ui(cfg, router, &cert_pem, &key_der).await
-}
-
-/// Put the front-door router on the TLS listener. Nothing returns from
-/// [`ws_web::serve_tls`] in the normal course (the serve loop runs until
-/// the process exits — including the watcher's exit after setup).
-async fn serve_ui(
-    cfg: BootConfig,
-    router: axum::Router,
-    cert_pem: &str,
-    key_der: &[u8],
-) -> Result<(), BootError> {
-    Ok(ws_web::serve_tls(cfg.bind, router, cert_pem, key_der).await?)
+    // A tenant beside an unsealed volume: setup committed but crashed
+    // before sealing the keys (the seal writes `master.envelope` first,
+    // so any later crash boots sealed and the unlock heals it). Nothing
+    // is served on plaintext keys; a fresh install has nothing to keep.
+    Err(BootError::Config(
+        "the keys volume is not sealed but the default tenant exists: setup \
+         was interrupted before it sealed the keys — remove both volumes \
+         (`docker compose down -v`) and run setup again"
+            .to_owned(),
+    ))
 }
 
 /// The `api` mode: ws-api's REST router served DIRECTLY as plain HTTP —
@@ -918,9 +785,9 @@ fn sealed_instance(keys_dir: &std::path::Path) -> bool {
 /// Does the operator-supplied DATABASE_URL carry a password? The
 /// password-less compose contract (the api's env holds no credential at
 /// all — everything credential-shaped lives in the sealed envelopes):
-/// a password-less URL on an unsealed volume is the fresh-install
-/// signal; the api can build no pool at boot and comes up as the sealed
-/// shell instead, waiting for the setup commit's relay. The parsing
+/// the api always boots the sealed shell (it builds no pool at boot and
+/// waits for the setup commit's or the unlock's relay), and a password in
+/// its URL is refused as a misconfiguration (G5). The parsing
 /// mirrors [`substitute_db_password`]'s: the password is whatever
 /// follows the last `:` in the `://…@` authority.
 fn db_url_has_password(url: &str) -> bool {
@@ -934,8 +801,8 @@ fn db_url_has_password(url: &str) -> bool {
     url[auth_start..at].rfind(':').is_some()
 }
 
-/// The api's [`ws_api::ApiConfig`] from the boot env — shared by both the
-/// legacy boot and the sealed unlock's build closure.
+/// The api's [`ws_api::ApiConfig`] from the boot env, for the sealed
+/// unlock's build closure.
 fn api_config_from(cfg: &BootConfig) -> ws_api::ApiConfig {
     if cfg.public_url.is_none() {
         tracing::warn!(
@@ -1010,30 +877,19 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
 }
 
 async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
-    // The sealed shell serves whenever the volume is sealed OR the env
-    // carries no database credential (the compose contract: the api's
-    // DATABASE_URL is password-less, so a fresh install — no envelopes
-    // yet — has nothing to build a pool from; the setup commit's relay
-    // performs the unlock that brings the full surface up).
-    if sealed_instance(&cfg.keys_dir) || !db_url_has_password(&cfg.database_url) {
-        return run_api_sealed(cfg).await;
+    // The compose contract: the api's DATABASE_URL is password-less — its
+    // credential lives only in the sealed envelope. The api always boots
+    // the sealed shell (a fresh install's setup commit, or the unlock,
+    // relays it up); a password in the URL is a misconfiguration (G5).
+    if db_url_has_password(&cfg.database_url) {
+        return Err(BootError::Config(
+            "the api's DATABASE_URL carries a password: it must be password-less \
+             (postgres://wardstone@db:5432/wardstone) — the credential lives in \
+             the sealed keys volume"
+                .to_owned(),
+        ));
     }
-    let pool = ws_core::db::connect(&cfg.database_url).await?;
-    // The JWT key pair: ws-api signs every access token with it. Loading
-    // (or creating, on a virgin volume) exactly once per boot — the same
-    // on-disk pair the `ui` process guarantees exists.
-    let jwt = std::sync::Arc::new(ws_auth::jwt::JwtKeys::load_or_create(&cfg.keys_dir)?);
-
-    let config = api_config_from(&cfg);
-    let app = ws_api::router(ws_api::AppState::new(pool, jwt, config));
-
-    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-    tracing::info!(bind = %cfg.bind, "serving the REST API");
-    Ok(axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?)
+    run_api_sealed(cfg).await
 }
 
 /// The serving-leaf candidates over a tenant's certificates: ACTIVE
@@ -1397,51 +1253,6 @@ mod tests {
         assert!(
             sealed_instance(&dir),
             "master.envelope marks the sealed state"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The legacy-volume predicate (spec §5): ANY pre-sealing plaintext
-    /// file — the master key, the secret-encryption key, or either JWT
-    /// PEM (a torn pair included) — lands the boot on the INIT
-    /// conversion page; a clean volume (fresh install) and a sealed
-    /// volume do not.
-    #[test]
-    fn legacy_volume_reads_the_plaintext_predicate() {
-        for file in [
-            "master.key",
-            "secret-encryption.key",
-            "jwt-signing-key.pem",
-            "jwt-verify-key.pem",
-        ] {
-            let dir = std::env::temp_dir()
-                .join(format!("ws-legacy-predicate-{file}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            assert!(
-                !ws_web::init::legacy_volume(&dir),
-                "a clean dir is not a legacy volume"
-            );
-            std::fs::write(dir.join(file), b"legacy plaintext").unwrap();
-            assert!(
-                ws_web::init::legacy_volume(&dir),
-                "{file} marks the legacy conversion state"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        // A sealed volume is not a legacy volume by the file set alone:
-        // the boot checks the sealed predicate FIRST, so even a torn
-        // conversion's leftover plaintext (sealed envelope + a stray
-        // file) boots sealed — the unlock path, not the INIT page.
-        let dir =
-            std::env::temp_dir().join(format!("ws-legacy-predicate-sealed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(MASTER_ENVELOPE_FILE), b"{}").unwrap();
-        assert!(
-            !ws_web::init::legacy_volume(&dir),
-            "master.envelope means sealed, not legacy"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
