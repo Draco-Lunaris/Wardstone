@@ -1,12 +1,80 @@
 //! KeyEnvelope tests: the operator master passphrase derives a KEK that
 //! seals sensitive files as inert ciphertext envelopes. No database — pure
-//! crypto + temp files.
+//! crypto + temp files, plus the locked-slot guarantee: the KDF's
+//! memory-hard scratch must come from the `memfd_secret` pool, never the
+//! heap.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fs;
 use std::path::PathBuf;
 
 use ws_core::crypto::KeyEnvelope;
 use ws_core::error::CoreError;
+
+/// A single allocation at least this large is argon2's scratch arriving on
+/// the heap. The suite derives at `m_cost = 8192` (8 MiB), and nothing else
+/// on the envelope path allocates more than an envelope's worth of bytes,
+/// so 1 MiB separates the two cleanly.
+const ARGON2_SCRATCH_FLOOR: usize = 1_048_576;
+
+thread_local! {
+    /// The largest single allocation served to THIS thread since the last
+    /// reset. Thread-local so the tests cargo runs in parallel cannot
+    /// pollute each other's measurement.
+    static LARGEST_ALLOCATION: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The system allocator, watched. It changes no allocation behaviour; it
+/// only records the high-water mark of a single request, which is what
+/// separates "the KDF ran in the locked slot" from "the KDF allocated its
+/// scratch".
+struct WatchfulAlloc;
+
+// SAFETY: every method forwards to `System` with the layout and pointer it
+// was given, so the allocator contract is `System`'s. The recording side
+// effect touches only a `Cell<usize>` in a const-initialised thread-local,
+// which allocates nothing and registers no destructor, so it cannot
+// re-enter the allocator.
+unsafe impl GlobalAlloc for WatchfulAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record(new_size);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+}
+
+fn record(size: usize) {
+    // During thread teardown the thread-local is gone; the measurement
+    // windows below are all inside a running test, so dropping those
+    // samples costs nothing.
+    let _ = LARGEST_ALLOCATION.try_with(|largest| largest.set(largest.get().max(size)));
+}
+
+/// Runs `body` and reports the largest single heap allocation it caused on
+/// this thread.
+fn largest_allocation_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    LARGEST_ALLOCATION.with(|largest| largest.set(0));
+    let value = body();
+    let seen = LARGEST_ALLOCATION.with(Cell::get);
+    (value, seen)
+}
+
+#[global_allocator]
+static ALLOCATOR: WatchfulAlloc = WatchfulAlloc;
 
 /// Low-cost KDF params: the production unlock targets ~1 s (argon2id with
 /// heavy memory); the tests assert the crypto, not the wall clock.
@@ -89,13 +157,16 @@ fn envelope_open_is_in_memory_only() {
 fn kek_derive_is_deterministic_per_salt_and_params() {
     let a = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek();
+        .into_kek()
+        .unwrap();
     let b = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek();
+        .into_kek()
+        .unwrap();
     let c = KeyEnvelope::derive_kek("passphrase-2", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek();
+        .into_kek()
+        .unwrap();
     assert_eq!(&*a, &*b, "same passphrase+salt+params derive the same KEK");
     assert_ne!(&*a, &*c, "a different passphrase derives a different KEK");
 }
@@ -478,7 +549,7 @@ fn derive_kek_matches_the_heap_reference() {
         .expect("derive in the locked KDF slot");
 
     assert_eq!(
-        derived.secrets().as_slice(),
+        derived.secrets().unwrap().as_slice(),
         reference.as_slice(),
         "the locked-slot KEK must equal argon2's heap output at the same parameters"
     );
@@ -497,5 +568,33 @@ fn derive_kek_matches_the_heap_reference() {
     // accidentally keyed on the salt alone).
     let other = KeyEnvelope::derive_kek("a different master passphrase", salt, params)
         .expect("derive in the locked KDF slot");
-    assert_ne!(other.secrets().as_slice(), reference.as_slice());
+    assert_ne!(other.secrets().unwrap().as_slice(), reference.as_slice());
+}
+
+#[test]
+fn derive_kek_never_allocates_argon2_memory_on_the_heap() {
+    // The pool's one-time mapping and the first derivation happen outside
+    // the measurement window: this test is about argon2's scratch, not
+    // about startup.
+    let warm = KeyEnvelope::derive_kek(
+        "warm the one-time paths",
+        b"a-sixteen-byte!!",
+        cheap_params(),
+    )
+    .expect("warm-up derivation");
+    drop(warm);
+
+    let (derived, largest) = largest_allocation_during(|| {
+        KeyEnvelope::derive_kek(
+            "the operator master passphrase",
+            b"a-sixteen-byte!!",
+            cheap_params(),
+        )
+    });
+    derived.expect("derive in the locked KDF slot");
+    assert!(
+        largest < ARGON2_SCRATCH_FLOOR,
+        "derive_kek must take its scratch from the locked pool, but a \
+         {largest}-byte heap allocation was served"
+    );
 }

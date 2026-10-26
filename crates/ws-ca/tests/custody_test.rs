@@ -70,7 +70,7 @@ fn unlocked_ram_mode_serves_without_any_master_file() -> Result<(), CaError> {
         cheap_params(),
     )
     .unwrap();
-    let kek_zeroizing = master.into_kek();
+    let kek_zeroizing = master.into_kek().unwrap();
     let mut ks = KeyStore::open_unlocked(&dir, kek_zeroizing)?;
     let ca_id = uuid::Uuid::new_v4();
     let ca_bytes = b"ram-custody-ca-key".to_vec();

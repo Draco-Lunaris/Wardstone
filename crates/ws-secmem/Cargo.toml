@@ -10,7 +10,11 @@ rust-version.workspace = true
 # dependency rather than a transitive one.
 libc = { workspace = true }
 # argon2::Block is the unit the locked KDF/password slots hand out, so the
-# slot API is typed in argon2's own vocabulary (see slots.rs).
+# slot API is typed in argon2's own vocabulary (see slots.rs). The workspace
+# pin carries the `zeroize` feature, which this crate's promise depends on:
+# the slot guard wipes the pool, but only argon2 itself can wipe the prehash
+# and blockhash copies it keeps on the stack. No crate here re-declares
+# argon2's features — the workspace pin is the single home for them.
 argon2 = { workspace = true }
 # Volatile, non-elidable wipes of arena buffers and argon2 slots on drop.
 zeroize = { workspace = true }

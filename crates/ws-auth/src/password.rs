@@ -12,10 +12,14 @@
 //! all over it. There is no heap fallback: a slot is waited for, and an
 //! `m_cost` the slot cannot hold is refused.
 //!
-//! Acquiring a slot **blocks the calling OS thread** (see
-//! [`ws_secmem::SecMem::hash_slot`]), so async callers reach both functions
+//! Acquiring a slot **blocks the calling OS thread** on a `Condvar` (see
+//! [`ws_secmem::SecMem::hash_slot`]), which an async runtime can neither see
+//! nor work around. Async callers must therefore reach both functions
 //! through `tokio::task::spawn_blocking` — which argon2's
-//! multi-hundred-millisecond CPU burn already required.
+//! multi-hundred-millisecond CPU burn already required. ws-api's auth routes
+//! do; the setup, unlock and boot paths that call these from a runtime
+//! thread today are moved under `spawn_blocking` by the later setup/boot
+//! tasks of this plan, which own those call sites.
 
 use argon2::password_hash::phc::{Output, PasswordHash, Salt};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -157,13 +161,14 @@ fn derive(password: &str, salt: &[u8], params: Params) -> Result<SecretBuf, Auth
         .map_err(|_| AuthError::Crypto("the argon2id m_cost is out of range".to_string()))?;
     let hasher = Argon2::new(Algorithm::Argon2id, VERSION, params);
 
-    // The slot comes first, then the arena. Both are finite pool resources,
-    // so they are always taken in this order — a thread that waited for a
-    // slot while holding arena space could deadlock against one holding a
-    // slot and waiting for arena space.
+    // The slot comes first, then the arena. Neither order can deadlock —
+    // the arena never waits, it refuses with `ArenaFull` — but the slot is
+    // the resource with a queue behind it, and taking it first means a
+    // thread parked on that queue is not also pinning arena space for as
+    // long as it waits.
     //
     // Acquiring the slot blocks the OS thread until one frees (a `Condvar`,
-    // invisible to an async runtime) — callers are inside `spawn_blocking`.
+    // invisible to an async runtime) — see the module docs.
     let mut slot = mem.hash_slot();
     // Refused here, before a single argon2 pass: an `m_cost` the slot
     // cannot hold has no heap fallback to fall back to.

@@ -42,7 +42,16 @@ rand = { version = "0.10.3" }
 # `memfd_secret` slot instead of a fresh heap allocation (ws-auth's password
 # hashing and the master-key KDF both borrow those slots). `Block` is a
 # 1 KiB `#[repr(align(64))]` value, so m_cost KiB == one block per KiB.
-argon2 = { version = "0.6.0" }
+#
+# The `zeroize` feature is NOT a default and is load-bearing here: it is what
+# makes argon2 wipe the state it keeps on its own STACK, which a locked slot
+# cannot reach. Without it argon2 leaves the Blake2b prehash `H0`
+# (`lib.rs:389-390`) and `finalize`'s 1 KiB blockhash copy
+# (`lib.rs:553-574`) lying in the caller's frame — and `H0` plus the salt and
+# parameters, both of which are public in the envelope and the PHC string,
+# recompute the master KEK outright. zeroize 1.9.1 is the pin below, so the
+# feature adds no new crate to the graph.
+argon2 = { version = "0.6.0", features = ["zeroize"] }
 # Volatile, non-elidable wipes. ws-secmem leans on `Zeroize for [u8]` to wipe
 # arena buffers and argon2 slots on drop; the compiler must not optimise
 # those stores away, which a plain `fill(0)` permits.

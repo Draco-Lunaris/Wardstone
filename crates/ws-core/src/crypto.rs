@@ -444,10 +444,16 @@ impl KeyEnvelope {
     /// The argon2id pass runs in the pool's locked KDF slot, so neither the
     /// 256 MiB of memory-hard scratch nor the derived key ever touches the
     /// heap; there is no heap fallback, and an `m_cost` larger than the slot
-    /// is refused. Acquiring the slot **blocks the calling OS thread** (a
-    /// `Condvar` an async runtime cannot see), which is why every async
-    /// caller reaches this inside `tokio::task::spawn_blocking` — the
-    /// ~1 s CPU burn already required that.
+    /// is refused.
+    ///
+    /// Acquiring the slot **blocks the calling OS thread** on a `Condvar`,
+    /// which an async runtime can neither see nor work around, so an async
+    /// caller must reach this through `tokio::task::spawn_blocking` — the
+    /// ~1 s CPU burn already required that. Several callers do not yet:
+    /// ws-web's setup conversion, ws-api's sealed shell and its master-key
+    /// route still derive on a runtime thread. The later setup/boot/custody
+    /// tasks of this plan own those call sites and move them; this task
+    /// changes only where argon2's memory comes from.
     pub fn derive_kek(passphrase: &str, salt: &[u8], params: KdfParams) -> Result<Self, CoreError> {
         use argon2::{Algorithm, Argon2, Params, Version};
         let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN))
@@ -459,11 +465,12 @@ impl KeyEnvelope {
             .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
 
         let mem = ws_secmem::global().map_err(protected_memory_failure)?;
-        // The slot comes first, then the arena: both are finite pool
-        // resources, and taking them in one fixed order everywhere is what
-        // keeps a thread waiting for a slot while holding arena space from
-        // deadlocking against one holding a slot and waiting for arena
-        // space.
+        // The slot comes first, then the arena. Neither order can deadlock
+        // — the arena never waits, it refuses with `ArenaFull` — but the
+        // slot is the resource with a queue behind it, and taking it first
+        // means a thread parked on that queue is not also pinning arena
+        // space for as long as it waits. Same order as ws-auth's password
+        // hashing, so the two readers of the pool agree.
         let mut slot = mem.kdf_slot();
         let scratch = slot
             .blocks(blocks_needed)
@@ -631,24 +638,30 @@ impl KeyEnvelope {
     ///
     /// This copies the key out of protected memory into the caller's own
     /// `Zeroizing` custody, which is weaker than the pool it came from.
-    /// The signature is held fixed here so this change stays a swap of
+    /// The custody type is held as it was so this task stays a swap of
     /// argon2's memory; Task 5 retargets the custody types and these
     /// consumers with them.
     ///
-    /// The buffer is [`KEY_LEN`] long by construction, so the `min` is only
-    /// there to keep the copy panic-free, not to handle a reachable short
-    /// buffer.
-    pub fn secrets(&self) -> Zeroizing<[u8; KEY_LEN]> {
-        let mut out = Zeroizing::new([0u8; KEY_LEN]);
-        let len = self.kek.len().min(KEY_LEN);
-        out[..len].copy_from_slice(&self.kek[..len]);
-        out
+    /// # Errors
+    ///
+    /// [`CoreError::Crypto`] if the held buffer is not [`KEY_LEN`] bytes.
+    /// It is, by construction — [`KeyEnvelope::derive_kek`] is the only
+    /// constructor and reserves exactly that — so this arm is unreachable
+    /// today. It is an error rather than a zero-padded short key because a
+    /// truncated KEK fails open: it would seal and unseal perfectly well
+    /// against itself while being far weaker than the passphrase behind it.
+    pub fn secrets(&self) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
+        Ok(Zeroizing::new(*self.kek_bytes()?))
     }
 
     /// The KEK as its raw 32 bytes (for callers that re-wrap it into their
     /// own custody handling, e.g. the keystore conversion). Copies out of
     /// protected memory — see [`KeyEnvelope::secrets`].
-    pub fn into_kek(self) -> Zeroizing<[u8; KEY_LEN]> {
+    ///
+    /// # Errors
+    ///
+    /// As [`KeyEnvelope::secrets`].
+    pub fn into_kek(self) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
         self.secrets()
     }
 }
