@@ -755,6 +755,10 @@ fn map_core(err: ws_core::error::CoreError) -> CaError {
 /// The DB credential rotation rides along: the fresh random password is
 /// ALTER'd over the just-used bootstrap connection and sealed — the
 /// bootstrap (and the env's `WARDSTONE_DB_PASSWORD`) retires here.
+///
+/// [TRANSITIONAL — the seal-at-creation plan removes this volume seal
+/// with the setup paths in Task 6; a volume sealed at creation never
+/// holds the legacy plaintext it converts.]
 pub async fn seal_keys_volume(
     keys_dir: &Path,
     passphrase: &str,
@@ -872,6 +876,10 @@ pub async fn seal_keys_volume(
 /// the unlock (the boot serves it the setup page, or refuses it beside
 /// a tenant); the heal refuses it rather than sealing anything against
 /// a generation it cannot name.
+///
+/// [TRANSITIONAL — the seal-at-creation plan removes this crashed-seal
+/// heal with the volume seal in Task 6; a volume sealed at creation has
+/// no per-file crash windows to converge.]
 pub fn heal_keys_volume(keys_dir: &Path, passphrase: &str) -> Result<(), CaError> {
     let generation =
         ws_core::crypto::KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))

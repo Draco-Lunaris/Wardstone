@@ -633,6 +633,14 @@ impl KeyEnvelope {
         open_bytes(kek.kek_bytes()?, &nonce, &ciphertext)
     }
 
+    /// [TRANSITIONAL — test support only: every production caller takes
+    /// the KEK through [`KeyEnvelope::into_kek`] (the move, no copy) or
+    /// the unlock handshake, and the callers left are test code; the
+    /// seal-at-creation plan removes the last of them with the Task 6/7
+    /// cleanup, and this copy-bearing accessor goes with them — an
+    /// untagged second way to copy the KEK out of an envelope must not
+    /// survive the plan.]
+    ///
     /// The KEK as a fresh 32-byte reservation in the protected arena (a
     /// compatibility accessor for callers that hold a borrowed envelope;
     /// the production custody paths move the buffer instead, via
