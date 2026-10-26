@@ -366,12 +366,75 @@ pub const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
 /// must be readable while the instance is locked).
 pub const RELAY_NONCE_FILE: &str = "relay-nonce";
 
+/// Percent-encode a URL userinfo component — the typed database
+/// password being spliced into a connection URL: every byte outside the
+/// RFC 3986 unreserved set `[A-Za-z0-9._~-]` becomes `%XX`, so a
+/// password carrying URL-significant bytes (`@ : / % # ?` and friends)
+/// cannot break the authority parse. Hand-rolled inline rather than a
+/// new dependency — the same precedent as dbcred's base32. Unreserved
+/// bytes map to themselves, so a generated base32 credential (`a-z2-7`)
+/// encodes to itself bit-identically and every existing rotation and
+/// restore flow is unchanged.
+pub fn percent_encode_userinfo(component: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(component.len());
+    for &byte in component.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => {
+                out.push(byte as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[usize::from(byte >> 4)] as char);
+                out.push(HEX[usize::from(byte & 0x0f)] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Percent-DECODE a userinfo component — the mirror of
+/// [`percent_encode_userinfo`], so the recovery arm's URL extraction
+/// and the splice speak one shape. `%XX` becomes the byte; a bare `%`
+/// that does not head a valid pair is taken literally (fail toward the
+/// original bytes, never panic). An input that was never encoded (a
+/// legacy raw URL) comes back unchanged, so the interim extraction
+/// cannot silently mangle a pre-encoding credential.
+pub fn percent_decode_userinfo(component: &str) -> String {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = component.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (nibble(bytes[index + 1]), nibble(bytes[index + 2])) {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Substitute `password` into `url`'s `://user:password@host` authority —
 /// inserting a `:password` when the URL carries none (the api's
-/// password-less compose contract). The one home for the parsing: the
-/// binary's boot rule, the ui's credential unwrap, the api's unlock
-/// rotation, and the tests all speak this exact shape. A URL with no
-/// `userinfo@` comes back unchanged (the caller's error to raise).
+/// password-less compose contract). The password splices in
+/// PERCENT-ENCODED ([`percent_encode_userinfo`]): a typed password
+/// carrying `@ : / % # ?` must not break the URL's own parse. The one
+/// home for the parsing: the binary's boot rule, the ui's credential
+/// unwrap, the api's unlock rotation, and the tests all speak this
+/// exact shape. A URL with no `userinfo@` comes back unchanged (the
+/// caller's error to raise).
 pub fn substitute_db_password(url: &str, password: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -380,12 +443,13 @@ pub fn substitute_db_password(url: &str, password: &str) -> String {
     let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
         return url.to_string();
     };
+    let encoded = percent_encode_userinfo(password);
     match url[auth_start..at].rfind(':') {
         Some(colon_rel) => {
             let colon_abs = auth_start + colon_rel;
-            format!("{}{}{}", &url[..=colon_abs], password, &url[at..])
+            format!("{}{}{}", &url[..=colon_abs], encoded, &url[at..])
         }
-        None => format!("{}:{}{}", &url[..at], password, &url[at..]),
+        None => format!("{}:{}{}", &url[..at], encoded, &url[at..]),
     }
 }
 
@@ -814,4 +878,84 @@ pub fn scan_volume(dir: &Path) -> Result<VolumeScan, CoreError> {
         present.push(file);
     }
     Ok(VolumeScan { present, mixed })
+}
+
+/// # Unit tests
+///
+/// The URL-significant password coverage (the fix round 1 defect): a
+/// typed password containing URL-significant bytes was spliced RAW,
+/// produced a malformed URL, and was answered as "the database rejected
+/// that password" — a correct password refused with misleading copy.
+/// The encode/decode pair and the splice now round trip.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every URL-significant byte survives the splice and the parse.
+    /// sqlx 0.8.6's `PgConnectOptions` exposes no password getter, so the
+    /// decode side is proven the mirror way: sqlx's own URL parse must
+    /// ACCEPT the spliced URL (a raw `:` or `@` inside the password breaks
+    /// the authority parse — the original defect), and the userinfo
+    /// slice — taken with the same authority convention the extractors
+    /// speak — must percent-decode to the ORIGINAL bytes: `@ : / % # ?`
+    /// plus the unreserved set all at once.
+    #[test]
+    fn a_url_significant_password_survives_the_splice_and_the_parse() {
+        let password = "p@ss:wo%rd/?#x~._-Z9";
+        let url = substitute_db_password(
+            "postgres://wardstone:placeholder@localhost:5432/wardstone_test",
+            password,
+        );
+        url.parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("the spliced URL parses as a Postgres connect URL");
+        let authority = url.split("://").nth(1).expect("the scheme is present");
+        let userinfo_end = authority.find('@').expect("the authority carries userinfo");
+        let (user, encoded) = authority[..userinfo_end]
+            .split_once(':')
+            .expect("the userinfo carries a password");
+        assert_eq!(user, "wardstone");
+        assert_eq!(
+            percent_decode_userinfo(encoded),
+            password,
+            "the splice/parse/decode round trip preserves the exact bytes"
+        );
+    }
+
+    /// The no-op property: a generated base32 credential (`a-z2-7`
+    /// only) encodes to itself, so every existing rotation and restore
+    /// flow is bit-identical.
+    #[test]
+    fn a_generated_base32_credential_encodes_to_itself() {
+        let fresh = crate::dbcred::generate_db_password().expect("the generator runs");
+        let text = std::str::from_utf8(&fresh).expect("the generated credential is ascii");
+        assert!(
+            text.bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+            "the generated credential is base32 a-z2-7"
+        );
+        assert_eq!(
+            percent_encode_userinfo(text),
+            text,
+            "the encoder is a no-op on base32 credentials"
+        );
+    }
+
+    /// Encoding is injective for the literal-`%` case: a `%` in the
+    /// password becomes `%25` and decodes back to the original — a raw
+    /// splice would have eaten it as an escape. A legacy raw URL
+    /// (never encoded) extracts unchanged.
+    #[test]
+    fn a_literal_percent_survives_the_round_trip() {
+        let password = "100%secure%";
+        assert_eq!(percent_encode_userinfo(password), "100%25secure%25");
+        assert_eq!(
+            percent_decode_userinfo(&percent_encode_userinfo(password)),
+            password
+        );
+        assert_eq!(
+            percent_decode_userinfo("no-escapes-here"),
+            "no-escapes-here",
+            "a legacy raw URL extracts unchanged"
+        );
+    }
 }

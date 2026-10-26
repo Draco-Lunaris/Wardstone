@@ -1248,9 +1248,12 @@ async fn the_setup_connect_rides_the_urls_login_role_not_a_constant() {
     // DATABASE_URL whose login role is not the compose default. The
     // setup POST builds its own pool from the URL's role plus the typed
     // password; a URL naming a nonexistent role pins the connect side:
-    // the refusal is a 500 naming THAT role's database failure, nothing
-    // is generated or written (the keys directory never comes to
-    // exist), and the real role keeps its bootstrap password.
+    // Postgres answers it with the same 28P01 as a wrong password, so
+    // the refusal is the 400 wrong-password copy (a compile-time
+    // "wardstone" role with the typed password would have CONNECTED and
+    // the setup would have run), nothing is generated or written (the
+    // keys directory never comes to exist), and the real role keeps its
+    // bootstrap password.
     let _db = lock_db().await;
     let mut fixture = fixture().await;
     let mut state = setup_state(&fixture);
@@ -1355,6 +1358,14 @@ async fn setup_writes_master_envelope_last() {
             "the master envelope lands after every earlier envelope ({index})"
         );
     }
+    // A coarse-mtime filesystem cannot make the >= pins vacuous: the
+    // master must be STRICTLY newer than at least the earliest sealed
+    // envelope (the order is real, not an equal-timestamp artifact).
+    let earliest = earlier.iter().min().expect("the earlier envelopes exist");
+    assert!(
+        master > *earliest,
+        "the master envelope is strictly newer than the earliest envelope"
+    );
 
     // The rotation's envelope lands AFTER the marker, by design.
     let db_credential = mtime(setup::DB_CREDENTIAL_ENVELOPE_FILE);

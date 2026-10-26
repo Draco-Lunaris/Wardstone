@@ -892,7 +892,10 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
 /// The sealed-at-rest envelope file names on the keys volume, from
 /// ws-core's single home for the contract (the design's state predicate:
 /// `master.envelope` present ⇒ the instance is sealed at boot).
-use ws_core::crypto::{substitute_db_password, DB_CREDENTIAL_ENVELOPE_FILE, MASTER_ENVELOPE_FILE};
+use ws_core::crypto::{
+    percent_decode_userinfo, substitute_db_password, DB_CREDENTIAL_ENVELOPE_FILE,
+    MASTER_ENVELOPE_FILE,
+};
 
 /// Keys-directory-only state derivation (spec §3): `master.envelope`
 /// present → the instance boots sealed and waits for the unlock relay.
@@ -926,13 +929,16 @@ fn db_url_has_password(url: &str) -> bool {
 /// password is the one the recovery rotation connects with. The
 /// parsing mirrors [`substitute_db_password`]'s (and
 /// [`db_url_has_password`]'s): the password is whatever follows the
-/// last `:` in the `://…@` authority. Never logged.
+/// last `:` in the `://…@` authority, percent-DECODED — the mirror of
+/// the splice's encode ([`percent_encode_userinfo`]), so a
+/// URL-significant password extracts with its exact original bytes
+/// (round trip, tested together). Never logged.
 fn url_password_of(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let auth_start = scheme_end + 3;
     let at = url[auth_start..].find('@').map(|i| i + auth_start)?;
     let colon = url[auth_start..at].rfind(':')?;
-    Some(url[auth_start + colon + 1..at].to_owned())
+    Some(percent_decode_userinfo(&url[auth_start + colon + 1..at]))
 }
 
 /// The api's [`ws_api::ApiConfig`] from the boot env, for the sealed
@@ -1734,6 +1740,30 @@ mod tests {
         assert!(
             !serving_leaf_candidates(std::slice::from_ref(&leaf)).is_empty(),
             "the same one-predicate rule drives both boot outcomes"
+        );
+    }
+
+    /// The recovery arm's URL extraction is the decode mirror of the
+    /// splice: a password carrying every URL-significant byte
+    /// (`@ : / % # ?`) round trips through `substitute_db_password` and
+    /// `url_password_of` with its exact original bytes — and a plain
+    /// bootstrap password ("wardstone"-shaped, and a base32 credential
+    /// the same way) extracts unchanged.
+    #[test]
+    fn url_password_extracts_what_the_splice_encoded() {
+        let url = "postgres://wardstone:placeholder@localhost:5432/wardstone_test";
+        let password = "p@ss:wo%rd/?#x";
+        let spliced = substitute_db_password(url, password);
+        assert_eq!(
+            url_password_of(&spliced).as_deref(),
+            Some(password),
+            "the splice/extract round trip preserves the exact bytes"
+        );
+        let plain = substitute_db_password(url, "wardstone");
+        assert_eq!(
+            url_password_of(&plain).as_deref(),
+            Some("wardstone"),
+            "a plain password extracts unchanged"
         );
     }
 }
