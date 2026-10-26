@@ -165,12 +165,6 @@ impl KeyStore {
         Ok(keystore)
     }
 
-    /// The keys directory this store was opened on, so the caller does
-    /// not have to carry the directory separately from the store.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Encrypt and store a CA private key under `<dir>/ca/<ca_id>.key`.
     ///
     /// A fresh random 32-byte DEK encrypts the DER key (XChaCha20-Poly1305,

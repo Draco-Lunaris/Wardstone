@@ -7,9 +7,10 @@
 //!
 //! The DB-gated cases below pin the PRODUCTION build closure
 //! ([`unlocked_router_from_envelopes`]): the unlock opens the sealed
-//! volume's three envelopes, rotates the database credential
-//! unconditionally, and mints the JWT pair straight into its envelope
-//! (a fresh install never writes plaintext). They run against the live
+//! volume's four envelopes, rotates the database credential
+//! unconditionally, and loads the JWT pair from its envelope (a
+//! missing envelope is a torn volume, refused loud — never minted).
+//! They run against the live
 //! test server like the suite's DB-gated siblings:
 //!
 //! ```text
@@ -456,8 +457,9 @@ async fn fixture() -> Fixture {
     }
 }
 
-/// Mint the three envelopes a converted volume holds — the conversion's
-/// exact outputs, hand-minted: this suite pins the BUILDER; ws-web's
+/// Mint the four envelopes a converted volume holds — the conversion's
+/// exact outputs, hand-minted (the JWT envelope mirrors the conversion's
+/// own `write_sealed`): this suite pins the BUILDER; ws-web's
 /// suites own the conversion itself. The db-credential envelope seals
 /// the CURRENT role password, so the builder's connection with it
 /// matches the live role.
@@ -488,6 +490,14 @@ fn mint_sealed_volume(keys_dir: &std::path::Path, passphrase: &str) {
         0,
     )
     .expect("mint the db-credential envelope");
+    let jwt_pair = ws_auth::jwt::JwtKeys::generate(900).expect("mint the volume's JWT pair");
+    ws_auth::jwt::write_sealed(
+        &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        passphrase.as_bytes(),
+        &jwt_pair,
+        0,
+    )
+    .expect("seal the JWT envelope");
 }
 
 /// The api [`ws_api::state::ApiConfig`] the builder takes, in the test
@@ -498,8 +508,8 @@ fn api_config(keys_dir: &std::path::Path) -> ws_api::state::ApiConfig {
 
 /// An unlock against a volume that is NOT sealed (no master envelope —
 /// the fresh-install window before the setup conversion) is refused
-/// with ZERO side effects: no JWT pair minted under the caller's
-/// passphrase, no credential rotation. A compose-internal race that
+/// with ZERO side effects: no JWT envelope written, no credential
+/// rotation. A compose-internal race that
 /// beats the setup commit must leave nothing behind that the real
 /// relay's passphrase could no longer open.
 #[tokio::test]
@@ -523,8 +533,7 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the refused unlock mints no JWT envelope (the real relay's \
-         passphrase must stay able to mint it)"
+        "the refused unlock writes no JWT envelope"
     );
     assert!(
         bootstrap_credential_connects().await,
@@ -533,13 +542,80 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
     fixture.cleanup().await;
 }
 
-/// The production unlock: the three envelopes open, the database
+/// A sealed volume missing its JWT envelope (torn or corrupt — under
+/// D1 setup writes it before the master marker, so a sealed volume
+/// always carries one) is refused LOUD with the exact torn-volume copy
+/// and zero side effects: the gate fires before any secret is
+/// unwrapped or the database touched, so no connection URL is ever
+/// used and no envelope is written. The refusal copy is pinned
+/// byte-for-byte — the unlock page relays this text to the operator.
+#[tokio::test]
+async fn the_builder_refuses_a_torn_volume_missing_the_jwt_envelope() {
+    let keys_dir =
+        std::env::temp_dir().join(format!("ws-api-sealed-torn-jwt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&keys_dir);
+    std::fs::create_dir_all(&keys_dir).expect("create the keys directory");
+    let params = ws_core::crypto::KdfParams {
+        m_cost: 8192,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    for (file, payload) in [
+        (ws_core::crypto::MASTER_ENVELOPE_FILE, &[7u8; 32] as &[u8]),
+        (ws_core::crypto::SECRET_ENVELOPE_FILE, &[9u8; 32] as &[u8]),
+        (
+            ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE,
+            b"wardstone" as &[u8],
+        ),
+    ] {
+        ws_core::crypto::KeyEnvelope::write_envelope(
+            &keys_dir.join(file),
+            "the-master-passphrase",
+            payload,
+            params,
+            0,
+        )
+        .expect("mint the envelope");
+    }
+
+    let built = ws_api::sealed::unlocked_router_from_envelopes(
+        &keys_dir,
+        "postgres://wardstone:wardstone@localhost:5432/wardstone_test",
+        &api_config(&keys_dir),
+        "the-master-passphrase",
+        None,
+    )
+    .await;
+    let err = built.expect_err("the torn volume refuses the unlock");
+    let ws_api::error::ApiError::BadRequest { code, message } = err else {
+        panic!("expected the torn-volume refusal, got: {err}");
+    };
+    assert_eq!(code, "jwt_envelope_missing");
+    assert_eq!(
+        message,
+        format!(
+            "the sealed volume is missing its jwt key envelope ({}): \
+             a sealed volume always carries one, so the keys volume is \
+             torn or corrupt — the unlock refuses rather than silently \
+             re-keying every token",
+            keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE).display()
+        ),
+        "the refusal carries the exact torn-volume copy"
+    );
+    assert!(
+        !keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE).exists(),
+        "the refusal writes no JWT envelope — never a silent re-key"
+    );
+    let _ = std::fs::remove_dir_all(&keys_dir);
+}
+
+/// The production unlock: the four envelopes open, the database
 /// credential rotates (the bootstrap credential dies), the fresh
-/// credential is re-sealed, the JWT pair mints straight into its
-/// envelope, and the built router serves.
+/// credential is re-sealed, the JWT pair loads from its envelope, and
+/// the built router serves.
 #[tokio::test]
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
-async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
+async fn the_builder_unlocks_rotates_and_loads_the_jwt_pair() {
     let _db = lock_db().await;
     let mut fixture = fixture().await;
     mint_sealed_volume(&fixture.keys_dir, "the-master-passphrase");
@@ -565,14 +641,15 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
         .expect("probe the built router");
     assert_eq!(health.status(), StatusCode::OK, "the built router serves");
 
-    // Mint-at-unlock: a fresh install's JWT pair exists only as the
-    // envelope the builder just wrote — plaintext was never on the volume.
+    // Load-only: the JWT envelope the volume already held is still
+    // there — the unlock loads it, never mints or rewrites it — and no
+    // plaintext pair is ever written.
     assert!(
         fixture
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the unlock mints the JWT pair into its envelope"
+        "the JWT envelope the volume held survives the unlock"
     );
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
@@ -607,7 +684,8 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
 }
 
 /// A wrong passphrase against a sealed volume changes nothing: the
-/// envelopes stay as they are, no JWT pair mints, no rotation runs.
+/// envelopes stay as they are, the JWT envelope is untouched, no
+/// rotation runs.
 #[tokio::test]
 #[ignore = "DB-gated: the sealed-volume world (role restored)"]
 async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
@@ -626,11 +704,11 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
     .await;
     assert!(built.is_err(), "the wrong passphrase is refused");
     assert!(
-        !fixture
+        fixture
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the refused unlock mints no JWT envelope"
+        "the refused unlock leaves the JWT envelope untouched"
     );
     assert!(
         bootstrap_credential_connects().await,
@@ -654,12 +732,10 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
 
 /// A crashed passphrase change's aftermath, hand-minted: the
 /// db-credential envelope already re-wrapped under the NEXT passphrase
-/// at generation 1, the master + secret envelopes still at generation 0
-/// under the current one (master is written LAST — the anchor rule).
-/// The jwt envelope is deliberately ABSENT (the fresh-install shape):
-/// the completion re-wraps what exists, and the builder's normal
-/// mint-at-unlock then stamps the fresh pair at the advanced generation
-/// under the next passphrase.
+/// at generation 1, the master + secret + jwt envelopes still at
+/// generation 0 under the current one (master is written LAST — the
+/// anchor rule): the completion re-wraps everything present, and the
+/// builder then loads the JWT pair under the next passphrase.
 fn mint_mixed_volume(keys_dir: &std::path::Path, current: &str, next: &str) {
     use ws_core::crypto::KeyEnvelope;
     let params = ws_core::crypto::KdfParams {
@@ -691,6 +767,14 @@ fn mint_mixed_volume(keys_dir: &std::path::Path, current: &str, next: &str) {
         1,
     )
     .expect("mint the advanced db-credential envelope");
+    let jwt_pair = ws_auth::jwt::JwtKeys::generate(900).expect("mint the volume's JWT pair");
+    ws_auth::jwt::write_sealed(
+        &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        current.as_bytes(),
+        &jwt_pair,
+        0,
+    )
+    .expect("seal the JWT envelope at the current generation");
 }
 
 /// The generation every standard envelope in `keys_dir` records — one
@@ -723,8 +807,7 @@ fn volume_generations(
 /// MIXED volume the operator re-enters the interrupted change's
 /// `current` + `next`, the builder converges the volume to one
 /// generation under `next`, and the unlock proceeds under `next` alone —
-/// the fresh JWT pair included, minted straight into its envelope at
-/// the ADVANCED generation.
+/// the JWT envelope included, re-wrapped to the ADVANCED generation.
 #[tokio::test]
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
 async fn the_builder_completes_a_mixed_volume_at_unlock() {
@@ -761,9 +844,9 @@ async fn the_builder_completes_a_mixed_volume_at_unlock() {
         "the completed unlock serves"
     );
 
-    // The volume converged: every envelope — the minted JWT pair
-    // included — sits at generation 1 under the NEXT passphrase, and
-    // the retired current opens nothing.
+    // The volume converged: every envelope — the JWT envelope included
+    // — sits at generation 1 under the NEXT passphrase, and the retired
+    // current opens nothing.
     for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
         assert_eq!(generation, Some(1), "{file} advanced to generation 1");
         let opened = ws_core::crypto::KeyEnvelope::open_envelope(
@@ -811,19 +894,12 @@ async fn the_builder_refuses_a_completion_on_a_consistent_volume() {
         "the refusal names the condition, got: {err}"
     );
     for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
-        let expected = if file == ws_core::crypto::JWT_ENVELOPE_FILE {
-            None
-        } else {
-            Some(0)
-        };
-        assert_eq!(generation, expected, "{file} is untouched");
-        if expected.is_some() {
-            ws_core::crypto::KeyEnvelope::open_envelope(
-                &fixture.keys_dir.join(file),
-                "the-master-passphrase",
-            )
-            .unwrap_or_else(|e| panic!("the refused completion leaves {file} openable: {e}"));
-        }
+        assert_eq!(generation, Some(0), "{file} is untouched");
+        ws_core::crypto::KeyEnvelope::open_envelope(
+            &fixture.keys_dir.join(file),
+            "the-master-passphrase",
+        )
+        .unwrap_or_else(|e| panic!("the refused completion leaves {file} openable: {e}"));
     }
     assert!(
         bootstrap_credential_connects().await,

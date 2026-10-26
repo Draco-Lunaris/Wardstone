@@ -18,8 +18,8 @@
 //! it), finds no tenant, and the process EXITS non-zero with the
 //! spec's exact refusal copy.
 //!
-//! Every test sweeps the default tenant before and after its body and
-//! holds a session-level advisory lock on [`ADVISORY_KEY`] (the
+//! Every database-backed test sweeps the default tenant before and after
+//! its body and holds a session-level advisory lock on [`ADVISORY_KEY`] (the
 //! "WARDST" family with this suite's marker 0x0017) plus the
 //! in-process mutex for the harness's threads. The cases that rotate
 //! the shared login role (the torn state's recovery and the api's
@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
 use tokio::sync::Mutex as TokioMutex;
-use ws_core::crypto::{DB_CREDENTIAL_ENVELOPE_FILE, MASTER_ENVELOPE_FILE, SECRET_ENVELOPE_FILE};
+use ws_core::crypto::{
+    DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE, MASTER_ENVELOPE_FILE, SECRET_ENVELOPE_FILE,
+};
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
 /// plus the suite marker 0x0017.
@@ -723,13 +725,22 @@ async fn the_ui_reads_nothing_after_the_api_rotates() {
         .expect("insert the default tenant");
 
     // The sealed volume both children unlock through: the master, the
-    // secret-encryption key, and the CURRENT login credential (the
-    // role's live bootstrap password) — no JWT envelope (the api's
-    // unlock mints it sealed), no tenant certificates (the leafless
-    // fallback is the unlocked shape this test pins).
+    // secret-encryption key, the JWT pair, and the CURRENT login
+    // credential (the role's live bootstrap password) — the api's
+    // unlock is load-only, so the fixture seals the JWT envelope itself
+    // — no tenant certificates (the leafless fallback is the unlocked
+    // shape this test pins).
     mint_envelope(&fx.keys_dir.join(MASTER_ENVELOPE_FILE), &[7u8; 32]);
     mint_envelope(&fx.keys_dir.join(SECRET_ENVELOPE_FILE), &[9u8; 32]);
     mint_envelope(&fx.keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE), b"wardstone");
+    let jwt_pair = ws_auth::jwt::JwtKeys::generate(900).expect("mint the fixture's JWT pair");
+    ws_auth::jwt::write_sealed(
+        &fx.keys_dir.join(JWT_ENVELOPE_FILE),
+        PASSPHRASE.as_bytes(),
+        &jwt_pair,
+        0,
+    )
+    .expect("seal the fixture's JWT pair");
 
     let api = Boot::api(&fx.keys_dir, &child_database_url(), free_port());
     let api_boot = api.output_until(&[API_SEALED_LOG]);
@@ -758,6 +769,21 @@ async fn the_ui_reads_nothing_after_the_api_rotates() {
         unlock.status().as_u16(),
         200,
         "the ui unlocks against the live api"
+    );
+
+    // The pre-sweep verdict: the pool release must already have
+    // happened when the unlock's 200 returned — a retained-but-idle ui
+    // pool cannot pass this leg, where only the force-close sweep
+    // below would mask it.
+    let ui_backends_pre: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'wardstone-ui'",
+    )
+    .fetch_one(&fx.pool)
+    .await
+    .expect("count the ui's labelled backends before the sweep");
+    assert_eq!(
+        ui_backends_pre, 0,
+        "the ui holds no database connection the moment the unlock returns"
     );
 
     // The relay landed: the api reports unlocked, and its pool carries

@@ -172,21 +172,23 @@ pub fn sealed_router(sealed: Arc<SealedApi>, rate_limit: Option<crate::AuthRateL
 
 /// The production build closure's body — the one construct every sealed
 /// api process (and the e2e world) unlocks through: open the volume's
-/// three envelopes, rotate the database credential unconditionally (spec
+/// four envelopes, rotate the database credential unconditionally (spec
 /// §5.6 — a leaked credential, including the compose bootstrap, dies at
-/// the next unlock), mint-or-load the JWT pair sealed under the
-/// passphrase, and return the FULL router over RAM custody
+/// the next unlock), load the JWT pair from its sealed envelope, and
+/// return the FULL router over RAM custody
 /// ([`crate::AppState::new_unlocked`]) — the converted volume holds no
 /// plaintext for the file mode to read.
 ///
-/// The ORDER is the security contract. The three envelope opens come
-/// first: a volume without them is not sealed, and an unlock against it
-/// is refused with zero side effects. The JWT pair mints LAST, only
-/// once the passphrase is proven against existing sealed material — so
-/// neither a wrong passphrase nor a compose-internal race against a
-/// fresh install can leave a JWT envelope behind that the real
-/// passphrase would no longer open (a poisoned pair would lock the
-/// instance out until an operator deleted the envelope by hand).
+/// The ORDER is the security contract. The four envelope opens come
+/// first: a volume without the master envelope is not sealed, and an
+/// unlock against it is refused with zero side effects; a sealed
+/// volume missing its JWT envelope is torn or corrupt, refused by the
+/// gate BEFORE any secret is unwrapped or the database touched — never
+/// healed by a mint (a fresh pair would silently re-key every token).
+/// The JWT pair loads LAST, only once the passphrase is proven against
+/// existing sealed material — so neither a wrong passphrase nor a
+/// compose-internal race can leave a JWT envelope behind that the real
+/// passphrase would no longer open.
 ///
 /// `next_passphrase` is the mixed-state completion (Task 4b, spec
 /// §5.7): when a passphrase change crashed mid-re-wrap the envelope
@@ -215,15 +217,16 @@ pub async fn unlocked_router_from_envelopes(
     // The master envelope: the keystore's unwrapped custody. Its absence
     // IS the unsealed state (the boot predicate's other half) — there is
     // nothing to unlock, and nothing may be written. Its generation is
-    // the volume's passphrase epoch: the rotation re-seals at it, the JWT
-    // mint stamps it, and a disagreement with the other envelopes is the
-    // mixed state a crashed passphrase change leaves behind.
+    // the volume's passphrase epoch: the rotation re-seals at it, and
+    // a disagreement with the other envelopes is the mixed state a
+    // crashed passphrase change leaves behind.
     let volume_generation = KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))?;
 
     // The mixed-state completion (spec §5.7). Which envelopes the volume
-    // actually holds decides the state: the JWT envelope is absent until
-    // the first unlock mints it (fresh install), so the scan is over
-    // what EXISTS, not over the fixed four. A generation the file
+    // actually holds decides the state: a sealed volume always carries
+    // all four envelopes (setup writes them before the master marker),
+    // so the scan reads what EXISTS as the mixed-state evidence. A
+    // generation the file
     // cannot name (a v1 envelope, a damaged header) fails loudly right
     // here rather than misreading as a mixed volume.
     let mut present: Vec<&'static str> = Vec::new();
@@ -278,6 +281,25 @@ pub async fn unlocked_router_from_envelopes(
         }
         (false, None) => (passphrase, volume_generation),
     };
+    // The torn-volume gate (D1): a sealed volume ALWAYS carries the JWT
+    // envelope — setup writes it before the master marker — so its
+    // absence means the keys volume is torn or corrupt, and the unlock
+    // REFUSES rather than silently re-keying every token by minting a
+    // fresh pair. Checked before any secret is unwrapped or the
+    // database is touched: a volume that cannot unlock must leave
+    // zero side effects.
+    if !present.contains(&JWT_ENVELOPE_FILE) {
+        return Err(ApiError::BadRequest {
+            code: "jwt_envelope_missing",
+            message: format!(
+                "the sealed volume is missing its jwt key envelope ({}): \
+                 a sealed volume always carries one, so the keys volume is \
+                 torn or corrupt — the unlock refuses rather than silently \
+                 re-keying every token",
+                keys_dir.join(JWT_ENVELOPE_FILE).display()
+            ),
+        });
+    }
     // The unwrapped keys' live custody starts here: each envelope's
     // plaintext crosses straight into the protected arena, and the
     // zeroizing heap copy the envelope's KDF produced is wiped at the
@@ -356,15 +378,11 @@ pub async fn unlocked_router_from_envelopes(
         &String::from_utf8_lossy(&fresh),
     ))
     .await?;
-    // The JWT pair: mint-at-unlock on a fresh install (the envelope is
-    // the pair's only form — plaintext never exists on a sealed volume),
-    // the sealed load on a converted one. LAST, per the order contract
-    // above.
-    let jwt = ws_auth::jwt::load_or_create_sealed(
-        &keys_dir.join(JWT_ENVELOPE_FILE),
-        passphrase.as_bytes(),
-        volume_generation,
-    )?;
+    // The JWT pair: a sealed load only — the torn-volume gate above
+    // already refused a missing envelope, so this open can never fall
+    // back to a mint (a silent re-key of every issued token). LAST, per
+    // the order contract above.
+    let jwt = ws_auth::jwt::load_sealed(&keys_dir.join(JWT_ENVELOPE_FILE), passphrase.as_bytes())?;
     Ok(crate::router(crate::AppState::new_unlocked(
         pool,
         Arc::new(jwt),

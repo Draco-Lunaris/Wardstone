@@ -316,39 +316,6 @@ pub fn percent_encode_userinfo(component: &str) -> String {
     out
 }
 
-/// Percent-DECODE a userinfo component — the mirror of
-/// [`percent_encode_userinfo`], so the recovery arm's URL extraction
-/// and the splice speak one shape. `%XX` becomes the byte; a bare `%`
-/// that does not head a valid pair is taken literally (fail toward the
-/// original bytes, never panic). An input that was never encoded (a
-/// legacy raw URL) comes back unchanged, so the interim extraction
-/// cannot silently mangle a pre-encoding credential.
-pub fn percent_decode_userinfo(component: &str) -> String {
-    fn nibble(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-    let bytes = component.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (nibble(bytes[index + 1]), nibble(bytes[index + 2])) {
-                out.push(high * 16 + low);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Substitute `password` into `url`'s `://user:password@host` authority —
 /// inserting a `:password` when the URL carries none (the api's
 /// password-less compose contract). The password splices in
@@ -815,13 +782,15 @@ mod tests {
     use super::*;
 
     /// Every URL-significant byte survives the splice and the parse.
-    /// sqlx 0.8.6's `PgConnectOptions` exposes no password getter, so the
-    /// decode side is proven the mirror way: sqlx's own URL parse must
-    /// ACCEPT the spliced URL (a raw `:` or `@` inside the password breaks
-    /// the authority parse — the original defect), and the userinfo
-    /// slice — taken with the same authority convention the extractors
-    /// speak — must percent-decode to the ORIGINAL bytes: `@ : / % # ?`
-    /// plus the unreserved set all at once.
+    /// sqlx 0.8.6's `PgConnectOptions` exposes no password getter, so
+    /// the decode side is proven the runtime way: sqlx's own URL parse
+    /// percent-decodes the userinfo AT PARSE TIME, so its ACCEPTING
+    /// the spliced URL (a raw `:` or `@` inside the password breaks
+    /// the authority parse — the original defect) proves the bytes
+    /// survive, and the userinfo slice — taken with the same authority
+    /// convention the extractors speak — is pinned directly in its
+    /// ENCODED form: `@ : / % # ?` percent-escape and the unreserved
+    /// set passes through, all at once.
     #[test]
     fn a_url_significant_password_survives_the_splice_and_the_parse() {
         let password = "p@ss:wo%rd/?#x~._-Z9";
@@ -838,9 +807,8 @@ mod tests {
             .expect("the userinfo carries a password");
         assert_eq!(user, "wardstone");
         assert_eq!(
-            percent_decode_userinfo(encoded),
-            password,
-            "the splice/parse/decode round trip preserves the exact bytes"
+            encoded, "p%40ss%3Awo%25rd%2F%3F%23x~._-Z9",
+            "the encoder emits the exact percent-encoded form"
         );
     }
 
@@ -864,21 +832,10 @@ mod tests {
     }
 
     /// Encoding is injective for the literal-`%` case: a `%` in the
-    /// password becomes `%25` and decodes back to the original — a raw
-    /// splice would have eaten it as an escape. A legacy raw URL
-    /// (never encoded) extracts unchanged.
+    /// password becomes `%25` in the ENCODED form — a raw splice would
+    /// have eaten it as an escape.
     #[test]
-    fn a_literal_percent_survives_the_round_trip() {
-        let password = "100%secure%";
-        assert_eq!(percent_encode_userinfo(password), "100%25secure%25");
-        assert_eq!(
-            percent_decode_userinfo(&percent_encode_userinfo(password)),
-            password
-        );
-        assert_eq!(
-            percent_decode_userinfo("no-escapes-here"),
-            "no-escapes-here",
-            "a legacy raw URL extracts unchanged"
-        );
+    fn a_literal_percent_is_injectively_encoded() {
+        assert_eq!(percent_encode_userinfo("100%secure%"), "100%25secure%25");
     }
 }

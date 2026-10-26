@@ -499,10 +499,4 @@ impl AppState {
     pub fn secret_box(&self) -> Result<Arc<SecretBox>, crate::error::ApiError> {
         Ok(Arc::clone(&self.secret_custody))
     }
-
-    /// The path of the secret-encryption key file (the TOTP and OIDC
-    /// client-secret envelope key under the keys directory).
-    pub fn secret_key_path(&self) -> PathBuf {
-        self.config.keys_dir.join(SECRET_KEY_FILE)
-    }
 }

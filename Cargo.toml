@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Bump from 1.85: the transitional JwtKeys::load_or_create (std's
+# Bump from 1.85: the legacy plaintext JWT loader (std's
 # File::lock / try_lock) is gone and no std file lock remains, but
 # lowering an MSRV is a deliberate, separately-verified change rather
 # than a deletion side effect — the floor stays at 1.89.
