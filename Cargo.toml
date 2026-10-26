@@ -29,6 +29,15 @@ serde_json = { version = "1.0.154" }
 # enters via sqlx-core as pure data, no crypto provider.
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }
 
+# `log::LevelFilter::Off` for sqlx's statement-logging suppression
+# (ws-core db::connect_options_with_statement_logging_off — the
+# rotation's ALTER inlines the fresh SCRAM verifier into the statement
+# text and sqlx logs statement text at TRACE / slow statements at WARN;
+# the Global Constraint is level-absolute). sqlx does not re-export the
+# log crate. Already compiled in the graph transitively via sqlx — the
+# pin adds the direct edge, not new code.
+log = "0.4.34"
+
 # Async runtime
 tokio = { version = "1.54.0", features = ["full"] }
 

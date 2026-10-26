@@ -3872,6 +3872,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "log",
  "rand 0.10.3",
  "ring",
  "serde",

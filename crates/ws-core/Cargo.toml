@@ -8,6 +8,10 @@ rust-version.workspace = true
 # "ipnet" adds the std::net::IpAddr <-> inet binding (and its array form)
 # used by the certificates table's san_ips inet[] column (migration 002).
 sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono", "ipnet"] }
+# `log::LevelFilter::Off` in db.rs's statement-logging suppression: sqlx
+# does not re-export the log crate (already in the graph transitively via
+# sqlx — the direct pin adds no new code to the build).
+log = { workspace = true }
 # XChaCha20-Poly1305 sealing of small secrets at rest (crypto.rs SecretBox:
 # the TOTP/WebAuthn secret-encryption key file); the "zeroize" feature
 # wipes the cipher's retained key copy (same features as ws-ca's keystore).

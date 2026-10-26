@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use sqlx::ConnectOptions;
 use sqlx::PgPool;
 
 use crate::error::CoreError;
@@ -36,9 +37,10 @@ pub const REQUIRED_MIGRATION_COUNT: u16 = 12;
 ///    returning [`CoreError::Migration`] on mismatch (e.g. the database is
 ///    ahead of this binary).
 pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
+    let options = connect_options_with_statement_logging_off(url)?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(url)
+        .connect_with(options)
         .await?;
 
     let migrations_table_exists: bool = sqlx::query_scalar(
@@ -88,6 +90,33 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
     }
 
     Ok(pool)
+}
+
+/// Parse `url` into [`PgConnectOptions`] with sqlx's statement logging
+/// turned OFF — the one shared surface every production connection the
+/// binaries create is built from ([`connect`]'s pool and the ui's
+/// dedicated recovery connection).
+///
+/// The WHY (the Global Constraint: no secret, credential, passphrase,
+/// token, verifier, or key material in any log line or error message at
+/// ANY level): the DB credential rotation's `ALTER ROLE … PASSWORD
+/// '<verifier>'` inlines the freshly minted SCRAM verifier into the
+/// statement text — Postgres utility statements accept no bind
+/// parameters — and sqlx logs the full statement text of every
+/// execution: TRACE for statements, WARN for slow ones (>1s by
+/// default). BOTH setters go OFF, so a slow ALTER under load cannot
+/// leak at WARN either; the suppression happens here because sqlx
+/// keeps its per-connection log settings private with no runtime
+/// accessor. sqlx never logs bind VALUES and the tree's only
+/// value-inlined statement is the ALTER, so nothing observable is lost.
+pub fn connect_options_with_statement_logging_off(
+    url: &str,
+) -> Result<PgConnectOptions, CoreError> {
+    let options = PgConnectOptions::from_str(url)
+        .map_err(|e| CoreError::Config(format!("database URL does not parse: {e}")))?;
+    Ok(options
+        .log_statements(log::LevelFilter::Off)
+        .log_slow_statements(log::LevelFilter::Off, std::time::Duration::from_secs(1)))
 }
 
 /// Map sqlx's migration failure set onto [`CoreError`]. `MigrateError::Execute`

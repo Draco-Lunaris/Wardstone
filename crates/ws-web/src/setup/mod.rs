@@ -1082,7 +1082,13 @@ pub async fn recover_db_credential(
         ))
     })?;
     let connect_url = substitute_db_password(database_url, typed);
-    let mut conn = sqlx::PgConnection::connect(&connect_url)
+    // The recovery connection builds from the shared statement-logging-off
+    // options: the rotation ALTER rides this dedicated connection, and its
+    // statement text carries the fresh verifier — the same suppression
+    // every pool connection gets (the Global Constraint is level-absolute).
+    let connect_options = ws_core::db::connect_options_with_statement_logging_off(&connect_url)
+        .map_err(SetupError::Core)?;
+    let mut conn = sqlx::PgConnection::connect_with(&connect_options)
         .await
         .map_err(|err| {
             let core = CoreError::Database(err);
