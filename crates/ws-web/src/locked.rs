@@ -1,7 +1,7 @@
 //! The ui process's sealed mode (the sealed-at-rest design): while the
 //! instance is sealed the front door serves ONLY the unlock page over the
 //! existing TLS listener (the locked-mode certificate), the health
-//! surface, and the relay to the api's internal unlock endpoint.
+//! surface, and the relay to the api's Unix-socket unlock endpoint.
 //! Everything else — the SPA, the login relay, the API proxy, the ACME
 //! surface — answers `503 sealed` through the same delegate fallback the
 //! api uses. The unlock POST derives the KEK locally (argon2id in-process:
@@ -9,8 +9,8 @@
 //! (open envelopes, resolve the tenant and the serving leaf, RELEASE the
 //! pool — the api's relayed unlock rotates the database credential, so
 //! the unlocked front door holds no database connection at all), and
-//! relays the passphrase to the api once over the compose-internal
-//! channel. A volume without `db-credential.envelope` grows the
+//! relays the passphrase to the api once over the Unix relay socket
+//! (Task 10, D8). A volume without `db-credential.envelope` grows the
 //! database-password field: the recovery runbook's typed password
 //! re-seals the credential before anything connects. A sealed volume
 //! whose database holds no default tenant is the torn state: the build
@@ -106,50 +106,82 @@ impl SealedUi {
     }
 }
 
-/// Relay the unlock to the api process ONCE (spec §5): a POST of the
-/// passphrase over the compose-internal channel — the same trust
-/// domain the api's own plaintext HTTP occupies. Best-effort BY DESIGN:
-/// the api may be seeding a fresh install, a redeploy racer, or already
+/// Relay the unlock to the api process ONCE (spec §5): a minimal
+/// HTTP/1.1 POST of the passphrase over the api's Unix-socket listener
+/// (Task 10, D8: a local link — `SO_PEERCRED` is the transport's
+/// credential, and no HTTP client stack rides the relay: the POST is
+/// spoken by hand, and only the `/api/v1` PROXY keeps a client, over
+/// the internal network (ruling 28f). Best-effort BY DESIGN: the api
+/// may be seeding a fresh install, a redeploy racer, or already
 /// unlocked; every one of those is the spec's documented fallback, and
 /// the CALLER logs the verdict — the relay never fails the ui's own
 /// unlock.
 ///
-/// The POST carries the volume's one-time nonce (spec §10, the final
-/// review's F2): minted into `keys_dir` right here — only a volume
-/// holder can write the claim — and consumed by the api's unlock, so a
-/// captured POST is dead after the real one. Each relay attempt mints
-/// afresh, which makes a superseded attempt's nonce dead too. The
-/// client is BOUNDED (the final review's F8, the proxy's numbers): a
-/// hung api fails the relay in bounded time instead of hanging the
-/// operator's unlock POST forever.
-pub async fn relay_unlock(
-    keys_dir: &std::path::Path,
-    api_base_url: &str,
-    passphrase: &str,
-) -> Result<(), String> {
-    let nonce =
-        ws_core::crypto::mint_relay_nonce(keys_dir).map_err(|e| format!("the relay nonce: {e}"))?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("the relay transport: {e}"))?;
-    let response = client
-        .post(format!("{api_base_url}/api/internal/unlock"))
-        .header("content-type", "application/json")
-        .body(serde_json::json!({ "passphrase": passphrase, "nonce": nonce }).to_string())
-        .send()
+/// The POST carries the relay dir's one-time nonce (spec §10, the
+/// final review's F2): minted into the socket's OWN directory right
+/// here — only a relay-dir holder can write the claim, and the nonce
+/// is an authenticator, so it never touches the keys volume (G1) — and
+/// consumed by the api's unlock, so a captured POST is dead after the
+/// real one. Each relay attempt mints afresh, which makes a
+/// superseded attempt's nonce dead too. The call is BOUNDED (the
+/// final review's F8, the proxy's numbers): a hung api fails the
+/// relay in bounded time instead of hanging the operator's unlock
+/// POST forever.
+pub async fn relay_unlock(socket_path: &std::path::Path, passphrase: &str) -> Result<(), String> {
+    // The claim FIRST: the nonce must exist before the POST leaves,
+    // and its home is the socket's own directory —
+    // `socket.parent()/relay-nonce`, no second env var names it.
+    let relay_dir = socket_path
+        .parent()
+        .ok_or_else(|| "the relay socket has no parent directory".to_string())?;
+    let nonce = ws_core::crypto::mint_relay_nonce(relay_dir)
+        .map_err(|e| format!("the relay nonce: {e}"))?;
+    let body = serde_json::json!({ "passphrase": passphrase, "nonce": nonce }).to_string();
+    let request = format!(
+        "POST /unlock HTTP/1.1\r\nhost: wardstone-relay\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let relay = async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| format!("the relay transport: {e}"))?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("the relay transport: {e}"))?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|e| format!("the relay transport: {e}"))?;
+        Ok::<_, String>(response)
+    };
+    // `connection: close` makes the api's answer end at EOF, so
+    // read_to_end terminates; the timeout is the belt on top (F8).
+    let response = tokio::time::timeout(std::time::Duration::from_secs(60), relay)
         .await
-        .map_err(|e| format!("the relay transport: {e}"))?;
-    if response.status().is_success() || response.status().as_u16() == 409 {
-        // 409 = already unlocked: the api is live and serving; the relay's
-        // job is done either way.
+        .map_err(|_| "the relay transport timed out after 60s".to_string())??;
+    // The status line is all the relay reads: "HTTP/1.1 <code> …".
+    let status = std::str::from_utf8(&response)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    let code = status.ok_or_else(|| {
+        format!(
+            "the api's relay answer is not an HTTP status line: {}",
+            String::from_utf8_lossy(&response)
+        )
+    })?;
+    // 2xx = unlocked; 409 = already unlocked: the api is live and
+    // serving; the relay's job is done either way.
+    if (200..300).contains(&code) || code == 409 {
         return Ok(());
     }
-    Err(format!(
-        "the api answered the relay with HTTP {}",
-        response.status().as_u16()
-    ))
+    Err(format!("the api answered the relay with HTTP {code}"))
 }
 
 /// The sealed front door: the unlock page, the health surface, the unlock

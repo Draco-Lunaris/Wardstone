@@ -143,7 +143,7 @@ pub struct SetupFields {
 /// volume), the SHA-256 fingerprint of the setup certificate the
 /// LISTENER serves (the binary computes it when it mounts the setup
 /// page), the configured instance hostname, the serving-certificate
-/// resolver the commit swaps in place, the compose-internal api base URL,
+/// resolver the commit swaps in place, the api's relay socket path,
 /// and the instance's `DATABASE_URL` — the setup POST builds its OWN pool
 /// from that URL plus the form's typed `db_password` (the D2 direction:
 /// no boot-time database connection belongs to the setup surface at
@@ -164,11 +164,12 @@ pub struct SetupState {
     /// IS the reload, see [`crate::tls_signer`]). `None` in the tests
     /// (no listener to swap).
     pub tls_reload: Option<std::sync::Arc<crate::tls_signer::SwapResolver>>,
-    /// The compose-internal api base URL: the setup commit relays the
-    /// unlock to the api process once (the fresh-install flow — the
-    /// api booted as the sealed shell and only the relay brings its
-    /// full surface up).
-    pub api_base_url: String,
+    /// The api's relay socket path (`WARDSTONE_RELAY_SOCKET`, Task 10,
+    /// D8): the setup commit relays the unlock to the api process once
+    /// over the Unix socket (the fresh-install flow — the api booted
+    /// as the sealed shell and only the relay brings its full surface
+    /// up).
+    pub relay_socket: PathBuf,
     /// The instance's `DATABASE_URL`: its login role is the one the
     /// setup commit's credential rotation ALTERs (the External variant —
     /// a URL that does not use the compose default role must rotate ITS

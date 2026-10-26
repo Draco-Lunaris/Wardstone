@@ -48,6 +48,11 @@ const DEFAULT_BIND: &str = "0.0.0.0:8443";
 /// the compose service name of the `api` mode on the internal network.
 const DEFAULT_API_URL: &str = "http://ws-api:8080";
 
+/// The relay socket's path when `WARDSTONE_RELAY_SOCKET` is unset (the
+/// brief's pin): the compose contract's path inside the shared relay
+/// volume (ruling 28a's host-/run bind mount).
+const DEFAULT_RELAY_SOCKET: &str = "/run/wardstone/relay/relay.sock";
+
 /// The auth-routes GCRA refill period when not configured (house value:
 /// one credit per 500 ms — the same constants ws-api's `AuthRateLimit`
 /// docs name as the house's).
@@ -78,6 +83,13 @@ struct BootConfig {
     /// `WARDSTONE_API_URL`: ws-web's proxy target (`ui` only; `api` has
     /// no proxy). Defaults to [`DEFAULT_API_URL`].
     api_url: String,
+    /// `WARDSTONE_RELAY_SOCKET`: the unlock relay's Unix-socket path
+    /// (BOTH modes — the api binds it during the locked/boot phase and
+    /// the ui's unlock relay dials it; Task 10, D8: no network listener
+    /// carries the relay). Defaults to [`DEFAULT_RELAY_SOCKET`]; the
+    /// api's bind forces mode 0600 and checks every peer's
+    /// `SO_PEERCRED` uid against its own.
+    relay_socket: PathBuf,
     /// `WARDSTONE_BIND`: the listen address (both modes; the compose
     /// bundle gives each service its own value). Defaults to
     /// [`DEFAULT_BIND`].
@@ -346,6 +358,8 @@ fn usage_text() -> String {
          \x20 WARDSTONE_SERVER_HOSTNAME  the setup certificate's SAN (optional)\n\
          \x20 WARDSTONE_API_URL          the UI's proxy target (ui; default \
          {DEFAULT_API_URL})\n\
+         \x20 WARDSTONE_RELAY_SOCKET     the unlock relay's Unix-socket path \
+(both modes; default {DEFAULT_RELAY_SOCKET})\n\
          \x20 WARDSTONE_BIND             the listen address (default \
          {DEFAULT_BIND})\n\
          \x20 WARDSTONE_RATE_LIMIT_PER_MILLIS / _BURST\n\
@@ -412,6 +426,15 @@ fn config_from(
         Some(value) => value,
     };
 
+    // The relay socket: read in BOTH modes (the api binds it, the ui
+    // dials it), defaulting to the compose contract's shared-volume
+    // path. An empty value is already filtered to None by the lookup
+    // contract, so it means the default, not a blank path.
+    let relay_socket = match lookup("WARDSTONE_RELAY_SOCKET") {
+        None => PathBuf::from(DEFAULT_RELAY_SOCKET),
+        Some(value) => PathBuf::from(value),
+    };
+
     let auth_rate_limit = auth_rate_limit_from(&lookup)?;
     // The ACME per-account limiter: its OWN switch, the same loud-toggle
     // contract as the auth one, parsed in BOTH modes (api consumes it;
@@ -434,6 +457,7 @@ fn config_from(
         keys_dir,
         server_hostname: lookup("WARDSTONE_SERVER_HOSTNAME"),
         api_url,
+        relay_socket,
         bind,
         auth_rate_limit,
         web_rate_limit,
@@ -652,6 +676,7 @@ fn unlocked_web_build(
     // only the authority, so the label reaches the live connection.
     let database_url = with_application_name(&cfg.database_url, UI_APP_NAME);
     let api_url = cfg.api_url.clone();
+    let relay_socket = cfg.relay_socket.clone();
     let session_ttl = ws_web::DEFAULT_SESSION_TTL;
     let rate_limit = cfg.web_rate_limit;
 
@@ -660,6 +685,7 @@ fn unlocked_web_build(
             let keys_dir = keys_dir.clone();
             let database_url = database_url.clone();
             let api_url = api_url.clone();
+            let relay_socket = relay_socket.clone();
             let reload = reload.clone();
             let fatal = fatal.clone();
             let passphrase = passphrase.to_string();
@@ -874,8 +900,7 @@ fn unlocked_web_build(
                 // a logged verdict (the api may be seeding, a redeploy
                 // racer, or already unlocked — every one of those is the
                 // spec's documented fallback, never a ui failure).
-                if let Err(e) = ws_web::locked::relay_unlock(&keys_dir, &api_url, &passphrase).await
-                {
+                if let Err(e) = ws_web::locked::relay_unlock(&relay_socket, &passphrase).await {
                     tracing::warn!(
                         error = %e,
                         "the api unlock relay did not complete; the api logs its own state"
@@ -921,6 +946,11 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
                 .to_owned(),
         ));
     }
+    // Task 10's external-DB policy (D5), additive beside the password
+    // gate and after it: parse, don't connect — a socket URL is a
+    // local link, a TCP URL must carry sslmode=verify-full AND the
+    // operator's sslrootcert.
+    ws_core::db::check_database_url(&cfg.database_url)?;
     if sealed_instance(&cfg.keys_dir) {
         return run_ui_sealed(cfg).await;
     }
@@ -952,6 +982,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         hostname,
         Some(resolver.clone()),
         &cfg.api_url,
+        &cfg.relay_socket,
         cfg.database_url.clone(),
         ws_web::DEFAULT_SESSION_TTL,
         cfg.web_rate_limit,
@@ -1062,9 +1093,12 @@ fn api_config_from(cfg: &BootConfig) -> ws_api::ApiConfig {
     }
 }
 
-/// The sealed api boot: the process binds its listener immediately (the
-/// health surface answers `200 sealed`) and waits for the ui's unlock
-/// relay. The build closure is the ws-api builder
+/// The sealed api boot: the process binds its TCP listener immediately
+/// (the health surface answers `200 sealed`) and its Unix relay socket
+/// (Task 10, D8: the unlock's ONLY transport — every peer's
+/// `SO_PEERCRED` uid is checked against the api's own before any body
+/// byte is read), and waits for the ui's unlock relay. The build
+/// closure is the ws-api builder
 /// ([`ws_api::sealed::unlocked_router_from_envelopes`]): it opens the
 /// envelopes, rotates the DB credential (unconditionally, every unlock —
 /// a leaked credential dies at the next unlock), and swaps the FULL
@@ -1073,10 +1107,6 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let keys_dir = cfg.keys_dir.clone();
     let database_url = cfg.database_url.clone();
     let config = api_config_from(&cfg);
-    // Hoisted before the closure moves `config`: the sealed router's
-    // limiter is the same configured budget (spec §5.1's internal
-    // surface).
-    let auth_rate_limit = config.auth_rate_limit;
 
     let build: ws_api::sealed::LockedBuild =
         std::sync::Arc::new(move |req: &ws_api::sealed::UnlockRequest| {
@@ -1097,18 +1127,46 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
             })
         });
 
-    let api = std::sync::Arc::new(ws_api::sealed::SealedApi::new(build, cfg.keys_dir.clone()));
-    let app = ws_api::sealed::sealed_router(api, auth_rate_limit);
+    // The relay socket's directory is the relay nonce's claim home
+    // (Task 10: `socket.parent()/relay-nonce`, G1 — never the keys
+    // volume), and the socket itself is the unlock's ONLY transport
+    // (D8): bound here, during the locked phase, before anything
+    // serves. The operator's pre-step created the directory (compose's
+    // inline comment); a missing parent fails this bind loudly.
+    let relay_dir = cfg
+        .relay_socket
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| {
+            BootError::Config(format!(
+                "WARDSTONE_RELAY_SOCKET {:?} has no parent directory",
+                cfg.relay_socket
+            ))
+        })?;
+    let api = std::sync::Arc::new(ws_api::sealed::SealedApi::new(build, relay_dir));
+    let app = ws_api::sealed::sealed_router(api.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    let relay_listener = ws_api::sealed::bind_relay_socket(&cfg.relay_socket)?;
+    let own_uid = ws_api::sealed::current_uid();
     tracing::info!(
         bind = %cfg.bind,
-        "serving the sealed REST API: unlock through the front door to continue"
+        relay_socket = %cfg.relay_socket.display(),
+        "serving the sealed REST API: unlock through the front door's relay to continue"
     );
-    Ok(axum::serve(
+    // The two listeners serve CONCURRENTLY and the process dies with
+    // either: the TCP surface is the health/`/api/v1` surface (ruling
+    // 28f keeps it on the internal network), the relay socket is the
+    // unlock's one path in — a dead relay is a locked instance that can
+    // never be unlocked.
+    let serve_tcp = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?)
+    );
+    let serve_relay = ws_api::sealed::serve_relay(relay_listener, api, own_uid);
+    tokio::select! {
+        result = serve_tcp => result.map_err(BootError::from),
+        result = serve_relay => result.map_err(BootError::from),
+    }
 }
 
 async fn run_api(mut cfg: BootConfig) -> Result<(), BootError> {
@@ -1129,6 +1187,11 @@ async fn run_api(mut cfg: BootConfig) -> Result<(), BootError> {
                 .to_owned(),
         ));
     }
+    // Task 10's external-DB policy (D5), additive beside the password
+    // gate and after it: parse, don't connect — a socket URL is a
+    // local link, a TCP URL must carry sslmode=verify-full AND the
+    // operator's sslrootcert.
+    ws_core::db::check_database_url(&cfg.database_url)?;
     // The api's connections carry their process label (Task 11's
     // Postgres-side scans key off the ui/api `application_name`s, and
     // the label rides the query through every credential splice).
@@ -1265,6 +1328,32 @@ mod tests {
             .expect("the limiter is configured when the disable var is unset");
         assert_eq!(rl.per_millis, 500);
         assert_eq!(rl.burst, 20);
+    }
+
+    /// The relay socket: BOTH modes read `WARDSTONE_RELAY_SOCKET` (the
+    /// api binds it, the ui's relay dials it), with the compose
+    /// contract's default path (ruling 28a's host-/run relay volume).
+    #[test]
+    fn config_parses_the_relay_socket_in_both_modes() {
+        let ui = config_from(BootMode::Ui, table(&MINIMAL)).expect("the minimal table parses");
+        assert_eq!(
+            ui.relay_socket,
+            PathBuf::from("/run/wardstone/relay/relay.sock")
+        );
+        let api = config_from(BootMode::Api, table(&MINIMAL)).expect("the minimal table parses");
+        assert_eq!(
+            api.relay_socket,
+            PathBuf::from("/run/wardstone/relay/relay.sock"),
+            "the default is mode-independent"
+        );
+
+        let entries = [
+            MINIMAL[0],
+            MINIMAL[1],
+            ("WARDSTONE_RELAY_SOCKET", "/run/relay/custom.sock"),
+        ];
+        let cfg = config_from(BootMode::Api, table(&entries)).expect("the override parses");
+        assert_eq!(cfg.relay_socket, PathBuf::from("/run/relay/custom.sock"));
     }
 
     /// Every override is honored; a missing variable is named in the error.

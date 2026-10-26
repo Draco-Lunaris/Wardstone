@@ -55,7 +55,7 @@ pub async fn submit_setup(
     // recovery is the api's restart plus its own unlock — the operator's
     // setup result never depends on it.
     if let Err(reason) =
-        crate::locked::relay_unlock(&keys_dir, &state.api_base_url, &fields.master_passphrase).await
+        crate::locked::relay_unlock(&state.relay_socket, &fields.master_passphrase).await
     {
         tracing::warn!(
             error = %reason,

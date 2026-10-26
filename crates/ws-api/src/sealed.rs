@@ -4,8 +4,11 @@
 //! the whole `/api/v1` REST surface — answers `503 sealed`.
 //!
 //! The unlock relay: the ui front door collects the master passphrase
-//! over its TLS front door and relays it here ONCE, over the
-//! compose-internal channel. The api derives the same argon2id KEK, opens
+//! over its TLS front door and relays it here ONCE, over the Unix
+//! socket the api binds at `WARDSTONE_RELAY_SOCKET` (Task 10, D8: a
+//! local link — the socket's `SO_PEERCRED` credentials must match the
+//! api's own uid, and no network listener carries the relay at all).
+//! The api derives the same argon2id KEK, opens
 //! its envelopes (the DB credential, the JWT key pair, the master KEK),
 //! builds its pool + migrations, constructs the FULL `ws_api::router`,
 //! and swaps it in behind the sealed service. The passphrase then exists
@@ -36,8 +39,9 @@ use crate::error::ApiError;
 /// passphrase change that crashed mid-re-wrap): the unlock page re-offers
 /// the completion and the operator re-enters the same `current` + `next`
 /// pair (spec §5.7). `nonce` is the relay's one-time claim (spec §10,
-/// the final review's F2): minted into the shared keys volume by the ui
-/// process, consumed by the unlock itself — a captured POST is dead.
+/// the final review's F2): minted into the relay dir (the socket's own
+/// directory — never the keys volume, G1) by the ui process, consumed
+/// by the unlock itself — a captured POST is dead.
 #[derive(Debug)]
 pub struct UnlockRequest {
     pub passphrase: String,
@@ -55,7 +59,7 @@ pub struct UnlockRequest {
 pub struct SealedApi {
     router: RwLock<Option<Arc<Router>>>,
     build: LockedBuild,
-    keys_dir: std::path::PathBuf,
+    relay_dir: std::path::PathBuf,
     unlock_window: tokio::sync::Mutex<()>,
 }
 
@@ -66,17 +70,20 @@ pub type LockedBuild = Arc<
 >;
 
 impl SealedApi {
-    /// Build the sealed shell around `build` and the shared `keys_dir`
-    /// (the compose volume both processes mount): main's closure
-    /// receives the unlock request and returns the FULL router (pool +
-    /// migrations + `ws_api::router`), or a typed failure if the
-    /// envelopes or the DB refuse. The keys dir is the relay nonce's
-    /// claim home — the unlock consumes the claim file itself.
-    pub fn new(build: LockedBuild, keys_dir: std::path::PathBuf) -> Self {
+    /// Build the sealed shell around `build` and the relay dir — the
+    /// host-/run directory the api's Unix socket lives in, and the
+    /// relay nonce's claim home (a socket sibling named by
+    /// [`ws_core::crypto::RELAY_NONCE_FILE`]; Task 10, G1: the claim is
+    /// an authenticator, so it never touches the keys volume): main's
+    /// closure receives the unlock request and returns the FULL router
+    /// (pool + migrations + `ws_api::router`), or a typed failure if
+    /// the envelopes or the DB refuse. The unlock consumes the claim
+    /// file itself.
+    pub fn new(build: LockedBuild, relay_dir: std::path::PathBuf) -> Self {
         SealedApi {
             router: RwLock::new(None),
             build,
-            keys_dir,
+            relay_dir,
             unlock_window: tokio::sync::Mutex::new(()),
         }
     }
@@ -104,7 +111,7 @@ impl SealedApi {
         // even when the passphrase then fails: the ui's next relay
         // attempt mints a fresh claim, so the operator's retry is
         // unaffected while a captured POST dies at its first use.
-        ws_core::crypto::consume_relay_nonce(&self.keys_dir, &request.nonce)
+        ws_core::crypto::consume_relay_nonce(&self.relay_dir, &request.nonce)
             .map_err(|e| ApiError::Unauthorized(format!("the relay nonce: {e}")))?;
         if self.is_unlocked() {
             return Err(ApiError::Conflict(
@@ -119,55 +126,176 @@ impl SealedApi {
     }
 }
 
-/// The sealed api's server router: the health surface, the internal
-/// unlock endpoint, and the delegate fallback into the full router once
-/// unlocked. Served by `main` in place of the plain full router. The
-/// internal unlock POST carries the per-IP GCRA (spec §5.1: it is the
-/// same credential surface the public unlock route is, on the same
-/// house budget — anything that can reach this listener spends a
-/// bucket credit per guess).
-pub fn sealed_router(sealed: Arc<SealedApi>, rate_limit: Option<crate::AuthRateLimit>) -> Router {
-    let unlock = match rate_limit {
-        Some(limit) => {
-            // The auth.rs idiom verbatim: `finish()` fails only on a zero
-            // burst or period (both caller-configured); a broken number is
-            // a loudly-logged skip, never a panic.
-            match tower_governor::governor::GovernorConfigBuilder::<
-                tower_governor::key_extractor::PeerIpKeyExtractor,
-                _,
-            >::default()
-            .per_millisecond(limit.per_millis)
-            .burst_size(limit.burst)
-            .finish()
-            {
-                Some(config) => Router::new()
-                    .route("/api/internal/unlock", post(unlock_handler))
-                    .with_state(sealed.clone())
-                    .layer(tower_governor::GovernorLayer::new(Arc::new(config))),
-                None => {
-                    tracing::error!(
-                        per_millis = limit.per_millis,
-                        burst = limit.burst,
-                        "invalid unlock rate-limit configuration: per_millis and burst must \
-                         be positive; the internal unlock route runs WITHOUT rate limiting"
-                    );
-                    Router::new()
-                        .route("/api/internal/unlock", post(unlock_handler))
-                        .with_state(sealed.clone())
-                }
-            }
-        }
-        None => Router::new()
-            .route("/api/internal/unlock", post(unlock_handler))
-            .with_state(sealed.clone()),
-    };
+/// The sealed api's server router: the health surface and the delegate
+/// fallback into the full router once unlocked. Served by `main` in
+/// place of the plain full router. The internal unlock endpoint is NOT
+/// here (Task 10, D8): the relay lives on the Unix socket alone —
+/// [`relay_router`] behind [`serve_relay`], where `SO_PEERCRED` is the
+/// credential — so no network listener carries the unlock at all.
+pub fn sealed_router(sealed: Arc<SealedApi>) -> Router {
     Router::new()
         .route("/api/v1/healthz", get(healthz))
         .with_state(sealed.clone())
-        .merge(unlock)
         .fallback_service(SealedDelegate {
             api: sealed.clone(),
         })
+}
+
+// --- The unlock relay over the Unix socket (Task 10, D8) ---
+
+/// The admission rule: `SO_PEERCRED`'s uid must equal the api's own —
+/// true ONLY when they match. The socket is mode 0600 in the
+/// operator-created relay dir, so the kernel credentials are a second
+/// gate (defense in depth against a mis-permissioned dir), and root is
+/// "someone else", not the api: a uid-0 pass would make the relay
+/// root-reachable, the opposite of D8.
+pub fn peer_admitted(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid
+}
+
+/// The api's own uid — `SO_PEERCRED`'s comparison side, read from the
+/// kernel (never the environment: the operator does not get to claim a
+/// uid).
+pub fn current_uid() -> u32 {
+    // Plain libc call, no failure mode (getuid cannot fail).
+    unsafe { libc::getuid() }
+}
+
+/// Bind the relay's Unix-socket listener at `path`, mode 0600. A stale
+/// socket file from an unclean shutdown would fail the bind, so the
+/// path is probed first: a LIVE listener answers the probe and the
+/// bind refuses loudly (two api processes configured for one socket is
+/// a deployment error to fail boot on, never one to silently steal);
+/// a dead SOCKET file is removed and the bind retried. Anything else
+/// sitting at the path is left for the bind to fail on — the api must
+/// never delete a file it does not own the meaning of.
+pub fn bind_relay_socket(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(std::io::Error::other(format!(
+            "the relay socket {} has a live listener: refusing to steal \
+             another api process's relay",
+            path.display()
+        )));
+    }
+    let stale_socket = std::fs::metadata(path)
+        .map(|meta| {
+            use std::os::unix::fs::FileTypeExt as _;
+            meta.file_type().is_socket()
+        })
+        .unwrap_or(false);
+    if stale_socket {
+        std::fs::remove_file(path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    // 0600 by hand, not by umask: the socket is the api's own-uid gate
+    // (D8), so group/other reach must not exist even on a
+    // mis-permissioned relay dir.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// The `Listener` adapter that enforces D8 at accept time: every
+/// accepted stream's `SO_PEERCRED` uid is checked against the api's
+/// own BEFORE any byte of the peer's request is read — a wrong-uid
+/// peer's stream is dropped right here (the peer sees EOF, never an
+/// HTTP answer), and a failed credential read is treated the same way
+/// (refuse on doubt). Accept errors are logged and retried — a
+/// transient failure must not kill the relay.
+struct PeerCheckedListener {
+    listener: tokio::net::UnixListener,
+    own_uid: u32,
+}
+
+impl PeerCheckedListener {
+    /// The stream peer's kernel-verified uid (`SO_PEERCRED`).
+    fn peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+        use std::os::fd::AsRawFd as _;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // The kernel fills the struct or reports the error; the zeroed
+        // memory is only the destination buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
+                std::ptr::addr_of_mut!(len),
+            )
+        };
+        if rc == 0 {
+            Ok(cred.uid)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl axum::serve::Listener for PeerCheckedListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, addr)) => match Self::peer_uid(&stream) {
+                    Ok(uid) if peer_admitted(uid, self.own_uid) => {
+                        return (stream, addr);
+                    }
+                    Ok(uid) => tracing::warn!(
+                        peer_uid = uid,
+                        own_uid = self.own_uid,
+                        "a peer that is not this process's uid was dropped from \
+                         the relay socket before its body was read"
+                    ),
+                    Err(err) => tracing::error!(
+                        error = %err,
+                        "the relay peer's SO_PEERCRED credentials could not be \
+                         read: the connection is dropped"
+                    ),
+                },
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "the relay socket's accept failed: retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+/// Serve the relay router ([`relay_router`]) on the already-bound
+/// listener, checking every peer's `SO_PEERCRED` uid against
+/// `own_uid`: the unlock endpoint exists ONLY on this socket (D8 —
+/// [`sealed_router`]'s TCP surface never carries it). Runs for the
+/// process's life; `main` runs it beside the TCP listener and fails
+/// the process if either dies.
+pub async fn serve_relay(
+    listener: tokio::net::UnixListener,
+    sealed: Arc<SealedApi>,
+    own_uid: u32,
+) -> std::io::Result<()> {
+    let app = relay_router(sealed).into_make_service();
+    axum::serve(PeerCheckedListener { listener, own_uid }, app).await
+}
+
+/// The relay router: `POST /unlock`, the one endpoint the locked phase
+/// exists for. NO GCRA here, deliberately: a per-IP limiter is
+/// meaningless on a local socket (an admitted peer IS this process's
+/// uid), the 0600 socket plus the operator-owned relay dir are the
+/// admission rule, and the one-time nonce is the replay rule — the
+/// public unlock PAGE keeps the house GCRA at the front door.
+pub fn relay_router(sealed: Arc<SealedApi>) -> Router {
+    Router::new()
+        .route("/unlock", post(unlock_handler))
+        .with_state(sealed)
 }
 
 /// The production build closure's body — the one construct every sealed
@@ -423,9 +551,9 @@ struct UnlockBody {
     /// re-offers it; a bare unlock POST never carries it).
     #[serde(default)]
     next_passphrase: Option<String>,
-    /// The relay's one-time volume claim (spec §10): minted by the ui's
-    /// relay, consumed by the unlock. Absent or wrong on any POST that
-    /// did not come through the volume holder's relay.
+    /// The relay's one-time claim (spec §10): minted by the ui's relay
+    /// into the relay dir, consumed by the unlock. Absent or wrong on
+    /// any POST that did not come through the relay-dir holder's relay.
     #[serde(default)]
     nonce: Option<String>,
 }

@@ -106,31 +106,33 @@ pub fn random_hex(len: usize) -> Result<String, CoreError> {
     Ok(hex::encode(bytes))
 }
 
-/// Mint a fresh one-time relay nonce into the keys volume (the final
-/// review's F2, spec §10: the ui→api unlock call must not be replayable
-/// by anything else on the internal network). Writing this file IS the
-/// claim — only a volume holder can mint — and each mint REPLACES the
-/// previous claim, so a nonce captured from an earlier relay attempt is
-/// dead the moment the ui re-offers the form. The file is owner-only
-/// and crash-atomic like every other volume write; it is never sealed
-/// (it must be readable while the instance is locked, and it carries
-/// no long-lived secret).
-pub fn mint_relay_nonce(keys_dir: &Path) -> Result<String, CoreError> {
+/// Mint a fresh one-time relay nonce into the RELAY DIR (Task 10, G1:
+/// the claim is an authenticator, so it lives beside the api's Unix
+/// socket in the host-/run relay directory — never the persistent keys
+/// volume; the final review's F2, spec §10: the ui→api unlock call
+/// must not be replayable by anything else on the box). Writing this
+/// file IS the claim — only a relay-dir holder can mint — and each
+/// mint REPLACES the previous claim, so a nonce captured from an
+/// earlier relay attempt is dead the moment the ui re-offers the form.
+/// The file is owner-only and crash-atomic like every other secret-
+/// adjacent write; it is never sealed (it must be readable while the
+/// instance is locked, and it carries no long-lived secret).
+pub fn mint_relay_nonce(relay_dir: &Path) -> Result<String, CoreError> {
     let nonce = random_hex(32)?;
-    write_private(&keys_dir.join(RELAY_NONCE_FILE), nonce.as_bytes())?;
+    write_private(&relay_dir.join(RELAY_NONCE_FILE), nonce.as_bytes())?;
     Ok(nonce)
 }
 
 /// Consume the relay nonce: `Ok(())` only when `nonce` matches the
-/// volume's claim, and the match DELETES the file — one use, so a
+/// relay dir's claim, and the match DELETES the file — one use, so a
 /// captured POST is dead after the real unlock. A mismatch or a missing
 /// claim is a typed refusal that leaves the file alone; the real
 /// holder's next relay mints a fresh claim anyway. The nonce is 256
 /// bits of OS entropy, not a long-lived secret — a plain comparison.
 /// The CALLER serializes the check+delete (the api's unlock window):
 /// two concurrent same-nonce POSTs must not both consume one claim.
-pub fn consume_relay_nonce(keys_dir: &Path, nonce: &str) -> Result<(), CoreError> {
-    let claim = keys_dir.join(RELAY_NONCE_FILE);
+pub fn consume_relay_nonce(relay_dir: &Path, nonce: &str) -> Result<(), CoreError> {
+    let claim = relay_dir.join(RELAY_NONCE_FILE);
     let expected = fs::read_to_string(&claim).map_err(|e| key_io_err(&claim, e))?;
     if expected != nonce {
         return Err(CoreError::Crypto(
@@ -284,9 +286,12 @@ pub const SECRET_ENVELOPE_FILE: &str = "secret-encryption.envelope";
 /// unlock, so a leaked credential dies at the next one.
 pub const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
 /// The one-time relay nonce's claim file (spec §10): the ui process
-/// mints it into the shared keys volume and the api consumes it on the
-/// internal unlock POST — a volume sibling, never sealed itself (it
-/// must be readable while the instance is locked).
+/// mints it into the RELAY DIR — the Unix socket's own directory
+/// (`socket.parent()/relay-nonce`, Task 10: no second env var names it)
+/// — and the api consumes it on the unlock relay. Never sealed itself
+/// (it must be readable while the instance is locked) and never on the
+/// persistent keys volume (G1: it is an authenticator, and the relay
+/// dir is host-/run-backed).
 pub const RELAY_NONCE_FILE: &str = "relay-nonce";
 
 /// Percent-encode a URL userinfo component — the typed database

@@ -102,11 +102,14 @@ fn test_database_url() -> String {
 }
 
 /// The URL the CHILDREN boot with: the compose contract's password-less
-/// form — the ui refuses a password-bearing URL at boot, and the
+/// socket form (Task 10, D8) — the ui refuses a password-bearing URL at
+/// boot, `check_database_url` refuses the bare TCP form, and the
 /// children read their credential from the sealed envelope (or the
-/// typed recovery password), never from the URL.
+/// typed recovery password), never from the URL. The socket rides the
+/// authority percent-encoded: sqlx cannot parse the libpq empty-host
+/// spelling, and the binary's password splice needs the userinfo.
 fn child_database_url() -> String {
-    strip_url_password(&database_url())
+    "postgres://wardstone@%2Fvar%2Frun%2Fpostgresql/wardstone_test".to_string()
 }
 
 /// Append an `application_name` label to a connection URL (the same
@@ -120,23 +123,6 @@ fn with_application_name(url: &str, name: &str) -> String {
     } else {
         format!("{url}?application_name={name}")
     }
-}
-
-/// The password-less form of a connection URL: the authority's
-/// `user:password@` collapses to `user@` (the mirror of the binary's
-/// `db_url_has_password` parse).
-fn strip_url_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_owned();
-    };
-    let auth_start = scheme_end + 3;
-    let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
-        return url.to_owned();
-    };
-    let Some(colon) = url[auth_start..at].rfind(':') else {
-        return url.to_owned();
-    };
-    format!("{}{}", &url[..auth_start + colon], &url[at..])
 }
 
 /// Delete every row a previous run may have left under the default
@@ -172,6 +158,16 @@ fn scratch_keys_dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the scratch keys dir");
     dir
+}
+
+/// A fresh, empty relay directory unique to this test (Task 10, D8):
+/// the api child BINDS its relay socket here and the ui child dials it
+/// — the dual-process test passes the SAME path to both.
+fn scratch_relay_socket(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ws-boot-relay-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the scratch relay dir");
+    dir.join("relay.sock")
 }
 
 /// Every file name currently in a keys directory (the write-nothing
@@ -408,6 +404,9 @@ struct Boot {
     child: Child,
     lines: mpsc::Receiver<String>,
     bind_port: u16,
+    /// The relay socket path the child was handed (Drop sweeps its
+    /// directory — the api's socket file included).
+    relay_socket: PathBuf,
 }
 
 impl Boot {
@@ -417,12 +416,19 @@ impl Boot {
         db_url: &str,
         bind_port: u16,
         api_url: Option<String>,
+        relay_socket: PathBuf,
     ) -> Boot {
+        // The api mode binds the relay socket, so its parent directory
+        // must exist by the time the child reaches the bind.
+        if let Some(parent) = relay_socket.parent() {
+            std::fs::create_dir_all(parent).expect("create the relay socket's directory");
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_wardstone"));
         command
             .arg(mode)
             .env("DATABASE_URL", db_url)
             .env("WARDSTONE_KEYS_DIR", keys_dir)
+            .env("WARDSTONE_RELAY_SOCKET", &relay_socket)
             .env("WARDSTONE_BIND", format!("127.0.0.1:{bind_port}"))
             .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
@@ -451,15 +457,22 @@ impl Boot {
             child,
             lines,
             bind_port,
+            relay_socket,
         }
     }
 
-    fn ui(keys_dir: &Path, db_url: &str, bind_port: u16, api_url: Option<String>) -> Boot {
-        Boot::start("ui", keys_dir, db_url, bind_port, api_url)
+    fn ui(
+        keys_dir: &Path,
+        db_url: &str,
+        bind_port: u16,
+        api_url: Option<String>,
+        relay_socket: PathBuf,
+    ) -> Boot {
+        Boot::start("ui", keys_dir, db_url, bind_port, api_url, relay_socket)
     }
 
-    fn api(keys_dir: &Path, db_url: &str, bind_port: u16) -> Boot {
-        Boot::start("api", keys_dir, db_url, bind_port, None)
+    fn api(keys_dir: &Path, db_url: &str, bind_port: u16, relay_socket: PathBuf) -> Boot {
+        Boot::start("api", keys_dir, db_url, bind_port, None, relay_socket)
     }
 
     /// The port the child's listener binds.
@@ -525,21 +538,31 @@ impl Drop for Boot {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(parent) = self.relay_socket.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }
 
 /// A fresh install before setup: the boot dispatches on the sealed
 /// marker alone, so a volume with no `master.envelope` serves the
 /// first-run setup page WITHOUT touching the database — the
-/// `DATABASE_URL` points at a closed port, and any connect attempt
-/// would have failed the boot before the line was logged.
+/// `DATABASE_URL` points at a socket directory that does not exist
+/// (the bare-TCP form Task 10's `check_database_url` refuses anyway),
+/// and any connect attempt would have failed the boot before the line
+/// was logged.
 #[tokio::test]
 #[ignore = "part of the DB-gated boot battery (--include-ignored)"]
 async fn no_master_envelope_serves_setup_without_touching_the_database() {
     let keys = scratch_keys_dir("first-run-no-db");
-    let closed = free_port();
-    let db_url = format!("postgres://wardstone@127.0.0.1:{closed}/wardstone_test");
-    let mut boot = Boot::ui(&keys, &db_url, free_port(), None);
+    let db_url = "postgres://wardstone@%2Frun%2Fwardstone-boot-absent/wardstone_test".to_string();
+    let mut boot = Boot::ui(
+        &keys,
+        &db_url,
+        free_port(),
+        None,
+        scratch_relay_socket("first-run-no-db"),
+    );
     let out = boot.output_until(&[SETUP_PAGE_LOG]);
     // "Stays up": the closed port makes any dial fatal, so a live
     // process after the line is proof no dial happened.
@@ -573,11 +596,12 @@ async fn no_master_envelope_serves_setup_without_touching_the_database() {
 async fn a_restart_before_setup_writes_nothing() {
     let keys = scratch_keys_dir("restart-nothing");
     let db_url = child_database_url();
+    let relay = scratch_relay_socket("restart-nothing");
 
-    let first = Boot::ui(&keys, &db_url, free_port(), None);
+    let first = Boot::ui(&keys, &db_url, free_port(), None, relay.clone());
     let first_out = first.output_until(&[SETUP_PAGE_LOG]);
     drop(first);
-    let second = Boot::ui(&keys, &db_url, free_port(), None);
+    let second = Boot::ui(&keys, &db_url, free_port(), None, relay);
     let second_out = second.output_until(&[SETUP_PAGE_LOG]);
     drop(second);
 
@@ -612,6 +636,7 @@ async fn a_password_in_the_ui_database_url_is_refused() {
         "postgres://wardstone:a-typed-password@127.0.0.1:5/wardstone_test",
         free_port(),
         None,
+        scratch_relay_socket("ui-pw-refusal"),
     );
     let status = boot.wait_exit();
     std::thread::sleep(Duration::from_millis(300));
@@ -647,7 +672,13 @@ async fn a_sealed_volume_without_a_tenant_is_refused() {
     sweep_default_tenant(&fx.pool).await;
 
     mint_envelope(&fx.keys_dir.join(MASTER_ENVELOPE_FILE), &[7u8; 32]);
-    let mut ui = Boot::ui(&fx.keys_dir, &child_database_url(), free_port(), None);
+    let mut ui = Boot::ui(
+        &fx.keys_dir,
+        &child_database_url(),
+        free_port(),
+        None,
+        scratch_relay_socket("torn"),
+    );
     let boot_out = ui.output_until(&[SEALED_DOOR_LOG]);
     wait_for_tcp(ui.port());
 
@@ -742,7 +773,16 @@ async fn the_ui_reads_nothing_after_the_api_rotates() {
     )
     .expect("seal the fixture's JWT pair");
 
-    let api = Boot::api(&fx.keys_dir, &child_database_url(), free_port());
+    // One relay socket both children share (Task 10, D8): the api binds
+    // it, the ui dials it, and SO_PEERCRED admits the peer because both
+    // children run as this test's own uid.
+    let relay = scratch_relay_socket("dual");
+    let api = Boot::api(
+        &fx.keys_dir,
+        &child_database_url(),
+        free_port(),
+        relay.clone(),
+    );
     let api_boot = api.output_until(&[API_SEALED_LOG]);
     wait_for_tcp(api.port());
     let mut ui = Boot::ui(
@@ -750,6 +790,7 @@ async fn the_ui_reads_nothing_after_the_api_rotates() {
         &child_database_url(),
         free_port(),
         Some(format!("http://127.0.0.1:{}", api.port())),
+        relay,
     );
     let ui_boot = ui.output_until(&[SEALED_DOOR_LOG]);
     wait_for_tcp(ui.port());

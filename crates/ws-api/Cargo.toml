@@ -26,6 +26,12 @@ tower_governor = { workspace = true }
 sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
 # Async test bodies and spawn_blocking for the CPU-bound crypto calls.
 tokio = { workspace = true }
+# SO_PEERCRED on the relay socket's accepted streams (Task 10, D8):
+# libc::getsockopt + ucred are the kernel-verified peer credentials, and
+# libc::getuid the api's own uid they must match. Already resolved in
+# the lock transitively (ws-secmem); the direct pin keeps the sealed
+# module's imports stable.
+libc = { workspace = true }
 # Request/response DTOs.
 serde = { workspace = true }
 serde_json = { workspace = true }

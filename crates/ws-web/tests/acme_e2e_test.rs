@@ -664,6 +664,9 @@ async fn env() -> Env {
         E2E_DOMAIN.to_owned(),
         None, // no listener to swap in the router suites
         &api_base,
+        // Never unlocked here: an absent relay directory keeps the
+        // unlock relay inert (Task 10, D8).
+        &std::env::temp_dir().join("ws-web-acme-no-relay/relay.sock"),
         database_url(),
         store,
         None, // the front-door limiters key on ConnectInfo, absent for a oneshot

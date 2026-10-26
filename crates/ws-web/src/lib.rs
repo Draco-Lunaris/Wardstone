@@ -161,6 +161,7 @@ pub async fn web_router(
     hostname: String,
     tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
     api_base_url: &str,
+    relay_socket: &std::path::Path,
     database_url: String,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -173,6 +174,7 @@ pub async fn web_router(
         hostname,
         tls_reload,
         api_base_url,
+        relay_socket,
         database_url,
         store,
         rate_limit,
@@ -201,6 +203,7 @@ pub async fn web_router_with_store(
     hostname: String,
     tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
     api_base_url: &str,
+    relay_socket: &std::path::Path,
     database_url: String,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -218,7 +221,7 @@ pub async fn web_router_with_store(
             fingerprint,
             hostname,
             tls_reload,
-            api_base_url: api_base_url.to_owned(),
+            relay_socket: relay_socket.to_path_buf(),
             database_url,
         }))
     } else {
@@ -303,6 +306,7 @@ pub fn first_run_web_router(
     hostname: String,
     tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
     api_base_url: &str,
+    relay_socket: &std::path::Path,
     database_url: String,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -314,7 +318,7 @@ pub fn first_run_web_router(
             fingerprint,
             hostname,
             tls_reload,
-            api_base_url: api_base_url.to_owned(),
+            relay_socket: relay_socket.to_path_buf(),
             database_url,
         }))
         // The SPA rides LAST as always: the setup routes and the proxy

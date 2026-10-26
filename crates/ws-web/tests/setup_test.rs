@@ -180,6 +180,14 @@ struct Fixture {
     net: RestoreNet,
 }
 
+/// The modeled no-api world's relay socket (Task 10, D8): a path whose
+/// relay directory does not exist, so the setup commit's unlock relay
+/// fails at the nonce mint and logs its WARN — the best-effort
+/// contract, never a failed setup.
+fn no_relay_socket() -> PathBuf {
+    std::env::temp_dir().join("ws-web-setup-no-relay/relay.sock")
+}
+
 /// The state the setup handlers need, from the fixture.
 fn setup_state(fixture: &Fixture) -> SetupState {
     SetupState {
@@ -188,9 +196,9 @@ fn setup_state(fixture: &Fixture) -> SetupState {
         hostname: HOSTNAME.to_string(),
         tls_reload: None,
         // No api process exists in this suite's world: the setup commit's
-        // relay finds a closed port and logs its WARN — the modeled
+        // relay finds no socket and logs its WARN — the modeled
         // best-effort path, never a failed setup.
-        api_base_url: "http://127.0.0.1:9".to_string(),
+        relay_socket: no_relay_socket(),
         database_url: database_url(),
     }
 }
@@ -733,6 +741,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -779,6 +788,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -959,6 +969,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -1577,21 +1588,26 @@ async fn stray_envelopes_without_a_master_are_overwritten() {
 
 /// The relay ordering (D1 step 6's successor): the api relay fires only
 /// AFTER the setup's rotation, so the api's unlock opens the ROTATED
-/// credential. The fake api below is a plain HTTP listener (at Task 6
-/// the relay is still HTTP over TCP): it asserts, at the moment the
-/// relay request arrives, that the db-credential envelope already
-/// exists on the volume and that the request body carries the master
-/// passphrase — then answers 200 so the relay lands.
+/// credential. The fake api below is a plain Unix-socket listener
+/// (Task 10, D8: the relay rides the local socket): it asserts, at the
+/// moment the relay request arrives, that the db-credential envelope
+/// already exists on the volume and that the request body carries the
+/// master passphrase — then answers 200 so the relay lands.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn setup_relays_after_rotation() {
     let _db = lock_db().await;
     let mut fixture = fixture().await;
 
-    // The fake api: one TCP listener on the loopback, a worker thread
-    // that answers the ONE relay POST the setup commit sends.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let api_addr = listener.local_addr().unwrap();
+    // The fake api: one Unix-socket listener in a scratch relay
+    // directory, a worker thread that answers the ONE relay POST the
+    // setup commit sends.
+    let relay_dir =
+        std::env::temp_dir().join(format!("ws-web-relay-rotation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&relay_dir);
+    std::fs::create_dir_all(&relay_dir).expect("create the fake relay directory");
+    let socket_path = relay_dir.join("relay.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
     let keys_dir = fixture.keys_dir.clone();
     let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Result<(bool, String), String>>();
     std::thread::spawn(move || {
@@ -1648,7 +1664,7 @@ async fn setup_relays_after_rotation() {
     });
 
     let mut state = setup_state(&fixture);
-    state.api_base_url = format!("http://{api_addr}");
+    state.relay_socket = socket_path;
     let fields = test_fields();
     let router = setup::setup_router(state);
     let response = post_setup(router, &fields).await;
@@ -1668,6 +1684,7 @@ async fn setup_relays_after_rotation() {
         relay_body.contains("the-master-passphrase"),
         "the relay carries the master passphrase to the api"
     );
+    let _ = std::fs::remove_dir_all(&relay_dir);
 
     fixture.cleanup().await;
 }

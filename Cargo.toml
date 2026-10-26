@@ -19,8 +19,15 @@ rust-version = "1.89"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154" }
 
-# Database (numbered sqlx migrations; REQUIRED_MIGRATION_COUNT convention)
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres"] }
+# Database (numbered sqlx migrations; REQUIRED_MIGRATION_COUNT convention).
+# `tls-rustls-ring` (Task 10, D5): the external-DB policy admits TCP URLs
+# with sslmode=verify-full only, so the driver must actually own a TLS
+# stack — this feature wires sqlx to rustls with the `ring` provider
+# (via tls-rustls-ring-webpki; plain `tls-rustls` is just its alias).
+# The aws-lc-rs variant is a separate feature and never enabled — the
+# same graph-wide constraint ws-web's rustls pins record. webpki-roots
+# enters via sqlx-core as pure data, no crypto provider.
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }
 
 # Async runtime
 tokio = { version = "1.54.0", features = ["full"] }

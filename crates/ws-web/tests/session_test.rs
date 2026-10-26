@@ -320,6 +320,9 @@ async fn env(ttl: Duration) -> TestEnv {
         "ui.relay.test".to_owned(),
         None, // no listener to swap in the router suites
         &api_base,
+        // Never unlocked here: an absent relay directory keeps the
+        // unlock relay inert (Task 10, D8).
+        &std::env::temp_dir().join("ws-web-session-no-relay/relay.sock"),
         database_url(),
         store.clone(),
         None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter
