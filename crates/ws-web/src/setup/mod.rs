@@ -100,7 +100,7 @@ const SETUP_ACTOR: &str = "system:setup";
 ///
 /// This struct IS the POST body (`Json<SetupFields>`), so it carries the
 /// binding spec's serde casing attribute like every other JSON DTO.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SetupFields {
     /// The operator bootstrap account's login name (role: admin).
@@ -127,10 +127,12 @@ pub struct SetupFields {
     #[serde(default)]
     pub db_password: Zeroizing<String>,
     /// The operator's master passphrase (entered twice on the page; the
-    /// handler refuses a mismatch or a blank). At commit the setup flow
-    /// wraps every plaintext key file into a passphrase-sealed envelope,
-    /// rotates the DB credential under it, and DELETES the plaintext
-    /// originals — the next boot is sealed and this passphrase is its
+    /// handler refuses a mismatch or a blank). At commit every key's
+    /// only copy is already its passphrase-sealed envelope (each key is
+    /// BORN sealed — its first-ever write is the envelope, so no
+    /// plaintext original ever exists to wrap or delete), and the setup
+    /// flow rotates the DB credential and seals the fresh one the same
+    /// way — the next boot is sealed and this passphrase is its
     /// unlock key. It exists on no disk and is not recoverable; the page
     /// says so.
     #[serde(default)]

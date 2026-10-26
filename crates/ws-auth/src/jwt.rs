@@ -357,13 +357,15 @@ pub fn load_sealed(path: &Path, passphrase: &[u8]) -> Result<JwtKeys, crate::err
     JwtKeys::from_pem_pair(signing, verification, DEFAULT_ACCESS_TTL_SECS)
 }
 
-/// The sealed boot's load-or-create: open the envelope when it exists;
-/// mint a fresh pair IN the protected arena and seal it as the envelope
-/// when it does
-/// not. A fresh password-less install has no plaintext pair to convert
-/// (nothing ever minted one), so the pair is BORN sealed — no plaintext
-/// file is ever written. The minted pair is proven usable before it is
-/// sealed (the same probe the sealed open runs on what it reads).
+/// The test suites' fixture constructor (test-only; the production tree
+/// has no caller): open the sealed pair when the envelope exists; mint a
+/// fresh pair IN the protected arena and seal it as the envelope when it
+/// does not. The production sealed boot never calls this — it is
+/// `load_sealed`-only and REFUSES a missing envelope (the typed
+/// `jwt_envelope_missing` refusal, before any secret is unwrapped or the
+/// database touched) rather than re-keying every issued token. The
+/// minted pair is proven usable before it is sealed (the same probe the
+/// sealed open runs on what it reads).
 /// The mint stamps the volume's `generation` (the unlock reads it from
 /// the master envelope first), so a mid-change crash leaves no envelope
 /// from a foreign epoch.

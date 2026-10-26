@@ -300,7 +300,11 @@ habit to know: sqlx logs an unrecognized `DATABASE_URL` query
 parameter's key AND value at WARN, and turning statement logging off
 does not cover connect-time parameter logging — so never put a
 credential in a query parameter; no Wardstone URL carries one
-(credentials ride the URL's userinfo, which is never logged). Further
+(credentials ride the URL's userinfo, which is never logged). The live
+database credential itself also sits inside sqlx's connection options —
+a library-held, non-zeroizing heap `String` the pool keeps for its life
+to reopen connections — until the next unlock's rotation retires it
+(the library-internal-copy class, bounded by that rotation). Further
 hardening habits (no forwarded-for trust, server-computed challenge
 verification, tokens never in browser state, tenancy enforced in the
 schema) ride along underneath.

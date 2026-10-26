@@ -42,7 +42,6 @@ use crate::error::ApiError;
 /// the final review's F2): minted into the relay dir (the socket's own
 /// directory — never the keys volume, G1) by the ui process, consumed
 /// by the unlock itself — a captured POST is dead.
-#[derive(Debug)]
 pub struct UnlockRequest {
     pub passphrase: String,
     pub next_passphrase: Option<String>,
@@ -413,9 +412,12 @@ pub async fn unlocked_router_from_envelopes(
     // envelope — setup writes it before the master marker — so its
     // absence means the keys volume is torn or corrupt, and the unlock
     // REFUSES rather than silently re-keying every token by minting a
-    // fresh pair. Checked before any secret is unwrapped or the
-    // database is touched: a volume that cannot unlock must leave
-    // zero side effects.
+    // fresh pair. On a CONSISTENT volume it is checked before any
+    // secret is unwrapped or the database is touched: a volume that
+    // cannot unlock must leave zero side effects. The one pre-gate
+    // write is the passphrase-change completion above, which re-wraps
+    // a mixed volume's present envelopes first — the refusal comes
+    // after that re-wrap.
     if !present.contains(&JWT_ENVELOPE_FILE) {
         return Err(ApiError::BadRequest {
             code: "jwt_envelope_missing",

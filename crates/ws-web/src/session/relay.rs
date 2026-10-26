@@ -100,7 +100,7 @@ pub fn relay_router(
 /// The relayed ws-api login body (the same shape ws-api's `LoginBody`
 /// takes; `totp_code` simply travels when present). Serialized as-is to
 /// ws-api and deserialized from the browser — both directions need it.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct UiLoginBody {
     pub username: String,
     pub password: String,

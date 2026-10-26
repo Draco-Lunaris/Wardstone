@@ -111,7 +111,7 @@ pub struct OidcConfigResponse {
 /// The upsert body. `client_secret: None` keeps the stored secret on an
 /// EXISTING row; a new row without a secret is a 400 (an empty string is
 /// the public-client convention and is accepted as `Some("")`).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct UpsertOidcConfigBody {
     pub provider_type: String,
@@ -128,7 +128,7 @@ pub struct UpsertOidcConfigBody {
 /// UI sends it only when the operator is testing unsaved values);
 /// `override` carries an upsert-shaped payload to probe INSTEAD of the
 /// saved configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OidcTestBody {
     #[serde(default, rename = "override")]

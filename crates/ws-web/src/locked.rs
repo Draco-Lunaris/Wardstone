@@ -255,7 +255,7 @@ async fn unlock_page(State((ui, keys_dir, hostname)): State<UiState>) -> Respons
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct UnlockBody {
     passphrase: String,
     /// Present only on the mixed-state completion (the page offers it
