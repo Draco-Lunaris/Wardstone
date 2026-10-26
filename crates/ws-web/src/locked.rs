@@ -6,9 +6,16 @@
 //! surface — answers `503 sealed` through the same delegate fallback the
 //! api uses. The unlock POST derives the KEK locally (argon2id in-process:
 //! the passphrase never leaves this host), runs main's build closure
-//! (open envelopes, connect the pool, build the full `web_router`), and
+//! (open envelopes, resolve the tenant and the serving leaf, RELEASE the
+//! pool — the api's relayed unlock rotates the database credential, so
+//! the unlocked front door holds no database connection at all), and
 //! relays the passphrase to the api once over the compose-internal
-//! channel.
+//! channel. A volume without `db-credential.envelope` grows the
+//! database-password field: the recovery runbook's typed password
+//! re-seals the credential before anything connects. A sealed volume
+//! whose database holds no default tenant is the torn state: the build
+//! reports [`INTERRUPTED_SETUP_REFUSAL`], this router answers the POST
+//! with the same copy, and the binary exits the process non-zero.
 
 use std::sync::{Arc, RwLock};
 
@@ -20,6 +27,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tower::Service;
+
+/// The torn-state refusal (Task 7's verbatim copy): a sealed volume
+/// whose database holds no default tenant is the aftermath of a setup
+/// that crashed AFTER sealing — `master.envelope` is written LAST, so
+/// the sealed marker promises the seal landed but never that the
+/// install did. Nothing auto-recovers from a half-finished install
+/// (the database side may itself be incomplete), so the unlock's build
+/// sends the process a fatal with this copy and the door answers the
+/// POST's 409 with the same words: remove both volumes and run setup
+/// again.
+pub const INTERRUPTED_SETUP_REFUSAL: &str =
+    "setup was interrupted after sealing — remove both volumes and run setup again";
 
 /// The late-bound full web router: `None` while sealed; swapped in by the
 /// unlock. `main` supplies the build closure (it owns the config: the keys
@@ -36,7 +55,11 @@ pub struct SealedUi {
 }
 
 pub type LockedWebBuild = Arc<
-    dyn Fn(&str, Option<&str>) -> futures_util::future::BoxFuture<'static, Result<Router, String>>
+    dyn Fn(
+            &str,
+            Option<&str>,
+            Option<&str>,
+        ) -> futures_util::future::BoxFuture<'static, Result<Router, String>>
         + Send
         + Sync,
 >;
@@ -57,11 +80,15 @@ impl SealedUi {
     /// The ONE unlock: `passphrase` is the volume's current one;
     /// `next_passphrase` is present only on the mixed-state completion
     /// (spec §5.7 — the page re-offers the interrupted change, and the
-    /// build closure converges the volume before it opens it).
+    /// build closure converges the volume before it opens it); and
+    /// `db_password` is present only on the recovery runbook's boot
+    /// (Task 7): the volume holds no `db-credential.envelope`, so the
+    /// TYPED database password is what re-seals it.
     pub async fn unlock(
         &self,
         passphrase: &str,
         next_passphrase: Option<&str>,
+        db_password: Option<&str>,
     ) -> Result<(), String> {
         // The serialized window (F4): the guard spans check, build, and
         // swap — a racing second unlock waits here, then sees the
@@ -70,7 +97,7 @@ impl SealedUi {
         if self.is_unlocked() {
             return Err("already_unlocked".to_string());
         }
-        let router = (self.build)(passphrase, next_passphrase).await?;
+        let router = (self.build)(passphrase, next_passphrase, db_password).await?;
         *self
             .router
             .write()
@@ -174,14 +201,20 @@ async fn unlock_page(State((ui, keys_dir, hostname)): State<UiState>) -> Respons
     if ui.is_unlocked() {
         return axum::response::Redirect::to("/login").into_response();
     }
-    // The completion probe (spec §5.7): a crashed passphrase change
-    // leaves the envelope generations disagreeing, and the page
-    // re-offers the completion. A volume the scan cannot read renders
-    // the plain form — the POST then names the real condition.
+    // The completion probe (spec §5.7) and the recovery probe (Task 7):
+    // a crashed passphrase change leaves the envelope generations
+    // disagreeing (the page re-offers the completion), and a volume
+    // WITHOUT `db-credential.envelope` grows the database-password field
+    // (the recovery runbook's typed re-seal). A volume the scan cannot
+    // read renders the plain form — the POST then names the real
+    // condition.
     let mixed = ws_core::crypto::scan_volume(&keys_dir)
         .map(|scan| scan.mixed)
         .unwrap_or(false);
-    let html = render_unlock_page(&hostname, mixed);
+    let needs_db_password = !keys_dir
+        .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        .exists();
+    let html = render_unlock_page(&hostname, mixed, needs_db_password);
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
@@ -197,14 +230,45 @@ struct UnlockBody {
     /// when the envelope generations disagree).
     #[serde(default)]
     next_passphrase: Option<String>,
+    /// Present only on the recovery runbook's boot (Task 7): the volume
+    /// holds no `db-credential.envelope`, so the TYPED database password
+    /// re-seals it before anything connects.
+    #[serde(default)]
+    db_password: Option<String>,
 }
 
 async fn unlock_handler(
-    State((ui, _, _)): State<UiState>,
+    State((ui, keys_dir, _)): State<UiState>,
     Json(body): Json<UnlockBody>,
 ) -> Response {
+    // The recovery runbook's pre-check (Task 7): without the sealed db
+    // credential the build needs the TYPED password — and refusing
+    // BEFORE the build spends neither the argon2 derive nor the
+    // unlock-window mutex on a request that could only fail. The 400
+    // names the field so the page (and the operator) learn exactly
+    // what to add.
+    if !keys_dir
+        .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        .exists()
+        && body.db_password.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "code": "db_password_required",
+                    "message": "the keys volume holds no db-credential envelope: \
+                                the db_password field is required to re-seal it \
+                                (the recovery runbook)" }
+            })),
+        )
+            .into_response();
+    }
     match ui
-        .unlock(&body.passphrase, body.next_passphrase.as_deref())
+        .unlock(
+            &body.passphrase,
+            body.next_passphrase.as_deref(),
+            body.db_password.as_deref(),
+        )
         .await
     {
         Ok(()) => (
@@ -244,6 +308,19 @@ async fn unlock_handler(
                     "message": "no completion is pending on this volume: unlock \
                                 without the new passphrase (the admin surface \
                                 changes it once unlocked)" }
+            })),
+        )
+            .into_response(),
+        // The torn state (Task 7): the build resolved the tenant and
+        // found none — an interrupted setup. The binary exits the
+        // process on this verdict; the POST's own response carries the
+        // same copy so the operator's browser shows it, not a generic
+        // refusal.
+        Err(code) if code == INTERRUPTED_SETUP_REFUSAL => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "setup_interrupted",
+                    "message": INTERRUPTED_SETUP_REFUSAL }
             })),
         )
             .into_response(),
@@ -306,34 +383,61 @@ pub(crate) fn sealed_503() -> Response {
 
 /// The unlock page: server-rendered HTML (the SPA is sealed away, so the
 /// locked mode cannot depend on it — the same reasoning the setup page
-/// uses). One field, one button, no JavaScript beyond the POST — and on
-/// a mixed volume (the crashed change's aftermath, probed at render
-/// time) the completion re-offer: the new-passphrase field joins the
-/// form and the copy names the condition (spec §5.7).
-fn render_unlock_page(hostname: &str, mixed: bool) -> String {
-    let (lede, extra_field, payload) = if mixed {
-        (
-            "A passphrase change did not finish — the disks still hold \
-             envelopes sealed under both passphrases. Enter the current \
-             passphrase and the new one together to complete the change \
-             and unlock.",
-            concat!(
-                r#"<label for="next-passphrase">New passphrase</label>"#,
-                "\n",
-                r#"<input id="next-passphrase" type="password" autocomplete="off" required>"#,
-            ),
-            "JSON.stringify({ passphrase: document.getElementById('passphrase').value, \
-             next_passphrase: document.getElementById('next-passphrase').value })",
-        )
+/// uses). One passphrase field, one button, no JavaScript beyond the
+/// POST — plus, per the volume's probed state, the mixed completion's
+/// new-passphrase field (spec §5.7) and/or the recovery runbook's
+/// database-password field (Task 7: no `db-credential.envelope` means
+/// the typed password must re-seal it). The lede names whichever
+/// condition the page re-offers, so the operator is never left guessing
+/// which fields the instance wants.
+fn render_unlock_page(hostname: &str, mixed: bool, needs_db_password: bool) -> String {
+    // The lede names the condition by precedence: a crashed completion
+    // outranks the recovery (a mixed volume still holds its
+    // db-credential envelope or it would not be mixed), and both
+    // outrank the plain sealed copy.
+    let lede = if mixed {
+        "A passphrase change did not finish — the disks still hold \
+         envelopes sealed under both passphrases. Enter the current \
+         passphrase and the new one together to complete the change \
+         and unlock."
+    } else if needs_db_password {
+        "The keys volume holds no sealed database credential — the \
+         recovery runbook. Enter the master passphrase and the \
+         database's password together: the typed password re-seals \
+         the credential, and the unlock continues."
     } else {
-        (
-            "Enter the master passphrase to unlock this instance. Everything \
-             on its disks is inert until you do — that is the design, not an \
-             outage.",
-            "",
-            "JSON.stringify({ passphrase: document.getElementById('passphrase').value })",
-        )
+        "Enter the master passphrase to unlock this instance. Everything \
+         on its disks is inert until you do — that is the design, not an \
+         outage."
     };
+    let mut fields = String::new();
+    if mixed {
+        fields.push_str(concat!(
+            r#"<label for="next-passphrase">New passphrase</label>"#,
+            "\n",
+            r#"<input id="next-passphrase" type="password" autocomplete="off" required>"#,
+            "\n",
+        ));
+    }
+    if needs_db_password {
+        fields.push_str(concat!(
+            r#"<label for="db-password">Database password</label>"#,
+            "\n",
+            r#"<input id="db-password" type="password" autocomplete="off" required>"#,
+            "\n",
+        ));
+    }
+    // The POST payload carries exactly the fields the form shows — a
+    // plain volume never sends the optional keys.
+    let mut payload =
+        String::from("JSON.stringify({ passphrase: document.getElementById('passphrase').value");
+    if mixed {
+        payload.push_str(", next_passphrase: document.getElementById('next-passphrase').value");
+    }
+    if needs_db_password {
+        payload.push_str(", db_password: document.getElementById('db-password').value");
+    }
+    payload.push_str(" })");
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -354,7 +458,7 @@ button {{ margin-top: 1rem; padding: 0.6rem 1.4rem; font-size: 1rem; }}
 <p>{lede}</p>
 <form id="unlock-form">
 <input id="passphrase" type="password" autocomplete="off" required>
-{extra_field}
+{fields}
 <button type="submit">Unlock</button>
 </form>
 <div id="result"></div>
@@ -386,7 +490,7 @@ document.getElementById('unlock-form').addEventListener('submit', async (event) 
 "#,
         hostname = hostname,
         lede = lede,
-        extra_field = extra_field,
+        fields = fields,
         payload = payload,
     )
 }

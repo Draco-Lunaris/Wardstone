@@ -277,6 +277,67 @@ pub fn session_router_with_store(
         )
 }
 
+/// The FIRST-RUN front-door router (Task 7's boot rule): the setup
+/// surface with NO database connection behind it. The boot dispatched on
+/// the sealed marker's ABSENCE — a fresh install, where no tenant can
+/// exist behind an unsealed volume and setup is the only path in — so
+/// this router is built WITHOUT a pool: the RAM-only certificate, the
+/// setup page, the session relay, and the proxies are the whole
+/// surface, and the setup POST is the first thing that ever dials the
+/// database (with the operator's typed password, via
+/// [`setup::run_setup`]). A pool-less router is what makes the
+/// closed-port boot test pin real behavior: the process serves the
+/// page while `DATABASE_URL` points at a dead port, and a restart
+/// before setup writes nothing and accumulates nothing.
+///
+/// `tls_reload` is the listener's reloadable TLS config — the handle
+/// the setup commit swaps onto the CA-issued leaf in place (the resume
+/// contract); the boot passes `Some(clone)`.
+#[allow(clippy::too_many_arguments)]
+pub fn first_run_web_router(
+    keys_dir: PathBuf,
+    fingerprint: String,
+    hostname: String,
+    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
+    api_base_url: &str,
+    database_url: String,
+    session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
+    session_router_with_store(store, api_base_url, rate_limit)
+        .merge(setup_router(SetupState {
+            keys_dir,
+            fingerprint,
+            hostname,
+            tls_reload,
+            api_base_url: api_base_url.to_owned(),
+            database_url,
+        }))
+        // The SPA rides LAST as always: the setup routes and the proxy
+        // above are never masked.
+        .fallback_service(ui::ui_router())
+}
+
+/// The UNLOCKED front-door router (Task 7's pool release, Review Focus
+/// 1): the session relay, the `/api/v1` and `/acme` proxies, the plain
+/// 404s for the retired setup surface, and the SPA — with NO database
+/// pool anywhere in it. The unlock build resolved the tenant and the
+/// serving leaf BEFORE the api relay (whose rotation invalidates every
+/// fresh ui connection) and released its pool; this router serves
+/// pool-less for the process's whole remaining life, and everything
+/// database-touching rides the proxy to the api.
+pub fn unlocked_web_router(
+    api_base_url: &str,
+    session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
+    session_router_with_store(store, api_base_url, rate_limit)
+        .merge(setup_unmounted_router())
+        .fallback_service(ui::ui_router())
+}
+
 /// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
 /// with a PKCS#8 DER private key (the exact form every envelope-encrypted
 /// key in the keystore holds and every issued certificate is stored in).

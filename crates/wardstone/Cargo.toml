@@ -54,3 +54,11 @@ ws-secmem = { path = "../ws-secmem" }
 # (workspace pins; the workspace uuid pin carries `v4`).
 uuid = { workspace = true }
 chrono = { workspace = true }
+# The boot tests' process probes: HTTPS against the children's TLS front
+# doors — their self-signed first-run/sealed certificates are accepted
+# deliberately, the tests assert behavior, not the certificate chain —
+# plus plain-HTTP healthz polls of the api child (the workspace pin
+# carries rustls-tls + json, so no new features enter the graph).
+reqwest = { workspace = true }
+# The unlock/healthz JSON bodies those probes send and read.
+serde_json = { workspace = true }

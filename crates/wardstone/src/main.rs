@@ -18,20 +18,22 @@
 //! api`, and `ws-web` publishes the only LAN port.
 //!
 //! `main` is a thin dispatcher: it parses the mode argument, reads the
-//! shared environment contract, initializes logging, and hands over to
-//! [`run_ui`] / [`run_api`]. The process lifecycle the binary owns:
-//! open the pool (`ws_core::db::connect` runs the migrations), load OR
-//! create the JWT key pair (`JwtKeys::load_or_create` — on a virgin volume
-//! the keys must exist before the setup page can be served; the
-//! transitional plaintext loader the seal-at-creation plan's Task 7
-//! removes), open the keystore, then serve.
+//! shared environment contract, initializes logging (and the protected
+//! memory pool — every mode's FIRST act), and hands over to
+//! [`run_ui`] / [`run_api`]. The boot rule both modes share
+//! (seal-at-creation): `master.envelope` absent → the first-run setup
+//! page over a RAM-only certificate with NO database connection and
+//! nothing written to the keys volume; present → the locked page, whose
+//! unlock resolves the tenant and the serving leaf BEFORE the api relay
+//! (whose credential rotation would strand any fresh ui connection) and
+//! then releases the pool — the unlocked front door holds no database
+//! connection at all.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
 use ws_ca::error::CaError;
-use ws_ca::keystore::KeyStore;
 use ws_core::error::CoreError;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_secmem::SecretBuf;
@@ -234,6 +236,15 @@ fn run_result(result: Result<(), BootError>) -> std::process::ExitCode {
 /// is stdout-or-nothing, and no tracing call sits on this path (a log
 /// line would outlive the operator's terminal).
 fn run_db_verifier(second: Option<&str>) -> std::process::ExitCode {
+    // The protected arena before ANY print (Task 7's init-order pin):
+    // every mode initializes ws-secmem first, and a refusal here keeps
+    // this path's own failure shape — stderr and a non-zero exit, no
+    // panic and no tracing line (the stdout contract below still
+    // holds: nothing credential-shaped is ever logged).
+    if let Err(err) = ws_secmem::init(ws_secmem::PRODUCTION_POOL) {
+        eprintln!("error: {}", ws_ca::keystore::protected_memory_failure(err));
+        return std::process::ExitCode::FAILURE;
+    }
     let salt = match ws_core::dbcred::fresh_scram_salt() {
         Ok(salt) => salt,
         Err(err) => {
@@ -544,33 +555,24 @@ fn rate_limit_from(
     Ok(ws_api::AuthRateLimit { per_millis, burst })
 }
 
-/// The `ui` mode: the TLS front door over ws-web's composition and
-/// serving glue. The serving certificate is resolved at boot:
-///
-/// - no default tenant: the FIRST-RUN setup — a freshly minted
-///   self-signed setup certificate (its key in the keystore's setup slot,
-///   its SHA-256 fingerprint displayed on the page), with the setup
-///   routes mounted ([`ws_web::web_router`] performs the mount check
-///   itself). A completion watcher exits the process with a success code
-///   once setup commits the tenant (the in-place TLS resume).
-/// - tenant with an active `web-server` leaf: the CA-issued leaf — the
-///   certificates row's PEM plus the key envelope under the certificate
-///   id (the leaf is a first-class issuance: `unwrap_ca_key(cert.id)`).
-/// - tenant WITHOUT an active leaf — the pinned torn state of a crash
-///   between setup's bootstrap commit and the leaf-issuance transaction:
-///   a fresh setup certificate keeps TLS SERVING (see [`resolve_serving_leaf`]'s
-///   docs for the exact walk and the WARN line that records the
-///   choice; recovery is operator-initiated: log in and re-issue the
-///   server leaf through the proxied API).
-///
-/// The sealed ui boot: the front door binds with an EPHEMERAL
+/// The sealed `ui` boot: the front door binds with an EPHEMERAL
 /// sealed-mode certificate (no key material exists in this process yet)
-/// and serves the locked page until the operator's unlock. The build
-/// closure opens the envelopes (the master for the keystore, the DB
-/// credential for the pool), relays the passphrase to the api once,
-/// resolves the CA-issued leaf with the unlocked keystore, reloads the
-/// listener's TLS in place (the resume contract), and swaps the full
-/// `web_router` in behind the locked door's delegate.
+/// and serves the locked page until the operator's unlock.
+///
+/// The build closure ([`unlocked_web_build`]) is where the world comes
+/// up: it converges a mixed volume when the completion pair rides along,
+/// opens the envelopes (the master for the keystore, the DB credential
+/// for the pool — or the unlock form's typed database password on the
+/// recovery runbook), resolves the tenant and the serving leaf (the
+/// newest ACTIVE `web-server` row whose key envelope the keystore
+/// actually holds — [`resolve_serving_leaf`]'s walk), and reloads the
+/// listener's TLS onto the CA-issued leaf in place (the resume
+/// contract). A tenant WITHOUT a servable leaf keeps the sealed
+/// certificate serving (the WARN line records the choice; recovery is
+/// operator-initiated: log in and re-issue the server leaf through the
+/// proxied API). A volume whose database holds NO tenant is the torn
+/// state: the build's fatal exits the process non-zero with the spec's
+/// copy.
 async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let hostname = cfg
         .server_hostname
@@ -585,7 +587,14 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
     let reload_handle = tls_config.clone();
 
-    let build = unlocked_web_build(&cfg, &hostname, reload_handle);
+    // The torn-state exit channel: a build that resolves the tenant and
+    // finds none is a REFUSED boot (the process must not keep serving a
+    // volume whose install never completed) — but the build runs inside
+    // the unlock POST's request task, so the fatal crosses here and the
+    // serve loop unwinds with a non-zero exit carrying the spec's copy
+    // (the POST's own 409 shows the operator the same words).
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<BootError>();
+    let build = unlocked_web_build(&cfg, reload_handle, fatal_tx);
     let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
     let router = ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname, cfg.web_rate_limit);
     tracing::info!(
@@ -594,209 +603,279 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
         bind = %cfg.bind,
         "serving the sealed front door: enter the master passphrase to continue"
     );
-    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
+    // The serve loop races the fatal channel: whichever ends first wins —
+    // a listener failure returns its error, a torn verdict exits the
+    // process non-zero (`run_result` prints the copy on stderr).
+    let serve = ws_web::serve_tls_with_config(cfg.bind, tls_config, router);
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result.map_err(BootError::from),
+        Some(verdict) = fatal_rx.recv() => Err(verdict),
+    }
 }
 
 /// The web build the sealed boot hands its `SealedUi`: it converges a
 /// mixed volume when the completion pair rides along, opens the
-/// envelopes, builds the ui's pool from the sealed DB credential, relays
-/// the passphrase to the api (best-effort, logged), reloads the listener
-/// onto the CA-issued leaf, and returns the full web router. A sealed
-/// volume implies setup committed, so there is no setup-commit TLS swap
-/// to wire here.
+/// envelopes, builds the ui's pool from the sealed DB credential (or
+/// re-seals a lost one from the unlock form's typed database password —
+/// the recovery runbook), resolves the tenant and the serving leaf,
+/// RELEASES the pool, relays the passphrase to the api (best-effort,
+/// logged), and returns the pool-less unlocked router (Review Focus 1:
+/// the api's relayed unlock rotates the database credential, so any
+/// fresh ui connection after the relay dies 28P01 — the unlocked front
+/// door holds no database connection at all). A sealed volume implies
+/// setup committed, so there is no setup-commit TLS swap to wire here.
+///
+/// `fatal` carries the torn-state verdict (a sealed volume whose
+/// database holds no default tenant): the build runs inside the unlock
+/// POST's request task, so the refusal crosses the channel to the serve
+/// loop and the process exits non-zero — while the build's own error
+/// string makes the POST answer 409 with the same copy.
 fn unlocked_web_build(
     cfg: &BootConfig,
-    hostname: &str,
     reload: ws_web::TlsReloadConfig,
+    fatal: tokio::sync::mpsc::UnboundedSender<BootError>,
 ) -> ws_web::locked::LockedWebBuild {
     let keys_dir = cfg.keys_dir.clone();
-    let database_url = cfg.database_url.clone();
+    // The ui's connections carry the process's application_name label:
+    // sqlx parses the query parameter onto the backend's registration,
+    // Task 11's Postgres-side scans key off the ui/api labels, and the
+    // label rides the QUERY — every credential splice below rewrites
+    // only the authority, so the label reaches the live connection.
+    let database_url = with_application_name(&cfg.database_url, UI_APP_NAME);
     let api_url = cfg.api_url.clone();
-    let hostname = hostname.to_owned();
     let session_ttl = ws_web::DEFAULT_SESSION_TTL;
     let rate_limit = cfg.web_rate_limit;
 
-    std::sync::Arc::new(move |passphrase: &str, next_passphrase: Option<&str>| {
-        let keys_dir = keys_dir.clone();
-        let database_url = database_url.clone();
-        let api_url = api_url.clone();
-        let hostname = hostname.clone();
-        let reload = reload.clone();
-        let passphrase = passphrase.to_string();
-        let next_passphrase = next_passphrase.map(str::to_string);
-        futures_util::future::FutureExt::boxed(async move {
-            let err = |msg: String| msg; // the ui's build reports strings
-                                         // The mixed-state completion (spec §5.7), the same arm the
-                                         // api builder runs: a crashed passphrase change leaves the
-                                         // envelope generations disagreeing, the page re-offered the
-                                         // completion, and the volume converges BEFORE anything
-                                         // opens. The ui converges it and proceeds under the new
-                                         // passphrase — the relay then carries the EFFECTIVE one
-                                         // alone, so the api unlocks a volume that is already clean
-                                         // (relaying the pair would trip the api's
-                                         // no_completion_pending refusal).
-            let scan = ws_core::crypto::scan_volume(&keys_dir)
-                .map_err(|e| err(format!("the volume scan: {e}")))?;
-            let passphrase = match (scan.mixed, next_passphrase) {
-                (true, Some(next)) => {
-                    ws_core::crypto::rewrap_volume(&keys_dir, &scan.present, &passphrase, &next)
-                        .map_err(|e| err(format!("the volume completion: {e}")))?;
-                    next
-                }
-                (true, None) => {
-                    return Err(err("completion_required".to_string()));
-                }
-                (false, Some(_)) => {
-                    return Err(err("no_completion_pending".to_string()));
-                }
-                (false, None) => passphrase,
-            };
-            // The master envelope: the keystore's unwrapped custody.
-            let master = ws_core::crypto::KeyEnvelope::open_envelope(
-                &keys_dir.join(MASTER_ENVELOPE_FILE),
-                &passphrase,
-            )
-            .map_err(|e| err(format!("the master envelope: {e}")))?;
-            let mut master_bytes = Zeroizing::new([0u8; 32]);
-            master_bytes.copy_from_slice(&master);
-            // The crashed-seal heal (F3, spec §3's per-file
-            // contract): the setup seal goes file by file, and a crash
-            // mid-arm strands a plaintext beside its envelope (or
-            // unwrapped). The passphrase just proved itself against the
-            // master — the authenticated moment to converge the volume
-            // before anything else opens. Idempotent on a clean volume.
-            ws_web::setup::heal_keys_volume(&keys_dir, &passphrase)
-                .map_err(|e| err(format!("the volume heal: {e}")))?;
-            // The unlocked keystore holds its master as a ws-secmem arena
-            // reservation: the envelope's Zeroizing plaintext dies at this
-            // scope's end and only the protected copy crosses into the
-            // keystore's custody.
-            let master_buf = ws_secmem::global()
-                .and_then(|mem| mem.alloc_copy(&master_bytes[..]))
-                .map_err(|e| err(format!("the master key's protected arena: {e}")))?;
-            let keystore = ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, master_buf)
-                .map_err(|e| err(format!("the keystore: {e}")))?;
-
-            // The ui's own pool: the db credential (read-only unwrap
-            // per the spec — the api rotates, the ui re-reads). One
-            // exception: the recovery runbook (spec §8) — an operator
-            // who lost the credential deletes the envelope, sets a
-            // fresh bootstrap password, and reboots; the envelope's
-            // absence is the ONLY thing distinguishing that boot, so
-            // this arm re-seals it through the identical first-install
-            // step (the shared rotation) before anything connects.
-            let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
-            let connect_url =
-                match ws_core::crypto::KeyEnvelope::open_envelope(&db_credential_path, &passphrase)
-                {
-                    Ok(current) => {
-                        substitute_db_password(&database_url, &String::from_utf8_lossy(&current))
-                    }
-                    Err(ws_core::error::CoreError::Config(_)) => {
-                        let generation = ws_core::crypto::KeyEnvelope::read_generation(
-                            &keys_dir.join(MASTER_ENVELOPE_FILE),
-                        )
-                        .map_err(|e| err(format!("the recovery generation: {e}")))?;
-                        // The typed credential the recovery connects with:
-                        // until Task 7's unlock page collects a typed
-                        // database password field, the recovery runbook's
-                        // env URL itself carries the fresh bootstrap
-                        // password (the old §8 shape), so the URL's own
-                        // embedded password IS the typed one. Never
-                        // logged, never stored.
-                        let typed = url_password_of(&database_url).ok_or_else(|| {
-                            err("the recovery URL carries no password: the \
-                                 db-volume-recovery runbook sets the fresh bootstrap \
-                                 credential in the URL"
-                                .to_string())
-                        })?;
-                        let fresh = ws_web::setup::recover_db_credential(
+    std::sync::Arc::new(
+        move |passphrase: &str, next_passphrase: Option<&str>, db_password: Option<&str>| {
+            let keys_dir = keys_dir.clone();
+            let database_url = database_url.clone();
+            let api_url = api_url.clone();
+            let reload = reload.clone();
+            let fatal = fatal.clone();
+            let passphrase = passphrase.to_string();
+            let next_passphrase = next_passphrase.map(str::to_string);
+            let db_password = db_password.map(str::to_string);
+            futures_util::future::FutureExt::boxed(async move {
+                let err = |msg: String| msg; // the ui's build reports strings
+                                             // The mixed-state completion (spec §5.7), the same arm the
+                                             // api builder runs: a crashed passphrase change leaves the
+                                             // envelope generations disagreeing, the page re-offered the
+                                             // completion, and the volume converges BEFORE anything
+                                             // opens. The ui converges it and proceeds under the new
+                                             // passphrase — the relay then carries the EFFECTIVE one
+                                             // alone, so the api unlocks a volume that is already clean
+                                             // (relaying the pair would trip the api's
+                                             // no_completion_pending refusal).
+                let scan = ws_core::crypto::scan_volume(&keys_dir)
+                    .map_err(|e| err(format!("the volume scan: {e}")))?;
+                let passphrase = match (scan.mixed, next_passphrase) {
+                    (true, Some(next)) => {
+                        ws_core::crypto::rewrap_volume(
                             &keys_dir,
-                            passphrase.as_bytes(),
-                            &database_url,
-                            typed.as_bytes(),
-                            generation,
+                            &scan.present,
+                            &passphrase,
+                            &next,
                         )
-                        .await
-                        .map_err(|e| err(format!("the db re-seed: {e}")))?;
-                        substitute_db_password(&database_url, &String::from_utf8_lossy(&fresh))
+                        .map_err(|e| err(format!("the volume completion: {e}")))?;
+                        next
                     }
-                    Err(other) => return Err(err(format!("the db credential: {other}"))),
+                    (true, None) => {
+                        return Err(err("completion_required".to_string()));
+                    }
+                    (false, Some(_)) => {
+                        return Err(err("no_completion_pending".to_string()));
+                    }
+                    (false, None) => passphrase,
                 };
-            let pool = ws_core::db::connect(&connect_url)
-                .await
-                .map_err(|e| err(format!("the database: {e}")))?;
+                // The master envelope: the keystore's unwrapped custody.
+                let master = ws_core::crypto::KeyEnvelope::open_envelope(
+                    &keys_dir.join(MASTER_ENVELOPE_FILE),
+                    &passphrase,
+                )
+                .map_err(|e| err(format!("the master envelope: {e}")))?;
+                let mut master_bytes = Zeroizing::new([0u8; 32]);
+                master_bytes.copy_from_slice(&master);
+                // The unlocked keystore holds its master as a ws-secmem arena
+                // reservation: the envelope's Zeroizing plaintext dies at this
+                // scope's end and only the protected copy crosses into the
+                // keystore's custody.
+                let master_buf = ws_secmem::global()
+                    .and_then(|mem| mem.alloc_copy(&master_bytes[..]))
+                    .map_err(|e| err(format!("the master key's protected arena: {e}")))?;
+                let keystore = ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, master_buf)
+                    .map_err(|e| err(format!("the keystore: {e}")))?;
 
-            // Relay the unlock to the api: one POST, best-effort with
-            // a logged verdict (the api may be seeding, a redeploy
-            // racer, or already unlocked — every one of those is the
-            // spec's documented fallback, never a ui failure).
-            if let Err(e) = ws_web::locked::relay_unlock(&keys_dir, &api_url, &passphrase).await {
-                tracing::warn!(
-                    error = %e,
-                    "the api unlock relay did not complete; the api logs its own state"
-                );
-            }
-
-            // The serving leaf with the unlocked keystore
-            // ([`resolve_serving_leaf`]'s walk), then the in-place TLS
-            // reload onto the CA-issued leaf.
-            let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
-                .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
-                .await
-                .map_err(|e| err(format!("the tenant lookup: {e}")))?
-                .ok_or_else(|| err("the default tenant vanished mid-unlock".to_string()))?;
-            let certs = ws_core::repo::certificate_repo::CertificateRepo::new()
-                .list_by_tenant(&pool, tenant.id, 0, 500)
-                .await
-                .map_err(|e| err(format!("the certificate listing: {e}")))?;
-            let leaf = resolve_serving_leaf(&certs, |leaf| keystore.unwrap_ca_key(&leaf.id))
-                .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
-            match leaf {
-                Some((leaf_row, key_der)) => {
-                    let key_pem = pkcs8_pem_of(&key_der);
-                    reload
-                        .reload_from_pem(
-                            leaf_row.cert_pem.clone().into_bytes(),
-                            key_pem.clone().into_bytes(),
-                        )
+                // The ui's only pool: the db credential, read-only per the
+                // spec (the api rotates it, the ui re-reads it). The
+                // pending-first rule is the CALLER's (the unlock): try the
+                // `.pending` sibling first (a rotation whose commit step
+                // crashed); a live connect promotes it atomically, a 28P01
+                // discards it (a pending that cannot log in was never made
+                // live on the database side) and falls to the current
+                // credential. One exception: the recovery runbook (spec §8)
+                // — an operator who lost the credential deletes the
+                // envelope, sets a fresh bootstrap password, and reboots; the
+                // envelope's absence is the ONLY thing distinguishing that
+                // boot, so the unlock form's TYPED database password re-seals
+                // it through the identical first-install step (the shared
+                // rotation) before anything else connects.
+                let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
+                let pool = if db_credential_path.exists() {
+                    let candidates = ws_core::dbcred::open_db_credential(
+                        &db_credential_path,
+                        passphrase.as_bytes(),
+                    )
+                    .map_err(|e| err(format!("the db credential: {e}")))?;
+                    let mut live = None;
+                    if let Some(pending) = candidates.pending.as_ref() {
+                        match ws_core::db::connect(&substitute_db_password(
+                            &database_url,
+                            &String::from_utf8_lossy(pending),
+                        ))
                         .await
-                        .map_err(|e| err(format!("the TLS reload: {e}")))?;
-                    tracing::info!(
-                        certificate_id = %leaf_row.id,
-                        subject = %leaf_row.subject,
-                        "the TLS listener resumed onto the CA-issued leaf"
-                    );
-                }
-                None => {
-                    // The torn state keeps the sealed certificate: the
-                    // operator reaches the recovery flow next.
-                    tracing::warn!(
-                        "no active serving leaf after unlock; the sealed \
-                         certificate keeps serving"
-                    );
-                }
-            }
+                        {
+                            Ok(pool) => {
+                                ws_core::dbcred::promote_pending(&db_credential_path).map_err(
+                                    |e| err(format!("the pending credential's promotion: {e}")),
+                                )?;
+                                live = Some(pool);
+                            }
+                            Err(e) if db_rejected(&e) => {
+                                ws_core::dbcred::discard_pending(&db_credential_path).map_err(
+                                    |e| err(format!("the pending credential's discard: {e}")),
+                                )?;
+                            }
+                            Err(e) => return Err(err(format!("the database: {e}"))),
+                        }
+                    }
+                    match live {
+                        Some(pool) => pool,
+                        None => ws_core::db::connect(&substitute_db_password(
+                            &database_url,
+                            &String::from_utf8_lossy(&candidates.current),
+                        ))
+                        .await
+                        .map_err(|e| err(format!("the database: {e}")))?,
+                    }
+                } else {
+                    // The recovery runbook (spec §8): the unlock form's
+                    // typed database password IS the fresh bootstrap
+                    // credential the operator set; the rotation re-seals it
+                    // into the envelope before the pool connects with it.
+                    // The locked page's 400 has normally already refused a
+                    // missing field — this is the build's own guard for the
+                    // race where the envelope vanished mid-POST.
+                    let typed = db_password.ok_or_else(|| {
+                        err("the db_password field is required when the volume holds \
+                             no db-credential envelope (the recovery runbook)"
+                            .to_string())
+                    })?;
+                    let generation = ws_core::crypto::KeyEnvelope::read_generation(
+                        &keys_dir.join(MASTER_ENVELOPE_FILE),
+                    )
+                    .map_err(|e| err(format!("the recovery generation: {e}")))?;
+                    let fresh = ws_web::setup::recover_db_credential(
+                        &keys_dir,
+                        passphrase.as_bytes(),
+                        &database_url,
+                        typed.as_bytes(),
+                        generation,
+                    )
+                    .await
+                    .map_err(|e| err(format!("the db re-seal: {e}")))?;
+                    ws_core::db::connect(&substitute_db_password(
+                        &database_url,
+                        &String::from_utf8_lossy(&fresh),
+                    ))
+                    .await
+                    .map_err(|e| err(format!("the database: {e}")))?
+                };
 
-            ws_web::web_router(
-                pool,
-                keys_dir,
-                String::new(),
-                hostname,
-                // The unlock's own TLS reload already happened above (the
-                // ephemeral certificate gave way to the CA-issued leaf); no
-                // setup commit ever swaps on a locked door — see the
-                // function's doc for the two boots' reasoning.
-                None,
-                &api_url,
-                database_url,
-                session_ttl,
-                rate_limit,
-            )
-            .await
-            .map_err(|e| err(format!("the web router: {e}")))
-        })
-    })
+                // The tenant and the serving leaf resolve HERE, before the
+                // relay (Review Focus 1): the api's relayed unlock rotates
+                // the database credential, and every FRESH ui connection
+                // after the relay dies 28P01 — so these reads ride the pool
+                // this build is about to release, never a post-relay dial.
+                let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+                    .get_by_name(&pool, ws_web::setup::DEFAULT_TENANT_NAME)
+                    .await
+                    .map_err(|e| err(format!("the tenant lookup: {e}")))?
+                    .ok_or_else(|| {
+                        // The torn state: the sealed marker promises the
+                        // seal landed, but the database holds no tenant —
+                        // setup crashed after sealing. Nothing
+                        // auto-recovers from a half-finished install (the
+                        // database side may itself be incomplete): the fatal
+                        // exits the process non-zero and the POST's 409
+                        // carries the same copy.
+                        let _ = fatal.send(BootError::Config(
+                            ws_web::locked::INTERRUPTED_SETUP_REFUSAL.to_owned(),
+                        ));
+                        err(ws_web::locked::INTERRUPTED_SETUP_REFUSAL.to_string())
+                    })?;
+                let certs = ws_core::repo::certificate_repo::CertificateRepo::new()
+                    .list_by_tenant(&pool, tenant.id, 0, 500)
+                    .await
+                    .map_err(|e| err(format!("the certificate listing: {e}")))?;
+                let leaf = resolve_serving_leaf(&certs, |leaf| keystore.unwrap_ca_key(&leaf.id))
+                    .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
+                match leaf {
+                    Some((leaf_row, key_der)) => {
+                        let key_pem = pkcs8_pem_of(&key_der);
+                        reload
+                            .reload_from_pem(
+                                leaf_row.cert_pem.clone().into_bytes(),
+                                key_pem.clone().into_bytes(),
+                            )
+                            .await
+                            .map_err(|e| err(format!("the TLS reload: {e}")))?;
+                        tracing::info!(
+                            certificate_id = %leaf_row.id,
+                            subject = %leaf_row.subject,
+                            "the TLS listener resumed onto the CA-issued leaf"
+                        );
+                    }
+                    None => {
+                        // The torn state keeps the sealed certificate: the
+                        // operator reaches the recovery flow next.
+                        tracing::warn!(
+                            "no active serving leaf after unlock; the sealed \
+                             certificate keeps serving"
+                        );
+                    }
+                }
+
+                // The pool's whole life ends HERE (Review Focus 1): the
+                // unlocked front door serves pool-less — everything
+                // database-touching rides the proxy to the api from this
+                // moment on, and the relay's rotation cannot strand a
+                // connection that no longer exists.
+                drop(pool);
+                // Relay the unlock to the api: one POST, best-effort with
+                // a logged verdict (the api may be seeding, a redeploy
+                // racer, or already unlocked — every one of those is the
+                // spec's documented fallback, never a ui failure).
+                if let Err(e) = ws_web::locked::relay_unlock(&keys_dir, &api_url, &passphrase).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "the api unlock relay did not complete; the api logs its own state"
+                    );
+                }
+                tracing::info!(
+                    "the sealed front door unlocked: the tenant and serving leaf \
+                     resolved, the pool released; no database connection is held"
+                );
+                Ok(ws_web::unlocked_web_router(
+                    &api_url,
+                    session_ttl,
+                    rate_limit,
+                ))
+            })
+        },
+    )
 }
 
 /// A PKCS#8 DER private key as the PEM form rustls's reload takes (the
@@ -816,68 +895,67 @@ fn pkcs8_pem_of(der: &[u8]) -> String {
     pem
 }
 
+/// The `ui` mode: the TLS front door. The boot dispatches on the sealed
+/// marker alone (`master.envelope`): present → the locked page
+/// ([`run_ui_sealed`]); absent → the FIRST-RUN setup page over a
+/// RAM-only self-signed certificate with NO database connection — a
+/// fresh install's shape, where no tenant can exist behind an unsealed
+/// volume (setup is the only path in, and the setup POST is the first
+/// thing that ever dials the database).
 async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
-    // The sealed instance: the front door locks and waits for the
-    // operator's master passphrase — no key material at boot.
+    // The protected arena is the process's FIRST act: the unlock's
+    // argon2 derive sits on the KDF slot, and every certificate mint or
+    // envelope open claims the pool — it must exist before any of them
+    // run (the same idiom the api and db-verifier boots use).
+    ws_secmem::init(ws_secmem::PRODUCTION_POOL)
+        .map_err(ws_ca::keystore::protected_memory_failure)?;
+    // The compose contract (Review Focus 5): the ui's DATABASE_URL is
+    // password-less — its credential lives only in the sealed
+    // `db-credential.envelope` (or the setup page's typed field, the
+    // first install's shape). A password in the URL is refused before
+    // any key or database work.
+    if db_url_has_password(&cfg.database_url) {
+        return Err(BootError::Config(
+            "DATABASE_URL carries a password; Wardstone reads the database \
+             credential only from its sealed envelope or the setup page"
+                .to_owned(),
+        ));
+    }
     if sealed_instance(&cfg.keys_dir) {
         return run_ui_sealed(cfg).await;
     }
-    let pool = ws_core::db::connect(&cfg.database_url).await?;
-    // The JWT keys are the process-lifecycle boot step the brief pins:
-    // they exist (or are created) before anything is served — on a virgin
-    // volume the setup page is reachable ONLY behind this line. The pair
-    // itself is used by ws-api (the separate `api` process); `ui` just
-    // guarantees it exists.
-    ws_auth::jwt::JwtKeys::load_or_create(&cfg.keys_dir)?;
-    let mut keystore = KeyStore::open(&cfg.keys_dir)?;
     let hostname = cfg
         .server_hostname
         .clone()
         .unwrap_or_else(|| ws_web::setup::tls::PLACEHOLDER_SAN.to_owned());
-
-    if !ws_web::tenant_exists(&pool).await? {
-        // First run: mint the setup certificate (its key lands in the
-        // setup slot), then load the slot back as the TLS key — the
-        // round-trip doubles as the slot's post-mint readback.
-        let (cert_pem, fingerprint) =
-            ws_web::setup::tls::setup_certificate(&mut keystore, &hostname)?;
-        let key = keystore.load_setup_key()?;
-        tracing::info!(
-            hostname = %hostname,
-            fingerprint = %fingerprint,
-            bind = %cfg.bind,
-            "no tenant yet: serving the first-run setup page over the \
-             self-signed setup certificate"
-        );
-        // The reloadable listener: the setup commit swaps onto the
-        // CA-issued leaf IN PLACE (the resume contract — the sealed design
-        // removed the self-exit restart, so there is no setup watcher).
-        let tls_config = ws_web::reloadable_tls_config(&cert_pem, &key)?;
-        let router = ws_web::web_router(
-            pool,
-            cfg.keys_dir.clone(),
-            fingerprint,
-            hostname,
-            Some(tls_config.clone()),
-            &cfg.api_url,
-            cfg.database_url.clone(),
-            ws_web::DEFAULT_SESSION_TTL,
-            cfg.web_rate_limit,
-        )
-        .await?;
-        return Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?);
-    }
-
-    // A tenant beside an unsealed volume: setup committed but crashed
-    // before sealing the keys (the seal writes `master.envelope` first,
-    // so any later crash boots sealed and the unlock heals it). Nothing
-    // is served on plaintext keys; a fresh install has nothing to keep.
-    Err(BootError::Config(
-        "the keys volume is not sealed but the default tenant exists: setup \
-         was interrupted before it sealed the keys — remove both volumes \
-         (`docker compose down -v`) and run setup again"
-            .to_owned(),
-    ))
+    // The RAM-only first-run certificate: self-signed, keyed in the
+    // protected arena, written NOWHERE — two boots before setup leave
+    // the keys volume empty, and the boot dials no database. The setup
+    // page echoes the fingerprint for the operator's out-of-band check;
+    // the setup commit's TLS reload replaces the certificate in place
+    // (the resume contract).
+    let (cert_pem, key_der, fingerprint) = ws_web::setup::tls::first_run_certificate(&hostname)?;
+    let tls_config = ws_web::reloadable_tls_config(&cert_pem, &key_der)?;
+    tracing::info!(
+        hostname = %hostname,
+        fingerprint = %fingerprint,
+        bind = %cfg.bind,
+        "no master envelope: serving the first-run setup page"
+    );
+    // The pool-less first-run router: the setup surface with nothing
+    // behind it — no keystore, no JWT pair, no pool exists in this
+    // process until the setup POST builds the world.
+    let router = ws_web::first_run_web_router(
+        cfg.keys_dir.clone(),
+        fingerprint,
+        hostname,
+        Some(tls_config.clone()),
+        &cfg.api_url,
+        cfg.database_url.clone(),
+        ws_web::DEFAULT_SESSION_TTL,
+        cfg.web_rate_limit,
+    );
+    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
 }
 
 /// The `api` mode: ws-api's REST router served DIRECTLY as plain HTTP —
@@ -892,10 +970,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
 /// The sealed-at-rest envelope file names on the keys volume, from
 /// ws-core's single home for the contract (the design's state predicate:
 /// `master.envelope` present ⇒ the instance is sealed at boot).
-use ws_core::crypto::{
-    percent_decode_userinfo, substitute_db_password, DB_CREDENTIAL_ENVELOPE_FILE,
-    MASTER_ENVELOPE_FILE,
-};
+use ws_core::crypto::{substitute_db_password, DB_CREDENTIAL_ENVELOPE_FILE, MASTER_ENVELOPE_FILE};
 
 /// Keys-directory-only state derivation (spec §3): `master.envelope`
 /// present → the instance boots sealed and waits for the unlock relay.
@@ -904,11 +979,12 @@ fn sealed_instance(keys_dir: &std::path::Path) -> bool {
 }
 
 /// Does the operator-supplied DATABASE_URL carry a password? The
-/// password-less compose contract (the api's env holds no credential at
-/// all — everything credential-shaped lives in the sealed envelopes):
-/// the api always boots the sealed shell (it builds no pool at boot and
-/// waits for the setup commit's or the unlock's relay), and a password in
-/// its URL is refused as a misconfiguration (G5). The parsing
+/// password-less compose contract — BOTH modes refuse a URL password
+/// (the credential lives only in the sealed envelope, or the setup
+/// page's / unlock form's typed field): the api always boots the sealed
+/// shell (it builds no pool at boot and waits for the setup commit's or
+/// the unlock's relay), and a ui password would smuggle a credential
+/// around the sealed custody (G5, Review Focus 5). The parsing
 /// mirrors [`substitute_db_password`]'s: the password is whatever
 /// follows the last `:` in the `://…@` authority.
 fn db_url_has_password(url: &str) -> bool {
@@ -922,23 +998,41 @@ fn db_url_has_password(url: &str) -> bool {
     url[auth_start..at].rfind(':').is_some()
 }
 
-/// The password embedded in a `DATABASE_URL` authority, if any — the
-/// recovery arm's interim TYPED credential (Task 7's unlock page
-/// replaces it with a typed field): the old §8 runbook sets the fresh
-/// bootstrap password in the env URL itself, so the URL's own embedded
-/// password is the one the recovery rotation connects with. The
-/// parsing mirrors [`substitute_db_password`]'s (and
-/// [`db_url_has_password`]'s): the password is whatever follows the
-/// last `:` in the `://…@` authority, percent-DECODED — the mirror of
-/// the splice's encode ([`percent_encode_userinfo`]), so a
-/// URL-significant password extracts with its exact original bytes
-/// (round trip, tested together). Never logged.
-fn url_password_of(url: &str) -> Option<String> {
-    let scheme_end = url.find("://")?;
-    let auth_start = scheme_end + 3;
-    let at = url[auth_start..].find('@').map(|i| i + auth_start)?;
-    let colon = url[auth_start..at].rfind(':')?;
-    Some(percent_decode_userinfo(&url[auth_start + colon + 1..at]))
+/// The `application_name` the ui process labels its database
+/// connections with (sqlx parses the query parameter onto the backend's
+/// pg_stat_activity row): Task 11's Postgres-side scans key off the
+/// ui/api labels, and the boot battery's terminate sweep targets them.
+const UI_APP_NAME: &str = "wardstone-ui";
+
+/// The api process's label — [`UI_APP_NAME`]'s twin.
+const API_APP_NAME: &str = "wardstone-api";
+
+/// Append the process's `application_name` to a connection URL as a
+/// query parameter (sqlx parses it onto the backend's registration).
+/// Idempotent, and the label rides the QUERY — so it survives every
+/// [`substitute_db_password`] splice (which rewrites only the
+/// authority) and never disturbs [`db_url_has_password`]'s parse.
+fn with_application_name(url: &str, name: &str) -> String {
+    if url.contains("application_name=") {
+        url.to_owned()
+    } else if url.contains('?') {
+        format!("{url}&application_name={name}")
+    } else {
+        format!("{url}?application_name={name}")
+    }
+}
+
+/// The database's own "wrong password" verdict (SQLSTATE `28P01`) — the
+/// pending-first rule's only tolerated connect failure: a pending
+/// credential that cannot log in was never made live on the database
+/// side. Mirrors ws-api's `invalid_password` and ws-web's `db_rejected`
+/// (the house idiom: the SQLSTATE, never message text).
+fn db_rejected(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Database(db)
+            if db.as_database_error().and_then(|e| e.code()).as_deref() == Some("28P01")
+    )
 }
 
 /// The api's [`ws_api::ApiConfig`] from the boot env, for the sealed
@@ -1016,7 +1110,12 @@ async fn run_api_sealed(cfg: BootConfig) -> Result<(), BootError> {
     .await?)
 }
 
-async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
+async fn run_api(mut cfg: BootConfig) -> Result<(), BootError> {
+    // The protected arena is the process's FIRST act (the unlock's
+    // argon2 derive sits on the KDF slot; the sealed surface's envelope
+    // opens claim the pool the moment the relay lands).
+    ws_secmem::init(ws_secmem::PRODUCTION_POOL)
+        .map_err(ws_ca::keystore::protected_memory_failure)?;
     // The compose contract: the api's DATABASE_URL is password-less — its
     // credential lives only in the sealed envelope. The api always boots
     // the sealed shell (a fresh install's setup commit, or the unlock,
@@ -1029,6 +1128,10 @@ async fn run_api(cfg: BootConfig) -> Result<(), BootError> {
                 .to_owned(),
         ));
     }
+    // The api's connections carry their process label (Task 11's
+    // Postgres-side scans key off the ui/api `application_name`s, and
+    // the label rides the query through every credential splice).
+    cfg.database_url = with_application_name(&cfg.database_url, API_APP_NAME);
     run_api_sealed(cfg).await
 }
 
@@ -1743,27 +1846,43 @@ mod tests {
         );
     }
 
-    /// The recovery arm's URL extraction is the decode mirror of the
-    /// splice: a password carrying every URL-significant byte
-    /// (`@ : / % # ?`) round trips through `substitute_db_password` and
-    /// `url_password_of` with its exact original bytes — and a plain
-    /// bootstrap password ("wardstone"-shaped, and a base32 credential
-    /// the same way) extracts unchanged.
+    /// The application-name splice: a bare URL gains the label as the
+    /// query's first parameter, a URL with query params gains it
+    /// `&`-joined, an already-labelled URL comes back unchanged
+    /// (idempotent), and the label never disturbs the password parse
+    /// (it rides the query, not the authority) nor the credential
+    /// splice (which rewrites only the authority) — so a labelled URL
+    /// connects live with its label and its substituted credential
+    /// together.
     #[test]
-    fn url_password_extracts_what_the_splice_encoded() {
-        let url = "postgres://wardstone:placeholder@localhost:5432/wardstone_test";
-        let password = "p@ss:wo%rd/?#x";
-        let spliced = substitute_db_password(url, password);
+    fn application_name_splices_as_a_query_parameter() {
+        let bare = "postgres://wardstone@db:5432/wardstone";
+        let labelled = with_application_name(bare, UI_APP_NAME);
         assert_eq!(
-            url_password_of(&spliced).as_deref(),
-            Some(password),
-            "the splice/extract round trip preserves the exact bytes"
+            labelled,
+            "postgres://wardstone@db:5432/wardstone?application_name=wardstone-ui"
         );
-        let plain = substitute_db_password(url, "wardstone");
+        let queried = "postgres://wardstone@db:5432/wardstone?sslmode=disable";
         assert_eq!(
-            url_password_of(&plain).as_deref(),
-            Some("wardstone"),
-            "a plain password extracts unchanged"
+            with_application_name(queried, UI_APP_NAME),
+            "postgres://wardstone@db:5432/wardstone?sslmode=disable&application_name=wardstone-ui"
+        );
+        assert_eq!(
+            with_application_name(&labelled, UI_APP_NAME),
+            labelled,
+            "the splice is idempotent"
+        );
+        assert!(
+            !db_url_has_password(&with_application_name(
+                "postgres://wardstone@db:5432/wardstone",
+                UI_APP_NAME
+            )),
+            "the label rides the query — a password-less URL stays password-less"
+        );
+        assert_eq!(
+            substitute_db_password(&with_application_name(bare, API_APP_NAME), "wardstone"),
+            "postgres://wardstone:wardstone@db:5432/wardstone?application_name=wardstone-api",
+            "the credential splice preserves the label"
         );
     }
 }

@@ -91,6 +91,51 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
     Ok((certificate.pem(), fingerprint))
 }
 
+/// The FIRST-RUN certificate (Task 7's boot rule): the same mint as
+/// [`sealed_certificate`] (ECDSA P-256, the operator's browser is the
+/// consumer, the same pins) but for the boot that found NO
+/// `master.envelope` — self-signed and keyed ONLY in RAM (a ws-secmem
+/// arena reservation): no keystore open, no master key, no setup slot,
+/// no file, no database. The first-run boot writes NOTHING to the keys
+/// volume and dials nothing; the setup page echoes the returned
+/// SHA-256 fingerprint for the operator's out-of-band check, and the
+/// setup commit's TLS reload replaces the certificate in place (the
+/// resume contract). The validity window is the setup page's week
+/// ([`validity_window`]): the certificate must outlive the operator's
+/// completing the form.
+pub fn first_run_certificate(san: &str) -> Result<(String, ws_secmem::SecretBuf, String), CaError> {
+    let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
+    let private_key_der = Zeroizing::new(private_key_der);
+
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "Wardstone Setup");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![san_type(san)?];
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![RcgensEku::ServerAuth];
+    params.serial_number = Some(setup_serial()?);
+    let (not_before, not_after) = validity_window();
+    params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+    params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
+    let certificate = params.self_signed(&key_pair)?;
+    let fingerprint = hex::encode(Sha256::digest(certificate.der().as_ref()));
+    // The private key crosses to the caller in RAM custody only: the
+    // arena reservation is the one plaintext copy (the Zeroizing
+    // original above dies at this scope's end), so the first-run boot
+    // hands it to the listener without any intermediate heap buffer —
+    // and without leaving anything on the volume a restart would
+    // have to trust.
+    let key = ws_secmem::global()
+        .and_then(|mem| mem.alloc_copy(&private_key_der))
+        .map_err(|e| CaError::Worker(format!("tls: the protected key arena: {e}")))?;
+    Ok((certificate.pem(), key, fingerprint))
+}
+
 /// The SEALED-MODE certificate: the same mint as
 /// [`setup_certificate`] (ECDSA P-256, the operator's browser is the
 /// consumer, the same pins) but EPHEMERAL — no keystore access (the
