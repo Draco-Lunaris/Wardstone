@@ -51,9 +51,16 @@ pub struct OidcConfigModel {
     pub discovery_url: String,
     /// OIDC client id.
     pub client_id: String,
-    /// OIDC client secret (empty string for public clients; sealing at
-    /// rest is applied by the auth layer, Task 5 carries the column).
-    pub client_secret: String,
+    /// The confidential client's secret, sealed at rest under the
+    /// instance's secret-encryption key (`SecretBox`: XChaCha20-Poly1305
+    /// ciphertext with the tag appended) — exactly the TOTP credential's
+    /// storage shape. `None` is the public-client convention (the empty
+    /// string never reaches storage); a HALF pair is a damaged row and is
+    /// refused at the exchange, never treated as a public client.
+    pub client_secret_ciphertext: Option<Vec<u8>>,
+    /// The seal's fresh 24-byte nonce (the pair's second half, stored as
+    /// the TOTP columns store theirs).
+    pub client_secret_nonce: Option<Vec<u8>>,
     /// Redirect URI registered with the provider.
     pub redirect_uri: String,
     /// Requested scopes (space separated).

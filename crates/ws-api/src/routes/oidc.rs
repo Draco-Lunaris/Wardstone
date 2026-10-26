@@ -13,7 +13,10 @@
 //! with no capability gate (the pre-auth login page's flag — see
 //! [`config_status`]).
 //!
-//! The `client_secret` never leaves the server: the read response carries
+//! The `client_secret` never leaves the server — it is SEALED at rest
+//! under the instance's secret-encryption key (the TOTP pair's storage
+//! shape) on write, and is opened into the protected arena only where
+//! the login flow's exchange path consumes it: the read response carries
 //! `client_secret_set: bool` only, and the audit details carry
 //! `provider_type` and `discovery_url` — never secret material.
 
@@ -25,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use ws_auth::oidc::{discover, OidcConfig};
+use ws_ca::keystore::protected_memory_failure;
 use ws_core::models::credential::OidcConfigModel;
 use ws_core::models::rbac::Capability;
 use ws_core::repo::audit_repo::AuditRepo;
@@ -154,11 +158,13 @@ async fn get_config(
     Ok(json_no_store(OidcConfigResponse::of(&row)))
 }
 
-/// `PUT /api/v1/oidc/config` — `manage_system`. Validates the body, fills
-/// `client_secret: None` from the row being replaced (or refuses a
-/// secret-less first configuration), upserts, and audits
-/// `oidc_config_updated` in one transaction (the audit-failure rollback
-/// contract).
+/// `PUT /api/v1/oidc/config` — `manage_system`. Validates the body, seals
+/// the typed `client_secret` under the instance's secret-encryption key
+/// (an EMPTY typed secret normalizes to the absent pair — the
+/// public-client convention), keeps the stored seal byte-identical when
+/// `client_secret` is `None` on an existing row (or refuses a secret-less
+/// first configuration), upserts, and audits `oidc_config_updated` in one
+/// transaction (the audit-failure rollback contract).
 async fn put_config(
     auth: AuthActor,
     State(state): State<AppState>,
@@ -177,21 +183,32 @@ async fn put_config(
     }
 
     // The upsert replaces the whole row, so a `None` secret on an
-    // EXISTING row is filled from that very row (keep the stored
-    // secret); on a NEW row there is nothing to keep — the secret is
-    // required. Read, upsert, and the audit row share one transaction.
+    // EXISTING row carries that row's stored seal forward BYTE-IDENTICAL
+    // (never open+re-seal — resealing would churn the nonce and create a
+    // needless unseal event); on a NEW row there is nothing to keep —
+    // the secret is required. A typed EMPTY secret normalizes to the
+    // ABSENT pair (the public client) — never a sealed empty ciphertext.
+    // Read, upsert, and the audit row share one transaction.
     let mut tx = state.pool.begin().await?;
     let existing = OidcConfigRepo::new().get(&mut *tx, auth.tenant_id).await?;
-    let client_secret = match body.client_secret.as_deref() {
-        Some(secret) => secret.to_string(),
-        None => existing
-            .as_ref()
-            .map(|row| row.client_secret.clone())
-            .ok_or_else(|| {
-                ApiError::bad_request(
+    let secret_box = state.secret_box()?;
+    let (client_secret_ciphertext, client_secret_nonce) = match body.client_secret.as_deref() {
+        Some(secret) if !secret.is_empty() => {
+            let (ciphertext, nonce) = secret_box.seal(secret.as_bytes()).map_err(ApiError::from)?;
+            (Some(ciphertext), Some(nonce))
+        }
+        Some(_) => (None, None),
+        None => match existing.as_ref() {
+            Some(row) => (
+                row.client_secret_ciphertext.clone(),
+                row.client_secret_nonce.clone(),
+            ),
+            None => {
+                return Err(ApiError::bad_request(
                     "client_secret is required when first configuring the provider",
-                )
-            })?,
+                ))
+            }
+        },
     };
     let model = OidcConfigModel {
         tenant_id: auth.tenant_id,
@@ -199,7 +216,8 @@ async fn put_config(
         display_name: body.display_name,
         discovery_url: body.discovery_url,
         client_id: body.client_id,
-        client_secret,
+        client_secret_ciphertext,
+        client_secret_nonce,
         redirect_uri: body.redirect_uri,
         scopes: body.scopes,
     };
@@ -274,23 +292,40 @@ async fn test_config(
         .map_err(ApiError::from)?;
     let config: OidcConfig = match body.and_then(|Json(body)| body.r#override) {
         // An override is probed exactly as given; discovery uses only the
-        // discovery URL, so an absent secret is the public-client
-        // default and the other fields are unused by `discover`.
-        Some(override_body) => OidcConfig {
-            provider_type: override_body.provider_type,
-            display_name: override_body.display_name,
-            discovery_url: override_body.discovery_url,
-            client_id: override_body.client_id,
-            client_secret: override_body.client_secret.unwrap_or_default(),
-            redirect_uri: override_body.redirect_uri,
-            scopes: override_body.scopes,
-        },
+        // discovery URL. The TYPED override secret — never stored, never
+        // read from the database — is copied into the protected arena, and
+        // an absent or empty one is the public-client convention.
+        Some(override_body) => {
+            let mem = ws_secmem::global()
+                .map_err(protected_memory_failure)
+                .map_err(ApiError::from)?;
+            let client_secret = match override_body.client_secret.as_deref() {
+                Some(secret) if !secret.is_empty() => mem
+                    .alloc_copy(secret.as_bytes())
+                    .map_err(protected_memory_failure)
+                    .map_err(ApiError::from)?,
+                _ => mem
+                    .alloc(0)
+                    .map_err(protected_memory_failure)
+                    .map_err(ApiError::from)?,
+            };
+            OidcConfig {
+                provider_type: override_body.provider_type,
+                display_name: override_body.display_name,
+                discovery_url: override_body.discovery_url,
+                client_id: override_body.client_id,
+                client_secret,
+                redirect_uri: override_body.redirect_uri,
+                scopes: override_body.scopes,
+            }
+        }
         None => to_auth_config(
+            &state,
             &OidcConfigRepo::new()
                 .get(&state.pool, auth.tenant_id)
                 .await?
                 .ok_or_else(not_configured)?,
-        ),
+        )?,
     };
     let discovery = discover(&config).await.map_err(|e| {
         // The shared AuthError table maps `Config` to 500 (a login-flow
@@ -307,17 +342,62 @@ async fn test_config(
     }))
 }
 
-/// The model → ws-auth conversion (field-for-field), as the login-flow
-/// side performs it in `auth.rs::provider_config`.
-fn to_auth_config(model: &OidcConfigModel) -> OidcConfig {
-    OidcConfig {
+/// The model → ws-auth conversion, as the login-flow side
+/// (`auth.rs::provider_config`) and the saved-configuration probe both
+/// perform it: the stored seal opens into the protected arena (never the
+/// heap), an absent pair is the public-client convention, and a HALF pair
+/// fails closed — see [`client_secret_of`].
+pub(crate) fn to_auth_config(
+    state: &AppState,
+    model: &OidcConfigModel,
+) -> Result<OidcConfig, ApiError> {
+    Ok(OidcConfig {
         provider_type: model.provider_type.clone(),
         display_name: model.display_name.clone(),
         discovery_url: model.discovery_url.clone(),
         client_id: model.client_id.clone(),
-        client_secret: model.client_secret.clone(),
+        client_secret: client_secret_of(state, model)?,
         redirect_uri: model.redirect_uri.clone(),
         scopes: model.scopes.clone(),
+    })
+}
+
+/// The stored client-secret seal opened into the protected arena — the
+/// exact custody the token exchange receives (`SecretBox::open`'s
+/// `Zeroizing` heap intermediate is a bounded transient; the arena copy
+/// is the one the exchange reads). An ABSENT pair is the public-client
+/// convention (an empty arena buffer). A HALF pair — ciphertext without
+/// its nonce or vice versa, a damaged or corrupted row — fails CLOSED as
+/// a typed refusal, never a silent public-client login (the same rule
+/// the TOTP open side applies to a row that claims MFA but carries no
+/// seal).
+fn client_secret_of(
+    state: &AppState,
+    model: &OidcConfigModel,
+) -> Result<ws_secmem::SecretBuf, ApiError> {
+    let mem = ws_secmem::global()
+        .map_err(protected_memory_failure)
+        .map_err(ApiError::from)?;
+    match (
+        model.client_secret_ciphertext.as_deref(),
+        model.client_secret_nonce.as_deref(),
+    ) {
+        (Some(ciphertext), Some(nonce)) => {
+            let secret_box = state.secret_box()?;
+            let opened = secret_box.open(ciphertext, nonce).map_err(ApiError::from)?;
+            mem.alloc_copy(&opened)
+                .map_err(protected_memory_failure)
+                .map_err(ApiError::from)
+        }
+        (None, None) => mem
+            .alloc(0)
+            .map_err(protected_memory_failure)
+            .map_err(ApiError::from),
+        _ => Err(ApiError::Internal(
+            "the provider configuration carries a damaged client-secret seal — refusing \
+             rather than treating it as a public client"
+                .to_string(),
+        )),
     }
 }
 
@@ -332,7 +412,7 @@ impl OidcConfigResponse {
             client_id: model.client_id.clone(),
             redirect_uri: model.redirect_uri.clone(),
             scopes: model.scopes.clone(),
-            client_secret_set: !model.client_secret.is_empty(),
+            client_secret_set: model.client_secret_ciphertext.is_some(),
         }
     }
 }

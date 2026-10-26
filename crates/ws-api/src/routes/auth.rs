@@ -728,7 +728,10 @@ async fn oidc_callback(
 
 /// The per-tenant configured provider row for `{provider}` — the row's
 /// `provider_type` must equal the label in the path; anything else is a
-/// 404 (the provider is not configured).
+/// 404 (the provider is not configured). The stored client-secret seal
+/// opens into the protected arena inside the shared conversion
+/// (`routes::oidc::to_auth_config`), so the token exchange — and only
+/// it — receives the plaintext secret.
 async fn provider_config(
     state: &AppState,
     tenant_id: Uuid,
@@ -739,15 +742,7 @@ async fn provider_config(
         .await?
         .filter(|row| row.provider_type == provider)
         .ok_or_else(|| ApiError::NotFound(format!("provider {provider:?} is not configured")))?;
-    Ok(ws_auth::oidc::OidcConfig {
-        provider_type: row.provider_type,
-        display_name: row.display_name,
-        discovery_url: row.discovery_url,
-        client_id: row.client_id,
-        client_secret: row.client_secret,
-        redirect_uri: row.redirect_uri,
-        scopes: row.scopes,
-    })
+    crate::routes::oidc::to_auth_config(state, &row)
 }
 
 /// Match the verified provider identity to an account: by `oidc_sub`

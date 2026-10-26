@@ -2426,14 +2426,15 @@ async fn oidc_start_mints_csrf_state() {
     let _db = lock_db().await;
     let mut fx = fixture().await;
 
-    // Configure the (single) tenant's OIDC provider. The discovery URL is
-    // unreachable here — start is expected to fail on the network leg, but
-    // only AFTER the state was minted and stored.
+    // Configure the (single) tenant's OIDC provider: an ABSENT secret pair
+    // (the public-client convention — the columns default to NULL). The
+    // discovery URL is unreachable here — start is expected to fail on the
+    // network leg, but only AFTER the state was minted and stored.
     sqlx::query(
         "INSERT INTO oidc_config (tenant_id, provider_type, display_name, discovery_url, \
-         client_id, client_secret, redirect_uri, scopes) \
+         client_id, redirect_uri, scopes) \
          VALUES ($1, 'custom', 'Test IdP', 'http://127.0.0.1:9/.well-known/openid-configuration', \
-         'client', '', 'http://127.0.0.1:9/callback', 'openid profile email')",
+         'client', 'http://127.0.0.1:9/callback', 'openid profile email')",
     )
     .bind(fx.tenant_id)
     .execute(&fx.pool)

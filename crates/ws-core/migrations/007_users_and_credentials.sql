@@ -108,9 +108,13 @@ CREATE TABLE oidc_config (
     display_name  TEXT NOT NULL DEFAULT '',
     discovery_url TEXT NOT NULL DEFAULT '',
     client_id     TEXT NOT NULL DEFAULT '',
-    -- Empty string for public clients (Keycloak); non-empty for
-    -- confidential clients (Azure AD). Sealing at rest is Task 5's.
-    client_secret TEXT NOT NULL DEFAULT '',
+    -- The confidential client's secret, sealed at rest under the
+    -- instance master KEK (XChaCha20-Poly1305 via ws_core::crypto's
+    -- SecretBox, the TOTP pair's storage shape); an ABSENT pair is the
+    -- public-client convention (Keycloak) — the empty string never
+    -- reaches storage.
+    client_secret_ciphertext BYTEA,
+    client_secret_nonce     BYTEA,
     redirect_uri  TEXT NOT NULL DEFAULT '',
     scopes        TEXT NOT NULL DEFAULT 'openid profile email'
 );
