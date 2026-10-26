@@ -37,6 +37,13 @@ pub const PLACEHOLDER_SAN: &str = "wardstone-setup.local";
 /// requires it (`store_setup_key` is `Corrupt` without one). The setup key
 /// counts towards `has_stored_keys`, so a store holding ONLY the setup key
 /// never silently gets a fresh master either.
+///
+/// [TRANSITIONAL — Task 6 removed the SETUP-side callers (the seal-at-
+/// creation setup mints every key sealed from the start and never touches
+/// the slot); this mint survives on its ONE remaining caller, the
+/// first-run branch of the `wardstone ui` boot, until Task 7's D2 boot
+/// rewrite replaces it with the ephemeral in-memory shape and deletes it
+/// together with the setup-key slot.]
 pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, String), CaError> {
     keystore.ensure_master_key()?;
 
@@ -91,9 +98,13 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
 /// setup-slot write, and a validity of hours: the certificate lives only
 /// long enough for the operator to read the unlock page and enter the
 /// master passphrase, after which the TLS reload presents the real leaf.
-/// The fingerprint returns for the unlock page's out-of-band hint.
-pub fn sealed_certificate(san: &str) -> Result<(String, Vec<u8>, String), CaError> {
+/// The private key returns as a `ws_secmem::SecretBuf` — born straight
+/// into the protected arena (no heap copy, no file; wiped with the arena
+/// reservation when the caller drops it). The fingerprint returns for
+/// the unlock page's out-of-band hint.
+pub fn sealed_certificate(san: &str) -> Result<(String, ws_secmem::SecretBuf, String), CaError> {
     let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
+    let private_key_der = Zeroizing::new(private_key_der);
 
     let mut params = rcgen::CertificateParams::default();
     let mut dn = rcgen::DistinguishedName::new();
@@ -125,7 +136,14 @@ pub fn sealed_certificate(san: &str) -> Result<(String, Vec<u8>, String), CaErro
 
     let certificate = params.self_signed(&key_pair)?;
     let fingerprint = hex::encode(Sha256::digest(certificate.der().as_ref()));
-    Ok((certificate.pem(), private_key_der.to_vec(), fingerprint))
+    // The private key crosses to the caller in RAM custody only: the
+    // arena reservation is the one plaintext copy (the Zeroizing
+    // original above dies at this scope's end), so the sealed boot can
+    // hand it to the listener without any intermediate heap buffer.
+    let key = ws_secmem::global()
+        .and_then(|mem| mem.alloc_copy(&private_key_der))
+        .map_err(|e| CaError::Worker(format!("tls: the protected key arena: {e}")))?;
+    Ok((certificate.pem(), key, fingerprint))
 }
 
 /// The SAN from `san`: an IP address becomes an `iPAddress`, anything else

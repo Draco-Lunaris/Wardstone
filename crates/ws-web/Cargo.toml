@@ -43,8 +43,12 @@ hex = { workspace = true }
 # ws-ca's keystore and ws-api's export use).
 base64 = { workspace = true }
 # Zeroizing the leaf key DER copies between generation and the keystore
-# envelope (the same pattern ws-ca/key material handling uses).
-zeroize = { workspace = true }
+# envelope (the same pattern ws-ca/key material handling uses). The
+# `serde` feature is load-bearing for the setup POST: `db_password` IS a
+# `Zeroizing<String>` inside the `Json<SetupFields>` extractor, so the
+# typed database password deserializes straight into the zeroizing
+# wrapper and is wiped the moment the handler returns.
+zeroize = { workspace = true, features = ["serde"] }
 # 16 fresh OS-entropy bytes for the setup certificate's serial (rand 0.10
 # SysRng, the house pattern — rcgen's default serial is deterministic and
 # the house refuses it: ws-ca's `new_serial` documents why).
@@ -87,6 +91,14 @@ tower = { workspace = true }
 # The sealed shells' async build closures return BoxFuture (the unlock
 # constructs pools + routers asynchronously).
 futures-util = { workspace = true }
+# Seal-at-creation: the setup flow MINTS its keys (master,
+# secret-encryption, JWT pair, CA + leaf) straight into the protected
+# arena — `run_setup` allocates the `SecretBuf` custodies, `tls.rs`
+# hands the sealed-mode key to the listener in RAM custody, and
+# `SetupOutcome.leaf_key` crosses to the caller the same way. Production
+# code in this crate now holds key custody, so the dependency is a
+# regular one (it was dev-only when only the test fixtures used it).
+ws-secmem = { path = "../ws-secmem" }
 
 [dev-dependencies]
 # Parsing the minted setup certificate in the tests (self-signedness,
@@ -105,13 +117,3 @@ jsonwebtoken = { workspace = true }
 # same canonical answers. Test-only: ws-web's production graph stays
 # acyclic without it.
 ws-acme = { path = "../ws-acme" }
-# The unlock-state fixtures (e2e_test, setup_test, heal_test) build the
-# unlocked custodies over the protected arena (SecretBuf / SecretBox)
-# exactly as the sealed boot does. Dev-only: ws-web's production graph
-# keeps no key custody of its own beyond the per-use unwrap it borrows
-# from ws-ca.
-ws-secmem = { path = "../ws-secmem" }
-
-# The fixture keypair's modulus bytes → the JWK `n` (base64url).
-# (base64 itself is a regular dependency above; the URL-safe engine rides
-# the same crate.)

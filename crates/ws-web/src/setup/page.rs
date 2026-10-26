@@ -7,8 +7,9 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-use super::{run_setup, validate_hostname_permitted, SetupFields, SetupState};
+use super::{run_setup, validate_hostname_permitted, SetupError, SetupFields, SetupState};
 
 /// The setup page. The fingerprint is the SHA-256 of the DER of the
 /// certificate the TLS listener is serving for THIS request — the binary
@@ -19,21 +20,15 @@ pub async fn setup_page(State(state): State<SetupState>) -> Html<String> {
     Html(render(&state.fingerprint, &state.hostname))
 }
 
-/// The setup submit: validate, run the bootstrap, and report.
+/// The setup submit: validate, run the seal-at-creation bootstrap (the
+/// pool rides the typed `db_password`; the master envelope lands LAST;
+/// the DB credential rotation follows the commit), relay the unlock to
+/// the api, resume the listener onto the CA-issued leaf IN PLACE, and
+/// report.
 ///
-/// # The TLS switch is a process restart
-///
-/// The bootstrap has written the CA-issued leaf into the keystore (its
-/// certificate row and key envelope) by the time this response is sent;
-/// the response body carries `"restart": true`, and the `wardstone ui`
-/// binary treats THAT as its signal to exit with a success code, letting
-/// the compose service's `restart: unless-stopped` bring the process back
-/// up serving the CA-issued certificate. axum-server also supports a
-/// graceful listener restart, but the exit-and-restart path is the
-/// simplest correct implementation for a single-purpose, stateless
-/// process — and it re-runs the boot checks the process owns (JWT keys,
-/// keystore open, conditional setup mount) instead of hot-swapping one
-/// certificate underneath them.
+/// The relay order is the design's (the D1 step list's successor): it
+/// runs AFTER the rotation inside [`run_setup`] — so the api's unlock
+/// opens the ROTATED credential — and BEFORE the TLS swap below.
 pub async fn submit_setup(
     State(state): State<SetupState>,
     Json(fields): Json<SetupFields>,
@@ -43,64 +38,23 @@ pub async fn submit_setup(
     // The Plan-2 I-3 fix's primary seam: refuse a `server_hostname` the
     // built-in `web-server` profile's SAN patterns forbid BEFORE any
     // bootstrap work — nothing is committed, the form gets a 400. The
-    // same check is re-applied by `run_setup` inside its leaf transaction
-    // as defense-in-depth for direct library callers (see
+    // same check is re-applied by `run_setup` inside its setup
+    // transaction as defense-in-depth for direct library callers (see
     // `validate_hostname_permitted`'s "two checks").
     validate_hostname_permitted(&fields).map_err(SubmitError::BadRequest)?;
 
-    let keys_dir = state.keys_dir;
-    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir)?;
-    let (leaf_pem, leaf_key_der) = run_setup(&fields, &state.pool, &mut keystore).await?;
-
-    // The seal: every plaintext key file wraps into
-    // passphrase-sealed envelopes, the DB credential rotates under the
-    // same passphrase, and the plaintext originals are DELETED — the
-    // volume is inert from here on and every future boot is locked.
-    // The rotation's target is the URL's login role (F5, the External
-    // variant): a DATABASE_URL that does not use the compose default
-    // must rotate ITS role, or the next boot's connect strands the
-    // real one on its bootstrap password. The same derivation the
-    // api's unlock builder uses.
-    let db_role = ws_core::crypto::db_role_of(&state.database_url)
-        .map_err(|e| ws_ca::error::CaError::Worker(format!("the database URL: {e}")))?;
-    crate::setup::seal_keys_volume(&keys_dir, &fields.master_passphrase, &state.pool, &db_role)
-        .await?;
-    drop(keystore);
-
-    // The resume contract: the listener swaps onto the CA-issued leaf IN
-    // PLACE — no restart, no re-listen. The operator continues straight
-    // to the login on the same connection.
-    if let Some(reload) = state.tls_reload.clone() {
-        use base64::Engine as _;
-        let body = base64::engine::general_purpose::STANDARD.encode(&*leaf_key_der);
-        let mut key_pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-        let mut rest = body.as_str();
-        while !rest.is_empty() {
-            let (line, tail) = rest.split_at(rest.len().min(64));
-            key_pem.push_str(line);
-            key_pem.push('\n');
-            rest = tail;
-        }
-        key_pem.push_str("-----END PRIVATE KEY-----\n");
-        reload
-            .reload_from_pem(leaf_pem.into_bytes(), key_pem.into_bytes())
-            .await
-            .map_err(|e| {
-                SubmitError::Setup(ws_ca::error::CaError::Worker(format!(
-                    "the TLS resume failed: {e}"
-                )))
-            })?;
-        tracing::info!("the listener resumed onto the CA-issued leaf in place");
-    }
+    let keys_dir = state.keys_dir.clone();
+    let outcome = run_setup(&fields, &state.database_url, &keys_dir).await?;
 
     // The fresh-install flow's api half (the compose contract): the api
     // process booted as the sealed shell — its password-less
     // DATABASE_URL leaves it nothing to build a pool from — and this one
-    // relay is the event that brings its full surface up. Best-effort BY
-    // DESIGN (spec §5): a relay that does not land leaves the api sealed,
-    // the logged verdict names it, and the documented recovery is the
-    // api's restart plus its own unlock — the operator's setup result
-    // never depends on it.
+    // relay is the event that brings its full surface up. It runs AFTER
+    // the rotation (the api's unlock opens the rotated credential).
+    // Best-effort BY DESIGN (spec §5): a relay that does not land leaves
+    // the api sealed, the logged verdict names it, and the documented
+    // recovery is the api's restart plus its own unlock — the operator's
+    // setup result never depends on it.
     if let Err(reason) =
         crate::locked::relay_unlock(&keys_dir, &state.api_base_url, &fields.master_passphrase).await
     {
@@ -109,6 +63,27 @@ pub async fn submit_setup(
             "the setup commit's api unlock relay did not land; the api stays \
              sealed until its restart and unlock"
         );
+    }
+
+    // The resume contract: the listener swaps onto the CA-issued leaf IN
+    // PLACE — no restart, no re-listen. The operator continues straight
+    // to the login on the same connection. The leaf key's PEM lives in a
+    // `Zeroizing` buffer until the reload consumes it (Task 8's resolver
+    // removes this interim PEM handoff).
+    if let Some(reload) = state.tls_reload.clone() {
+        let key_pem = pkcs8_pem_of(&outcome.leaf_key);
+        reload
+            .reload_from_pem(
+                outcome.leaf_cert_pem.clone().into_bytes(),
+                key_pem.as_str().as_bytes().to_vec(),
+            )
+            .await
+            .map_err(|e| {
+                SubmitError::Setup(SetupError::Ca(ws_ca::error::CaError::Worker(format!(
+                    "the TLS resume failed: {e}"
+                ))))
+            })?;
+        tracing::info!("the listener resumed onto the CA-issued leaf in place");
     }
 
     Ok(Json(serde_json::json!({
@@ -120,17 +95,41 @@ pub async fn submit_setup(
     })))
 }
 
-/// A setup-submit failure: a malformed form is the caller's mistake (400),
-/// anything the bootstrap rejects is an operator problem to look at (500,
-/// with the typed message).
+/// A PKCS#8 DER private key as the PEM form the reload takes (the same
+/// 64-column wrapping the house uses). The returned buffer is
+/// `Zeroizing`: the leaf key's PEM form exists only for the reload's
+/// interim handoff (Task 8's resolver removes it).
+fn pkcs8_pem_of(der: &ws_secmem::SecretBuf) -> Zeroizing<String> {
+    use base64::Engine as _;
+
+    let body = base64::engine::general_purpose::STANDARD.encode(&der[..]);
+    let mut pem = Zeroizing::new(String::from("-----BEGIN PRIVATE KEY-----\n"));
+    let mut rest = body.as_str();
+    while !rest.is_empty() {
+        let (line, tail) = rest.split_at(rest.len().min(64));
+        pem.push_str(line);
+        pem.push('\n');
+        rest = tail;
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    pem
+}
+
+/// A setup-submit failure: the typed vocabulary the seal-at-creation
+/// bootstrap produces. The page answers a 400 the operator can retry
+/// (form checks, a wrong database password), a 409 for an existing
+/// install (the state conflict — this pair of volumes cannot proceed at
+/// all), and a 500 for everything else (the server logs carry the typed
+/// message). No message ever carries key material, a passphrase, or a
+/// password.
 #[derive(Debug, Error)]
 pub enum SubmitError {
     /// The form failed its basic checks.
     #[error("invalid setup form: {0}")]
     BadRequest(String),
-    /// The bootstrap transaction (or the TLS material around it) failed.
+    /// The bootstrap (or the TLS resume around it) failed.
     #[error(transparent)]
-    Setup(#[from] ws_ca::error::CaError),
+    Setup(#[from] SetupError),
 }
 
 impl IntoResponse for SubmitError {
@@ -141,9 +140,31 @@ impl IntoResponse for SubmitError {
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
-            SubmitError::Setup(inner) => (
+            // The operator can retry with corrected input; the copy is
+            // the form's own, never internals.
+            SubmitError::Setup(SetupError::Validation(message)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            SubmitError::Setup(SetupError::DbRejected) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "the database rejected that password" })),
+            )
+                .into_response(),
+            // The copy is the design's exact refusal — verbatim.
+            SubmitError::Setup(SetupError::InstallExists) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "the database already holds an install but the keys volume \
+                     is empty — restore the matching keys volume, or remove both \
+                     volumes and run setup again"
+                })),
+            )
+                .into_response(),
+            SubmitError::Setup(other) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": inner.to_string() })),
+                Json(serde_json::json!({ "error": other.to_string() })),
             )
                 .into_response(),
         }
@@ -168,6 +189,7 @@ fn validate(fields: &SetupFields) -> Result<(), String> {
         ("admin_password", fields.admin_password.as_str()),
         ("default_domain", fields.default_domain.as_str()),
         ("server_hostname", fields.server_hostname.as_str()),
+        ("db_password", fields.db_password.as_str()),
     ];
     for (name, value) in required {
         if value.trim().is_empty() {
@@ -207,6 +229,7 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
     default_domain: form.default_domain.value,
     admin_cidrs: form.admin_cidrs.value.split(',').map(s => s.trim()).filter(Boolean),
     server_hostname: form.server_hostname.value,
+    db_password: form.db_password.value,
   };
   const note = document.getElementById('result');
   try {
@@ -291,6 +314,11 @@ fn render(fingerprint: &str, hostname: &str) -> String {
              will serve after setup — it is not derived from the default domain, but it MUST \
              fall under the default domain above (e.g. <code>wardstone.example.com</code> \
              with default domain <code>example.com</code>).</p>\n",
+            "<label for=\"db_password\">Database password — the login credential DATABASE_URL's role carries today</label>\n",
+            "<input id=\"db_password\" name=\"db_password\" type=\"password\" autocomplete=\"current-password\" required>\n",
+            "<p class=\"hint\">Setup connects with this password exactly once, rotates the \
+             database role to a fresh random credential, and seals that one under the master \
+             passphrase — the password you type here is never stored.</p>\n",
             "<button type=\"submit\">Complete setup</button>\n",
             "</form>\n",
             "<div id=\"result\"></div>\n",

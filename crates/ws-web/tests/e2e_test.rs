@@ -83,6 +83,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
+use zeroize::Zeroizing;
 
 use ws_api::state::{ApiConfig, AppState};
 use ws_web::session::store::SessionStore;
@@ -469,6 +470,7 @@ async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: SETUP_PASSPHRASE.to_string(),
         master_passphrase_confirm: SETUP_PASSPHRASE.to_string(),
     };
@@ -497,26 +499,19 @@ async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
         "the setup submit carries the resume contract (the listener swaps \
          onto the CA-issued leaf in place — no restart, no re-listen)"
     );
-    // The conversion sealed the shared volume's three bootstrap secrets;
-    // the FOURTH envelope belongs to the api's unlocked construction — a
-    // fresh install never mints a plaintext JWT pair for the conversion
-    // to wrap, so the pair's envelope is minted at the relayed unlock.
+    // The seal-at-creation setup sealed the shared volume's FOUR
+    // bootstrap envelopes — the JWT pair's included (every key is minted
+    // straight into its envelope; the relayed unlock merely opens it).
     assert!(
         [
             ws_web::setup::MASTER_ENVELOPE_FILE,
             ws_web::setup::SECRET_ENVELOPE_FILE,
+            ws_web::setup::JWT_ENVELOPE_FILE,
             ws_web::setup::DB_CREDENTIAL_ENVELOPE_FILE,
         ]
         .iter()
         .all(|name| fixture.keys_dir.join(name).exists()),
-        "the conversion seals the shared volume"
-    );
-    assert!(
-        fixture
-            .keys_dir
-            .join(ws_web::setup::JWT_ENVELOPE_FILE)
-            .exists(),
-        "the relayed unlock mints the JWT pair straight into its envelope"
+        "the setup seals the shared volume"
     );
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
@@ -704,7 +699,6 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
     // the setup must succeed ANYWAY — the best-effort contract whose
     // recovery is the api's restart plus its own unlock.
     let setup_router = setup::setup_router(SetupState {
-        pool: fixture.pool.clone(),
         keys_dir: fixture.keys_dir.clone(),
         fingerprint: PAGE_FINGERPRINT.to_string(),
         hostname: HOSTNAME.to_string(),
@@ -718,6 +712,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: SETUP_PASSPHRASE.to_string(),
         master_passphrase_confirm: SETUP_PASSPHRASE.to_string(),
     };
@@ -752,21 +747,22 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
 
     // -- 2. The API router over the SAME pool and keys directory ------------
     // The api process's post-unlock construction, modeled in-process:
-    // the JWT pair mints straight into its envelope (a fresh install
-    // never writes plaintext — there is no pair for the conversion to
-    // have wrapped), and the CA master + secret-encryption keys open
-    // from their envelopes into RAM custody — the converted volume
-    // holds no plaintext for the file mode to read. The builder's own
-    // pool + rotation are the sealed-test's and the front-door helper's
-    // coverage; here the fixture's pool keeps this world divergence-
-    // free while the CUSTODY (what the issuance cycle exercises) is the
-    // production shape.
+    // the JWT pair's envelope was minted by the setup commit itself
+    // (seal-at-creation: no key is ever minted in plaintext and
+    // converted later), so this call merely LOADS it, and the CA
+    // master + secret-encryption keys open from their envelopes into
+    // RAM custody — the sealed volume holds no plaintext for the file
+    // mode to read. The builder's own pool + rotation are the
+    // sealed-test's and the front-door helper's coverage; here the
+    // fixture's pool keeps this world divergence-free while the
+    // CUSTODY (what the issuance cycle exercises) is the production
+    // shape.
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &fixture.keys_dir.join(ws_web::setup::JWT_ENVELOPE_FILE),
         SETUP_PASSPHRASE.as_bytes(),
         0,
     )
-    .expect("mint the JWT pair straight into its envelope");
+    .expect("load the setup-minted JWT pair envelope");
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
             && !fixture.keys_dir.join("jwt-verify-key.pem").exists(),
@@ -776,12 +772,12 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         &fixture.keys_dir.join(ws_web::setup::MASTER_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
     )
-    .expect("open the master envelope the conversion sealed");
+    .expect("open the master envelope the setup sealed");
     let secret = ws_core::crypto::KeyEnvelope::open_envelope(
         &fixture.keys_dir.join(ws_web::setup::SECRET_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
     )
-    .expect("open the secret-encryption envelope the conversion sealed");
+    .expect("open the secret-encryption envelope the setup sealed");
     let config = ApiConfig::new(DOMAIN.to_string(), fixture.keys_dir.clone());
     let mem = ws_secmem::global().expect("the protected pool initializes");
     let state = AppState::new_unlocked(
@@ -1212,6 +1208,7 @@ async fn ui_session_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: "the-master-passphrase".to_string(),
         master_passphrase_confirm: "the-master-passphrase".to_string(),
     };

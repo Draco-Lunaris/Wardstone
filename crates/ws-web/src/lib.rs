@@ -212,7 +212,6 @@ pub async fn web_router_with_store(
     // plain 404 the setup/e2e suites pin (404, not 403).
     let app = if !tenant_exists(&pool).await? {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_router(SetupState {
-            pool,
             keys_dir,
             fingerprint,
             hostname,

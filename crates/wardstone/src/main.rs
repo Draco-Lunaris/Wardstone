@@ -579,8 +579,9 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     // The ephemeral sealed certificate: hours of validity, no keystore.
     let (sealed_pem, sealed_key, sealed_fingerprint) =
         ws_web::setup::tls::sealed_certificate(&hostname)?;
-    // The sealed key exists only long enough to build the initial config.
-    let sealed_key = Zeroizing::new(sealed_key);
+    // The sealed key exists only long enough to build the initial config
+    // (a ws-secmem arena reservation: RAM custody, wiped on drop — no
+    // intermediate heap copy).
     let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
     let reload_handle = tls_config.clone();
 
@@ -696,15 +697,29 @@ fn unlocked_web_build(
                             &keys_dir.join(MASTER_ENVELOPE_FILE),
                         )
                         .map_err(|e| err(format!("the recovery generation: {e}")))?;
-                        let fresh = ws_web::setup::reseed_db_credential(
+                        // The typed credential the recovery connects with:
+                        // until Task 7's unlock page collects a typed
+                        // database password field, the recovery runbook's
+                        // env URL itself carries the fresh bootstrap
+                        // password (the old §8 shape), so the URL's own
+                        // embedded password IS the typed one. Never
+                        // logged, never stored.
+                        let typed = url_password_of(&database_url).ok_or_else(|| {
+                            err("the recovery URL carries no password: the \
+                                 db-volume-recovery runbook sets the fresh bootstrap \
+                                 credential in the URL"
+                                .to_string())
+                        })?;
+                        let fresh = ws_web::setup::recover_db_credential(
                             &keys_dir,
-                            &passphrase,
+                            passphrase.as_bytes(),
                             &database_url,
+                            typed.as_bytes(),
                             generation,
                         )
                         .await
                         .map_err(|e| err(format!("the db re-seed: {e}")))?;
-                        substitute_db_password(&database_url, &fresh)
+                        substitute_db_password(&database_url, &String::from_utf8_lossy(&fresh))
                     }
                     Err(other) => return Err(err(format!("the db credential: {other}"))),
                 };
@@ -902,6 +917,22 @@ fn db_url_has_password(url: &str) -> bool {
         return false;
     };
     url[auth_start..at].rfind(':').is_some()
+}
+
+/// The password embedded in a `DATABASE_URL` authority, if any — the
+/// recovery arm's interim TYPED credential (Task 7's unlock page
+/// replaces it with a typed field): the old §8 runbook sets the fresh
+/// bootstrap password in the env URL itself, so the URL's own embedded
+/// password is the one the recovery rotation connects with. The
+/// parsing mirrors [`substitute_db_password`]'s (and
+/// [`db_url_has_password`]'s): the password is whatever follows the
+/// last `:` in the `://…@` authority. Never logged.
+fn url_password_of(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let auth_start = scheme_end + 3;
+    let at = url[auth_start..].find('@').map(|i| i + auth_start)?;
+    let colon = url[auth_start..at].rfind(':')?;
+    Some(url[auth_start + colon + 1..at].to_owned())
 }
 
 /// The api's [`ws_api::ApiConfig`] from the boot env, for the sealed
