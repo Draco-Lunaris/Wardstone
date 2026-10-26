@@ -5,18 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Argon2id password hashing (workspace pin; default features enable the
-# auto-salted `PasswordHasher::hash_password`).
+# Argon2id password hashing (workspace pin). Production code uses the
+# externally-supplied-memory API (`hash_password_into_with_memory`) so every
+# pass runs in a locked ws-secmem slot; the default features are still on
+# for `password_hash::phc` — the PHC parser, and the B64 field encoders the
+# hand-built PHC string uses — and for the auto-salted
+# `PasswordHasher::hash_password`, which only the format-compatibility test
+# calls (it allocates its own argon2 memory on the heap).
 argon2 = { workspace = true }
 # iat/exp unix timestamps on the JWT claims (house pattern).
 chrono = { workspace = true }
 # Ed25519 keypair generation for the JWT signing/verification key pair
-# (keys are kept in PEM form, matching the house layout).
+# (the signing key lives in the protected arena as PKCS#8 DER; the sealed
+# envelope's payload speaks the pair's PEM forms).
 ed25519-dalek = { workspace = true }
 # JWT issuing/validation with the pure-Rust Ed25519 backend.
 jsonwebtoken = { workspace = true }
 # PKCS#8/SPKI encoders plus the `pem` feature (to_pkcs8_pem /
-# to_public_key_pem / LineEnding) for writing the key pair.
+# to_public_key_pem / LineEnding) for the pair's PEM forms.
 pkcs8 = { workspace = true }
 # OIDC discovery / code-exchange / JWKS HTTP fetches (rustls backend).
 reqwest = { workspace = true }
@@ -55,6 +61,10 @@ uuid = { workspace = true, features = ["serde"] }
 # would be a Cargo cycle. Task 1 deferred this edge; re-exports it at the
 # crate root.
 ws-core = { path = "../ws-core" }
+# The locked argon2 slots and the protected arena: argon2id's 64 MiB of
+# scratch and the derived tag both live in the process's `memfd_secret`
+# pool, never on the heap (see password.rs).
+ws-secmem = { path = "../ws-secmem" }
 
 [dev-dependencies]
 # The TOTP test computes a code with an independent RFC 6238 HMAC-SHA1

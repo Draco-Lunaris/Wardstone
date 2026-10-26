@@ -8,6 +8,10 @@ rust-version.workspace = true
 # "ipnet" adds the std::net::IpAddr <-> inet binding (and its array form)
 # used by the certificates table's san_ips inet[] column (migration 002).
 sqlx = { workspace = true, features = ["macros", "migrate", "uuid", "chrono", "ipnet"] }
+# `log::LevelFilter::Off` in db.rs's statement-logging suppression: sqlx
+# does not re-export the log crate (already in the graph transitively via
+# sqlx — the direct pin adds no new code to the build).
+log = { workspace = true }
 # XChaCha20-Poly1305 sealing of small secrets at rest (crypto.rs SecretBox:
 # the TOTP/WebAuthn secret-encryption key file); the "zeroize" feature
 # wipes the cipher's retained key copy (same features as ws-ca's keystore).
@@ -17,17 +21,27 @@ zeroize = { workspace = true }
 # OS entropy for fresh secret-encryption keys and AEAD nonces (rand 0.10
 # SysRng, the house pattern).
 rand = { workspace = true }
+# The DB credential's SCRAM-SHA-256 verifier derivation (dbcred, Task 4):
+# PBKDF2-HMAC-SHA-256, HMAC-SHA-256, SHA-256 — the same ring the rustls
+# `ring` provider already resolves, so aws-lc-rs stays out.
+ring = { workspace = true }
 # jsonb decode/encode for the audit_log details column (migration 003).
 # The master-passphrase KEK derivation (KeyEnvelope): argon2id is the
 # memory-hard KDF that makes off-box brute force against the sealed
 # envelopes meet the unlock-latency budget (~1 s at the shipped params).
-# Workspace pin; the same argon2 ws-auth uses for credentials.
+# Workspace pin; the same argon2 ws-auth uses for credentials. The
+# derivation uses the externally-supplied-memory API so the 256 MiB of
+# memory-hard scratch comes from a locked ws-secmem slot, never the heap.
 argon2 = { workspace = true }
+# The locked KDF slot and the protected arena: the master-key derivation's
+# scratch and the derived KEK both live in the process's `memfd_secret`
+# pool (see KeyEnvelope::derive_kek).
+ws-secmem = { path = "../ws-secmem" }
 # The envelope file format carries base64 (standard) fields — the same
 # encoding idiom as the keystore envelope's JSON.
 base64 = { workspace = true }
-# Hex encoding of the DB-credential rotation's fresh random bytes (the
-# same encoding the opaque token family uses).
+# Hex encoding of the relay nonce's random bytes (the same encoding
+# the opaque token family uses).
 hex = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -44,3 +58,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 # Audit-entry fixtures (json! macro) in tests/repo_test.rs.
 serde_json = { workspace = true }
+# The rotation suite's statement-capture wrapper implements sqlx's
+# `Executor` trait, whose `fetch_many` return type is spelled with
+# `BoxStream` (futures-util re-exports futures-core's alias; resolved
+# transitively via sqlx already).
+futures-util = { workspace = true }

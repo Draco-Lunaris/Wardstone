@@ -27,7 +27,8 @@
 //! mounted, the setup routes exist only while the default tenant does not
 //! (the setup endpoint is not routed once it does — the Review Focus item
 //! 5 — not merely refused), and the SPA router rides the fallback, so
-//! earlier routes always win. [`serve_tls`] is the listener the Task 12
+//! earlier routes always win. [`serve_tls_with_config`] is the listener
+//! the Task 12
 //! binary puts that router on: HTTPS from the very first request, on
 //! either the setup certificate or the CA-issued leaf — with the client's
 //! socket address attached to every request (`ConnectInfo`, Task 12's
@@ -37,6 +38,7 @@ pub mod locked;
 pub mod proxy;
 pub mod session;
 pub mod setup;
+pub mod tls_signer;
 pub mod ui;
 
 use std::net::SocketAddr;
@@ -45,8 +47,6 @@ use std::time::Duration;
 
 use axum::Extension;
 use axum::Router;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use sqlx::PgPool;
 use ws_ca::error::CaError;
 
@@ -146,19 +146,22 @@ pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
 /// oneshot request carries no `ConnectInfo` for the per-IP key extractor,
 /// the same reason ws-api's tests disable its layer).
 ///
-/// `tls_reload` is the listener's reloadable TLS config — the handle the
-/// SETUP branch's commit swaps onto the CA-issued leaf in place (the
-/// resume contract). It matters only while the setup surface mounts (no
-/// tenant yet): the binary passes `Some(clone)` on that boot path and
-/// `None` on the others; tests pass `None` (no listener to swap).
+/// `tls_reload` is the listener's serving-certificate RESOLVER — the
+/// handle the SETUP branch's commit swaps onto the CA-issued leaf in
+/// place (the resume contract; the swap IS the reload, see
+/// [`tls_signer::SwapResolver`]). It matters only while the setup
+/// surface mounts (no tenant yet): the binary passes `Some(clone)` on
+/// that boot path and `None` on the others; tests pass `None` (no
+/// listener to swap).
 #[allow(clippy::too_many_arguments)]
 pub async fn web_router(
     pool: PgPool,
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
-    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
     api_base_url: &str,
+    relay_socket: &std::path::Path,
     database_url: String,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -171,6 +174,7 @@ pub async fn web_router(
         hostname,
         tls_reload,
         api_base_url,
+        relay_socket,
         database_url,
         store,
         rate_limit,
@@ -197,8 +201,9 @@ pub async fn web_router_with_store(
     keys_dir: PathBuf,
     fingerprint: String,
     hostname: String,
-    tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
     api_base_url: &str,
+    relay_socket: &std::path::Path,
     database_url: String,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
@@ -212,12 +217,11 @@ pub async fn web_router_with_store(
     // plain 404 the setup/e2e suites pin (404, not 403).
     let app = if !tenant_exists(&pool).await? {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_router(SetupState {
-            pool,
             keys_dir,
             fingerprint,
             hostname,
             tls_reload,
-            api_base_url: api_base_url.to_owned(),
+            relay_socket: relay_socket.to_path_buf(),
             database_url,
         }))
     } else {
@@ -278,78 +282,81 @@ pub fn session_router_with_store(
         )
 }
 
-/// Build the rustls [`rustls::ServerConfig`] for a PEM certificate paired
-/// with a PKCS#8 DER private key (the exact form every envelope-encrypted
-/// key in the keystore holds and every issued certificate is stored in).
+/// The FIRST-RUN front-door router (Task 7's boot rule): the setup
+/// surface with NO database connection behind it. The boot dispatched on
+/// the sealed marker's ABSENCE — a fresh install, where no tenant can
+/// exist behind an unsealed volume and setup is the only path in — so
+/// this router is built WITHOUT a pool: the RAM-only certificate, the
+/// setup page, the session relay, and the proxies are the whole
+/// surface, and the setup POST is the first thing that ever dials the
+/// database (with the operator's typed password, via
+/// [`setup::run_setup`]). A pool-less router is what makes the
+/// closed-port boot test pin real behavior: the process serves the
+/// page while `DATABASE_URL` points at a dead port, and a restart
+/// before setup writes nothing and accumulates nothing.
 ///
-/// The `ring` crypto provider is selected explicitly: the workspace pins
-/// BOTH rustls edges with default features OFF (see the workspace
-/// `Cargo.toml` — `aws-lc-rs` cannot build in this container image), and
-/// no global default is installed, so this process makes the choice
-/// per-config instead of relying on mutable process-wide state.
-pub fn rustls_server_config(
-    cert_pem: &str,
-    key_der: &[u8],
-) -> Result<rustls::ServerConfig, CaError> {
-    let cert = rustls::pki_types::CertificateDer::from(pem_to_der(cert_pem)?);
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.to_vec());
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|err| CaError::X509(format!("tls: protocol versions: {err}")))?
-        // No client certificate is accepted: the browser authenticates
-        // with its login, not with client certificates.
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key.into())
-        .map_err(|err| CaError::X509(format!("tls: certificate/key pair rejected: {err}")))
+/// `tls_reload` is the listener's serving-certificate RESOLVER — the
+/// handle the setup commit swaps onto the CA-issued leaf in place (the
+/// resume contract; the swap IS the reload); the boot passes
+/// `Some(clone)`.
+#[allow(clippy::too_many_arguments)]
+pub fn first_run_web_router(
+    keys_dir: PathBuf,
+    fingerprint: String,
+    hostname: String,
+    tls_reload: Option<std::sync::Arc<tls_signer::SwapResolver>>,
+    api_base_url: &str,
+    relay_socket: &std::path::Path,
+    database_url: String,
+    session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
+    session_router_with_store(store, api_base_url, rate_limit)
+        .merge(setup_router(SetupState {
+            keys_dir,
+            fingerprint,
+            hostname,
+            tls_reload,
+            relay_socket: relay_socket.to_path_buf(),
+            database_url,
+        }))
+        // The SPA rides LAST as always: the setup routes and the proxy
+        // above are never masked.
+        .fallback_service(ui::ui_router())
 }
 
-/// Serve `router` under TLS from `cert_pem` + `key_der` (PKCS#8 DER) on
-/// `addr`. The Task 12 `ui` binary calls this on [`web_router`]'s output
-/// with EITHER the setup certificate (the keystore setup slot,
-/// `ca/setup.key`) while no tenant exists, OR the CA-issued server leaf
-/// (cert: the `certificates` row, key: the envelope under the
-/// certificate's id) after setup — a process restart, not a hot reload,
-/// is the TLS switch between the two.
-/// A RELOADABLE TLS config: the sealed ui's listener holds one of these
-/// from its first bind (the ephemeral sealed certificate) and the unlock
-/// closure reloads it with the CA-issued leaf in place — the resume
-/// contract's TLS half (no re-listen, no restart).
-pub type TlsReloadConfig = axum_server::tls_rustls::RustlsConfig;
-
-pub fn reloadable_tls_config(
-    cert_pem: &str,
-    key_der: &[u8],
-) -> Result<axum_server::tls_rustls::RustlsConfig, CaError> {
-    let config = rustls_server_config(cert_pem, key_der)?;
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
-        std::sync::Arc::new(config),
-    ))
+/// The UNLOCKED front-door router (Task 7's pool release, Review Focus
+/// 1): the session relay, the `/api/v1` and `/acme` proxies, the plain
+/// 404s for the retired setup surface, and the SPA — with NO database
+/// pool anywhere in it. The unlock build resolved the tenant and the
+/// serving leaf BEFORE the api relay (whose rotation invalidates every
+/// fresh ui connection) and released its pool; this router serves
+/// pool-less for the process's whole remaining life, and everything
+/// database-touching rides the proxy to the api.
+pub fn unlocked_web_router(
+    api_base_url: &str,
+    session_access_ttl: Duration,
+    rate_limit: Option<ws_api::AuthRateLimit>,
+) -> Router {
+    let store = std::sync::Arc::new(SessionStore::new(session_access_ttl, DEFAULT_IDLE_EVICTION));
+    session_router_with_store(store, api_base_url, rate_limit)
+        .merge(setup_unmounted_router())
+        .fallback_service(ui::ui_router())
 }
 
-/// Serve `router` under a caller-held RELOADABLE TLS config (the sealed
-/// boot binds with the ephemeral certificate; the unlock closure reloads
-/// the same listener onto the CA-issued leaf).
+/// Serve `router` under TLS from `resolver`'s CURRENT certificate pair
+/// (the serving-certificate resolver — [`tls_signer::SwapResolver`]).
+/// The sealed boot binds with the ephemeral certificate and the unlock
+/// closure — or the setup commit on the first-run listener — swaps the
+/// same listener onto the CA-issued leaf: the swap IS the reload, no
+/// re-listen and no restart at any point.
 pub async fn serve_tls_with_config(
     addr: SocketAddr,
-    config: axum_server::tls_rustls::RustlsConfig,
+    resolver: std::sync::Arc<tls_signer::SwapResolver>,
     router: Router,
 ) -> Result<(), CaError> {
-    axum_server::tls_rustls::bind_rustls(addr, config)
-        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .map_err(CaError::Io)
-}
-
-pub async fn serve_tls(
-    addr: SocketAddr,
-    router: Router,
-    cert_pem: &str,
-    key_der: &[u8],
-) -> Result<(), CaError> {
-    let config = rustls_server_config(cert_pem, key_der)?;
-    // axum-server keeps the rustls config under an ArcSwap so an operator
-    // tooling path could hot-reload it; we pass ours in wrapped once.
+    let config = tls_signer::rustls_server_config(resolver)?;
     axum_server::tls_rustls::bind_rustls(
         addr,
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(config)),
@@ -357,45 +364,4 @@ pub async fn serve_tls(
     .serve(router.into_make_service_with_connect_info::<SocketAddr>())
     .await
     .map_err(CaError::Io)
-}
-
-/// A PEM body's DER bytes: the base64 payload between the BEGIN/END
-/// lines. The workspace's own base64 encoder (the one ws-ca's keystore
-/// and ws-api's export use); no extra PEM-parsing crate on top of rustls's
-/// pki-types, which take DER only.
-fn pem_to_der(pem: &str) -> Result<Vec<u8>, CaError> {
-    let body: String = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
-    BASE64
-        .decode(body)
-        .map_err(|_| CaError::X509("pem body is not valid base64".to_owned()))
-}
-
-/// # Unit tests
-#[cfg(test)]
-mod tests {
-    // A nested module does not inherit the crate root's trait import; the
-    // Engine trait must be in scope for `STANDARD.encode` here.
-    use base64::Engine as _;
-
-    use super::pem_to_der;
-
-    /// The PEM/DER helper accepts the exact PEM shapes ws-ca emits
-    /// (64-character-wrapped base64 payloads between the BEGIN/END lines)
-    /// and refuses a non-base64 body.
-    #[test]
-    fn test_pem_to_der_round_trips_and_refuses_garbage() {
-        let der = b"some der bytes that must survive the round trip";
-        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-        let pem = format!("-----BEGIN CERTIFICATE-----\n{encoded}\n-----END CERTIFICATE-----\n");
-        assert_eq!(
-            pem_to_der(&pem).expect("decode the PEM body"),
-            der.to_vec(),
-            "the DER bytes must survive the PEM wrapper"
-        );
-        let bad = "-----BEGIN CERTIFICATE-----\nnot base64!!!\n-----END CERTIFICATE-----\n";
-        assert!(pem_to_der(bad).is_err(), "a non-base64 body is refused");
-    }
 }

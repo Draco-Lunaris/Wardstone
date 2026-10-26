@@ -23,14 +23,18 @@ default `http://ws-api:8080`, spelled out in the file).
 Wardstone plus its own Postgres. The database volume (`wardstone-pgdata`)
 holds the CA's certificates, CRLs, OCSP responses, audit log, tenants, and
 users; the keys volume (`wardstone-keys`) holds the cryptographic material —
-the master key, the CA key envelopes, the setup slot, the JWT key pair, and
-the secret-encryption key. Once setup completes, every one of those lives
-on the volume ONLY as a passphrase-sealed envelope (sealed at rest; the
-plaintext originals are deleted). **The keys are never in the database and
-the database never contains private keys**: backing up the instance means
-backing up BOTH volumes, and restoring one without the other yields an
-instance that boots but cannot sign (or one that is meaningless on its
-own).
+the master key, the CA key envelopes, the JWT key pair, the
+secret-encryption key, and the database credential. **Sealed at
+creation**: every key's FIRST write is its passphrase-sealed envelope
+(the setup flow mints straight into them), so no plaintext key file ever
+exists on the volume — and the database credential, rotated at every
+unlock, lives only in `db-credential.envelope`. **The keys are never in
+the database and the database never contains private keys**: backing up
+the instance means backing up BOTH volumes, and restoring one without
+the other does not yield a half-working instance — the mismatch is
+refused loudly (by the setup POST when the database holds an install
+beside an empty keys volume; by the unlock POST — a fatal 409 — when
+a sealed keys volume has no install behind it).
 
 Setup:
 
@@ -44,16 +48,62 @@ Both `:?` variables are required on purpose: an unset hostname would serve
 the setup certificate with a placeholder SAN, and an unset password would
 make the bundled Postgres guessable.
 
+**The operator pre-step (once per host boot).** The bundle's two local
+links — the database socket directory and the unlock relay's — are bind
+mounts of directories on the docker HOST's `/run` (tmpfs: wiped at every
+reboot), and `up` fails loudly when they are absent. Create them before
+the first `up` and again after every host reboot:
+
+```sh
+install -d -m 0770 -o 70 -g 70 /run/wardstone/pg
+install -d -m 0770 -o 10001 -g 10001 /run/wardstone/relay
+```
+
+(`70` is the db image's postgres uid — it creates the 0770 database
+socket that the Wardstone services traverse via `group_add`; `10001` is
+the Wardstone image's fixed uid, which owns the relay directory.)
+
+**The database password: prefer a SCRAM verifier.** A plaintext
+`WARDSTONE_DB_PASSWORD` works, but the recommended bootstrap is the
+verifier minted by `wardstone db-verifier` — nothing plaintext is stored
+at rest (Postgres keeps the verifier as-is; only the password behind it
+logs in). The mint initializes the same protected arena the servers
+use, so give it the same memlock headroom:
+
+```sh
+docker run --rm --ulimit memlock=536870912:536870912 \
+  ${WARDSTONE_IMAGE:-wardstone:latest} wardstone db-verifier
+```
+
+prints a fresh 52-character `password:`, its `verifier:`, and the hint.
+Put ONLY the verifier in `.env`, single-quoted (verifiers carry `$`,
+`=`, and `/`, which compose would otherwise interpolate):
+
+```
+WARDSTONE_DB_PASSWORD='SCRAM-SHA-256$4096:…'
+```
+
+The `password:` value is what the setup page's database-password field
+takes on first run. `--password-stdin` hashes a password you choose
+(reads one line from stdin, prints only the verifier).
+
 First run: browse `https://<host>:8443/` and accept the freshly minted
 self-signed setup certificate (its SHA-256 fingerprint is displayed on the
 page for out-of-band verification). Fill the setup form — **set the master
 passphrase first** (it seals every key on the instance, is stored nowhere,
 and cannot be recovered: keep it in your password manager), then the admin
-username and password, default domain, optional admin CIDRs, and the
-server hostname. A successful POST answers
-`{"status": "ok", "resume": true}`: the seal wraps every key file
-into a passphrase-sealed envelope, rotates the database credential under
-the same passphrase, and the ui **resumes in place** — the listener swaps
+username and password, default domain, optional admin CIDRs, the server
+hostname, and the database password — the login credential the database
+role carries today (the bundled database's is the value behind
+`WARDSTONE_DB_PASSWORD`: the plaintext you chose, or the password printed
+beside a minted verifier). Setup connects with it exactly once, rotates
+the role to a fresh random credential, and seals that one under the
+master passphrase — the typed password is never stored. A successful
+POST answers
+`{"status": "ok", "resume": true}`: every key has been minted straight
+into its passphrase-sealed envelope (`master.envelope` written LAST — it
+is the sealed marker), the database credential is rotated under the same
+passphrase, and the ui **resumes in place** — the listener swaps
 onto the CA-issued `web-server` leaf over the same 8443 port, no restart,
 no re-typing. The api process comes up through the same commit (the ui
 relays the unlock to it once). `POST /setup` returns 404 from then on (the
@@ -70,14 +120,20 @@ The External variant is the same file with the Postgres service removed and
    definition, both `db:` entries under `depends_on`, and the
    `wardstone-pgdata:` entry under `volumes:`.
 3. Replace both services' `DATABASE_URL` with your own connection URL —
-   and keep the sealed-at-rest asymmetry the shipped file models: the
-   **ui's** URL carries a login role and password (the bootstrap
-   credential for the seeding boot; setup's seal rotates the role's
-   password away), while the **api's** URL stays password-less (role and
-   host only). A password-carrying api URL is refused at boot: the api's
-   credential lives only in the sealed keys volume.
-   The role, database, and extensions Wardstone requires are created by
-   the migrations on first connect, not by an image entrypoint.
+   **password-less in BOTH services** (a URL carrying a password is
+   refused at boot: the credential lives only in the sealed keys volume
+   or, on a fresh install, the setup page's database-password field).
+   A TCP URL is an external link and MUST carry BOTH
+   `sslmode=verify-full` and `sslrootcert=<path>` — mount your CA
+   bundle read-only and point the path at its in-container location;
+   the boot refuses a half-verified TLS link and names whichever
+   protection is missing. A unix-socket URL (database on the same
+   host) is a local link and needs no TLS keys. The role, database,
+   and extensions Wardstone requires are created by the migrations on
+   first connect, not by an image entrypoint; set the login role's
+   password with your own superuser — a SCRAM verifier from
+   `wardstone db-verifier` works and keeps plaintext out of your shell
+   history, with the printed password then typed at the setup page.
 4. Drop `WARDSTONE_DB_PASSWORD` from the required variables — it was only
    the bundled Postgres' password.
 
@@ -264,17 +320,23 @@ that image is:
 2. The image runs as a **non-root** user (`wardstone`, a fixed uid), and
    that user **owns `/var/lib/wardstone/keys`** in the image, so an empty
    named volume first mounted there inherits the correct ownership. The
-   `wardstone` process then writes its key files itself: the JWT signing
-   key with mode **0600**, the keystore envelopes likewise, all owned by
-   the container user — never world-readable, never root-owned.
+   `wardstone` processes then write the volume's files themselves: every
+   file is a passphrase-sealed envelope written by the setup flow, the
+   per-unlock credential rotation (including the recovery runbook's
+   re-seal), the admin surface's passphrase change and its completion
+   rewrap, or a root/sub-CA created through the unlocked api, all
+   owned by the container user — never world-readable, never
+   root-owned, and never a plaintext key.
 3. `wardstone-keys` is a named volume mounted at `/var/lib/wardstone/keys`
-   on **both** Wardstone services. Whichever process boots first finds a
-   complete volume: before setup the `ui` process creates the JWT key
-   pair if absent (setup's seal wraps it and deletes the plaintext), and
-   on a sealed volume the pair
-   mints at the FIRST UNLOCK — straight into its envelope, so plaintext
-   never exists (the `api` process reads the pair for token signing after
-   its own unlock).
+   on **both** Wardstone services. Before setup the volume is
+   legitimately EMPTY — the first-run boot touches neither database nor
+   volume (the setup page is served over a RAM-only certificate, and the
+   setup POST is the first thing that ever dials the database) — and at
+   the setup commit every key appears straight as its sealed envelope,
+   `master.envelope` written last as the sealed marker. On a sealed
+   volume the JWT pair is only ever READ: the `api` loads it from
+   `jwt-keys.envelope` after its own unlock, and a missing envelope is a
+   loud refusal, never a mint (see the JWT section below).
 
 ## Environment contract
 
@@ -282,10 +344,11 @@ Per service (the binary's contract, one variable at a time):
 
 | Variable                    | `ws-web` | `ws-api` | Meaning |
 |-----------------------------|----------|----------|---------|
-| `DATABASE_URL`              | set (role + bootstrap password) | set (**password-less**) | The Postgres connection URL. The ui's password is the bootstrap credential, read only by the seeding boot; the api's URL names the role to authenticate as, and every credential it uses comes from the db-credential envelope at unlock |
+| `DATABASE_URL`              | set (**password-less**) | set (**password-less**) | The Postgres connection URL — the bundled form is the shared-socket link `postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone` (the db binds no TCP at all). A password in EITHER URL is refused at boot; a TCP (external) URL must carry `sslmode=verify-full` + `sslrootcert`. On a fresh install the setup page's database-password field supplies the credential; after setup every credential comes from the db-credential envelope at unlock |
 | `WARDSTONE_KEYS_DIR`        | `/var/lib/wardstone/keys` | same | The keystore directory (shared volume) |
 | `WARDSTONE_SERVER_HOSTNAME` | required | required | The setup certificate's SAN; also the API's domain context |
 | `WARDSTONE_API_URL`         | `http://ws-api:8080` | ignored | The `ui` proxy's target |
+| `WARDSTONE_RELAY_SOCKET`    | `/run/wardstone/relay/relay.sock` (dials) | same (binds) | The unlock relay's Unix socket: the ui relays the master passphrase to the api over it once per unlock; the api binds it mode 0600 and admits only its own uid (`SO_PEERCRED`) — no network listener carries the relay |
 | `WARDSTONE_BIND`            | `0.0.0.0:8443` | `0.0.0.0:8080` | The listen address (one variable, per-service values) |
 | `WARDSTONE_PUBLIC_URL`      | ignored | optional | The absolute URL base every ACME (RFC 8555) URL is built from — unset, the ACME routes answer `serverInternal` problem documents |
 | `WARDSTONE_ACME_ACCOUNT_LIMIT_DISABLED` | ignored | optional switch | `1`/`true` disables the ACME per-account rate limiter; any other non-blank value fails the boot |
@@ -295,7 +358,7 @@ Compose-level:
 | Variable                  | Required | Meaning |
 |---------------------------|----------|---------|
 | `WARDSTONE_SERVER_HOSTNAME` | yes (`:?`) | Interpolated into both services |
-| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' **bootstrap** password: initializes the database and seeds the ui's seeding boot. Setup's seal rotates the `wardstone` role's password under the master passphrase, retiring this value as a login credential for good (the db's own healthcheck is auth-independent for exactly this reason) — it remains required only because the bundled `db` service and the fresh-install ui are built from it |
+| `WARDSTONE_DB_PASSWORD`     | yes (`:?`, Bundled only) | The bundled Postgres' **bootstrap** password: it initializes the database, and the FIRST-RUN setup page reads it (its database-password field) — setup's rotation then seals a fresh credential and retires this value as a login credential for good (the db's own healthcheck is auth-independent for exactly this reason). A plaintext value works; the recommended form is the SCRAM verifier minted by `wardstone db-verifier`, single-quoted in `.env` |
 | `WARDSTONE_IMAGE`           | no (default `wardstone:latest`) | Override the image; the e2e harness points it at a local build |
 | `WARDSTONE_PUBLIC_URL`      | no (default `https://$WARDSTONE_SERVER_HOSTNAME`) | The ACME URL base; override when certbot reaches the front door on a non-standard port or a different public name |
 
@@ -320,10 +383,21 @@ policy never churns a sealed instance; the database's own healthcheck is
 `pg_isready` (auth-independent — the rotated credential is none of the
 healthcheck's business).
 
-**An interrupted setup** — setup commits the tenant, then seals the keys
-volume. A crash between the two leaves a tenant beside an unsealed volume,
-and the `ui` refuses to boot it (`the keys volume is not sealed but the
-default tenant exists`) rather than serve the app on plaintext keys. There
+**An interrupted setup** — the seal and the install commit together:
+the ONE setup transaction (tenant, root CA, admin, profiles, the serving
+leaf) commits only after `master.envelope` — written LAST — lands, so a
+crash before the marker leaves NO tenant (the transaction rolls back;
+only overwritable strays remain) and the next boot serves the setup page
+again. A crash after the marker but before the commit is the one torn
+state: a sealed volume whose database holds no tenant, and the unlock
+POST answers it with the fatal refusal (`setup was interrupted after
+sealing — remove both volumes and run setup again`) rather than
+half-serve. The reverse mismatch is refused by the setup POST itself
+(`the database already holds an install but the keys volume is empty —
+restore the matching keys volume, or remove both volumes and run setup
+again`). A crash after the commit but before the credential rotation is
+the one deliberately healable window: the unlock page grows its
+database-password field and the runbook below re-seals. There
 is nothing to keep on an instance that never finished setup: remove both
 volumes (`docker compose -f docker/compose.yml down -v`) and run setup
 again.
@@ -335,51 +409,71 @@ under a fresh key and the change is audited. A partially-completed change
 that BOTH open with THEIR passphrases — the next unlock offers to finish
 the change; nothing sits in a silent mixed state.
 
-**Lost database credential (the recovery runbook).** The database password
-is random, rotated at every unlock, and shown nowhere — but its loss
-costs nothing but a deliberate reset, because the credential's envelope
-is the ONE file on the keys volume whose absence the unlock flow is built
-to heal. The reset happens on the database side first (the environment's
-value only ever reaches a database that accepts it):
+**Lost database credential (the recovery runbook).** The database
+credential is random, rotated at every unlock, and shown nowhere — but its
+envelope is the ONE file on the keys volume whose absence the unlock flow
+is BUILT to heal: the unlock page grows a database-password field exactly
+when `db-credential.envelope` is absent, the typed value is used once to
+connect and rotate, and nothing is stored. No `.env` edit is part of
+this runbook. Bring the instance to its locked page (it is already there
+after any restart; `docker compose -f docker/compose.yml restart ws-web
+ws-api` if it is not), then:
 
-1. `docker compose -f docker/compose.yml stop ws-web ws-api`, then reset
-   the login role's password on the database to a fresh value you choose —
-   the bundled db takes a local-socket ALTER that needs no old password:
-   `docker compose -f docker/compose.yml exec -T db psql -U wardstone -d
-   wardstone -c "ALTER USER wardstone PASSWORD '<fresh>';"`
-   (an external database means your own superuser).
-2. Put that same fresh value in the environment (`WARDSTONE_DB_PASSWORD`
-   in `.env` — the ui's `DATABASE_URL` is built from it) and remove the
-   envelope from the keys volume: `docker run --rm -v wardstone-keys:/keys
-   alpine rm /keys/db-credential.envelope`.
-3. `docker compose -f docker/compose.yml up -d`, then unlock.
+1. Mint fresh login material — `docker run --rm --ulimit
+   memlock=536870912:536870912 ${WARDSTONE_IMAGE:-wardstone:latest}
+   wardstone db-verifier` prints a 52-character password and its SCRAM
+   verifier (or pipe a password you choose into
+   `wardstone db-verifier --password-stdin` and get only the verifier).
+2. Install the VERIFIER on the database side — the bundled db takes a
+   local-socket ALTER as its `postgres` superuser (peer auth over the
+   shared socket, no old password needed):
+   `docker compose -f docker/compose.yml exec -T -u postgres db psql -h
+   /run/wardstone/pg -d postgres -c "ALTER ROLE wardstone PASSWORD
+   '<verifier>';"` (an external database means your own superuser).
+   Postgres stores the verifier as-is; the plaintext behind it is what
+   logs in.
+3. Remove the stale envelope from the keys volume — `docker run --rm -v
+   wardstone-keys:/keys alpine rm /keys/db-credential.envelope` (skip
+   this if it is already gone: the field appears for an absent
+   envelope).
+4. Reload the unlock page (the database-password field is there now) and
+   unlock with the master passphrase plus the minted password.
 
-The unlock flow re-seeds through the identical first-install path: the ui
-connects with the fresh bootstrap value, mints a random replacement, and
-seals it under the master passphrase; the api then rotates it again at its
-own unlock, exactly as on a healthy volume — the value from steps 1–2 was
-a single-boot credential and is already retired. No other key material is
-touched and the master passphrase is unchanged.
+The ui connects with the typed password exactly once, rotates the role
+to a fresh random credential, and seals it under the master passphrase;
+the api then rotates it again at its own unlock, exactly as on a healthy
+volume — the value from steps 1–2 was a single-use credential and is
+already retired. No other key material is touched and the master
+passphrase is unchanged.
 
-**Lost or broken JWT key material is a hard stop, with a recovery that costs
-every session.** The processes deliberately do NOT heal it by re-keying on
-their own, because a silent re-key would invalidate every outstanding
-token while looking perfectly normal.
+**Lost or broken JWT key material is a hard stop — there is no
+in-product re-key.** The processes deliberately do NOT heal it by
+re-keying on their own, because a silent re-key would invalidate every
+outstanding token while looking perfectly normal. On a sealed volume
+(every install after setup) the pair lives only in `jwt-keys.envelope`,
+and the api's unlock REFUSES a missing one — a sealed volume always
+carries it (setup writes it before the sealed marker) — with the typed
+`jwt_envelope_missing` refusal. On a consistent volume it is checked
+BEFORE any secret is unwrapped or the database is touched, so a failed
+attempt leaves zero side effects (no rotation ran, nothing re-sealed);
+the one pre-gate write is the passphrase-change completion, which
+re-wraps a half-finished volume's present envelopes first, and the
+refusal comes after that re-wrap. A corrupt envelope fails the
+unlock loudly the same way. Recovery, documented and loud:
 
-- **On a sealed volume** (every install after setup): the pair lives only
-  in `jwt-keys.envelope`. A corrupt envelope fails the unlock loudly —
-  the full surface never comes up, and anything the attempt already
-  completed (the per-unlock DB-credential rotation) stays committed and
-  consistent for the next unlock to re-read. Recovery, documented and
-  loud:
-  1. `docker compose -f docker/compose.yml stop ws-web ws-api`
-  2. Remove the envelope from the keys volume
-     (`docker run --rm -v wardstone-keys:/keys alpine rm /keys/jwt-keys.envelope`)
-  3. `docker compose -f docker/compose.yml up -d`, then unlock.
+1. Restore the keys volume from a backup of the sealed instance —
+   restoring BOTH volumes together (the same backup) is a consistent
+   pair and unlocks as-is; restoring the keys volume alone leaves its
+   `db-credential.envelope` older than the database role's current
+   password (every unlock rotates it), so run the database-credential
+   recovery runbook above once, then unlock.
+2. With no backup of the keys volume there is no recovery: wipe BOTH
+   volumes (`docker compose -f docker/compose.yml down -v`) and run
+   setup again — a fresh key pair, a fresh root CA, and re-import of
+   the new root everywhere it was trusted.
 
-  The next unlock mints a fresh pair **straight into a new envelope** —
-  plaintext never exists on the volume — and **every outstanding access
-  and refresh token is now invalid**; every user must log in again.
+Either way **every outstanding access and refresh token is invalid**;
+every user must log in again.
 
 **Rate limiting is always-on across the credential surfaces, keyed per
 client IP, tunable — but the coverage is never optional.** The `api`
@@ -428,5 +522,4 @@ docker compose -f docker/compose.yml config --quiet
 ```
 
 (On hosts without docker, this bundle was validated structurally — YAML
-parse plus a services/volumes/ports contract check; see Task 13's report
-for the exact evidence.)
+parse plus a services/volumes/ports contract check.)

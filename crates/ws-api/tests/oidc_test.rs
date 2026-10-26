@@ -200,10 +200,21 @@ async fn fixture() -> Fixture {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), Arc::new(jwt), config);
+    let state = AppState::new_unlocked(pool.clone(), Arc::new(jwt), config, master, secret_box);
     let router = ws_api::router(state.clone());
 
     Fixture {
@@ -427,6 +438,23 @@ fn config_body() -> Value {
     })
 }
 
+/// The raw stored seal of the fixture tenant's config row — the
+/// byte-identical keep-existing pin and the empty-secret normalization
+/// pin read it directly (the route layer must never expose it).
+async fn stored_secret_pair(
+    pool: &sqlx::PgPool,
+    tenant_id: uuid::Uuid,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    sqlx::query_as::<_, (Option<Vec<u8>>, Option<Vec<u8>>)>(
+        "SELECT client_secret_ciphertext, client_secret_nonce FROM oidc_config \
+         WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the stored client-secret pair")
+}
+
 /// Spawn the loopback discovery server and return its
 /// `/.well-known/openid-configuration` URL. A blocking std-net thread —
 /// the same shape ws-auth's OIDC suite serves its provider stubs with —
@@ -602,8 +630,10 @@ async fn put_roundtrips_and_never_exposes_the_secret() {
 }
 
 /// PUT with `client_secret: null` on an EXISTING row keeps the stored
-/// secret (`client_secret_set` stays true — the row it replaces carried
-/// one, and `None` means keep, not clear).
+/// secret — the row's ciphertext+nonce pair is carried forward
+/// BYTE-IDENTICAL (never open+re-seal) — and `client_secret_set` stays
+/// true (the row it replaces carried one, and `None` means keep, not
+/// clear).
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn put_null_secret_keeps_the_stored_secret() {
@@ -614,10 +644,12 @@ async fn put_null_secret_keeps_the_stored_secret() {
     let mut first = config_body();
     let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), first.clone()).await;
     assert_eq!(res.status(), StatusCode::OK, "first put must succeed");
+    let stored = stored_secret_pair(&fx.pool, fx.tenant_id).await;
     first["client_secret"] = Value::Null;
     let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), first).await;
     assert_eq!(res.status(), StatusCode::OK, "null-secret put must succeed");
     let second_set = json_body(res).await["client_secret_set"].clone();
+    let kept = stored_secret_pair(&fx.pool, fx.tenant_id).await;
 
     let res = get_bearer(&fx, "/api/v1/oidc/config", &token).await;
     let read = json_body(res).await;
@@ -625,6 +657,11 @@ async fn put_null_secret_keeps_the_stored_secret() {
 
     assert_eq!(second_set, true, "the replaced row still carries a secret");
     assert_eq!(read["client_secret_set"], true);
+    assert_eq!(
+        kept, stored,
+        "the keep-existing arm carries the ciphertext pair forward \
+         byte-identically (never open+re-seal)"
+    );
 }
 
 /// `client_secret: null` on a NEW row is 400 — nothing to keep it with.
@@ -644,6 +681,82 @@ async fn put_null_secret_on_a_new_row_is_400() {
 
     assert_eq!(error_code(&error), "bad_request");
     assert!(error_message(&error).contains("client_secret"));
+}
+
+/// A typed EMPTY secret normalizes to the ABSENT pair — the public-client
+/// convention: the read DTO reports `client_secret_set: false`, and the
+/// raw row stores NO ciphertext at all (never a sealed empty secret).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn put_empty_secret_normalizes_to_the_absent_pair() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    let mut body = config_body();
+    body["client_secret"] = json!("");
+    let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), body).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the public-client put succeeds"
+    );
+    let read = json_body(res).await;
+    let stored = stored_secret_pair(&fx.pool, fx.tenant_id).await;
+    fx.cleanup().await;
+
+    assert_eq!(read["client_secret_set"], false, "no secret is stored");
+    assert!(
+        stored.0.is_none() && stored.1.is_none(),
+        "the empty typed secret stores NO pair (never a sealed empty ciphertext): {stored:?}"
+    );
+}
+
+/// A damaged client-secret row fails CLOSED at the exchange path: with
+/// the nonce half of the seal hand-corrupted to NULL, the start route —
+/// which builds the exchange path's provider config through the same
+/// shared conversion the callback uses — refuses with a typed 500 naming
+/// the damaged seal, NEVER a silent public-client login (a redirect as
+/// if no secret were configured).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_half_secret_pair_fails_closed_at_the_exchange_path() {
+    let _db = lock_db().await;
+    let mut fx = fixture().await;
+    let token = admin_token(&fx);
+
+    // Seed through the route: a real seal, both halves present.
+    let res = put_json(&fx, "/api/v1/oidc/config", Some(&token), config_body()).await;
+    assert_eq!(res.status(), StatusCode::OK, "the seeding put must succeed");
+
+    // Hand-corrupt the row: ciphertext present, nonce gone.
+    sqlx::query("UPDATE oidc_config SET client_secret_nonce = NULL WHERE tenant_id = $1")
+        .bind(fx.tenant_id)
+        .execute(&fx.pool)
+        .await
+        .expect("hand-corrupt the nonce half of the seal");
+
+    let res = get_bearer(&fx, "/api/v1/auth/oidc/keycloak/start", &token).await;
+    let status = res.status();
+    let location = res.headers().get(axum::http::header::LOCATION).cloned();
+    let error = json_body(res).await;
+    fx.cleanup().await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the refusal is a typed 500"
+    );
+    assert!(
+        location.is_none(),
+        "a damaged seal NEVER logs in silently as a public client (no redirect)"
+    );
+    assert_eq!(error_code(&error), "internal");
+    assert!(
+        error_message(&error).contains("damaged client-secret seal"),
+        "the refusal names the damaged seal: {}",
+        error_message(&error)
+    );
 }
 
 /// A provider_type outside the migration's CHECK vocabulary is 400 (an

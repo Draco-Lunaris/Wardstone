@@ -150,3 +150,83 @@ async fn migration_count_guard_rejects_stale_db() {
         "unexpected error: {err:?}"
     );
 }
+
+/// Task 10 (D5): the external-DB URL policy — `check_database_url` is
+/// pure (parse, don't connect), so this arm runs WITHOUT the database
+/// and WITHOUT the suite lock: it never touches the shared server.
+///
+/// The rule: a socket host is a local link (D8's own-uid gate is the
+/// protection there, not TLS — the bundled compose form rides the
+/// authority percent-encoded, the one spelling sqlx parses); a TCP host
+/// is an EXTERNAL database and must carry BOTH protections —
+/// `sslmode=verify-full` and `sslrootcert=<path>` (the operator's
+/// mounted CA bundle) — and the refusal names both, whatever is
+/// missing.
+#[test]
+fn an_external_url_without_verify_full_is_refused() {
+    use ws_core::db::check_database_url;
+
+    // Socket forms: local links, admitted without any TLS keys. The
+    // socket rides the URL's authority percent-encoded — the libpq
+    // empty-host spelling (`user@/db?host=/path`) does not parse at
+    // all (the url crate refuses an authority whose host is empty),
+    // and the binary's password splice needs the userinfo, so the
+    // percent-encoded authority is the compose contract's spelling.
+    assert!(
+        check_database_url("postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone").is_ok(),
+        "the bundled socket form (the compose contract) is a local link"
+    );
+    assert!(
+        check_database_url("postgres://wardstone@%2Fvar%2Frun%2Fpostgresql/wardstone_test").is_ok(),
+        "a percent-encoded socket host is a local link"
+    );
+    assert!(
+        check_database_url("postgres://wardstone@/wardstone?host=/run/wardstone/pg").is_err(),
+        "the libpq empty-host spelling does not parse: refused, not misread"
+    );
+
+    // sslmode=require is a downgrade (no hostname/CA verification): the
+    // refusal names BOTH the missing verify-full and the CA bundle.
+    let err =
+        check_database_url("postgres://wardstone@db.example.com:5432/wardstone?sslmode=require")
+            .expect_err("sslmode=require is not verify-full and must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("verify-full"),
+        "the refusal names sslmode=verify-full, got: {text}"
+    );
+    assert!(
+        text.contains("sslrootcert"),
+        "the refusal names the sslrootcert requirement too, got: {text}"
+    );
+
+    // verify-full WITHOUT the operator's CA bundle: the refusal still
+    // names both protections.
+    let err = check_database_url(
+        "postgres://wardstone@db.example.com:5432/wardstone?sslmode=verify-full",
+    )
+    .expect_err("verify-full without sslrootcert must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("verify-full") && text.contains("sslrootcert"),
+        "the refusal names both protections, got: {text}"
+    );
+
+    // The fully-armed external form passes the policy (whether the
+    // server answers is `connect`'s concern, not this check's).
+    assert!(
+        check_database_url(
+            "postgres://wardstone@db.example.com:5432/wardstone?\
+             sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca.crt"
+        )
+        .is_ok(),
+        "verify-full plus sslrootcert is the one admitted external form"
+    );
+
+    // An unparsable URL is a configuration error, not a panic.
+    let err = check_database_url("not-a-url").expect_err("garbage must be refused, not parsed");
+    assert!(
+        !err.to_string().is_empty(),
+        "the parse failure carries a typed error message"
+    );
+}

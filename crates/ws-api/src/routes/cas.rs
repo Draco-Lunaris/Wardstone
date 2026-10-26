@@ -147,17 +147,14 @@ async fn create_ca(
 
     // The mint (including RSA key generation) is CPU-bound and
     // synchronous: `spawn_blocking`. The keystore custody moves into the
-    // task (legacy file mode on a plaintext volume, the unlocked RAM
-    // custody on a sealed instance); for a sub-CA the parent's key
-    // envelope is loaded there too.
+    // task (legacy file mode on a plaintext volume, the unlocked arena
+    // custody on a sealed instance); for a sub-CA the engine unwraps the
+    // parent's key inside `create_sub_ca`, per use.
     let keystore = state.keystore()?;
     let created = tokio::task::spawn_blocking(move || -> Result<CreatedCa, ApiError> {
         let mut keystore = keystore;
         let created = match &parent {
-            Some(parent) => {
-                let parent_key_der = keystore.load_ca_key(&parent.id).map_err(ApiError::from)?;
-                create_sub_ca(&parent.cert_pem, &parent_key_der, &spec, &mut keystore)
-            }
+            Some(parent) => create_sub_ca(&parent.cert_pem, &parent.id, &spec, &mut keystore),
             None => create_root(&spec, &mut keystore),
         }
         .map_err(ApiError::from)?;
@@ -266,8 +263,13 @@ async fn export_ca_key(
         .unwrap_or_else(|| "operator backup export".to_string());
 
     let keystore = state.keystore()?;
-    let key_der = keystore.load_ca_key(&ca.id).map_err(ApiError::from)?;
-    let key_pem = pem_from_der("PRIVATE KEY", &key_der);
+    // One per-use unwrap: the DER exists in the arena for exactly the
+    // PEM render, then the reservation is wiped. The PEM itself is the
+    // export's product — the response body the operator asked for — so
+    // it is ordinary heap memory by construction, never custody.
+    let key_pem = keystore
+        .with_ca_key(&ca.id, |key_der| Ok(pem_from_der("PRIVATE KEY", key_der)))
+        .map_err(ApiError::from)?;
 
     // The audit row commits on its own (the read-only export changes no
     // other row — the write-side contract is trivially satisfied by this

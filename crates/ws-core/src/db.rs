@@ -4,7 +4,11 @@
 //! runs from any working directory and the applied-checksum comparison is
 //! pinned to the binary's schema.
 
+use std::str::FromStr;
+
 use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use sqlx::ConnectOptions;
 use sqlx::PgPool;
 
 use crate::error::CoreError;
@@ -33,9 +37,10 @@ pub const REQUIRED_MIGRATION_COUNT: u16 = 12;
 ///    returning [`CoreError::Migration`] on mismatch (e.g. the database is
 ///    ahead of this binary).
 pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
+    let options = connect_options_with_statement_logging_off(url)?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(url)
+        .connect_with(options)
         .await?;
 
     let migrations_table_exists: bool = sqlx::query_scalar(
@@ -87,6 +92,33 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
     Ok(pool)
 }
 
+/// Parse `url` into [`PgConnectOptions`] with sqlx's statement logging
+/// turned OFF — the one shared surface every production connection the
+/// binaries create is built from ([`connect`]'s pool and the ui's
+/// dedicated recovery connection).
+///
+/// The WHY (the Global Constraint: no secret, credential, passphrase,
+/// token, verifier, or key material in any log line or error message at
+/// ANY level): the DB credential rotation's `ALTER ROLE … PASSWORD
+/// '<verifier>'` inlines the freshly minted SCRAM verifier into the
+/// statement text — Postgres utility statements accept no bind
+/// parameters — and sqlx logs the full statement text of every
+/// execution: TRACE for statements, WARN for slow ones (>1s by
+/// default). BOTH setters go OFF, so a slow ALTER under load cannot
+/// leak at WARN either; the suppression happens here because sqlx
+/// keeps its per-connection log settings private with no runtime
+/// accessor. sqlx never logs bind VALUES and the tree's only
+/// value-inlined statement is the ALTER, so nothing observable is lost.
+pub fn connect_options_with_statement_logging_off(
+    url: &str,
+) -> Result<PgConnectOptions, CoreError> {
+    let options = PgConnectOptions::from_str(url)
+        .map_err(|e| CoreError::Config(format!("database URL does not parse: {e}")))?;
+    Ok(options
+        .log_statements(log::LevelFilter::Off)
+        .log_slow_statements(log::LevelFilter::Off, std::time::Duration::from_secs(1)))
+}
+
 /// Map sqlx's migration failure set onto [`CoreError`]. `MigrateError::Execute`
 /// wraps a genuine [`sqlx::Error`] and keeps its typed source; every other
 /// variant (missing/edited migration, dirty state, source resolution) is a
@@ -96,4 +128,63 @@ fn migrate_error(err: sqlx::migrate::MigrateError) -> CoreError {
         sqlx::migrate::MigrateError::Execute(db_err) => CoreError::Database(db_err),
         other => CoreError::Config(format!("migration run failed: {other}")),
     }
+}
+
+/// The external-database URL policy (Task 10, D5): parse, don't
+/// connect — a pure preflight check the binary runs at boot in BOTH
+/// modes, additive beside (and after) the password-refusal gate.
+///
+/// The rule splits on the transport, which the parser alone reveals:
+/// a SOCKET host is a local link — unix-socket peer credentials are
+/// the protection there (D8), and no TLS keys apply; a TCP host is an
+/// EXTERNAL database and must carry BOTH `sslmode=verify-full` and
+/// `sslrootcert=<path>` (the operator mounts the CA bundle
+/// read-only), else the URL is refused — a half-verified TLS link is
+/// a downgrade, not a deployment. The refusal names both protections
+/// whatever is missing, and connects never happen here (whether the
+/// server answers is [`connect`]'s concern).
+///
+/// The `sslrootcert` check is a hand scan of the URL's query: sqlx
+/// parses the key into a private field with no getter
+/// (options/parse.rs:56-57 → `ssl_root_cert` → connection/tls.rs:58,
+/// so the driver honors it end-to-end), and the hand-rolled scan is
+/// the house's no-new-dependency precedent.
+pub fn check_database_url(url: &str) -> Result<(), CoreError> {
+    let options = PgConnectOptions::from_str(url)
+        .map_err(|e| CoreError::Config(format!("database URL does not parse: {e}")))?;
+
+    // A socket host is a local link: admitted with no TLS keys.
+    if options.get_socket().is_some() {
+        return Ok(());
+    }
+
+    // A TCP host is an external database: both protections or refusal.
+    if matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) && ssl_root_cert_configured(url) {
+        return Ok(());
+    }
+    Err(CoreError::Config(format!(
+        "an external (TCP) database URL must carry sslmode=verify-full and \
+         sslrootcert=<path> (the operator's mounted CA bundle); this URL has \
+         sslmode={:?} and {} — Wardstone refuses rather than downgrade TLS",
+        options.get_ssl_mode(),
+        if ssl_root_cert_configured(url) {
+            "an sslrootcert"
+        } else {
+            "no sslrootcert"
+        },
+    )))
+}
+
+/// Whether the URL's query names a non-empty `sslrootcert` (sqlx also
+/// accepts the `ssl-root-cert`/`ssl-ca` spellings). Only the PRESENCE
+/// of a value is checked here — the path itself is validated where it
+/// is used, by the driver's TLS handshake.
+fn ssl_root_cert_configured(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        matches!(key, "sslrootcert" | "ssl-root-cert" | "ssl-ca") && !value.is_empty()
+    })
 }

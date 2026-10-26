@@ -1,11 +1,31 @@
 //! The server-side session store: where ws-web keeps the JWT pair a
-//! browser session owns, so the browser NEVER does.
+//! browser session owns, so the browser NEVER does — and, since Task 8,
+//! where that pair lives in the protected arena, never on the heap.
 //!
 //! One entry per logged-in browser, keyed by the minted session `Uuid` —
 //! the cookie's opaque value. The store's memory IS the session: entries
 //! die on ws-web restart (the design refinement over a
 //! cookie-carries-refresh-token shape, controller-approved: strictly
 //! tighter — a stolen cookie dies with the process that minted it).
+//!
+//! # Arena custody (Task 8)
+//!
+//! A pair lives as two ws-secmem reservations ([`SecretBuf`] —
+//! `memfd_secret` pages, wiped on drop): [`SessionStore::claim_tokens`]
+//! is the ONE intake (every login and every rotation claims its fresh
+//! pair through it), the entry's fields hold the reservations behind
+//! `Arc`s (one shared reservation per token serves every generation of
+//! the pair — rotation replaces the handles, not the buffers), and the
+//! read side materializes only a transient wiped-on-drop string per
+//! outbound use ([`crate::session::relay::access_token_of`]). At rest
+//! there is exactly one plaintext of each token, and it is arena-only.
+//!
+//! The arena is a fixed budget, so the store composes with it: the two
+//! scarcity evictions — the [`MAX_SESSIONS`] insert limit and the
+//! arena-full retry inside [`SessionStore::claim_tokens`] — both give
+//! back the least-recently-touched session's reservations first, and an
+//! evicted entry's buffers are WIPED on drop (the arena's own guarantee,
+//! pinned by the session suite's `an_evicted_sessions_tokens_are_wiped`).
 //!
 //! # The generation-replacement design (the once-only rotation pin)
 //!
@@ -31,11 +51,21 @@
 //! binary pins 15 minutes, matching ws-api's JWT lifetime).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use ws_secmem::{SecMemError, SecretBuf};
+
+/// The most sessions one ws-web process will ever hold (Review Focus 3):
+/// the 1,025th login evicts the least-recently-touched entry, so a login
+/// flood cannot grow the store — nor its arena reservations — without
+/// bound. 1,024 sessions of two small arena reservations each is the
+/// session budget the 16 MiB general-purpose arena carries alongside the
+/// serving keys and credentials it also holds.
+pub const MAX_SESSIONS: usize = 1024;
 
 /// One logged-in browser session's server-side record.
 ///
@@ -52,21 +82,35 @@ pub struct SessionEntry {
     pub username: String,
     /// The account role from the `/me` identity fetch (fixed at insert).
     pub role: String,
-    /// The access token injected into proxied requests.
-    pub access_token: String,
+    /// The access token injected into proxied requests — an arena
+    /// reservation behind a shared handle: every generation of the pair
+    /// shares this ONE reservation (rotation swaps the handle for a fresh
+    /// one, it never copies the buffer), and the reservation is wiped
+    /// when the last handle dies (the entry evicted, or the store gone).
+    pub access_token: Arc<SecretBuf>,
     /// ws-web's local expiry bookkeeping: past this instant the proxy
     /// rotates proactively (the ws-api JWT's own `exp` is the authority
     /// behind it — this stamp is the cheaper first check).
     pub access_expires_at: Instant,
     /// The refresh token, alive ONLY here (never in a cookie, never in a
-    /// response body).
-    pub refresh_token: String,
+    /// response body) — the same arena-custody shape as the access token.
+    pub refresh_token: Arc<SecretBuf>,
     /// The instant of the session's last TOUCH (login insert, a token
-    /// rotation, or a `get` that found it live) — the idle-eviction clock's
-    /// reference. One more immutable generation field: replaced whenever a
+    /// rotation, or a `get` that found it live) — the idle-eviction
+    /// clock's reference AND the first key of the capacity/arena eviction
+    /// order. One more immutable generation field: replaced whenever a
     /// generation is replaced, never mutated in place, so a snapshot a
     /// reader holds stays internally consistent.
     pub last_touched: Instant,
+    /// The tie-break for [`Self::last_touched`]: the store-wide touch
+    /// counter's value at the entry's last touch. `Instant` ties are real
+    /// (rapid logins, one clock read), and the eviction order must be a
+    /// total order anyway — `(last_touched, touch_seq)` is one, with the
+    /// real clock alone and no injected test clock needed. A fresh
+    /// [`SessionEntry::new`] carries 0; only the store's own paths
+    /// (insert/get/update_tokens) stamp the real sequence, because only
+    /// they know the counter.
+    touch_seq: u64,
     /// The per-session rotation lock under an `Arc` so generations share
     /// ONE lock identity (see the module docs). Taking it serializes the
     /// session's refresh critical sections — including logout's
@@ -75,25 +119,29 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
-    /// Assemble an entry from a login's identity + token pair. The expiry
-    /// stamp is left "now" (already stale) — only the store's
+    /// Assemble an entry from a login's identity + a JUST-CLAIMED token
+    /// pair (arena reservations, taken through
+    /// [`SessionStore::claim_tokens`]). The expiry stamp is left "now"
+    /// (already stale) — only the store's
     /// [`SessionStore::insert`]/`update_tokens` know the store's TTL, and
     /// they stamp it themselves, which keeps the TTL in exactly one place.
     pub fn new(
         tenant_id: Uuid,
         username: String,
         role: String,
-        access_token: String,
-        refresh_token: String,
+        access_token: SecretBuf,
+        refresh_token: SecretBuf,
     ) -> Self {
         SessionEntry {
             tenant_id,
             username,
             role,
-            access_token,
+            access_token: Arc::new(access_token),
             access_expires_at: Instant::now(),
             last_touched: Instant::now(),
-            refresh_token,
+            refresh_token: Arc::new(refresh_token),
+            // Unstamped: `insert` stamps the store's sequence.
+            touch_seq: 0,
             rotation_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -115,7 +163,11 @@ type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// next time anything reads the store (forgotten browser tabs' server-held
 /// refresh tokens do not accumulate in memory until restart; ws-api's
 /// refresh token itself stays valid — stateless revocation — so eviction
-/// is memory hygiene, not revocation).
+/// is memory hygiene, not revocation). The same `last_touched` (with
+/// `SessionEntry`'s `touch_seq` tie-break) orders the two SCARCITY
+/// evictions: the [`MAX_SESSIONS`] insert limit and the arena-full retry
+/// inside [`SessionStore::claim_tokens`] both give back the
+/// least-recently-touched session first.
 pub struct SessionStore {
     /// The access lifetime stamped on every insert and rotation (the
     /// binary pins [`crate::DEFAULT_SESSION_TTL`]; tests use `ZERO`).
@@ -126,6 +178,10 @@ pub struct SessionStore {
     /// survive pass a far-future window.
     idle_eviction_after: Duration,
     now: NowFn,
+    /// The monotone touch sequence: every insert/get/update_tokens stamps
+    /// the entry's `touch_seq` from here, so the scarcity-eviction order
+    /// is a total order even when `Instant` ties.
+    next_touch_seq: AtomicU64,
     sessions: Mutex<HashMap<Uuid, Arc<SessionEntry>>>,
 }
 
@@ -135,6 +191,7 @@ impl SessionStore {
             default_access_ttl,
             idle_eviction_after,
             now: Arc::new(Instant::now),
+            next_touch_seq: AtomicU64::new(0),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -155,13 +212,73 @@ impl SessionStore {
         self.default_access_ttl
     }
 
+    /// The number of live sessions — never above [`MAX_SESSIONS`]: the
+    /// insert limit evicts, so this reads as the capacity pin's
+    /// bookkeeping side.
+    pub async fn len(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// Whether the store holds no session at all.
+    pub async fn is_empty(&self) -> bool {
+        self.sessions.lock().await.is_empty()
+    }
+
+    /// Claim a token pair into arena custody: the ONE intake every login
+    /// and every rotation takes — wire strings in, ws-secmem
+    /// reservations out (the wire strings themselves die with the
+    /// caller's zeroizing wire buffer).
+    ///
+    /// Both-or-neither: a failure on the second buffer drops (and so
+    /// wipes) the first. An [`SecMemError::ArenaFull`] answer evicts the
+    /// least-recently-touched session ONCE and retries — the eviction
+    /// releases that entry's reservations back to the arena (wiped), and
+    /// the arena's free list reuses the run — and a second refusal fails
+    /// the claim CLOSED: the caller turns the login/rotation away, and
+    /// the pair never falls back to the heap (there is no fallback; that
+    /// is the arena's contract).
+    pub async fn claim_tokens(
+        &self,
+        access: &str,
+        refresh: &str,
+    ) -> Result<(SecretBuf, SecretBuf), SecMemError> {
+        let mem = ws_secmem::global()?;
+        let claim = || -> Result<(SecretBuf, SecretBuf), SecMemError> {
+            let access_buf = mem.alloc_copy(access.as_bytes())?;
+            let refresh_buf = mem.alloc_copy(refresh.as_bytes())?;
+            Ok((access_buf, refresh_buf))
+        };
+        match claim() {
+            Ok(pair) => Ok(pair),
+            Err(SecMemError::ArenaFull { .. }) => {
+                // The evicted entry's reservations (wiped) return to the
+                // arena before the retry reads the free list.
+                let mut sessions = self.sessions.lock().await;
+                evict_least_recently_touched(&mut sessions);
+                drop(sessions);
+                claim()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Insert a fresh session; returns the minted session id — the cookie
     /// value (opaque: a v4 `Uuid` carries no token material).
+    ///
+    /// At [`MAX_SESSIONS`] the least-recently-touched entry is evicted
+    /// FIRST (its token reservations are wiped with the map slot): a
+    /// login flood cannot grow the store past the capacity pin, and the
+    /// entries a live operator actually touches are the last to go.
     pub async fn insert(&self, mut entry: SessionEntry) -> Uuid {
         entry.access_expires_at = (self.now)() + self.default_access_ttl;
         entry.last_touched = (self.now)();
+        entry.touch_seq = self.next_touch_seq.fetch_add(1, Ordering::Relaxed);
         let id = Uuid::new_v4();
-        self.sessions.lock().await.insert(id, Arc::new(entry));
+        let mut sessions = self.sessions.lock().await;
+        if sessions.len() >= MAX_SESSIONS {
+            evict_least_recently_touched(&mut sessions);
+        }
+        sessions.insert(id, Arc::new(entry));
         id
     }
 
@@ -192,10 +309,11 @@ impl SessionStore {
             tenant_id: old.tenant_id,
             username: old.username.clone(),
             role: old.role.clone(),
-            access_token: old.access_token.clone(),
+            access_token: Arc::clone(&old.access_token),
             access_expires_at: old.access_expires_at,
             last_touched: now,
-            refresh_token: old.refresh_token.clone(),
+            refresh_token: Arc::clone(&old.refresh_token),
+            touch_seq: self.next_touch_seq.fetch_add(1, Ordering::Relaxed),
             rotation_lock: Arc::clone(&old.rotation_lock),
         };
         let touched = Arc::new(touched);
@@ -204,27 +322,32 @@ impl SessionStore {
     }
 
     /// End a session (logout, or a rotation's failure). Removing an
-    /// already-removed id is a no-op.
+    /// already-removed id is a no-op. The removed generation's token
+    /// reservations are wiped when its last handle dies.
     pub async fn remove(&self, id: Uuid) {
         self.sessions.lock().await.remove(&id);
     }
 
     /// Swap in a fresh token pair as a new generation: the identity fields
     /// and the rotation lock's `Arc` carry over, the expiry stamp resets
-    /// to `now + default_access_ttl`. A no-op if the session was removed.
-    pub async fn update_tokens(&self, id: Uuid, access_token: String, refresh_token: String) {
+    /// to `now + default_access_ttl`, and the pair arrives as JUST-CLAIMED
+    /// arena reservations ([`Self::claim_tokens`]) — the old generation's
+    /// reservations are wiped when its last handle dies. A no-op if the
+    /// session was removed.
+    pub async fn update_tokens(&self, id: Uuid, access_token: SecretBuf, refresh_token: SecretBuf) {
         let mut sessions = self.sessions.lock().await;
         if let Some(old) = sessions.get(&id) {
             let replacement = SessionEntry {
                 tenant_id: old.tenant_id,
                 username: old.username.clone(),
                 role: old.role.clone(),
-                access_token,
+                access_token: Arc::new(access_token),
                 access_expires_at: (self.now)() + self.default_access_ttl,
                 // The rotation counts as a touch: a session actively
                 // rotating can never idle out while it rotates.
                 last_touched: (self.now)(),
-                refresh_token,
+                refresh_token: Arc::new(refresh_token),
+                touch_seq: self.next_touch_seq.fetch_add(1, Ordering::Relaxed),
                 rotation_lock: Arc::clone(&old.rotation_lock),
             };
             sessions.insert(id, Arc::new(replacement));
@@ -236,6 +359,9 @@ impl SessionStore {
     /// though the (real, 15-minute) JWT is still valid. A test seam: the
     /// session_test suite drives the rotation machinery deterministically
     /// (no waiting on the real clock). Unused by the product code.
+    /// `touch_seq` copies the old generation's: `force_expire` is
+    /// bookkeeping, not a touch, so the eviction order keeps the
+    /// session's recency identity.
     pub async fn force_expire(&self, id: Uuid) {
         let mut sessions = self.sessions.lock().await;
         if let Some(old) = sessions.get(&id) {
@@ -243,16 +369,39 @@ impl SessionStore {
                 tenant_id: old.tenant_id,
                 username: old.username.clone(),
                 role: old.role.clone(),
-                access_token: old.access_token.clone(),
+                access_token: Arc::clone(&old.access_token),
                 access_expires_at: (self.now)(),
                 // `force_expire` is bookkeeping, not a session touch: the
                 // idle clock keeps its previous stamp.
                 last_touched: old.last_touched,
-                refresh_token: old.refresh_token.clone(),
+                refresh_token: Arc::clone(&old.refresh_token),
+                touch_seq: old.touch_seq,
                 rotation_lock: Arc::clone(&old.rotation_lock),
             };
             sessions.insert(id, Arc::new(replacement));
         }
+    }
+}
+
+/// Evict the least-recently-touched entry — `(last_touched, touch_seq)`
+/// in that order, the total order the tie-break exists for — and report
+/// whether one existed to evict. The ONLY eviction primitive: the
+/// [`MAX_SESSIONS`] insert limit and the arena-full claim retry both go
+/// through it, so "least-recently-touched first" is a property of one
+/// place. The victim's token reservations are wiped when its last handle
+/// dies with the map slot.
+fn evict_least_recently_touched(sessions: &mut HashMap<Uuid, Arc<SessionEntry>>) -> bool {
+    let victim = sessions
+        .iter()
+        .min_by(|(_, a), (_, b)| {
+            a.last_touched
+                .cmp(&b.last_touched)
+                .then(a.touch_seq.cmp(&b.touch_seq))
+        })
+        .map(|(id, _)| *id);
+    match victim {
+        Some(id) => sessions.remove(&id).is_some(),
+        None => false,
     }
 }
 
@@ -261,18 +410,27 @@ impl SessionStore {
 mod tests {
     use super::*;
 
+    /// Claim a test token straight into the real global arena (the same
+    /// intake the relay uses; Ruling 20 — no test stand-in).
+    fn claim(bytes: &[u8]) -> SecretBuf {
+        ws_secmem::global()
+            .expect("the protected pool initializes")
+            .alloc_copy(bytes)
+            .expect("the arena holds the test token")
+    }
+
     fn entry() -> SessionEntry {
         SessionEntry::new(
             Uuid::new_v4(),
             "admin".to_owned(),
             "admin".to_owned(),
-            "access-token".to_owned(),
-            "ws_rt_refresh".to_owned(),
+            claim(b"access-token"),
+            claim(b"ws_rt_refresh"),
         )
     }
 
     /// `insert` stamps the TTL and mints the id the cookie carries; the
-    /// entry comes back through `get`.
+    /// entry comes back through `get`, tokens and all.
     #[tokio::test]
     async fn insert_stamps_ttl_and_get_round_trips() {
         let store = SessionStore::new(Duration::from_secs(900), Duration::from_secs(86400));
@@ -283,23 +441,35 @@ mod tests {
             "the TTL is stamped"
         );
         assert_eq!(fresh.username, "admin");
-        assert!(fresh.refresh_token.starts_with("ws_rt_"));
+        assert!(fresh.refresh_token.starts_with(b"ws_rt_"));
     }
 
-    /// `update_tokens` replaces the generation: new tokens, reset expiry,
-    /// but the SAME rotation lock identity — the once-only rotation pin
-    /// depends on waiters across generations sharing one lock.
+    /// `len`/`is_empty` track the live sessions.
+    #[tokio::test]
+    async fn len_tracks_the_live_sessions() {
+        let store = SessionStore::new(Duration::from_secs(900), Duration::from_secs(86400));
+        assert!(store.is_empty().await);
+        let id = store.insert(entry()).await;
+        assert_eq!(store.len().await, 1);
+        store.remove(id).await;
+        assert!(store.is_empty().await);
+    }
+
+    /// `update_tokens` replaces the generation: new arena reservations,
+    /// reset expiry, but the SAME rotation lock identity — the once-only
+    /// rotation pin depends on waiters across generations sharing one
+    /// lock.
     #[tokio::test]
     async fn update_tokens_rotates_the_generation_and_keeps_one_lock() {
         let store = SessionStore::new(Duration::from_secs(900), Duration::from_secs(86400));
         let id = store.insert(entry()).await;
         let first = store.get(id).await.expect("the first generation");
         store
-            .update_tokens(id, "access-2".to_owned(), "ws_rt_2".to_owned())
+            .update_tokens(id, claim(b"access-2"), claim(b"ws_rt_2"))
             .await;
         let second = store.get(id).await.expect("the second generation");
-        assert_eq!(second.access_token, "access-2");
-        assert_eq!(second.refresh_token, "ws_rt_2");
+        assert_eq!(&second.access_token[..], b"access-2".as_slice());
+        assert_eq!(&second.refresh_token[..], b"ws_rt_2".as_slice());
         assert!(
             second.access_expires_at > Instant::now(),
             "the expiry resets"
@@ -334,7 +504,11 @@ mod tests {
             expired.access_expires_at <= Instant::now(),
             "the expiry stamp is now past"
         );
-        assert_eq!(expired.refresh_token, "ws_rt_refresh", "tokens untouched");
+        assert_eq!(
+            &expired.refresh_token[..],
+            b"ws_rt_refresh".as_slice(),
+            "tokens untouched"
+        );
     }
 
     /// The ZERO-ttl seam: an insert is instantly stale — the always-rotate
@@ -416,7 +590,7 @@ mod tests {
         let id = store.insert(entry()).await;
         *clock.lock().unwrap() += Duration::from_secs(70);
         store
-            .update_tokens(id, "access-2".to_owned(), "ws_rt_2".to_owned())
+            .update_tokens(id, claim(b"access-2"), claim(b"ws_rt_2"))
             .await;
         assert!(
             store.get(id).await.is_some(),

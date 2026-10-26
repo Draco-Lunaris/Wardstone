@@ -84,12 +84,15 @@ const KEY_E_B64URL: &str = "AQAB";
 const TEST_KID: &str = "test-key";
 
 fn test_config(discovery_url: &str) -> OidcConfig {
+    let mem = ws_secmem::global().expect("the protected pool initializes");
     OidcConfig {
         provider_type: "keycloak".to_string(),
         display_name: "Test Provider".to_string(),
         discovery_url: discovery_url.to_string(),
         client_id: "wardstone-client".to_string(),
-        client_secret: "swordfish".to_string(),
+        client_secret: mem
+            .alloc_copy(b"swordfish")
+            .expect("the arena holds the test client secret"),
         redirect_uri: "http://localhost:8443/api/v1/auth/sso/callback".to_string(),
         scopes: "openid profile email".to_string(),
     }
@@ -138,8 +141,11 @@ fn id_token_claims(issuer: &str, audience: &str) -> Value {
 }
 
 /// Serve `discovery_doc`'s relative paths on a localhost listener until the
-/// test process ends. Returns the base URL ("http://127.0.0.1:port").
-fn spawn_server(config: &OidcConfig) -> String {
+/// test process ends. Returns the base URL ("http://127.0.0.1:port") and
+/// the captured BODIES of every token-endpoint POST — the exchange tests
+/// assert the confidential secret travels to the token endpoint and a
+/// public client's does not.
+fn spawn_server(config: &OidcConfig) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     // The discovery document points back at this server's /jwks and /token.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -152,13 +158,13 @@ fn spawn_server(config: &OidcConfig) -> String {
     let jwks = jwks_for(KEY_N_B64URL).to_string();
     // Token response: the caller-sent code mirrored back into a signed ID token.
     let token_prefix = config.client_id.clone();
+    let token_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = std::sync::Arc::clone(&token_bodies);
 
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let mut buf = [0u8; 4096];
-            let read = stream.read(&mut buf).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..read]);
+            let request = read_request(&mut stream);
             let first_line = request.lines().next().unwrap_or_default();
             let path = first_line.split_whitespace().nth(1).unwrap_or("/");
             let (status, body) = if path.starts_with("/discovery") {
@@ -166,6 +172,10 @@ fn spawn_server(config: &OidcConfig) -> String {
             } else if path.starts_with("/jwks") {
                 ("200 OK", jwks.clone())
             } else if path.starts_with("/token") {
+                captured
+                    .lock()
+                    .expect("the token-body capture lock")
+                    .push(request_body(&request).to_string());
                 let signed = sign_token(
                     KEY_PEM,
                     TEST_KID,
@@ -194,12 +204,59 @@ fn spawn_server(config: &OidcConfig) -> String {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), token_bodies)
+}
+
+/// Read one HTTP request off `stream` — the header block, then exactly
+/// `Content-Length` bytes of body — so the token-endpoint capture sees
+/// the whole form body (a single read is not guaranteed to carry it).
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let body_start = loop {
+        let read = stream.read(&mut chunk).unwrap_or(0);
+        if read == 0 {
+            return String::from_utf8_lossy(&request).into_owned();
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..body_start]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while request.len() < body_start + content_length {
+        let read = stream.read(&mut chunk).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// The body half of a captured request (empty when there was none).
+fn request_body(request: &str) -> &str {
+    request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
 }
 
 #[tokio::test]
 async fn discovery_fetches_the_provider_document() {
-    let config = test_config(&format!("{}/discovery", spawn_server(&test_config(""))));
+    let (base, _token_bodies) = spawn_server(&test_config(""));
+    let config = test_config(&format!("{base}/discovery"));
     let disc = discover(&config).await.unwrap();
     assert!(disc.authorization_endpoint.ends_with("/authorize"));
     assert!(disc.token_endpoint.ends_with("/token"));
@@ -221,7 +278,7 @@ async fn discovery_of_an_unreachable_provider_is_a_config_error() {
 #[tokio::test]
 async fn exchange_code_yields_a_verified_identity() {
     let config = test_config("PLACEHOLDER");
-    let base = spawn_server(&config);
+    let (base, _token_bodies) = spawn_server(&config);
     let config = test_config(&format!("{base}/discovery"));
     let disc = discover(&config).await.unwrap();
     let identity = exchange_code(&config, &disc, "the-auth-code", "the-state")
@@ -236,7 +293,7 @@ async fn exchange_code_yields_a_verified_identity() {
 #[tokio::test]
 async fn exchange_code_rejects_provider_side_rejection() {
     let config = test_config("PLACEHOLDER");
-    let base = spawn_server(&config);
+    let (base, _token_bodies) = spawn_server(&config);
     // Point the token endpoint at the 404 path: the provider never grants.
     let disc = ws_auth::oidc::OidcDiscovery {
         issuer: base.clone(),
@@ -248,6 +305,56 @@ async fn exchange_code_rejects_provider_side_rejection() {
         .await
         .unwrap_err();
     assert!(matches!(err, AuthError::BadCredentials), "got: {err:?}");
+}
+
+/// The exchange path receives the client secret: a confidential client's
+/// token POST carries the opened secret in its form body, and a PUBLIC
+/// client's POST omits the parameter outright (the house omission rule —
+/// never an empty credential).
+#[tokio::test]
+async fn exchange_code_carries_the_confidential_secret_and_omits_it_for_public_clients() {
+    // The confidential arm.
+    let config = test_config("PLACEHOLDER");
+    let (base, token_bodies) = spawn_server(&config);
+    let config = test_config(&format!("{base}/discovery"));
+    let disc = discover(&config).await.unwrap();
+    let identity = exchange_code(&config, &disc, "the-auth-code", "the-state")
+        .await
+        .unwrap();
+    assert_eq!(identity.subject, "user-12345");
+    let confidential = token_bodies
+        .lock()
+        .expect("the token-body capture lock")
+        .clone();
+    assert_eq!(confidential.len(), 1, "one token POST for the exchange");
+    assert!(
+        confidential[0].contains("client_secret=swordfish"),
+        "the confidential exchange carries the opened secret: {}",
+        confidential[0]
+    );
+
+    // The public arm: an EMPTY arena buffer — the absent-pair convention
+    // the API layer hands a public client — omits the parameter.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let mut public = test_config(&format!("{base}/discovery"));
+    public.client_secret = mem
+        .alloc(0)
+        .expect("the arena serves the empty public-client buffer");
+    let disc = discover(&public).await.unwrap();
+    let identity = exchange_code(&public, &disc, "the-auth-code", "the-state")
+        .await
+        .unwrap();
+    assert_eq!(identity.subject, "user-12345");
+    let bodies = token_bodies
+        .lock()
+        .expect("the token-body capture lock")
+        .clone();
+    assert_eq!(bodies.len(), 2, "the public exchange made its own POST");
+    assert!(
+        !bodies[1].contains("client_secret"),
+        "the public client's POST omits the secret parameter: {}",
+        bodies[1]
+    );
 }
 
 #[tokio::test]

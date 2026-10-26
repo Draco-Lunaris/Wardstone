@@ -1,15 +1,17 @@
 //! The sealed-mode tests (ws-api side): the health surface answers 200
 //! with the state field in both modes (liveness — compose never churns a
 //! correctly-locked service); every non-unlock route answers 503 `sealed`
-//! while sealed; the unlock POST swaps the full router in and the next
-//! request reaches it; a second unlock is a conflict; a wrong passphrase
+//! while sealed; the unlock POST over the Unix relay socket swaps the
+//! full router in and the next request reaches it; a second unlock is a
+//! conflict; a wrong passphrase
 //! leaves the state unchanged.
 //!
 //! The DB-gated cases below pin the PRODUCTION build closure
 //! ([`unlocked_router_from_envelopes`]): the unlock opens the sealed
-//! volume's three envelopes, rotates the database credential
-//! unconditionally, and mints the JWT pair straight into its envelope
-//! (a fresh install never writes plaintext). They run against the live
+//! volume's four envelopes, rotates the database credential
+//! unconditionally, and loads the JWT pair from its envelope (a
+//! missing envelope is a torn volume, refused loud — never minted).
+//! They run against the live
 //! test server like the suite's DB-gated siblings:
 //!
 //! ```text
@@ -23,7 +25,7 @@ use axum::routing::get;
 use axum::Router;
 use tower::ServiceExt;
 
-use ws_api::sealed::{sealed_router, SealedApi};
+use ws_api::sealed::{relay_router, sealed_router, SealedApi};
 
 /// A trivial full router the build closure swaps in: one route proving
 /// delegation reached it.
@@ -31,9 +33,11 @@ fn full_router() -> Router {
     Router::new().route("/api/v1/full", get(|| async { "the full surface" }))
 }
 
-/// A fresh keys volume for the relay-nonce claim (F2): each test mints
-/// its own, so the one-time consume never crosses tests.
-fn nonce_keys(name: &str) -> std::path::PathBuf {
+/// A fresh relay directory for the one-time nonce claim (F2, Task 10
+/// G1): the claim lives beside the relay socket, never in the keys
+/// volume, and each test mints its own so the one-time consume never
+/// crosses tests.
+fn relay_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ws-api-sealed-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -46,9 +50,9 @@ async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
         std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
             Box::pin(async move { Ok(full_router()) })
         }),
-        nonce_keys("healthz"),
+        relay_dir("healthz"),
     ));
-    let router = sealed_router(api, None);
+    let router = sealed_router(api);
 
     let health = router
         .clone()
@@ -94,26 +98,28 @@ async fn sealed_healthz_is_200_with_the_state_and_everything_else_503s() {
 
 #[tokio::test]
 async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
-    let keys = nonce_keys("swap");
+    let relay = relay_dir("swap");
     let api = std::sync::Arc::new(SealedApi::new(
         std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
             Box::pin(async move { Ok(full_router()) })
         }),
-        keys.clone(),
+        relay.clone(),
     ));
-    let router = sealed_router(api, None);
+    // The unlock route rides the relay socket (Task 10, D8): the TCP
+    // router above carries no unlock route at all.
+    let socket = relay_router(api.clone());
+    let router = sealed_router(api);
 
-    let unlock = router
-        .clone()
+    let unlock = socket
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
                         "passphrase": "the-master-passphrase",
-                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                        "nonce": ws_core::crypto::mint_relay_nonce(&relay).unwrap(),
                     })
                     .to_string(),
                 ))
@@ -160,7 +166,7 @@ async fn the_unlock_swaps_the_full_router_in_and_healthz_flips() {
 
 #[tokio::test]
 async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
-    let keys = nonce_keys("wrong-pass");
+    let relay = relay_dir("wrong-pass");
     let api = std::sync::Arc::new(SealedApi::new(
         std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
             let ok = req.passphrase == "the-master-passphrase";
@@ -174,24 +180,27 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
                 }
             })
         }),
-        keys.clone(),
+        relay.clone(),
     ));
-    let router = sealed_router(api, None);
+    // The unlock route rides the relay socket (Task 10, D8): the TCP
+    // router above carries no unlock route at all.
+    let socket = relay_router(api.clone());
+    let router = sealed_router(api);
 
     // Every POST carries a freshly minted claim (the consume is spent
     // even when the passphrase then fails), so each refusal below is
     // the PASSPHRASE's, not the nonce's.
-    let refused = router
+    let refused = socket
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
                         "passphrase": "wrong",
-                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                        "nonce": ws_core::crypto::mint_relay_nonce(&relay).unwrap(),
                     })
                     .to_string(),
                 ))
@@ -220,17 +229,17 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
         "a refused unlock leaves the state sealed"
     );
 
-    let ok = router
+    let ok = socket
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
                         "passphrase": "the-master-passphrase",
-                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                        "nonce": ws_core::crypto::mint_relay_nonce(&relay).unwrap(),
                     })
                     .to_string(),
                 ))
@@ -240,17 +249,16 @@ async fn a_wrong_passphrase_changes_nothing_and_a_second_unlock_conflicts() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
 
-    let second = router
-        .clone()
+    let second = socket
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
                         "passphrase": "the-master-passphrase",
-                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+                        "nonce": ws_core::crypto::mint_relay_nonce(&relay).unwrap(),
                     })
                     .to_string(),
                 ))
@@ -318,13 +326,35 @@ struct Fixture {
     net: RestoreNet,
 }
 
+/// The fixed 16-byte salt the shared role's restore verifier uses
+/// (Task 4's ruling: NO plaintext ALTER on the test side either — the
+/// restore sets the verifier form of `wardstone`'s bootstrap password,
+/// and a fixed salt keeps that verifier deterministic across every
+/// suite that restores the shared role).
+const FIXED_TEST_SALT: [u8; 16] = *b"0123456789abcdef";
+
+/// The shared test role's restore statement: the SCRAM-SHA-256
+/// verifier of the bootstrap password `wardstone` — Postgres stores
+/// the verifier as-is and the plaintext behind it logs in, so every
+/// suite's `wardstone:wardstone` connect keeps working.
+fn restore_statement() -> String {
+    format!(
+        "ALTER USER wardstone PASSWORD '{}'",
+        ws_core::dbcred::scram_verifier(
+            b"wardstone",
+            &FIXED_TEST_SALT,
+            ws_core::dbcred::SCRAM_ITERATIONS,
+        )
+    )
+}
+
 impl Fixture {
     /// Restore the shared login role's password over the
     /// pre-rotation advisory connection (established connections
     /// survive the rotation), BEFORE any post-rotation read or
     /// assertion can panic. Idempotent.
     async fn restore_role_password(&mut self) {
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&mut *self.advisory)
             .await
             .expect("restore the shared test role's password");
@@ -374,9 +404,7 @@ fn spawn_restore_net(url: &str) -> RestoreNet {
             return;
         }
         runtime.block_on(async {
-            let _ = sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
-                .execute(&mut conn)
-                .await;
+            let _ = sqlx::query(&restore_statement()).execute(&mut conn).await;
         });
         let _ = tx.send(());
     });
@@ -436,8 +464,9 @@ async fn fixture() -> Fixture {
     }
 }
 
-/// Mint the three envelopes a converted volume holds — the conversion's
-/// exact outputs, hand-minted: this suite pins the BUILDER; ws-web's
+/// Mint the four envelopes a converted volume holds — the conversion's
+/// exact outputs, hand-minted (the JWT envelope mirrors the conversion's
+/// own `write_sealed`): this suite pins the BUILDER; ws-web's
 /// suites own the conversion itself. The db-credential envelope seals
 /// the CURRENT role password, so the builder's connection with it
 /// matches the live role.
@@ -468,6 +497,14 @@ fn mint_sealed_volume(keys_dir: &std::path::Path, passphrase: &str) {
         0,
     )
     .expect("mint the db-credential envelope");
+    let jwt_pair = ws_auth::jwt::JwtKeys::generate(900).expect("mint the volume's JWT pair");
+    ws_auth::jwt::write_sealed(
+        &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        passphrase.as_bytes(),
+        &jwt_pair,
+        0,
+    )
+    .expect("seal the JWT envelope");
 }
 
 /// The api [`ws_api::state::ApiConfig`] the builder takes, in the test
@@ -478,8 +515,8 @@ fn api_config(keys_dir: &std::path::Path) -> ws_api::state::ApiConfig {
 
 /// An unlock against a volume that is NOT sealed (no master envelope —
 /// the fresh-install window before the setup conversion) is refused
-/// with ZERO side effects: no JWT pair minted under the caller's
-/// passphrase, no credential rotation. A compose-internal race that
+/// with ZERO side effects: no JWT envelope written, no credential
+/// rotation. A compose-internal race that
 /// beats the setup commit must leave nothing behind that the real
 /// relay's passphrase could no longer open.
 #[tokio::test]
@@ -503,8 +540,7 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the refused unlock mints no JWT envelope (the real relay's \
-         passphrase must stay able to mint it)"
+        "the refused unlock writes no JWT envelope"
     );
     assert!(
         bootstrap_credential_connects().await,
@@ -513,13 +549,80 @@ async fn the_builder_refuses_an_unsealed_volume_with_no_side_effects() {
     fixture.cleanup().await;
 }
 
-/// The production unlock: the three envelopes open, the database
+/// A sealed volume missing its JWT envelope (torn or corrupt — under
+/// D1 setup writes it before the master marker, so a sealed volume
+/// always carries one) is refused LOUD with the exact torn-volume copy
+/// and zero side effects: the gate fires before any secret is
+/// unwrapped or the database touched, so no connection URL is ever
+/// used and no envelope is written. The refusal copy is pinned
+/// byte-for-byte — the unlock page relays this text to the operator.
+#[tokio::test]
+async fn the_builder_refuses_a_torn_volume_missing_the_jwt_envelope() {
+    let keys_dir =
+        std::env::temp_dir().join(format!("ws-api-sealed-torn-jwt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&keys_dir);
+    std::fs::create_dir_all(&keys_dir).expect("create the keys directory");
+    let params = ws_core::crypto::KdfParams {
+        m_cost: 8192,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    for (file, payload) in [
+        (ws_core::crypto::MASTER_ENVELOPE_FILE, &[7u8; 32] as &[u8]),
+        (ws_core::crypto::SECRET_ENVELOPE_FILE, &[9u8; 32] as &[u8]),
+        (
+            ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE,
+            b"wardstone" as &[u8],
+        ),
+    ] {
+        ws_core::crypto::KeyEnvelope::write_envelope(
+            &keys_dir.join(file),
+            "the-master-passphrase",
+            payload,
+            params,
+            0,
+        )
+        .expect("mint the envelope");
+    }
+
+    let built = ws_api::sealed::unlocked_router_from_envelopes(
+        &keys_dir,
+        "postgres://wardstone:wardstone@localhost:5432/wardstone_test",
+        &api_config(&keys_dir),
+        "the-master-passphrase",
+        None,
+    )
+    .await;
+    let err = built.expect_err("the torn volume refuses the unlock");
+    let ws_api::error::ApiError::BadRequest { code, message } = err else {
+        panic!("expected the torn-volume refusal, got: {err}");
+    };
+    assert_eq!(code, "jwt_envelope_missing");
+    assert_eq!(
+        message,
+        format!(
+            "the sealed volume is missing its jwt key envelope ({}): \
+             a sealed volume always carries one, so the keys volume is \
+             torn or corrupt — the unlock refuses rather than silently \
+             re-keying every token",
+            keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE).display()
+        ),
+        "the refusal carries the exact torn-volume copy"
+    );
+    assert!(
+        !keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE).exists(),
+        "the refusal writes no JWT envelope — never a silent re-key"
+    );
+    let _ = std::fs::remove_dir_all(&keys_dir);
+}
+
+/// The production unlock: the four envelopes open, the database
 /// credential rotates (the bootstrap credential dies), the fresh
-/// credential is re-sealed, the JWT pair mints straight into its
-/// envelope, and the built router serves.
+/// credential is re-sealed, the JWT pair loads from its envelope, and
+/// the built router serves.
 #[tokio::test]
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
-async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
+async fn the_builder_unlocks_rotates_and_loads_the_jwt_pair() {
     let _db = lock_db().await;
     let mut fixture = fixture().await;
     mint_sealed_volume(&fixture.keys_dir, "the-master-passphrase");
@@ -545,14 +648,15 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
         .expect("probe the built router");
     assert_eq!(health.status(), StatusCode::OK, "the built router serves");
 
-    // Mint-at-unlock: a fresh install's JWT pair exists only as the
-    // envelope the builder just wrote — plaintext was never on the volume.
+    // Load-only: the JWT envelope the volume already held is still
+    // there — the unlock loads it, never mints or rewrites it — and no
+    // plaintext pair is ever written.
     assert!(
         fixture
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the unlock mints the JWT pair into its envelope"
+        "the JWT envelope the volume held survives the unlock"
     );
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
@@ -587,7 +691,8 @@ async fn the_builder_unlocks_rotates_and_mints_the_jwt_pair() {
 }
 
 /// A wrong passphrase against a sealed volume changes nothing: the
-/// envelopes stay as they are, no JWT pair mints, no rotation runs.
+/// envelopes stay as they are, the JWT envelope is untouched, no
+/// rotation runs.
 #[tokio::test]
 #[ignore = "DB-gated: the sealed-volume world (role restored)"]
 async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
@@ -606,11 +711,11 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
     .await;
     assert!(built.is_err(), "the wrong passphrase is refused");
     assert!(
-        !fixture
+        fixture
             .keys_dir
             .join(ws_core::crypto::JWT_ENVELOPE_FILE)
             .exists(),
-        "the refused unlock mints no JWT envelope"
+        "the refused unlock leaves the JWT envelope untouched"
     );
     assert!(
         bootstrap_credential_connects().await,
@@ -634,12 +739,10 @@ async fn the_builder_refuses_a_wrong_passphrase_without_side_effects() {
 
 /// A crashed passphrase change's aftermath, hand-minted: the
 /// db-credential envelope already re-wrapped under the NEXT passphrase
-/// at generation 1, the master + secret envelopes still at generation 0
-/// under the current one (master is written LAST — the anchor rule).
-/// The jwt envelope is deliberately ABSENT (the fresh-install shape):
-/// the completion re-wraps what exists, and the builder's normal
-/// mint-at-unlock then stamps the fresh pair at the advanced generation
-/// under the next passphrase.
+/// at generation 1, the master + secret + jwt envelopes still at
+/// generation 0 under the current one (master is written LAST — the
+/// anchor rule): the completion re-wraps everything present, and the
+/// builder then loads the JWT pair under the next passphrase.
 fn mint_mixed_volume(keys_dir: &std::path::Path, current: &str, next: &str) {
     use ws_core::crypto::KeyEnvelope;
     let params = ws_core::crypto::KdfParams {
@@ -671,6 +774,14 @@ fn mint_mixed_volume(keys_dir: &std::path::Path, current: &str, next: &str) {
         1,
     )
     .expect("mint the advanced db-credential envelope");
+    let jwt_pair = ws_auth::jwt::JwtKeys::generate(900).expect("mint the volume's JWT pair");
+    ws_auth::jwt::write_sealed(
+        &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        current.as_bytes(),
+        &jwt_pair,
+        0,
+    )
+    .expect("seal the JWT envelope at the current generation");
 }
 
 /// The generation every standard envelope in `keys_dir` records — one
@@ -703,8 +814,7 @@ fn volume_generations(
 /// MIXED volume the operator re-enters the interrupted change's
 /// `current` + `next`, the builder converges the volume to one
 /// generation under `next`, and the unlock proceeds under `next` alone —
-/// the fresh JWT pair included, minted straight into its envelope at
-/// the ADVANCED generation.
+/// the JWT envelope included, re-wrapped to the ADVANCED generation.
 #[tokio::test]
 #[ignore = "DB-gated: rotates the shared login role (restored)"]
 async fn the_builder_completes_a_mixed_volume_at_unlock() {
@@ -741,9 +851,9 @@ async fn the_builder_completes_a_mixed_volume_at_unlock() {
         "the completed unlock serves"
     );
 
-    // The volume converged: every envelope — the minted JWT pair
-    // included — sits at generation 1 under the NEXT passphrase, and
-    // the retired current opens nothing.
+    // The volume converged: every envelope — the JWT envelope included
+    // — sits at generation 1 under the NEXT passphrase, and the retired
+    // current opens nothing.
     for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
         assert_eq!(generation, Some(1), "{file} advanced to generation 1");
         let opened = ws_core::crypto::KeyEnvelope::open_envelope(
@@ -791,19 +901,12 @@ async fn the_builder_refuses_a_completion_on_a_consistent_volume() {
         "the refusal names the condition, got: {err}"
     );
     for (file, generation) in volume_generations(&fixture.keys_dir).unwrap() {
-        let expected = if file == ws_core::crypto::JWT_ENVELOPE_FILE {
-            None
-        } else {
-            Some(0)
-        };
-        assert_eq!(generation, expected, "{file} is untouched");
-        if expected.is_some() {
-            ws_core::crypto::KeyEnvelope::open_envelope(
-                &fixture.keys_dir.join(file),
-                "the-master-passphrase",
-            )
-            .unwrap_or_else(|e| panic!("the refused completion leaves {file} openable: {e}"));
-        }
+        assert_eq!(generation, Some(0), "{file} is untouched");
+        ws_core::crypto::KeyEnvelope::open_envelope(
+            &fixture.keys_dir.join(file),
+            "the-master-passphrase",
+        )
+        .unwrap_or_else(|e| panic!("the refused completion leaves {file} openable: {e}"));
     }
     assert!(
         bootstrap_credential_connects().await,
@@ -864,86 +967,12 @@ async fn the_builder_names_the_completion_a_mixed_volume_needs() {
     fixture.cleanup().await;
 }
 
-#[tokio::test]
-async fn the_internal_unlock_post_is_rate_limited_per_ip() {
-    // F1 (the final review): the internal unlock endpoint is the same
-    // credential surface the public /unlock is — anything that can
-    // reach the api's listener must spend a GCRA bucket credit per
-    // attempt, exactly like the auth routes (spec §5.1's budget shared
-    // across the credential surfaces).
-    let keys = nonce_keys("rate-limit");
-    let api = std::sync::Arc::new(SealedApi::new(
-        std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
-            let ok = req.passphrase == "the-master-passphrase";
-            Box::pin(async move {
-                if ok {
-                    Ok(full_router())
-                } else {
-                    Err(ws_api::error::ApiError::Unauthorized(
-                        "the master passphrase was refused".to_string(),
-                    ))
-                }
-            })
-        }),
-        keys.clone(),
-    ));
-    let one_shot = Some(ws_api::AuthRateLimit {
-        per_millis: 60_000,
-        burst: 1,
-    });
-    let router = sealed_router(api, one_shot);
-
-    let first = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/internal/unlock")
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    50003,
-                ))))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "passphrase": "wrong",
-                        "nonce": ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        first.status(),
-        StatusCode::UNAUTHORIZED,
-        "the first attempt reaches the handler and costs its bucket credit"
-    );
-
-    let second = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/internal/unlock")
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    50003,
-                ))))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "passphrase": "wrong" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        second.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "the bucket is spent: the second rapid attempt never reaches the handler"
-    );
-}
+// The per-IP rate-limit arm this slot once pinned is GONE (Task 10,
+// ruling 28f): the unlock route moved off the TCP router onto the Unix
+// relay socket, where "per IP" is meaningless — the 0600 socket, the
+// SO_PEERCRED own-uid gate, and the one-time nonce ARE the relay's
+// budget, and the public unlock page keeps its GCRA limiter at the
+// front door.
 
 #[tokio::test]
 async fn concurrent_unlocks_serialize_instead_of_double_building() {
@@ -955,7 +984,7 @@ async fn concurrent_unlocks_serialize_instead_of_double_building() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let builds = std::sync::Arc::new(AtomicUsize::new(0));
     let counted = builds.clone();
-    let keys = nonce_keys("concurrent");
+    let relay = relay_dir("concurrent");
     let api = std::sync::Arc::new(SealedApi::new(
         std::sync::Arc::new(move |req: &ws_api::sealed::UnlockRequest| {
             let ok = req.passphrase == "the-master-passphrase";
@@ -971,12 +1000,12 @@ async fn concurrent_unlocks_serialize_instead_of_double_building() {
                 }
             })
         }),
-        keys.clone(),
+        relay.clone(),
     ));
     let req = ws_api::sealed::UnlockRequest {
         passphrase: "the-master-passphrase".to_string(),
         next_passphrase: None,
-        nonce: ws_core::crypto::mint_relay_nonce(&keys).unwrap(),
+        nonce: ws_core::crypto::mint_relay_nonce(&relay).unwrap(),
     };
     let a = api.unlock(&req);
     let b = api.unlock(&req);
@@ -989,7 +1018,7 @@ async fn concurrent_unlocks_serialize_instead_of_double_building() {
         "the losing unlock never reaches the build"
     );
     assert!(
-        !keys.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
+        !relay.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
         "the winner consumed the one-time claim exactly once"
     );
 }
@@ -997,27 +1026,31 @@ async fn concurrent_unlocks_serialize_instead_of_double_building() {
 #[tokio::test]
 async fn the_internal_unlock_consumes_the_one_time_volume_nonce() {
     // F2 (the final review): spec §10 — the ui→api unlock call must not
-    // be replayable by anything else on the internal network. The relay
-    // mints a one-time nonce into the shared keys volume and the POST
+    // be replayable by anything else that reaches the relay socket. The
+    // relay mints a one-time nonce into the relay directory (Task 10,
+    // G1: beside the socket, never the keys volume) and the POST
     // carries it; the api refuses a POST without the matching claim,
     // and the matching consume deletes it — a captured POST is dead
     // after the real unlock.
-    let keys = nonce_keys("nonce");
+    let relay = relay_dir("nonce");
     let api = std::sync::Arc::new(SealedApi::new(
         std::sync::Arc::new(|_: &ws_api::sealed::UnlockRequest| {
             Box::pin(async move { Ok(full_router()) })
         }),
-        keys.clone(),
+        relay.clone(),
     ));
-    let router = sealed_router(api, None);
+    // The unlock route rides the relay socket (Task 10, D8): the TCP
+    // router above carries no unlock route at all.
+    let socket = relay_router(api.clone());
+    let router = sealed_router(api);
 
     // No nonce: refused even with the passphrase the build accepts.
-    let bare = router
+    let bare = socket
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({ "passphrase": "the-master-passphrase" }).to_string(),
@@ -1053,13 +1086,13 @@ async fn the_internal_unlock_consumes_the_one_time_volume_nonce() {
     );
 
     // The minted nonce unlocks — and consumes the claim.
-    let nonce = ws_core::crypto::mint_relay_nonce(&keys).expect("mint the relay nonce");
-    let ok = router
+    let nonce = ws_core::crypto::mint_relay_nonce(&relay).expect("mint the relay nonce");
+    let ok = socket
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -1074,16 +1107,16 @@ async fn the_internal_unlock_consumes_the_one_time_volume_nonce() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK, "the minted nonce unlocks");
     assert!(
-        !keys.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
+        !relay.join(ws_core::crypto::RELAY_NONCE_FILE).exists(),
         "the successful unlock consumed the claim"
     );
 
     // The replay: the same captured POST is dead — the claim is gone.
-    let replay = router
+    let replay = socket
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -1109,7 +1142,7 @@ async fn a_stale_nonce_is_refused_while_the_live_claim_unlocks() {
     // nonce captured from an earlier relay attempt is dead the moment
     // the ui re-offers the form — the api compares against the file,
     // not against history.
-    let keys = nonce_keys("stale");
+    let relay = relay_dir("stale");
     let api = std::sync::Arc::new(SealedApi::new(
         std::sync::Arc::new(|req: &ws_api::sealed::UnlockRequest| {
             let ok = req.passphrase == "the-master-passphrase";
@@ -1123,19 +1156,21 @@ async fn a_stale_nonce_is_refused_while_the_live_claim_unlocks() {
                 }
             })
         }),
-        keys.clone(),
+        relay.clone(),
     ));
-    let router = sealed_router(api, None);
+    // The unlock route rides the relay socket (Task 10, D8): the TCP
+    // router carries no unlock route at all.
+    let socket = relay_router(api);
 
-    let stale = ws_core::crypto::mint_relay_nonce(&keys).expect("mint");
-    let live = ws_core::crypto::mint_relay_nonce(&keys).expect("re-mint supersedes");
+    let stale = ws_core::crypto::mint_relay_nonce(&relay).expect("mint");
+    let live = ws_core::crypto::mint_relay_nonce(&relay).expect("re-mint supersedes");
     assert_ne!(stale, live);
-    let refused = router
+    let refused = socket
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -1153,11 +1188,11 @@ async fn a_stale_nonce_is_refused_while_the_live_claim_unlocks() {
         StatusCode::UNAUTHORIZED,
         "the superseded nonce is refused"
     );
-    let ok = router
+    let ok = socket
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/internal/unlock")
+                .uri("/unlock")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({

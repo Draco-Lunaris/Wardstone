@@ -25,15 +25,18 @@ use std::time::Duration;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
+use ws_secmem::SecretBuf;
 
 use crate::error::AuthError;
 
-/// The per-call OIDC provider configuration, as the API layer decodes it from
-/// the database row. The `client_secret` arrives in plaintext here — encryption
-/// at rest is the caller's job (the house rows carry
-/// `client_secret_encrypted` + `client_secret_nonce`, decrypted just before
-/// the exchange; `pm-web/src/routes/sso.rs` `OidcConfig`).
-#[derive(Debug, Clone)]
+/// The per-call OIDC provider configuration, as the API layer builds it
+/// from the database row. The `client_secret` arrives ALREADY OPENED into
+/// the process's protected arena (`ws_secmem::SecretBuf` — never the
+/// heap, never a plaintext `String`): the stored ciphertext+nonce pair
+/// is opened under the instance's secret-encryption key by the API layer,
+/// just before the token exchange. Deliberately not `Clone` — a copy
+/// would be a second plaintext of the same secret.
+#[derive(Debug)]
 pub struct OidcConfig {
     /// `keycloak` | `azure` | `custom` (house vocabulary).
     pub provider_type: String,
@@ -41,10 +44,10 @@ pub struct OidcConfig {
     /// The provider's `/.well-known/openid-configuration` URL.
     pub discovery_url: String,
     pub client_id: String,
-    /// Plaintext; decrypt the stored ciphertext just before use. An empty
-    /// string is the house's "public client" convention and is omitted from
+    /// The confidential client's secret, held in the protected arena. An
+    /// EMPTY buffer is the "public client" convention and is omitted from
     /// the token request.
-    pub client_secret: String,
+    pub client_secret: SecretBuf,
     pub redirect_uri: String,
     /// Space-separated, must include `openid` for an ID token to come back.
     pub scopes: String,
@@ -163,9 +166,17 @@ pub async fn exchange_code(
         ("client_id", &config.client_id),
     ];
     // House: an empty client_secret is a public client; it is then omitted
-    // outright rather than sent as an empty credential.
+    // outright rather than sent as an empty credential. The confidential
+    // arm borrows the secret from the arena buffer — no copy of the
+    // buffer is made — but reqwest's form serialization then writes it
+    // into its own heap request-body buffer for the request's lifetime,
+    // an un-wiped in-flight transient (the at-rest custody stays
+    // arena-only); a non-UTF-8 buffer cannot come from the JSON body the
+    // secret was typed into and is a typed config failure.
     if !config.client_secret.is_empty() {
-        params.push(("client_secret", &config.client_secret));
+        let secret = std::str::from_utf8(&config.client_secret)
+            .map_err(|_| AuthError::Config("the client secret is not valid utf-8".to_string()))?;
+        params.push(("client_secret", secret));
     }
 
     let resp = client

@@ -1,5 +1,6 @@
 //! The first-run setup: the setup page (GET), the setup submit (POST),
-//! the bootstrap transaction [`run_setup`], and the setup TLS certificate
+//! the seal-at-creation bootstrap transaction [`run_setup`], the
+//! recovery re-seal [`recover_db_credential`], and the setup TLS surface
 //! ([`tls`]).
 //!
 //! # Mounting contract (the Review Focus item 5)
@@ -13,19 +14,35 @@
 //! endpoint would not actually be unrouted). The binary (Task 12) and
 //! this crate's own composition perform the same check at startup.
 //!
+//! # Seal at creation (the design's D1)
+//!
+//! Every key a fresh install needs is generated in protected memory and
+//! its FIRST write is its passphrase-sealed envelope — nothing is ever
+//! minted in plaintext and converted later. The `master.envelope` is the
+//! sealed marker, written LAST (the boot derives "sealed" from its
+//! presence), the setup POST builds its own pool from the TYPED database
+//! password (a wrong password writes nothing: no file, no row, not even
+//! the keys directory), an existing install is refused before anything is
+//! generated, the setup DB transaction commits only after the marker
+//! lands, and the database credential rotation follows the commit — so
+//! the api relay (the page's step, after the rotation) opens the rotated
+//! credential.
+//!
 //! # The TLS switch
 //!
-//! The setup page is HTTPS from the start, on the self-signed setup
-//! certificate ([`tls::setup_certificate`]) whose SHA-256 fingerprint the
+//! The setup page is HTTPS from the start, on the first-run certificate
+//! ([`tls::first_run_certificate`]) whose SHA-256 fingerprint the
 //! page displays so the operator verifies it out of band. Its SAN comes
 //! from the instance configuration (`WARDSTONE_SERVER_HOSTNAME`, set
 //! before the form is filled in), with the placeholder
 //! [`tls::PLACEHOLDER_SAN`] when unset. At the end of setup the form's
-//! `server_hostname` field is used for the CA-issued leaf that replaces
-//! it: [`run_setup`] mints that leaf, stores its key envelope in the
-//! keystore, and the process RESTARTS (exit with a success code, letting
-//! the compose service's `restart: unless-stopped` bring it back up on
-//! the CA-issued certificate) — a restart, not a hot reload.
+//! `server_hostname` field names the CA-issued leaf that replaces it:
+//! [`run_setup`] mints that leaf sealed, and the page's TLS swap resumes
+//! the listener onto it IN PLACE (the resume contract — no restart, no
+//! re-listen): the setup commit publishes the pair onto the
+//! serving-certificate resolver — the swap IS the reload, and the
+//! leaf's private key crosses in arena custody inside the
+//! [`crate::tls_signer::ArenaKey`], never as a PEM.
 
 pub mod page;
 pub mod tls;
@@ -33,6 +50,7 @@ pub mod tls;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use rand::{rngs::SysRng, TryRng};
 use sqlx::PgPool;
 use uuid::Uuid;
 use ws_ca::ca::{certificate_validity, create_root, CaLifetime, CaSpec, KeyType};
@@ -41,6 +59,8 @@ use ws_ca::issue::{sign_leaf_with, ExtKeyUsagePurpose, IssuedLeaf, LeafSpec, San
 use ws_ca::keystore::KeyStore;
 use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
 use ws_ca::serial::allocate_serial;
+use ws_core::crypto::{db_role_of, substitute_db_password, KeyEnvelope, PROD_KDF_PARAMS};
+use ws_core::error::CoreError;
 use ws_core::models::audit::AuditEntry;
 use ws_core::models::ca::CaModel;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
@@ -54,6 +74,7 @@ use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::profile_repo::ProfileRepo;
 use ws_core::repo::tenant_repo::TenantRepo;
 use ws_core::repo::user_repo::UserRepo;
+use ws_secmem::{SecMemError, SecretBuf};
 use zeroize::Zeroizing;
 
 /// The one tenant a fresh Wardstone instance serves: setup creates it,
@@ -79,7 +100,7 @@ const SETUP_ACTOR: &str = "system:setup";
 ///
 /// This struct IS the POST body (`Json<SetupFields>`), so it carries the
 /// binding spec's serde casing attribute like every other JSON DTO.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SetupFields {
     /// The operator bootstrap account's login name (role: admin).
@@ -96,11 +117,22 @@ pub struct SetupFields {
     /// The server's own hostname: the SAN of the CA-issued leaf that
     /// replaces the setup certificate at the end of setup.
     pub server_hostname: String,
+    /// The database login password the operator typed — the credential
+    /// `DATABASE_URL`'s role carries TODAY (the compose bootstrap one,
+    /// or the fresh one the db-volume-recovery runbook set). It is
+    /// NEVER stored: setup connects with it exactly once, the rotation
+    /// ALTERs the role to a fresh random credential, and the typed
+    /// password dies with the zeroizing wrapper when the handler
+    /// returns — the sealed envelope holds only the fresh one.
+    #[serde(default)]
+    pub db_password: Zeroizing<String>,
     /// The operator's master passphrase (entered twice on the page; the
-    /// handler refuses a mismatch or a blank). At commit the setup flow
-    /// wraps every plaintext key file into a passphrase-sealed envelope,
-    /// rotates the DB credential under it, and DELETES the plaintext
-    /// originals — the next boot is sealed and this passphrase is its
+    /// handler refuses a mismatch or a blank). At commit every key's
+    /// only copy is already its passphrase-sealed envelope (each key is
+    /// BORN sealed — its first-ever write is the envelope, so no
+    /// plaintext original ever exists to wrap or delete), and the setup
+    /// flow rotates the DB credential and seals the fresh one the same
+    /// way — the next boot is sealed and this passphrase is its
     /// unlock key. It exists on no disk and is not recoverable; the page
     /// says so.
     #[serde(default)]
@@ -109,39 +141,95 @@ pub struct SetupFields {
     pub master_passphrase_confirm: String,
 }
 
-/// The state the setup handlers need: the pool, the keys directory (the
-/// keystore and the secret-encryption key file live under it), the
-/// SHA-256 fingerprint of the setup certificate the LISTENER serves (the
-/// binary computes it when it mounts the setup page), and the configured
-/// instance hostname the setup certificate is for.
+/// The state the setup handlers need: the keys directory (the envelope
+/// volume), the SHA-256 fingerprint of the setup certificate the
+/// LISTENER serves (the binary computes it when it mounts the setup
+/// page), the configured instance hostname, the serving-certificate
+/// resolver the commit swaps in place, the api's relay socket path,
+/// and the instance's `DATABASE_URL` — the setup POST builds its OWN pool
+/// from that URL plus the form's typed `db_password` (the D2 direction:
+/// no boot-time database connection belongs to the setup surface at
+/// all).
 #[derive(Clone, Debug)]
 pub struct SetupState {
-    /// The database pool.
-    pub pool: PgPool,
-    /// The keys directory (`WARDSTONE_KEYS_DIR`); [`KeyStore::open`] there
-    /// per-POST keeps the handler free of mutable shared state.
+    /// The keys directory (`WARDSTONE_KEYS_DIR`).
     pub keys_dir: PathBuf,
     /// The setup certificate's SHA-256 fingerprint, displayed on the page.
     pub fingerprint: String,
     /// The hostname the setup certificate carries (`WARDSTONE_SERVER_HOSTNAME`
     /// or [`tls::PLACEHOLDER_SAN`]).
     pub hostname: String,
-    /// The reloadable TLS config: the setup commit swaps the listener onto
-    /// the CA-issued leaf IN PLACE (the resume contract — the sealed design
-    /// removed the self-exit restart, so this is how the leaf takes over).
-    /// `None` in the tests (no listener to swap).
-    pub tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
-    /// The compose-internal api base URL: the setup commit relays the
-    /// unlock to the api process once (the fresh-install flow — the
-    /// api booted as the sealed shell and only the relay brings its
-    /// full surface up).
-    pub api_base_url: String,
+    /// The serving-certificate RESOLVER: the setup commit swaps the
+    /// listener onto the CA-issued leaf IN PLACE by publishing the pair
+    /// onto it (the resume contract — the sealed design removed the
+    /// self-exit restart, so this is how the leaf takes over; the swap
+    /// IS the reload, see [`crate::tls_signer`]). `None` in the tests
+    /// (no listener to swap).
+    pub tls_reload: Option<std::sync::Arc<crate::tls_signer::SwapResolver>>,
+    /// The api's relay socket path (`WARDSTONE_RELAY_SOCKET`, Task 10,
+    /// D8): the setup commit relays the unlock to the api process once
+    /// over the Unix socket (the fresh-install flow — the api booted
+    /// as the sealed shell and only the relay brings its full surface
+    /// up).
+    pub relay_socket: PathBuf,
     /// The instance's `DATABASE_URL`: its login role is the one the
-    /// setup commit's seal rotates (the External variant — a URL
-    /// that does not use the compose default role must rotate ITS
-    /// role). The same `db_role_of` derivation the api's unlock
-    /// builder uses.
+    /// setup commit's credential rotation ALTERs (the External variant —
+    /// a URL that does not use the compose default role must rotate ITS
+    /// role). The same `db_role_of` derivation the api's unlock builder
+    /// uses; the PASSWORD to connect with comes from the POST's typed
+    /// `db_password` field, never from the URL itself.
     pub database_url: String,
+}
+
+/// The seal-at-creation setup's typed error vocabulary. No variant's
+/// message ever carries key material, a passphrase, or a password.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    /// The database refused the TYPED password (Postgres `28P01`):
+    /// nothing was generated or written — no file, no row. The page
+    /// renders its wrong-password copy for this one.
+    #[error("the database rejected that password")]
+    DbRejected,
+    /// The default tenant already exists (a restored database beside a
+    /// fresh keys volume): the refusal ran BEFORE anything was generated
+    /// or written. Renders the design's exact copy — restore the matching
+    /// keys volume, or remove both volumes and run setup again.
+    #[error(
+        "the database already holds an install but the keys volume is \
+         empty — restore the matching keys volume, or remove both \
+         volumes and run setup again"
+    )]
+    InstallExists,
+    /// The form failed its basic checks (blank fields, passphrase
+    /// mismatch, a hostname the profile would not issue for).
+    #[error("invalid setup form: {0}")]
+    Validation(String),
+    /// Key or certificate work failed inside ws-ca.
+    #[error(transparent)]
+    Ca(#[from] CaError),
+    /// A ws-core failure (database, crypto, config). Messages never carry
+    /// key material.
+    #[error(transparent)]
+    Core(#[from] CoreError),
+}
+
+/// What a completed setup hands its caller: the CA-issued leaf the
+/// listener resumes onto, its private key in RAM custody (a ws-secmem
+/// arena reservation — wiped when the caller drops it), the ALGORITHM
+/// the key was minted as, and the hostname the leaf was minted for.
+#[derive(Debug)]
+pub struct SetupOutcome {
+    /// The CA-issued leaf certificate, PEM.
+    pub leaf_cert_pem: String,
+    /// The leaf's PKCS#8 DER private key, in the protected arena.
+    pub leaf_key: SecretBuf,
+    /// The leaf's key type — the algorithm the key was minted as
+    /// (mirrors the certificate row's `key_type` string; the page's
+    /// resolver swap pairs it with the key so the arena-backed signer
+    /// rebuilds the right backend per signature).
+    pub leaf_key_kind: LeafKeyType,
+    /// The form's `server_hostname` — the leaf's SAN.
+    pub hostname: String,
 }
 
 /// The setup page (GET) and the setup submit (POST) at [`SETUP_ROUTE`].
@@ -188,54 +276,131 @@ pub async fn tenant_exists(pool: &PgPool) -> Result<bool, CaError> {
     Ok(tenant.is_some())
 }
 
-/// The first-run bootstrap: everything a fresh instance needs, in the
-/// order durability requires.
+/// The generation block's payload: the zeroizing originals of the master
+/// and secret-encryption keys plus the admin's argon2id hash (the keys
+/// live only until the arena copies take custody).
+type GeneratedKeys = (
+    Zeroizing<[u8; MASTER_KEY_LEN]>,
+    Zeroizing<[u8; SECRET_BOX_KEY_LEN]>,
+    String,
+);
+
+/// The first-run bootstrap (the seal-at-creation design's D1): everything
+/// a fresh instance needs, sealed as it is created — no key ever exists
+/// in plaintext on disk, and the volume's sealed state begins the moment
+/// the POST succeeds.
 ///
-/// 1. The keystore master KEK (`ensure_master_key` generates when absent
-///    on a virgin volume, refuses with `Corrupt` when keys exist).
-/// 2. The secret-encryption key file (`secret-encryption.key` under the
-///    keys directory, the [`ws_api::state::SECRET_KEY_FILE`] name) — the
-///    TOTP secrets are encrypted under it, so it must exist before any
-///    user can enrol.
-/// 3. The root CA via ws-ca's `create_root`. **Its key envelope is stored
-///    in the keystore BEFORE the DB transaction commits** — `create_root`
-///    writes it before this function even opens one — because a
-///    certificate row without its key is worse than an orphaned key file:
-///    if the DB transaction rolls back, the key file remains but no CA
-///    references it, and the next setup run overwrites it. Write the key
-///    first, then commit the DB transaction.
-/// 4. ONE DB transaction committing: the tenant, the root CA's `cas` row,
-///    the admin user (argon2id hash), the two default profiles (with
-///    their revision rows and the current-revision pointer), and the
-///    audit entries — they stand or fall together.
-/// 5. The server's own leaf, issued by the new root against the
-///    built-in `web-server` profile with the form's `server_hostname` as
-///    its SAN. The SAN is validated against the profile's `san_patterns`
-///    (`validate_hostname_permitted`) inside the issuance transaction,
-///    right before minting — the same check the setup page pre-flights
-///    for its 400; a direct library caller's refusal surfaces as a
-///    [`CaError::Worker`] and the transaction rolls back without minting.
-///    Its serial is allocated inside its own issuance
-///    transaction (so a rollback releases it, Task 8's contract), and its
-///    private-key envelope is stored in the keystore BEFORE that
-///    transaction commits, for the same reason as the root's key above.
-/// 6. The leaf transaction also audits the completion of setup itself
-///    (`setup_completed`), written right after the certificate insert —
-///    exactly one row per completed setup.
+/// The steps, in the exact durability order the design pins:
+///
+/// 1. Validate the form (including the typed `db_password` and the
+///    confirmed master passphrase).
+/// 2. Build the pool from the TYPED password — connect, run the
+///    migrations, and refuse a Postgres `28P01`
+///    ([`SetupError::DbRejected`]) BEFORE anything exists: no file, no
+///    row, not even the keys directory.
+/// 3. Refuse an existing install ([`SetupError::InstallExists`]) before
+///    anything is generated or written: a restored database beside a
+///    fresh keys volume must never be half-overwritten by a second
+///    setup run.
+/// 4. Generate everything in protected memory, the memory-hard legs
+///    under `spawn_blocking` (Ruling 21: the admin's argon2id hash and
+///    the key-envelope writes never park the async runtime): the master
+///    key, the secret-encryption key, the JWT pair (born straight into
+///    the protected arena), the root CA — whose key envelope is stored
+///    in the keystore BEFORE anything else, under the in-memory master
+///    (the AEAD leg needs no argon2; the key-before-row contract: a
+///    certificate row without its key is worse than an orphaned key
+///    file a crashed run overwrites) — and the server leaf.
+/// 5. Write the non-master envelopes — `secret-encryption.envelope`,
+///    then `jwt-keys.envelope`, then the leaf's keystore envelope inside
+///    the issuance transaction. Each write is a crash-atomic replace, so
+///    stray files from a crashed earlier attempt are simply overwritten.
+/// 6. Write `master.envelope` LAST — the sealed marker — while the ONE
+///    setup transaction (tenant, root CA row, admin, default profiles,
+///    the leaf's certificate row, and every audit row, standing or
+///    falling together) is still open, and THEN commit: a crash at any
+///    earlier point leaves no tenant (the transaction rolls back) and
+///    only overwritable strays; a crash after the marker leaves the
+///    torn state the boot refuses loudly.
+/// 7. Rotate the database credential (the URL's login role — F5) over a
+///    dedicated connection and seal it at the volume's zeroth generation.
+///    The `db-credential.envelope` lands AFTER the marker on purpose:
+///    its absence is the D5 locked state the unlock's recovery arm
+///    heals, never a torn volume. The api relay (the page's step, after
+///    this rotation) therefore opens the rotated credential.
 pub async fn run_setup(
     fields: &SetupFields,
-    pool: &PgPool,
-    keystore: &mut KeyStore,
-) -> Result<(String, Zeroizing<Vec<u8>>), CaError> {
+    database_url: &str,
+    keys_dir: &Path,
+) -> Result<SetupOutcome, SetupError> {
     ensure_fields(fields)?;
 
-    keystore.ensure_master_key()?;
+    // The pool rides the TYPED password (never a boot-time credential —
+    // the D2 direction: the setup POST is the only thing that knows it,
+    // and the rotation below retires it). A wrong password refuses BEFORE
+    // anything exists: no envelope, no keystore file, no tenant, no
+    // profile, no cert row, not even the keys directory.
+    let connect_url = substitute_db_password(database_url, &fields.db_password);
+    let pool = match ws_core::db::connect(&connect_url).await {
+        Ok(pool) => pool,
+        Err(err) if db_rejected(&err) => return Err(SetupError::DbRejected),
+        Err(err) => return Err(SetupError::Core(err)),
+    };
 
-    ws_core::crypto::SecretBox::create(&keystore.dir().join(ws_api::state::SECRET_KEY_FILE))
-        .map_err(map_core)?;
+    // An existing install refuses BEFORE anything is generated or
+    // written (the router never mounts this surface once the tenant
+    // exists; this check is the defense for direct library callers and
+    // every racing window).
+    if tenant_exists(&pool).await? {
+        return Err(SetupError::InstallExists);
+    }
 
-    // The root CA: keyed in the keystore first (see the step contract in
-    // this function's docs), DB row follows inside the transaction.
+    // The memory-hard generation legs run under spawn_blocking (Ruling
+    // 21): fresh OS entropy for the master and secret-encryption keys,
+    // and the admin's argon2id hash. The zeroizing stack originals live
+    // only until the arena copies below (the master's survives into the
+    // LAST envelope write, so the marker is sealed from the same custody
+    // the keystore opened with).
+    let admin_password = fields.admin_password.clone();
+    let generated = tokio::task::spawn_blocking(move || -> Result<GeneratedKeys, SetupError> {
+        let mut master = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        let mut secret = Zeroizing::new([0u8; SECRET_BOX_KEY_LEN]);
+        SysRng
+            .try_fill_bytes(&mut master[..])
+            .map_err(|e| SetupError::Core(CoreError::Crypto(format!("the os entropy: {e}"))))?;
+        SysRng
+            .try_fill_bytes(&mut secret[..])
+            .map_err(|e| SetupError::Core(CoreError::Crypto(format!("the os entropy: {e}"))))?;
+        let password_hash = ws_auth::password::hash_password(&admin_password)
+            .map_err(|e| SetupError::Ca(CaError::Worker(format!("setup: the admin hash: {e}"))))?;
+        Ok((master, secret, password_hash))
+    })
+    .await
+    .map_err(|e| SetupError::Ca(CaError::Worker(format!("setup: the generation task: {e}"))))??;
+    let (master, secret, password_hash) = generated;
+
+    // The protected arena takes custody: the canonical copies of the
+    // master (the keystore's unlocked custody) and the secret-encryption
+    // key (its envelope write below) live in ws-secmem from here on.
+    let mem = ws_secmem::global().map_err(arena_failure)?;
+    let master_buf = mem.alloc_copy(&master[..]).map_err(arena_failure)?;
+    let secret_buf = mem.alloc_copy(&secret[..]).map_err(arena_failure)?;
+
+    // The JWT pair: generated straight into the arena, never a
+    // plaintext anywhere.
+    let jwt_keys = ws_auth::jwt::JwtKeys::generate(ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS)
+        .map_err(|e| SetupError::Ca(CaError::Worker(format!("setup: the jwt pair: {e}"))))?;
+
+    // The keystore opens UNLOCKED: the master exists only in the
+    // custodies above (the plaintext master mint the old flow wrote is
+    // gone with this flow — the master's first and only write is its
+    // envelope, below, LAST).
+    let mut keystore = KeyStore::open_unlocked(keys_dir, master_buf)?;
+
+    // The root CA: keyed in the keystore first (the key-before-row
+    // contract), under the in-memory master — the FIRST file this flow
+    // writes; a crash before the commit leaves it as a stray the next
+    // run overwrites.
     let spec = CaSpec {
         name: ROOT_CA_NAME.to_owned(),
         subject: fields.default_domain.clone(),
@@ -249,10 +414,52 @@ pub async fn run_setup(
         key_type: KeyType::EcdsaP256,
         lifetime: CaLifetime::Root,
     };
-    let created = create_root(&spec, keystore)?;
+    let created = create_root(&spec, &mut keystore)?;
     let (not_before, not_after) = certificate_validity(&created.cert_pem)?;
 
-    let mut tx = pool.begin().await?;
+    // The secret-encryption envelope — the FIRST thing ever written for
+    // this key is its sealed envelope (the old flow wrote the plaintext
+    // file and converted it later). Under spawn_blocking: the write is
+    // an argon2 derivation (Ruling 21).
+    {
+        let path = keys_dir.join(SECRET_ENVELOPE_FILE);
+        let passphrase = fields.master_passphrase.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), SetupError> {
+            KeyEnvelope::write_envelope(&path, &passphrase, &secret_buf[..], PROD_KDF_PARAMS, 0)
+                .map_err(SetupError::Core)
+        })
+        .await
+        .map_err(|e| {
+            SetupError::Ca(CaError::Worker(format!(
+                "setup: the secret-encryption envelope task: {e}"
+            )))
+        })??;
+    }
+
+    // The JWT pair's envelope (the same spawn_blocking shape).
+    {
+        let path = keys_dir.join(JWT_ENVELOPE_FILE);
+        let passphrase = fields.master_passphrase.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), SetupError> {
+            ws_auth::jwt::write_sealed(&path, passphrase.as_bytes(), &jwt_keys, 0).map_err(|e| {
+                SetupError::Ca(CaError::Worker(format!("setup: the jwt envelope: {e}")))
+            })
+        })
+        .await
+        .map_err(|e| {
+            SetupError::Ca(CaError::Worker(format!(
+                "setup: the jwt envelope task: {e}"
+            )))
+        })??;
+    }
+
+    // The ONE setup DB transaction: the tenant, the root CA's row, the
+    // admin user (argon2id hash precomputed above), the two default
+    // profiles (with their revision rows and the current-revision
+    // pointer), the audit entries, and — further down — the server
+    // leaf's certificate row and its own audits, all standing or
+    // falling with ONE commit (after the master envelope write below).
+    let mut tx = pool.begin().await.map_err(CaError::Db)?;
 
     let tenant = TenantRepo::new()
         .insert(&mut *tx, DEFAULT_TENANT_NAME)
@@ -281,8 +488,8 @@ pub async fn run_setup(
         .await
         .map_err(map_core)?;
 
-    let password_hash = ws_auth::password::hash_password(&fields.admin_password)
-        .map_err(|err| CaError::Worker(format!("setup: {err}")))?;
+    // The admin's argon2id hash was minted in the generation block above
+    // (Ruling 21: the memory-hard hash runs under spawn_blocking).
     let admin = UserModel {
         id: Uuid::new_v4(),
         tenant_id: tenant.id,
@@ -386,9 +593,9 @@ pub async fn run_setup(
         .map_err(map_core)?;
     for name in ["web-server", "web-server-ecdsa"] {
         let Some((profile_id, _)) = revision_ids.get(name) else {
-            return Err(CaError::Worker(format!(
+            return Err(SetupError::Ca(CaError::Worker(format!(
                 "setup: the default profile {name:?} was not persisted"
-            )));
+            ))));
         };
         audit
             .record(
@@ -404,8 +611,6 @@ pub async fn run_setup(
             .await
             .map_err(map_core)?;
     }
-
-    tx.commit().await?;
 
     // The server's own leaf. Its policy comes from the built-in
     // `web-server` profile's persisted revision; its SAN/subject is the
@@ -442,31 +647,41 @@ pub async fn run_setup(
         .collect::<Result<Vec<_>, CaError>>()?;
     let sans = vec![san_entry(&fields.server_hostname)?];
 
-    // One issuance transaction: the serial allocation inside it releases
-    // on rollback (Task 8's contract), the signing leg is CPU-bound and
-    // runs in spawn_blocking while the transaction stays open (the ws-api
-    // issuance shape), and the key envelope lands in the keystore BEFORE
-    // the certificate row commits (same ordering rationale as the root's
-    // key: an orphaned key file is the lesser evil).
-    let mut tx = pool.begin().await?;
+    // The leaf's issuance legs ride the SAME setup transaction (the
+    // serial allocation releases on rollback, Task 8's contract; the
+    // CPU-bound signing runs in spawn_blocking while the transaction
+    // stays open, the ws-api issuance shape; the key envelope lands in
+    // the keystore BEFORE the certificate row commits, the
+    // key-before-row contract — and a pre-commit stray is simply
+    // overwritten by the next run).
     // Defense-in-depth (see `validate_hostname_permitted`'s "two checks"):
     // the setup page has already pre-checked this and would have answered
     // 400; a direct library caller gets the refusal here instead — inside
-    // the issuance transaction, before anything is minted, as a `Worker`
-    // error per `run_setup`'s pinned `CaError` vocabulary.
-    validate_hostname_permitted(fields)
-        .map_err(|message| CaError::Worker(format!("setup: {message}")))?;
+    // the setup transaction, before anything is minted, as a
+    // [`SetupError::Validation`], and the transaction rolls back without
+    // minting.
+    validate_hostname_permitted(fields).map_err(SetupError::Validation)?;
     let serial = allocate_serial(root_ca.id, tenant.id, &mut *tx).await?;
 
     let ca_cert_pem = root_ca.cert_pem.clone();
-    let ca_key_der = keystore.load_ca_key(&root_ca.id)?;
+    // The root's key, unwrapped once for this issuance into the protected
+    // arena — the serving-leaf mint rides the serving-key holder's
+    // allowance, and the reservation wipes when the issuance completes.
+    let ca_key_der = keystore.unwrap_ca_key(&root_ca.id)?;
     let hostname = fields.server_hostname.clone();
     let sans_for_issuance = sans.clone();
     let lifetime = chrono::Duration::days(i64::from(template.lifetime_days));
-    let issuance = tokio::task::spawn_blocking(
-        move || -> Result<(IssuedLeaf, Zeroizing<Vec<u8>>), CaError> {
+    // The leaf's private key is born straight into the protected arena:
+    // the spawn_blocking generation copies its DER the moment it exists
+    // (the Zeroizing original dies inside the closure), and the
+    // reservation crosses out as the setup outcome's RAM custody.
+    let issuance =
+        tokio::task::spawn_blocking(move || -> Result<(IssuedLeaf, SecretBuf), CaError> {
             let (key_pair, private_key_der) = generate_leaf_key(serial_key_type)?;
             let private_key_der = Zeroizing::new(private_key_der);
+            let leaf_key = ws_secmem::global()
+                .and_then(|mem| mem.alloc_copy(&private_key_der))
+                .map_err(|e| CaError::Worker(format!("setup: the leaf key arena: {e}")))?;
             // The CSR carries the requested subject CN and SANs,
             // self-signed with the generated key (proof of possession,
             // verified by the signing leg — the same contract as the
@@ -482,17 +697,16 @@ pub async fn run_setup(
                 serial,
             };
             let issued = sign_leaf_with(&ca_cert_pem, &ca_key_der, &csr, &spec)?;
-            Ok((issued, private_key_der))
-        },
-    )
-    .await
-    .map_err(|err| CaError::Worker(format!("setup: the leaf-issuance task failed: {err}")))??;
-    let (issued, leaf_key_der) = issuance;
+            Ok((issued, leaf_key))
+        })
+        .await
+        .map_err(|err| CaError::Worker(format!("setup: the leaf-issuance task failed: {err}")))??;
+    let (issued, leaf_key) = issuance;
 
     let cert_id = Uuid::new_v4();
     // Key BEFORE row (see this function's docs): the envelope is on disk
     // before the certificate row can reference it.
-    keystore.store_ca_key(&cert_id, &leaf_key_der)?;
+    keystore.store_ca_key(&cert_id, &leaf_key[..])?;
 
     let certificate = CertificateModel {
         id: cert_id,
@@ -577,13 +791,66 @@ pub async fn run_setup(
         )
         .await
         .map_err(map_core)?;
-    tx.commit().await?;
+    // The master envelope LAST — the sealed marker: from this write on,
+    // every future boot derives "sealed" from its presence. It is
+    // written while the setup transaction is still open (see the doc's
+    // step list): a crash before this write leaves no tenant and only
+    // overwritable strays; a crash after it leaves the torn state the
+    // boot refuses loudly. Under spawn_blocking (Ruling 21: the write is
+    // an argon2 derivation).
+    {
+        let path = keys_dir.join(MASTER_ENVELOPE_FILE);
+        let passphrase = fields.master_passphrase.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), SetupError> {
+            KeyEnvelope::write_envelope(&path, &passphrase, &master[..], PROD_KDF_PARAMS, 0)
+                .map_err(SetupError::Core)
+        })
+        .await
+        .map_err(|e| {
+            SetupError::Ca(CaError::Worker(format!(
+                "setup: the master envelope task: {e}"
+            )))
+        })??;
+    }
+
+    // The commit: the tenant exists from exactly this line on.
+    tx.commit().await.map_err(CaError::Db)?;
+
+    // The DB credential rotation (the shared crash-safe
+    // [`ws_core::dbcred::rotate_db_credential`]): fresh random, the
+    // ALTER in verifier form over a dedicated connection, the pending
+    // envelope promoted after the ALTER — sealed at the volume's
+    // zeroth generation, AFTER the marker on purpose (its absence is
+    // the D5 locked state the unlock's recovery arm heals, never a
+    // torn volume). The rotation runs on the async path's own
+    // connection: its internal envelope write is the one argon2
+    // exception (the crash-safe rotation routine is shared with the
+    // api's unlock and stays single-sourced; Ruling 21's
+    // spawn_blocking mandate covers setup's OWN envelope writes, which
+    // all block above). The typed bootstrap password retires with the
+    // ALTER.
+    let db_role = db_role_of(database_url)?;
+    let mut conn = pool.acquire().await.map_err(CaError::Db)?;
+    ws_core::dbcred::rotate_db_credential(
+        &mut conn,
+        &db_role,
+        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+        fields.master_passphrase.as_bytes(),
+        0,
+    )
+    .await?;
 
     tracing::info!(
-        "first-run setup complete; the CA-issued certificate for {} is live",
+        "first-run setup complete: every key was sealed as it was created; \
+         the CA-issued certificate for {} is live",
         fields.server_hostname
     );
-    Ok((issued.cert_pem.clone(), leaf_key_der))
+    Ok(SetupOutcome {
+        leaf_cert_pem: issued.cert_pem,
+        leaf_key,
+        leaf_key_kind: serial_key_type,
+        hostname: fields.server_hostname.clone(),
+    })
 }
 
 /// Whether the form's `server_hostname` — the SAN of the leaf the CA will
@@ -609,11 +876,11 @@ pub async fn run_setup(
 /// - [`page::submit_setup`] pre-checks with this helper BEFORE
 ///   [`run_setup`] is called (nothing is committed yet) and maps a refusal
 ///   to [`page::SubmitError::BadRequest`] — a 400 for the form user.
-/// - [`run_setup`] re-applies the same check inside the leaf-mint
+/// - [`run_setup`] re-applies the same check inside the setup
 ///   transaction, right before minting, so a direct library caller (which
 ///   bypasses the page) is caught too; there the refusal is a
-///   [`CaError::Worker`], and the issuance transaction rolls back without
-///   minting.
+///   [`SetupError::Validation`], and the setup transaction rolls back
+///   without minting.
 ///
 /// A malformed pattern (e.g. a blank or ill-formed `admin_cidrs` entry,
 /// which become SAN patterns too, or a malformed hostname literal) also
@@ -641,23 +908,38 @@ pub(crate) fn validate_hostname_permitted(fields: &SetupFields) -> Result<(), St
     }
 }
 
-/// The setup form's blank-field policy: the four identity fields must be
-/// non-blank; CIDRs may be absent but not blank.
-fn ensure_fields(fields: &SetupFields) -> Result<(), CaError> {
+/// The setup form's blank-field policy: the identity fields (including
+/// the typed database password) must be non-blank; CIDRs may be absent
+/// but not blank; the master passphrase is required and confirmed — the
+/// whole bootstrap refuses before anything is generated or written.
+fn ensure_fields(fields: &SetupFields) -> Result<(), SetupError> {
     let required = [
         ("admin_username", fields.admin_username.as_str()),
         ("admin_password", fields.admin_password.as_str()),
         ("default_domain", fields.default_domain.as_str()),
         ("server_hostname", fields.server_hostname.as_str()),
+        ("db_password", fields.db_password.as_str()),
     ];
     for (name, value) in required {
         if value.trim().is_empty() {
-            return Err(CaError::Worker(format!("setup: {name} must not be blank")));
+            return Err(SetupError::Validation(format!("{name} must not be blank")));
         }
     }
     if fields.admin_cidrs.iter().any(|cidr| cidr.trim().is_empty()) {
-        return Err(CaError::Worker(
-            "setup: admin_cidrs entries must not be blank".to_owned(),
+        return Err(SetupError::Validation(
+            "admin_cidrs entries must not be blank".to_owned(),
+        ));
+    }
+    if fields.master_passphrase.trim().is_empty() {
+        return Err(SetupError::Validation(
+            "a master passphrase is required: it seals every key on this \
+             instance and is not recoverable"
+                .to_owned(),
+        ));
+    }
+    if fields.master_passphrase != fields.master_passphrase_confirm {
+        return Err(SetupError::Validation(
+            "the master passphrase and its confirmation do not match".to_owned(),
         ));
     }
     Ok(())
@@ -727,7 +1009,9 @@ fn audit_entry(
 }
 
 /// Map ws-core storage failures onto the pinned `CaError` vocabulary of
-/// [`run_setup`]. Plain database errors flow into `CaError::Db`; every
+/// [`tenant_exists`] (and, inside [`run_setup`], the row inserts whose
+/// errors flow through the `Ca(#[from] CaError)` arm). Plain database
+/// errors flow into `CaError::Db`; every
 /// other ws-core condition (a duplicate tenant from a concurrent setup
 /// run, a crypto/config failure) lands in the message-carrying `Worker`
 /// bucket prefixed `setup:` — `CaError` is ws-ca's enum and carries no
@@ -740,252 +1024,90 @@ fn map_core(err: ws_core::error::CoreError) -> CaError {
     }
 }
 
-/// The setup seal (the sealed-at-rest design's fresh-install
-/// path): wrap every plaintext key file on the keys volume into
-/// passphrase-sealed envelopes and DELETE the originals — the next boot
-/// derives from the state predicate that the volume is sealed. Per-file
-/// (each present plaintext wraps independently); the JWT pair wraps as
-/// ONE envelope (the loader's torn-pair contract is preserved: a torn
-/// pair wraps as-is and the sealed load refuses it loudly, exactly as the
-/// plaintext one did).
-///
-/// The DB credential rotation rides along: the fresh random password is
-/// ALTER'd over the just-used bootstrap connection and sealed — the
-/// bootstrap (and the env's `WARDSTONE_DB_PASSWORD`) retires here.
-pub async fn seal_keys_volume(
-    keys_dir: &Path,
-    passphrase: &str,
-    pool: &PgPool,
-    db_role: &str,
-) -> Result<(), CaError> {
-    use ws_core::crypto::{KeyEnvelope, PROD_KDF_PARAMS};
+/// The master key length the keystore's unlocked custody requires (a
+/// fresh install mints exactly this many OS-entropy bytes).
+const MASTER_KEY_LEN: usize = 32;
 
-    // The master KEK: read the plaintext, wrap, delete.
-    let master_path = keys_dir.join("master.key");
-    let master = std::fs::read(&master_path).map_err(CaError::Io)?;
-    KeyEnvelope::write_envelope(
-        &keys_dir.join(MASTER_ENVELOPE_FILE),
-        passphrase,
-        &master,
-        PROD_KDF_PARAMS,
-        0,
+/// The secret-encryption key length (`SecretBox`'s KEY_LEN).
+const SECRET_BOX_KEY_LEN: usize = 32;
+
+/// A Postgres `28P01` (invalid_password) refusal — the wrong-typed-
+/// password signal the setup connect and the recovery connect share.
+/// Never carries the password or any key material.
+fn db_rejected(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Database(db) if db.as_database_error().and_then(|e| e.code()).as_deref() == Some("28P01")
     )
-    .map_err(|e| CaError::Worker(format!("the master envelope: {e}")))?;
-    std::fs::remove_file(&master_path).map_err(CaError::Io)?;
-
-    // The SecretBox key: same treatment.
-    let secret_path = keys_dir.join(ws_api::state::SECRET_KEY_FILE);
-    if secret_path.exists() {
-        let secret = std::fs::read(&secret_path).map_err(CaError::Io)?;
-        KeyEnvelope::write_envelope(
-            &keys_dir.join(SECRET_ENVELOPE_FILE),
-            passphrase,
-            &secret,
-            PROD_KDF_PARAMS,
-            0,
-        )
-        .map_err(|e| CaError::Worker(format!("the secret-encryption envelope: {e}")))?;
-        std::fs::remove_file(&secret_path).map_err(CaError::Io)?;
-    }
-
-    // The JWT pair: one envelope holding the combined JSON form.
-    let signing_path = keys_dir.join("jwt-signing-key.pem");
-    let verify_path = keys_dir.join("jwt-verify-key.pem");
-    if signing_path.exists() || verify_path.exists() {
-        let signing = std::fs::read_to_string(&signing_path).unwrap_or_default();
-        let verification = std::fs::read_to_string(&verify_path).unwrap_or_default();
-        let combined = serde_json::json!({
-            "signing": signing,
-            "verification": verification,
-        })
-        .to_string();
-        ws_auth::jwt::write_sealed(
-            &keys_dir.join(JWT_ENVELOPE_FILE),
-            passphrase,
-            &ws_auth::jwt::JwtKeys {
-                signing_key_pem: signing,
-                verification_key_pem: verification,
-                ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
-            },
-            0,
-        )
-        .map_err(|e| CaError::Worker(format!("the jwt envelope: {e}")))?;
-        let _ = combined;
-        if signing_path.exists() {
-            std::fs::remove_file(&signing_path).map_err(CaError::Io)?;
-        }
-        if verify_path.exists() {
-            std::fs::remove_file(&verify_path).map_err(CaError::Io)?;
-        }
-    }
-
-    // The DB credential rotation (the shared step,
-    // [`ws_core::crypto::rotate_db_credential`]): fresh random, ALTER
-    // over the bootstrap connection, seal at the volume's zeroth
-    // generation. The env's embedded password retires here.
-    ws_core::crypto::rotate_db_credential(
-        pool,
-        db_role,
-        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
-        passphrase,
-        0,
-    )
-    .await
-    .map_err(|e| CaError::Worker(format!("the db rotation: {e}")))?;
-
-    tracing::info!(
-        "the keys volume is sealed: every plaintext original is gone and the \
-         instance boots locked from now on"
-    );
-    Ok(())
 }
 
-/// Finish a crashed seal (the final review's F3, the per-file
-/// contract spec §3 pins): [`seal_keys_volume`] seals the volume file
-/// by file, and a crash mid-arm leaves two windows per family — an
-/// envelope that landed while its plaintext original was never
-/// deleted, or a plaintext that never wrapped at all. The sealed
-/// boot's unlock heals both under the just-proven passphrase: the
-/// envelope is authoritative (its presence deletes the stray
-/// plaintext), an unwrapped plaintext wraps at the master envelope's
-/// generation and deletes, and the JWT pair heals as ONE unit — a torn
-/// pair seals as-is and the sealed loader refuses it loudly
-/// (`ws_auth::jwt::load_sealed`'s pair probe), the documented re-key
-/// runbook, never a silent boot on a key whose tokens fail their own
-/// verification. Idempotent: a clean volume heals as a no-op.
-///
-/// The DB credential has no heal arm: its plaintext never lived on the
-/// volume (the compose env held it) — the §8 recovery runbook's re-seed
-/// owns that window. A volume WITHOUT the master envelope never reaches
-/// the unlock (the boot serves it the setup page, or refuses it beside
-/// a tenant); the heal refuses it rather than sealing anything against
-/// a generation it cannot name.
-pub fn heal_keys_volume(keys_dir: &Path, passphrase: &str) -> Result<(), CaError> {
-    let generation =
-        ws_core::crypto::KeyEnvelope::read_generation(&keys_dir.join(MASTER_ENVELOPE_FILE))
-            .map_err(|e| CaError::Worker(format!("the heal's anchor: {e}")))?;
-
-    // The master family: the sealed boot's predicate guarantees the
-    // envelope, so a leftover plaintext is a stray delete.
-    let master_plaintext = keys_dir.join("master.key");
-    if master_plaintext.exists() {
-        std::fs::remove_file(&master_plaintext).map_err(CaError::Io)?;
-        tracing::warn!("heal: a stray master key plaintext was deleted beside its envelope");
-    }
-
-    heal_one(
-        passphrase,
-        generation,
-        &keys_dir.join(ws_api::state::SECRET_KEY_FILE),
-        &keys_dir.join(SECRET_ENVELOPE_FILE),
-    )?;
-
-    // The JWT pair: one envelope, two plaintexts, one decision.
-    let signing = keys_dir.join("jwt-signing-key.pem");
-    let verify = keys_dir.join("jwt-verify-key.pem");
-    if signing.exists() || verify.exists() {
-        if keys_dir.join(JWT_ENVELOPE_FILE).exists() {
-            for file in [&signing, &verify] {
-                if file.exists() {
-                    std::fs::remove_file(file).map_err(CaError::Io)?;
-                    tracing::warn!("heal: a stray jwt plaintext was deleted beside its envelope");
-                }
-            }
-        } else {
-            let signing_pem = std::fs::read_to_string(&signing).unwrap_or_default();
-            let verification_pem = std::fs::read_to_string(&verify).unwrap_or_default();
-            ws_auth::jwt::write_sealed(
-                &keys_dir.join(JWT_ENVELOPE_FILE),
-                passphrase,
-                &ws_auth::jwt::JwtKeys {
-                    signing_key_pem: signing_pem,
-                    verification_key_pem: verification_pem,
-                    ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
-                },
-                generation,
-            )
-            .map_err(|e| CaError::Worker(format!("the heal's jwt envelope: {e}")))?;
-            for file in [&signing, &verify] {
-                if file.exists() {
-                    std::fs::remove_file(file).map_err(CaError::Io)?;
-                }
-            }
-            tracing::warn!("heal: an unwrapped jwt pair was sealed at the volume's generation");
-        }
-    }
-    Ok(())
+/// Map a protected-arena failure onto the setup vocabulary (naming the
+/// arena, never any material).
+fn arena_failure(err: SecMemError) -> SetupError {
+    SetupError::Core(CoreError::Crypto(format!("the protected key arena: {err}")))
 }
 
-/// One plaintext/envelope family's heal window: the envelope is
-/// authoritative — present, it wins and the stray plaintext dies;
-/// absent, the plaintext wraps at the volume's generation and the
-/// original is deleted.
-fn heal_one(
-    passphrase: &str,
-    generation: u64,
-    plaintext: &Path,
-    envelope: &Path,
-) -> Result<(), CaError> {
-    if envelope.exists() {
-        if plaintext.exists() {
-            std::fs::remove_file(plaintext).map_err(CaError::Io)?;
-            tracing::warn!(
-                "heal: a stray plaintext was deleted beside its envelope: {}",
-                plaintext.display()
-            );
-        }
-    } else if plaintext.exists() {
-        let bytes = std::fs::read(plaintext).map_err(CaError::Io)?;
-        ws_core::crypto::KeyEnvelope::write_envelope(
-            envelope,
-            passphrase,
-            &bytes,
-            ws_core::crypto::PROD_KDF_PARAMS,
-            generation,
-        )
-        .map_err(|e| CaError::Worker(format!("the heal's envelope: {e}")))?;
-        std::fs::remove_file(plaintext).map_err(CaError::Io)?;
-        tracing::warn!(
-            "heal: an unwrapped plaintext was sealed at the volume's generation: {}",
-            plaintext.display()
-        );
-    }
-    Ok(())
-}
-
-/// The recovery re-seed (the sealed-at-rest spec's documented runbook):
+/// The recovery re-seal (the sealed-at-rest spec's documented runbook):
 /// an operator who lost the database credential deletes
 /// `db-credential.envelope` from the keys volume, sets a fresh bootstrap
-/// password in the env, and reboots — the ui's unlock build lands here,
-/// because the envelope's absence is the one thing that distinguishes
-/// recovery from every healthy boot. The step is the identical
-/// first-install one (the shared
-/// [`ws_core::crypto::rotate_db_credential`]): connect with the recovery
-/// URL's fresh credential, mint a random replacement, ALTER the login
-/// role to it, seal at the volume's generation. Returns the fresh
-/// credential so the caller connects with it (the api rotates again at
-/// its own unlock, exactly as on a healthy volume).
-pub async fn reseed_db_credential(
+/// password (the old runbook's env URL — Task 7's unlock page replaces
+/// that arm with a typed field), and reboots — the ui's unlock build
+/// lands here, because the envelope's absence is the one thing that
+/// distinguishes recovery from every healthy boot. The step is the
+/// identical first-install one (the shared
+/// [`ws_core::dbcred::rotate_db_credential`]): connect with the TYPED
+/// password — never a stored one, which by construction no longer
+/// exists — mint a random replacement, ALTER the login role to it in
+/// verifier form, seal at the volume's generation. Returns the fresh
+/// credential in RAM custody so the caller connects with it (the api
+/// rotates again at its own unlock, exactly as on a healthy volume). A
+/// stale `.pending` a crashed earlier rotation left behind is
+/// overwritten by this rotation's own pending write and promote. A
+/// refused typed password maps to [`SetupError::DbRejected`]; neither
+/// password is ever logged or carried in an error.
+pub async fn recover_db_credential(
     keys_dir: &Path,
-    passphrase: &str,
+    passphrase: &[u8],
     database_url: &str,
+    typed_db_password: &[u8],
     generation: u64,
-) -> Result<String, CaError> {
-    let role = ws_core::crypto::db_role_of(database_url)
-        .map_err(|e| CaError::Worker(format!("the recovery URL: {e}")))?;
-    let pool = sqlx::PgPool::connect(database_url)
+) -> Result<SecretBuf, SetupError> {
+    use sqlx::Connection as _;
+
+    let role = db_role_of(database_url)?;
+    // The connection rides the TYPED password — substituted into the
+    // instance's `DATABASE_URL`, never the URL's own embedded credential
+    // (which may be stale or absent).
+    let typed = std::str::from_utf8(typed_db_password).map_err(|_| {
+        SetupError::Core(CoreError::Config(
+            "the typed database password is not valid UTF-8".to_owned(),
+        ))
+    })?;
+    let connect_url = substitute_db_password(database_url, typed);
+    // The recovery connection builds from the shared statement-logging-off
+    // options: the rotation ALTER rides this dedicated connection, and its
+    // statement text carries the fresh verifier — the same suppression
+    // every pool connection gets (the Global Constraint is level-absolute).
+    let connect_options = ws_core::db::connect_options_with_statement_logging_off(&connect_url)
+        .map_err(SetupError::Core)?;
+    let mut conn = sqlx::PgConnection::connect_with(&connect_options)
         .await
-        .map_err(|e| CaError::Worker(format!("the recovery connection: {e}")))?;
-    let sealed = ws_core::crypto::rotate_db_credential(
-        &pool,
+        .map_err(|err| {
+            let core = CoreError::Database(err);
+            if db_rejected(&core) {
+                SetupError::DbRejected
+            } else {
+                SetupError::Core(core)
+            }
+        })?;
+    Ok(ws_core::dbcred::rotate_db_credential(
+        &mut conn,
         &role,
         &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
         passphrase,
         generation,
     )
-    .await;
-    pool.close().await;
-    sealed.map_err(|e| CaError::Worker(format!("the db re-seed: {e}")))
+    .await?)
 }
 
 /// The sealed-at-rest envelope names, re-exported from ws-core's single

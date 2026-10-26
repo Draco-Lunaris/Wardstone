@@ -83,6 +83,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
+use zeroize::Zeroizing;
 
 use ws_api::state::{ApiConfig, AppState};
 use ws_web::session::store::SessionStore;
@@ -227,6 +228,28 @@ struct Fixture {
     advisory: Option<PoolConnection<sqlx::Postgres>>,
 }
 
+/// The fixed 16-byte salt the shared role's restore verifier uses
+/// (Task 4's ruling: NO plaintext ALTER on the test side either — the
+/// restore sets the verifier form of `wardstone`'s bootstrap password,
+/// and a fixed salt keeps that verifier deterministic across every
+/// suite that restores the shared role).
+const FIXED_TEST_SALT: [u8; 16] = *b"0123456789abcdef";
+
+/// The shared test role's restore statement: the SCRAM-SHA-256
+/// verifier of the bootstrap password `wardstone` — Postgres stores
+/// the verifier as-is and the plaintext behind it logs in, so every
+/// suite's `wardstone:wardstone` connect keeps working.
+fn restore_statement() -> String {
+    format!(
+        "ALTER USER wardstone PASSWORD '{}'",
+        ws_core::dbcred::scram_verifier(
+            b"wardstone",
+            &FIXED_TEST_SALT,
+            ws_core::dbcred::SCRAM_ITERATIONS,
+        )
+    )
+}
+
 impl Fixture {
     /// Restore the shared login role's password IMMEDIATELY after a setup
     /// POST (the conversion — and the api's relayed unlock — rotate it):
@@ -234,7 +257,7 @@ impl Fixture {
     /// panic, so a mid-test failure can never leave the rotated password
     /// behind for the next suite's first connect.
     async fn restore_role_password(&self) {
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&self.pool)
             .await
             .expect("restore the shared test role's password");
@@ -251,7 +274,7 @@ impl Fixture {
     /// tests that never reach the seal.
     async fn cleanup(&mut self) {
         sweep_tenant(&self.pool, setup::DEFAULT_TENANT_NAME).await;
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&self.pool)
             .await
             .expect("restore the shared test role's password");
@@ -360,9 +383,10 @@ fn mint_csr(cn: &str, names: &[&str]) -> String {
 /// channel). Pre-setup the volume holds nothing to unlock and the api
 /// sits sealed (healthz `200 sealed`, everything else 503) — exactly the
 /// compose contract, where only the setup commit's relay brings the
-/// full surface up. Its base URL is what ws-web's proxy, session relay,
-/// and the setup commit's unlock relay target.
-async fn spawn_sealed_api(fixture: &Fixture) -> String {
+/// full surface up. Its TCP base URL is what ws-web's /api/v1 proxy and
+/// session relay target (ruling 28f); the setup commit's unlock relay
+/// rides the Unix socket it returns alongside (Task 10, D8).
+async fn spawn_sealed_api(fixture: &Fixture) -> (String, PathBuf) {
     let keys_dir = fixture.keys_dir.clone();
     let url = database_url();
     let config = ApiConfig::new(DOMAIN.to_string(), fixture.keys_dir.clone());
@@ -384,13 +408,15 @@ async fn spawn_sealed_api(fixture: &Fixture) -> String {
                 .await
             })
         });
-    let app = ws_api::sealed::sealed_router(
-        Arc::new(ws_api::sealed::SealedApi::new(
-            build,
-            fixture.keys_dir.clone(),
-        )),
-        None,
-    );
+    let relay_dir = std::env::temp_dir().join(format!(
+        "ws-e2e-sealed-relay-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&relay_dir).expect("create the api's relay directory");
+    let relay_socket = relay_dir.join("relay.sock");
+    let api = Arc::new(ws_api::sealed::SealedApi::new(build, relay_dir));
+    let app = ws_api::sealed::sealed_router(api.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the loopback sealed-api listener");
@@ -400,14 +426,27 @@ async fn spawn_sealed_api(fixture: &Fixture) -> String {
             .await
             .expect("serve the sealed api");
     });
-    format!("http://{addr}")
+    let relay_listener =
+        ws_api::sealed::bind_relay_socket(&relay_socket).expect("bind the api's relay socket");
+    let own_uid = ws_api::sealed::current_uid();
+    tokio::spawn(async move {
+        ws_api::sealed::serve_relay(relay_listener, api, own_uid)
+            .await
+            .expect("serve the api's relay socket");
+    });
+    (format!("http://{addr}"), relay_socket)
 }
 
 /// ws-web's composed front door (relay + proxy + SPA fallback) pointed at
 /// `api_base`: the production 15-minute session TTL, and NO per-IP rate
 /// limiter (in-process oneshot requests carry no `ConnectInfo` — the
 /// session_test reasoning).
-async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Router {
+async fn front(
+    pool: &PgPool,
+    keys_dir: &std::path::Path,
+    api_base: &str,
+    relay_socket: &std::path::Path,
+) -> Router {
     ws_web::web_router_with_store(
         pool.clone(),
         keys_dir.to_path_buf(),
@@ -415,6 +454,7 @@ async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Rou
         HOSTNAME.to_string(),
         None, // no listener to swap in the router suites
         api_base,
+        relay_socket,
         database_url(),
         Arc::new(SessionStore::new(
             ws_web::DEFAULT_SESSION_TTL,
@@ -439,14 +479,15 @@ async fn front(pool: &PgPool, keys_dir: &std::path::Path, api_base: &str) -> Rou
 /// surface behind the delegate. Returns the post-setup router and the
 /// setup body's text.
 async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
-    let api_base = spawn_sealed_api(fixture).await;
-    let pre_setup = front(&fixture.pool, &fixture.keys_dir, &api_base).await;
+    let (api_base, relay_socket) = spawn_sealed_api(fixture).await;
+    let pre_setup = front(&fixture.pool, &fixture.keys_dir, &api_base, &relay_socket).await;
     let fields = SetupFields {
         admin_username: "admin".to_string(),
         admin_password: ADMIN_PASSWORD.to_string(),
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: SETUP_PASSPHRASE.to_string(),
         master_passphrase_confirm: SETUP_PASSPHRASE.to_string(),
     };
@@ -475,26 +516,19 @@ async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
         "the setup submit carries the resume contract (the listener swaps \
          onto the CA-issued leaf in place — no restart, no re-listen)"
     );
-    // The conversion sealed the shared volume's three bootstrap secrets;
-    // the FOURTH envelope belongs to the api's unlocked construction — a
-    // fresh install never mints a plaintext JWT pair for the conversion
-    // to wrap, so the pair's envelope is minted at the relayed unlock.
+    // The seal-at-creation setup sealed the shared volume's FOUR
+    // bootstrap envelopes — the JWT pair's included (every key is minted
+    // straight into its envelope; the relayed unlock merely opens it).
     assert!(
         [
             ws_web::setup::MASTER_ENVELOPE_FILE,
             ws_web::setup::SECRET_ENVELOPE_FILE,
+            ws_web::setup::JWT_ENVELOPE_FILE,
             ws_web::setup::DB_CREDENTIAL_ENVELOPE_FILE,
         ]
         .iter()
         .all(|name| fixture.keys_dir.join(name).exists()),
-        "the conversion seals the shared volume"
-    );
-    assert!(
-        fixture
-            .keys_dir
-            .join(ws_web::setup::JWT_ENVELOPE_FILE)
-            .exists(),
-        "the relayed unlock mints the JWT pair straight into its envelope"
+        "the setup seals the shared volume"
     );
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
@@ -520,7 +554,7 @@ async fn setup_and_restarted_front(fixture: &Fixture) -> (Router, String) {
         health.contains(r#""state":"unlocked""#),
         "the setup commit's relay unlocked the api: {health}"
     );
-    let web = front(&fixture.pool, &fixture.keys_dir, &api_base).await;
+    let web = front(&fixture.pool, &fixture.keys_dir, &api_base, &relay_socket).await;
     (web, setup_body)
 }
 
@@ -678,16 +712,17 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
     // -- 1. First-run setup through the real setup route --------------------
     // No api process exists in this world (the sealed-shell relay path
     // and the builder's rotation are the front-door suites' and
-    // ws-api's own coverage): the relay target is a closed port, and
+    // ws-api's own coverage): no relay socket exists, and
     // the setup must succeed ANYWAY — the best-effort contract whose
     // recovery is the api's restart plus its own unlock.
     let setup_router = setup::setup_router(SetupState {
-        pool: fixture.pool.clone(),
         keys_dir: fixture.keys_dir.clone(),
         fingerprint: PAGE_FINGERPRINT.to_string(),
         hostname: HOSTNAME.to_string(),
         tls_reload: None,
-        api_base_url: "http://127.0.0.1:9".to_string(),
+        // The modeled no-api world (Task 10, D8): an absent relay
+        // directory keeps the setup commit's unlock relay inert.
+        relay_socket: std::env::temp_dir().join("ws-e2e-no-relay/relay.sock"),
         database_url: database_url(),
     });
     let fields = SetupFields {
@@ -696,6 +731,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: SETUP_PASSPHRASE.to_string(),
         master_passphrase_confirm: SETUP_PASSPHRASE.to_string(),
     };
@@ -730,21 +766,22 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
 
     // -- 2. The API router over the SAME pool and keys directory ------------
     // The api process's post-unlock construction, modeled in-process:
-    // the JWT pair mints straight into its envelope (a fresh install
-    // never writes plaintext — there is no pair for the conversion to
-    // have wrapped), and the CA master + secret-encryption keys open
-    // from their envelopes into RAM custody — the converted volume
-    // holds no plaintext for the file mode to read. The builder's own
-    // pool + rotation are the sealed-test's and the front-door helper's
-    // coverage; here the fixture's pool keeps this world divergence-
-    // free while the CUSTODY (what the issuance cycle exercises) is the
-    // production shape.
+    // the JWT pair's envelope was minted by the setup commit itself
+    // (seal-at-creation: no key is ever minted in plaintext and
+    // converted later), so this call merely LOADS it, and the CA
+    // master + secret-encryption keys open from their envelopes into
+    // RAM custody — the sealed volume holds no plaintext for the file
+    // mode to read. The builder's own pool + rotation are the
+    // sealed-test's and the front-door helper's coverage; here the
+    // fixture's pool keeps this world divergence-free while the
+    // CUSTODY (what the issuance cycle exercises) is the production
+    // shape.
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &fixture.keys_dir.join(ws_web::setup::JWT_ENVELOPE_FILE),
-        SETUP_PASSPHRASE,
+        SETUP_PASSPHRASE.as_bytes(),
         0,
     )
-    .expect("mint the JWT pair straight into its envelope");
+    .expect("load the setup-minted JWT pair envelope");
     assert!(
         !fixture.keys_dir.join("jwt-signing-key.pem").exists()
             && !fixture.keys_dir.join("jwt-verify-key.pem").exists(),
@@ -754,23 +791,24 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         &fixture.keys_dir.join(ws_web::setup::MASTER_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
     )
-    .expect("open the master envelope the conversion sealed");
-    let mut master_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    master_bytes.copy_from_slice(&master);
+    .expect("open the master envelope the setup sealed");
     let secret = ws_core::crypto::KeyEnvelope::open_envelope(
         &fixture.keys_dir.join(ws_web::setup::SECRET_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
     )
-    .expect("open the secret-encryption envelope the conversion sealed");
-    let mut secret_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    secret_bytes.copy_from_slice(&secret);
+    .expect("open the secret-encryption envelope the setup sealed");
     let config = ApiConfig::new(DOMAIN.to_string(), fixture.keys_dir.clone());
+    let mem = ws_secmem::global().expect("the protected pool initializes");
     let state = AppState::new_unlocked(
         fixture.pool.clone(),
         Arc::new(jwt),
         config,
-        zeroize::Zeroizing::new(master_bytes),
-        ws_core::crypto::SecretBox::from_key(zeroize::Zeroizing::new(secret_bytes)),
+        mem.alloc_copy(&master[..])
+            .expect("the arena holds the master"),
+        ws_core::crypto::SecretBox::from_key(
+            mem.alloc_copy(&secret[..])
+                .expect("the arena holds the secret key"),
+        ),
     );
     let router = ws_api::router(state);
 
@@ -992,7 +1030,9 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
-        database_url(),       // the URL whose login role the conversion rotates
+        // The modeled no-api world's relay socket (Task 10, D8).
+        &std::env::temp_dir().join("ws-e2e-no-relay/relay.sock"),
+        database_url(), // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -1189,6 +1229,7 @@ async fn ui_session_end_to_end() {
         default_domain: DOMAIN.to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string()],
         server_hostname: HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: "the-master-passphrase".to_string(),
         master_passphrase_confirm: "the-master-passphrase".to_string(),
     };

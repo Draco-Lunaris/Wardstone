@@ -1,99 +1,68 @@
 //! Secret-encryption helper: AEAD (XChaCha20-Poly1305) sealing of small
 //! secrets at rest — today the TOTP and WebAuthn secrets, encrypted in the
-//! `users` row with a key file created at setup under the keys volume,
+//! `users` row, and the OIDC client secret, sealed in the provider
+//! configuration row and opened only through the shared `to_auth_config`
+//! conversion (its two consumers: the login flow's token exchange and
+//! the saved-config probe) — with a key that exists only as a
+//! protected-arena
+//! reservation (minted at setup straight into
+//! `secret-encryption.envelope`, opened at the unlock handshake),
 //! analogous to the house's `pm-core/src/crypto.rs` helper.
 //!
-//! The key is the file's content: [`SecretBox::create`] generates 32
-//! OS-entropy bytes and writes them mode 0600, crash-atomically (sibling
-//! `.tmp`, fsync, rename), if the file is absent; [`SecretBox::load`] reads
-//! and validates it (exactly 32 bytes). [`SecretBox::seal`] encrypts with a
-//! fresh 24-byte OS-entropy nonce and returns `(ciphertext, nonce)`;
-//! [`SecretBox::open`] decrypts, returning the plaintext zeroized on drop.
+//! [`SecretBox::from_key`] takes the ALREADY-UNWRAPPED arena buffer.
+//! [`SecretBox::seal`] encrypts with a fresh 24-byte OS-entropy nonce and
+//! returns `(ciphertext, nonce)`; [`SecretBox::open`] decrypts, returning
+//! the plaintext zeroized on drop.
 //!
-//! Error contract: key-file problems (missing, unreadable, wrong length,
-//! unwritable) are [`CoreError::Config`] — an operator/environment problem;
-//! cryptographic failures (os-entropy exhaustion, AEAD authentication
-//! failure on tampered or wrong-key ciphertext, wrong nonce length) are
-//! [`CoreError::Crypto`]. No error message ever carries key or plaintext
-//! material.
+//! Error contract: key-volume io problems (the relay-nonce claim's
+//! read/write/remove) are [`CoreError::Config`] — an operator/environment
+//! problem; cryptographic failures (os-entropy exhaustion, AEAD
+//! authentication failure on tampered or wrong-key ciphertext, wrong
+//! nonce length) are [`CoreError::Crypto`]. No error message ever carries
+//! key or plaintext material.
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use rand::{rngs::SysRng, TryRng};
+use ws_secmem::{SecMemError, SecretBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CoreError;
 
-/// Key length in bytes (XChaCha20-Poly1305 key size).
+/// Key length in bytes (XChaCha20-Poly1305 key size): the
+/// secret-encryption key and the passphrase-derived envelope KEK.
 const KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 extended-nonce length in bytes.
 const NONCE_LEN: usize = 24;
 
-/// Holds the 32-byte secret-encryption key (zeroized on drop) and seals
-/// secrets under fresh XChaCha20-Poly1305 nonces.
-#[derive(Clone)]
+/// Holds the 32-byte secret-encryption key in the process's protected
+/// arena (a `ws_secmem::SecretBuf`: never swapped, never in a core dump,
+/// volatilely wiped on drop) and seals secrets under fresh
+/// XChaCha20-Poly1305 nonces.
+///
+/// Deliberately not `Clone` — a copy would be a second plaintext of the
+/// same key, and the arena's whole point is that exactly one exists.
+/// Shared custody is `Arc<SecretBox>`.
 pub struct SecretBox {
-    key: Zeroizing<[u8; KEY_LEN]>,
+    key: SecretBuf,
 }
 
 impl SecretBox {
-    /// Read the secret-encryption key from `<path>`: exactly
-    /// [`KEY_LEN`] bytes.
+    /// Construct from an ALREADY-UNWRAPPED key held in the protected
+    /// arena (the sealed-at-rest unlock flow: the SecretBox key comes
+    /// from its envelope under the operator passphrase-KEK and lives in
+    /// the process's `memfd_secret` pool for the process's life, wiped on
+    /// drop).
     ///
-    /// A missing or unreadable file, or a file of any other length, is
-    /// [`CoreError::Config`] — a missing key file means setup did not run
-    /// (or was lost), not an empty store the caller could bootstrap.
-    pub fn load(path: &Path) -> Result<Self, CoreError> {
-        let raw = match fs::read(path) {
-            Ok(raw) => Zeroizing::new(raw),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(CoreError::Config(format!(
-                    "secret-encryption key file {} not found (run setup first)",
-                    path.display()
-                )));
-            }
-            Err(e) => {
-                return Err(CoreError::Config(format!(
-                    "secret-encryption key file {}: {e}",
-                    path.display()
-                )));
-            }
-        };
-        if raw.len() != KEY_LEN {
-            return Err(CoreError::Config(format!(
-                "secret-encryption key file {} must be exactly {KEY_LEN} bytes, got {}",
-                path.display(),
-                raw.len()
-            )));
-        }
-        let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        key.as_mut().copy_from_slice(raw.as_slice());
-        Ok(SecretBox { key })
-    }
-
-    /// Construct from an ALREADY-UNWRAPPED key (the sealed-at-rest unlock
-    /// flow: the SecretBox key comes from its envelope under the operator
-    /// passphrase-KEK and lives zeroized in RAM).
-    pub fn from_key(key: Zeroizing<[u8; KEY_LEN]>) -> Self {
+    /// The buffer must be exactly 32 bytes; a different length
+    /// is refused at use time (seal/open fail with a typed crypto error),
+    /// because the constructor is infallible by design — the unlock
+    /// handshake has no recovery path a fallible form would serve.
+    pub fn from_key(key: SecretBuf) -> Self {
         SecretBox { key }
-    }
-
-    /// Guarantee a secret-encryption key exists: if the file is present,
-    /// load and validate it (a second `create` must never mint a different
-    /// key over data already sealed with the first); if it is absent,
-    /// generate 32 OS-entropy bytes and write them mode 0600,
-    /// crash-atomically.
-    pub fn create(path: &Path) -> Result<Self, CoreError> {
-        if path.exists() {
-            return SecretBox::load(path);
-        }
-        let key = random_key()?;
-        write_private(path, key.as_slice())?;
-        Ok(SecretBox { key })
     }
 
     /// Seal `plaintext` under a fresh 24-byte OS-entropy nonce, returning
@@ -130,9 +99,9 @@ impl SecretBox {
     }
 }
 
-/// `len` OS-entropy bytes, hex-encoded: the DB-credential rotation's
-/// fresh password material (and any future random-string need). The OS
-/// source failing is a typed error, never a panic.
+/// `len` OS-entropy bytes, hex-encoded: the relay nonce's material
+/// (and any future random-string need). The OS source failing is a
+/// typed error, never a panic.
 pub fn random_hex(len: usize) -> Result<String, CoreError> {
     let mut bytes = vec![0u8; len];
     SysRng
@@ -141,31 +110,33 @@ pub fn random_hex(len: usize) -> Result<String, CoreError> {
     Ok(hex::encode(bytes))
 }
 
-/// Mint a fresh one-time relay nonce into the keys volume (the final
-/// review's F2, spec §10: the ui→api unlock call must not be replayable
-/// by anything else on the internal network). Writing this file IS the
-/// claim — only a volume holder can mint — and each mint REPLACES the
-/// previous claim, so a nonce captured from an earlier relay attempt is
-/// dead the moment the ui re-offers the form. The file is owner-only
-/// and crash-atomic like every other volume write; it is never sealed
-/// (it must be readable while the instance is locked, and it carries
-/// no long-lived secret).
-pub fn mint_relay_nonce(keys_dir: &Path) -> Result<String, CoreError> {
+/// Mint a fresh one-time relay nonce into the RELAY DIR (Task 10, G1:
+/// the claim is an authenticator, so it lives beside the api's Unix
+/// socket in the host-/run relay directory — never the persistent keys
+/// volume; the final review's F2, spec §10: the ui→api unlock call
+/// must not be replayable by anything else on the box). Writing this
+/// file IS the claim — only a relay-dir holder can mint — and each
+/// mint REPLACES the previous claim, so a nonce captured from an
+/// earlier relay attempt is dead the moment the ui re-offers the form.
+/// The file is owner-only and crash-atomic like every other secret-
+/// adjacent write; it is never sealed (it must be readable while the
+/// instance is locked, and it carries no long-lived secret).
+pub fn mint_relay_nonce(relay_dir: &Path) -> Result<String, CoreError> {
     let nonce = random_hex(32)?;
-    write_private(&keys_dir.join(RELAY_NONCE_FILE), nonce.as_bytes())?;
+    write_private(&relay_dir.join(RELAY_NONCE_FILE), nonce.as_bytes())?;
     Ok(nonce)
 }
 
 /// Consume the relay nonce: `Ok(())` only when `nonce` matches the
-/// volume's claim, and the match DELETES the file — one use, so a
+/// relay dir's claim, and the match DELETES the file — one use, so a
 /// captured POST is dead after the real unlock. A mismatch or a missing
 /// claim is a typed refusal that leaves the file alone; the real
 /// holder's next relay mints a fresh claim anyway. The nonce is 256
 /// bits of OS entropy, not a long-lived secret — a plain comparison.
 /// The CALLER serializes the check+delete (the api's unlock window):
 /// two concurrent same-nonce POSTs must not both consume one claim.
-pub fn consume_relay_nonce(keys_dir: &Path, nonce: &str) -> Result<(), CoreError> {
-    let claim = keys_dir.join(RELAY_NONCE_FILE);
+pub fn consume_relay_nonce(relay_dir: &Path, nonce: &str) -> Result<(), CoreError> {
+    let claim = relay_dir.join(RELAY_NONCE_FILE);
     let expected = fs::read_to_string(&claim).map_err(|e| key_io_err(&claim, e))?;
     if expected != nonce {
         return Err(CoreError::Crypto(
@@ -176,29 +147,29 @@ pub fn consume_relay_nonce(keys_dir: &Path, nonce: &str) -> Result<(), CoreError
     Ok(())
 }
 
-/// Build an XChaCha20-Poly1305 cipher from the 32-byte key.
+/// Build an XChaCha20-Poly1305 cipher from the key bytes, which must be
+/// exactly 32 long — a different length cannot come from a well-formed
+/// key source and is refused as a typed crypto error rather than a
+/// panic.
 ///
 /// The transient `Key` copy is zeroized the moment the cipher has taken
 /// its own; the cipher's retained copy is zeroized on drop via the
 /// `chacha20poly1305` `zeroize` feature.
-fn cipher_for(key: &[u8; KEY_LEN]) -> Result<XChaCha20Poly1305, CoreError> {
-    let mut key = Key::try_from(key.as_slice())
+fn cipher_for(key: &[u8]) -> Result<XChaCha20Poly1305, CoreError> {
+    let mut key = Key::try_from(key)
         .map_err(|_| CoreError::Crypto("secret-encryption key is not 32 bytes".to_string()))?;
     let cipher = XChaCha20Poly1305::new(&key);
     Zeroize::zeroize(&mut *key);
     Ok(cipher)
 }
 
-/// 32 OS-entropy bytes for a fresh key file. The OS source failing is a
-/// typed error, never a panic.
-fn random_key() -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-    let mut key = Zeroizing::new([0u8; KEY_LEN]);
-    SysRng.try_fill_bytes(key.as_mut()).map_err(|e| {
-        CoreError::Crypto(format!(
-            "os entropy unavailable for the secret-encryption key: {e}"
-        ))
-    })?;
-    Ok(key)
+/// Map a protected-memory failure into the core vocabulary. `SecMemError`'s
+/// own `Display` names the protection that failed and the knob to turn, and
+/// carries no key or passphrase material by construction. Shared with
+/// `dbcred`'s allocations (the generated login credential's protected
+/// copy).
+pub(crate) fn protected_memory_failure(error: SecMemError) -> CoreError {
+    CoreError::Crypto(format!("protected memory for the master-key KDF: {error}"))
 }
 
 /// Write a file containing key material, mode 0600 on unix, and
@@ -319,17 +290,50 @@ pub const SECRET_ENVELOPE_FILE: &str = "secret-encryption.envelope";
 /// unlock, so a leaked credential dies at the next one.
 pub const DB_CREDENTIAL_ENVELOPE_FILE: &str = "db-credential.envelope";
 /// The one-time relay nonce's claim file (spec §10): the ui process
-/// mints it into the shared keys volume and the api consumes it on the
-/// internal unlock POST — a volume sibling, never sealed itself (it
-/// must be readable while the instance is locked).
+/// mints it into the RELAY DIR — the Unix socket's own directory
+/// (`socket.parent()/relay-nonce`, Task 10: no second env var names it)
+/// — and the api consumes it on the unlock relay. Never sealed itself
+/// (it must be readable while the instance is locked) and never on the
+/// persistent keys volume (G1: it is an authenticator, and the relay
+/// dir is host-/run-backed).
 pub const RELAY_NONCE_FILE: &str = "relay-nonce";
+
+/// Percent-encode a URL userinfo component — the typed database
+/// password being spliced into a connection URL: every byte outside the
+/// RFC 3986 unreserved set `[A-Za-z0-9._~-]` becomes `%XX`, so a
+/// password carrying URL-significant bytes (`@ : / % # ?` and friends)
+/// cannot break the authority parse. Hand-rolled inline rather than a
+/// new dependency — the same precedent as dbcred's base32. Unreserved
+/// bytes map to themselves, so a generated base32 credential (`a-z2-7`)
+/// encodes to itself bit-identically and every existing rotation and
+/// restore flow is unchanged.
+pub fn percent_encode_userinfo(component: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(component.len());
+    for &byte in component.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => {
+                out.push(byte as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[usize::from(byte >> 4)] as char);
+                out.push(HEX[usize::from(byte & 0x0f)] as char);
+            }
+        }
+    }
+    out
+}
 
 /// Substitute `password` into `url`'s `://user:password@host` authority —
 /// inserting a `:password` when the URL carries none (the api's
-/// password-less compose contract). The one home for the parsing: the
-/// binary's boot rule, the ui's credential unwrap, the api's unlock
-/// rotation, and the tests all speak this exact shape. A URL with no
-/// `userinfo@` comes back unchanged (the caller's error to raise).
+/// password-less compose contract). The password splices in
+/// PERCENT-ENCODED ([`percent_encode_userinfo`]): a typed password
+/// carrying `@ : / % # ?` must not break the URL's own parse. The one
+/// home for the parsing: the binary's boot rule, the ui's credential
+/// unwrap, the api's unlock rotation, and the tests all speak this
+/// exact shape. A URL with no `userinfo@` comes back unchanged (the
+/// caller's error to raise).
 pub fn substitute_db_password(url: &str, password: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -338,22 +342,22 @@ pub fn substitute_db_password(url: &str, password: &str) -> String {
     let Some(at) = url[auth_start..].find('@').map(|i| i + auth_start) else {
         return url.to_string();
     };
+    let encoded = percent_encode_userinfo(password);
     match url[auth_start..at].rfind(':') {
         Some(colon_rel) => {
             let colon_abs = auth_start + colon_rel;
-            format!("{}{}{}", &url[..=colon_abs], password, &url[at..])
+            format!("{}{}{}", &url[..=colon_abs], encoded, &url[at..])
         }
-        None => format!("{}:{}{}", &url[..at], password, &url[at..]),
+        None => format!("{}:{}{}", &url[..at], encoded, &url[at..]),
     }
 }
 
 /// The login role a `DATABASE_URL` authenticates as — the role whose
 /// password the rotation ALTERs. Validated to the strict
-/// alphanumeric+underscore shape (the interpolation counterpart of
-/// [`rotate_db_credential`]'s own check); a URL with no `userinfo@`
-/// names no role to rotate. The one home for the parse: the api's
-/// per-unlock rotation, the INIT conversion, and the ui's recovery
-/// re-seed all speak this exact shape.
+/// alphanumeric+underscore shape ([`is_safe_role_identifier`]); a URL
+/// with no `userinfo@` names no role to rotate. The one home for the
+/// parse: the api's per-unlock rotation, the INIT conversion, and the
+/// ui's recovery re-seed all speak this exact shape.
 pub fn db_role_of(url: &str) -> Result<String, CoreError> {
     let Some(scheme_end) = url.find("://") else {
         return Err(CoreError::Config(
@@ -371,7 +375,7 @@ pub fn db_role_of(url: &str) -> Result<String, CoreError> {
         .map(|i| i + auth_start)
         .unwrap_or(at);
     let role = &url[auth_start..user_end];
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !is_safe_role_identifier(role) {
         return Err(CoreError::Config(format!(
             "the database URL's login role {role:?} is not a safe identifier"
         )));
@@ -379,48 +383,19 @@ pub fn db_role_of(url: &str) -> Result<String, CoreError> {
     Ok(role.to_string())
 }
 
-/// Mint a fresh database login credential, ALTER `role` to it over an
-/// already-authenticated connection, and seal it under the volume's
-/// passphrase — the ONE home for the rotation step the setup
-/// conversion, the api's per-unlock rotation, and the ui's recovery
-/// re-seed all share. Postgres accepts no bind parameters in utility
-/// statements (`ALTER … PASSWORD $1` is a syntax error), so the
-/// statement interpolates both parts: the role is validated to the
-/// conservative identifier shape, and the credential is hex by
-/// construction — quote-doubled anyway, so the safety is local rather
-/// than resting on a distant generator's charset. Returns the fresh
-/// credential so the caller can reconnect with it.
-pub async fn rotate_db_credential(
-    executor: impl sqlx::PgExecutor<'_>,
-    role: &str,
-    envelope_path: &Path,
-    passphrase: &str,
-    generation: u64,
-) -> Result<String, CoreError> {
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(CoreError::Config(format!(
-            "the db login role name {role:?} is not a safe identifier"
-        )));
-    }
-    let fresh = random_hex(32)?;
-    sqlx::query(&format!(
-        "ALTER USER {role} PASSWORD '{}'",
-        fresh.replace('\'', "''")
-    ))
-    .execute(executor)
-    .await?;
-    KeyEnvelope::write_envelope(
-        envelope_path,
-        passphrase,
-        fresh.as_bytes(),
-        PROD_KDF_PARAMS,
-        generation,
-    )?;
-    Ok(fresh)
+/// The strict role-identifier shape every place that interpolates a
+/// role name into SQL requires ([`db_role_of`] and `dbcred`'s ALTER):
+/// non-empty ASCII alphanumeric + underscore — a role that cannot
+/// escape its identifier position or a single-quoted literal.
+pub(crate) fn is_safe_role_identifier(role: &str) -> bool {
+    !role.is_empty() && role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub struct KeyEnvelope {
-    kek: Zeroizing<[u8; 32]>,
+    /// The derived key-encryption key, held in the process's
+    /// `memfd_secret` pool: never swapped, never in a core dump, and not
+    /// readable through `/proc/<pid>/mem`. Wiped when the envelope drops.
+    kek: SecretBuf,
     salt: Vec<u8>,
     params: KdfParams,
 }
@@ -429,19 +404,61 @@ impl KeyEnvelope {
     /// Derive the KEK from the passphrase with the stored salt + params.
     /// Deterministic per (passphrase, salt, params) — the envelope's own
     /// salt means every write re-randomizes.
+    ///
+    /// The argon2id pass runs in the pool's locked KDF slot, so neither the
+    /// 256 MiB of memory-hard scratch nor the derived key ever touches the
+    /// heap; there is no heap fallback, and an `m_cost` larger than the slot
+    /// is refused.
+    ///
+    /// Acquiring the slot **blocks the calling OS thread** on a `Condvar`,
+    /// which an async runtime can neither see nor work around, so an async
+    /// caller must reach this through `tokio::task::spawn_blocking` — the
+    /// ~1 s CPU burn already required that. Several callers do not yet:
+    /// ws-web's setup conversion, ws-api's sealed shell and its master-key
+    /// route still derive on a runtime thread. The later setup/boot/custody
+    /// tasks of this plan own those call sites and move them; this task
+    /// changes only where argon2's memory comes from.
     pub fn derive_kek(passphrase: &str, salt: &[u8], params: KdfParams) -> Result<Self, CoreError> {
         use argon2::{Algorithm, Argon2, Params, Version};
-        let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+        let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN))
             .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
-        let mut kek = Zeroizing::new([0u8; 32]);
+        // What argon2 will actually index: `m_cost` rounded to the
+        // lane/segment geometry. Leasing exactly that makes the
+        // slot-too-small refusal exact rather than approximate.
+        let blocks_needed = u32::try_from(argon_params.block_count())
+            .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
+
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        // The slot comes first, then the arena. Neither order can deadlock
+        // — the arena never waits, it refuses with `ArenaFull` — but the
+        // slot is the resource with a queue behind it, and taking it first
+        // means a thread parked on that queue is not also pinning arena
+        // space for as long as it waits. Same order as ws-auth's password
+        // hashing, so the two readers of the pool agree.
+        let mut slot = mem.kdf_slot();
+        let scratch = slot
+            .blocks(blocks_needed)
+            .map_err(protected_memory_failure)?;
+        let mut kek = mem.alloc(KEY_LEN).map_err(protected_memory_failure)?;
         Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
-            .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut())
+            .hash_password_into_with_memory(passphrase.as_bytes(), salt, &mut kek, scratch)
             .map_err(|e| CoreError::Crypto(format!("the master-key derivation failed: {e}")))?;
         Ok(Self {
             kek,
             salt: salt.to_vec(),
             params,
         })
+    }
+
+    /// The KEK's bytes as the fixed-size array the AEAD helpers take, read
+    /// straight out of protected memory — no copy. The length is
+    /// [`KEY_LEN`] by construction ([`KeyEnvelope::derive_kek`] is the only
+    /// constructor, and it reserves exactly that), so the error arm is a
+    /// belt-and-braces check rather than a reachable path — and a check
+    /// rather than an index, because the house style has no `unwrap`.
+    fn kek_bytes(&self) -> Result<&[u8; KEY_LEN], CoreError> {
+        <&[u8; KEY_LEN]>::try_from(&self.kek[..])
+            .map_err(|_| CoreError::Crypto("the derived KEK is not 32 bytes".to_string()))
     }
 
     /// The envelope's recorded salt: the unlock re-derivation reads it from
@@ -521,7 +538,7 @@ impl KeyEnvelope {
             CoreError::Crypto(format!("os entropy unavailable for the envelope salt: {e}"))
         })?;
         let kek = Self::derive_kek(passphrase, &salt, params)?;
-        let (ciphertext, nonce) = seal_bytes(&kek.kek, plaintext)?;
+        let (ciphertext, nonce) = seal_bytes(kek.kek_bytes()?, plaintext)?;
         let envelope = serde_json::json!({
             "version": ENVELOPE_VERSION,
             "kdf": "argon2id",
@@ -576,19 +593,37 @@ impl KeyEnvelope {
                 p_cost,
             },
         )?;
-        open_bytes(&kek.kek, &nonce, &ciphertext)
+        open_bytes(kek.kek_bytes()?, &nonce, &ciphertext)
     }
 
-    /// The KEK as a 32-byte secret-encryption key: the SecretBox consumer
-    /// (TOTP/OIDC seals) takes custody of it at unlock and zeroizes on
-    /// drop.
-    pub fn secrets(&self) -> Zeroizing<[u8; 32]> {
-        self.kek.clone()
+    /// Test support only: a copy accessor for the test suites' borrowed
+    /// envelopes. Every production caller takes the KEK through
+    /// [`KeyEnvelope::into_kek`] (the move, no copy) or the unlock
+    /// handshake; no production caller is permitted here — one would
+    /// re-open a second copy path out of the envelope and must not
+    /// pass review quietly.
+    ///
+    /// The KEK as a fresh 32-byte reservation in the protected arena (a
+    /// copy for a caller holding a borrowed envelope; the production
+    /// custody paths move the buffer instead, via
+    /// [`KeyEnvelope::into_kek`], adding no copy). The caller's buffer is
+    /// wiped on drop; the envelope keeps its own.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Crypto`] if the protected arena cannot serve the
+    /// copy (it never falls back to the heap).
+    pub fn secrets(&self) -> Result<SecretBuf, CoreError> {
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        mem.alloc_copy(&self.kek).map_err(protected_memory_failure)
     }
 
-    /// The KEK as its raw 32 bytes (for callers that re-wrap it into their
-    /// own custody handling, e.g. the keystore conversion).
-    pub fn into_kek(self) -> Zeroizing<[u8; 32]> {
+    /// The KEK moved out of the envelope into the caller's arena custody
+    /// (e.g. the keystore conversion): the reservation transfers whole —
+    /// no copy is made, and the move is infallible by construction
+    /// ([`KeyEnvelope::derive_kek`] is the only constructor and reserves
+    /// exactly [`KEY_LEN`] bytes).
+    pub fn into_kek(self) -> SecretBuf {
         self.kek
     }
 }
@@ -672,10 +707,7 @@ pub fn rewrap_volume(
 }
 
 /// AEAD-seal bytes under a KEK (fresh entropy nonce; the tag appended).
-fn seal_bytes(
-    kek: &Zeroizing<[u8; 32]>,
-    plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+fn seal_bytes(kek: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
     let cipher = cipher_for(kek)?;
     let mut nonce = [0u8; NONCE_LEN];
     SysRng.try_fill_bytes(&mut nonce).map_err(|e| {
@@ -689,7 +721,7 @@ fn seal_bytes(
 
 /// AEAD-open bytes under a KEK; the plaintext is zeroized on drop.
 fn open_bytes(
-    kek: &Zeroizing<[u8; 32]>,
+    kek: &[u8; KEY_LEN],
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CoreError> {
@@ -744,4 +776,74 @@ pub fn scan_volume(dir: &Path) -> Result<VolumeScan, CoreError> {
         present.push(file);
     }
     Ok(VolumeScan { present, mixed })
+}
+
+/// # Unit tests
+///
+/// The URL-significant password coverage (the fix round 1 defect): a
+/// typed password containing URL-significant bytes was spliced RAW,
+/// produced a malformed URL, and was answered as "the database rejected
+/// that password" — a correct password refused with misleading copy.
+/// The encode/decode pair and the splice now round trip.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every URL-significant byte survives the splice and the parse.
+    /// sqlx 0.8.6's `PgConnectOptions` exposes no password getter, so
+    /// the decode side is proven the runtime way: sqlx's own URL parse
+    /// percent-decodes the userinfo AT PARSE TIME, so its ACCEPTING
+    /// the spliced URL (a raw `:` or `@` inside the password breaks
+    /// the authority parse — the original defect) proves the bytes
+    /// survive, and the userinfo slice — taken with the same authority
+    /// convention the extractors speak — is pinned directly in its
+    /// ENCODED form: `@ : / % # ?` percent-escape and the unreserved
+    /// set passes through, all at once.
+    #[test]
+    fn a_url_significant_password_survives_the_splice_and_the_parse() {
+        let password = "p@ss:wo%rd/?#x~._-Z9";
+        let url = substitute_db_password(
+            "postgres://wardstone:placeholder@localhost:5432/wardstone_test",
+            password,
+        );
+        url.parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("the spliced URL parses as a Postgres connect URL");
+        let authority = url.split("://").nth(1).expect("the scheme is present");
+        let userinfo_end = authority.find('@').expect("the authority carries userinfo");
+        let (user, encoded) = authority[..userinfo_end]
+            .split_once(':')
+            .expect("the userinfo carries a password");
+        assert_eq!(user, "wardstone");
+        assert_eq!(
+            encoded, "p%40ss%3Awo%25rd%2F%3F%23x~._-Z9",
+            "the encoder emits the exact percent-encoded form"
+        );
+    }
+
+    /// The no-op property: a generated base32 credential (`a-z2-7`
+    /// only) encodes to itself, so every existing rotation and restore
+    /// flow is bit-identical.
+    #[test]
+    fn a_generated_base32_credential_encodes_to_itself() {
+        let fresh = crate::dbcred::generate_db_password().expect("the generator runs");
+        let text = std::str::from_utf8(&fresh).expect("the generated credential is ascii");
+        assert!(
+            text.bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+            "the generated credential is base32 a-z2-7"
+        );
+        assert_eq!(
+            percent_encode_userinfo(text),
+            text,
+            "the encoder is a no-op on base32 credentials"
+        );
+    }
+
+    /// Encoding is injective for the literal-`%` case: a `%` in the
+    /// password becomes `%25` in the ENCODED form — a raw splice would
+    /// have eaten it as an escape.
+    #[test]
+    fn a_literal_percent_is_injectively_encoded() {
+        assert_eq!(percent_encode_userinfo("100%secure%"), "100%25secure%25");
+    }
 }

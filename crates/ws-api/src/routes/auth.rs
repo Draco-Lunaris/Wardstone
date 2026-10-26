@@ -142,7 +142,7 @@ async fn burn_dummy_verify(password: &str) -> Result<(), ApiError> {
 }
 
 /// The paired session tokens every auth flow returns.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct SessionTokens {
     access_token: String,
     refresh_token: String,
@@ -150,7 +150,7 @@ struct SessionTokens {
 
 /// The login body: username + password, plus the TOTP code when the
 /// account has MFA enabled.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct LoginBody {
     pub username: String,
@@ -267,8 +267,18 @@ async fn verify_totp_of_user(
     }
 }
 
+/// `JwtKeys` carries its TTL as `u64` (the custody shape Task 5 pinned);
+/// the claim-minting arithmetic is `i64`. A TTL beyond `i64::MAX` seconds
+/// cannot be configured on any real volume, so the conversion cannot
+/// fail in practice — the house default (15 minutes,
+/// `DEFAULT_ACCESS_TTL_SECS`) is the fallback so the claim's `exp` can
+/// never wrap into a negative timestamp.
+fn claim_ttl_secs(keys: &ws_auth::jwt::JwtKeys) -> i64 {
+    i64::try_from(keys.ttl_secs).unwrap_or(900)
+}
+
 /// The refresh body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RefreshBody {
     pub refresh_token: String,
@@ -309,7 +319,7 @@ async fn refresh(
         &user.username,
         user.role.as_str(),
         Some(refresh.id),
-        state.jwt.ttl_secs,
+        claim_ttl_secs(&state.jwt),
     );
     let access = issue_access_token(&claims, &state.jwt).map_err(ApiError::from)?;
     Ok(Json(SessionTokens {
@@ -338,7 +348,7 @@ async fn mint_session(state: &AppState, user: &UserModel) -> Result<SessionToken
         &user.username,
         user.role.as_str(),
         Some(refresh.id),
-        state.jwt.ttl_secs,
+        claim_ttl_secs(&state.jwt),
     );
     let access = issue_access_token(&claims, &state.jwt).map_err(ApiError::from)?;
     Ok(SessionTokens {
@@ -348,7 +358,7 @@ async fn mint_session(state: &AppState, user: &UserModel) -> Result<SessionToken
 }
 
 /// The logout body: the refresh token this session owns.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct LogoutBody {
     pub refresh_token: String,
@@ -451,7 +461,7 @@ pub struct MeResponse {
 }
 
 /// The TOTP mutation bodies (`activate`/`deactivate` verify a code).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TotpCodeBody {
     pub code: String,
@@ -459,7 +469,7 @@ pub struct TotpCodeBody {
 
 /// The enroll response: the base32 secret (shown once to scan/configure)
 /// and the otpauth:// provisioning URI.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TotpEnrolled {
     pub secret: String,
@@ -649,7 +659,7 @@ async fn oidc_start(
 }
 
 /// The query parameters of the callback.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OidcCallbackQuery {
     pub code: Option<String>,
@@ -718,7 +728,11 @@ async fn oidc_callback(
 
 /// The per-tenant configured provider row for `{provider}` — the row's
 /// `provider_type` must equal the label in the path; anything else is a
-/// 404 (the provider is not configured).
+/// 404 (the provider is not configured). The stored client-secret seal
+/// opens into the protected arena inside the shared conversion
+/// (`routes::oidc::to_auth_config`); the login flow's token exchange
+/// and the saved-config probe (the test route) are the conversion's two
+/// consumers, and both receive the plaintext secret only in the arena.
 async fn provider_config(
     state: &AppState,
     tenant_id: Uuid,
@@ -729,15 +743,7 @@ async fn provider_config(
         .await?
         .filter(|row| row.provider_type == provider)
         .ok_or_else(|| ApiError::NotFound(format!("provider {provider:?} is not configured")))?;
-    Ok(ws_auth::oidc::OidcConfig {
-        provider_type: row.provider_type,
-        display_name: row.display_name,
-        discovery_url: row.discovery_url,
-        client_id: row.client_id,
-        client_secret: row.client_secret,
-        redirect_uri: row.redirect_uri,
-        scopes: row.scopes,
-    })
+    crate::routes::oidc::to_auth_config(state, &row)
 }
 
 /// Match the verified provider identity to an account: by `oidc_sub`

@@ -27,3 +27,7 @@ x509-parser = { workspace = true }
 ws-ca = { path = "../ws-ca" }
 # The database models, repositories, and typed CoreError.
 ws-core = { path = "../ws-core" }
+# The CA-key source seam's unwrap hands the worker the plaintext CA key
+# inside the protected arena (a `ws_secmem::SecretBuf`), so the seam's
+# signature must name the type (Task 5, the seal-at-creation plan).
+ws-secmem = { path = "../ws-secmem" }

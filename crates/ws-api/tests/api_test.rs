@@ -215,15 +215,27 @@ async fn fixture() -> Fixture {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
-    keystore.ensure_master_key().expect("ensure master key");
-    // The TOTP/OIDC secret-encryption envelope key (created at setup).
-    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
-        .expect("create the secret-encryption key");
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), config);
+    let state = AppState::new_unlocked(
+        pool.clone(),
+        std::sync::Arc::new(jwt),
+        config,
+        master,
+        secret_box,
+    );
     let router = ws_api::router(state.clone());
 
     Fixture {
@@ -321,18 +333,22 @@ async fn sealed_fixture() -> Fixture {
     // production shape (no plaintext pair ever exists on a sealed volume).
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
-        PASSPHRASE,
+        PASSPHRASE.as_bytes(),
         0,
     )
     .expect("mint the JWT pair into its envelope");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
+    let mem = ws_secmem::global().expect("the protected pool initializes");
     let state = AppState::new_unlocked(
         pool.clone(),
         std::sync::Arc::new(jwt),
         config,
-        zeroize::Zeroizing::new(master),
-        ws_core::crypto::SecretBox::from_key(zeroize::Zeroizing::new(secret)),
+        mem.alloc_copy(&master).expect("the arena holds the master"),
+        ws_core::crypto::SecretBox::from_key(
+            mem.alloc_copy(&secret)
+                .expect("the arena holds the secret key"),
+        ),
     );
     let router = ws_api::router(state.clone());
 
@@ -1870,8 +1886,8 @@ async fn login_refresh_logout_lifecycle() {
     assert_eq!(me["actor_type"], "user");
     assert_eq!(me["username"], "operator");
     assert_eq!(
-        me["sealed_volume"], false,
-        "the legacy file-read state is not a sealed volume, got: {me}"
+        me["sealed_volume"], true,
+        "every volume is sealed at creation, got: {me}"
     );
 
     // Refresh rotates: the new pair works, the OLD refresh token is dead.
@@ -2410,14 +2426,15 @@ async fn oidc_start_mints_csrf_state() {
     let _db = lock_db().await;
     let mut fx = fixture().await;
 
-    // Configure the (single) tenant's OIDC provider. The discovery URL is
-    // unreachable here — start is expected to fail on the network leg, but
-    // only AFTER the state was minted and stored.
+    // Configure the (single) tenant's OIDC provider: an ABSENT secret pair
+    // (the public-client convention — the columns default to NULL). The
+    // discovery URL is unreachable here — start is expected to fail on the
+    // network leg, but only AFTER the state was minted and stored.
     sqlx::query(
         "INSERT INTO oidc_config (tenant_id, provider_type, display_name, discovery_url, \
-         client_id, client_secret, redirect_uri, scopes) \
+         client_id, redirect_uri, scopes) \
          VALUES ($1, 'custom', 'Test IdP', 'http://127.0.0.1:9/.well-known/openid-configuration', \
-         'client', '', 'http://127.0.0.1:9/callback', 'openid profile email')",
+         'client', 'http://127.0.0.1:9/callback', 'openid profile email')",
     )
     .bind(fx.tenant_id)
     .execute(&fx.pool)
@@ -4955,7 +4972,7 @@ async fn master_key_change_rewraps_the_volume_and_audits() {
     // either — the envelope above is the pair's only home.
     let jwt_err = ws_auth::jwt::load_sealed(
         &fx.keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
-        "the-current-master-passphrase",
+        "the-current-master-passphrase".as_bytes(),
     )
     .unwrap_err();
     assert!(

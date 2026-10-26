@@ -29,23 +29,32 @@
 //!
 //! # Key material handling
 //!
-//! Private keys exist in memory only inside [`Zeroizing`] buffers or the
-//! internal [`ZeroizingKey`] wrapper, whose drop zeroizes rcgen's
-//! serialized PKCS#8 copy on every exit path including `?` errors. At
-//! rest the key appears only inside the keystore's two-layer AEAD
-//! envelope. No error variant ever carries key material: `rsa` failures
-//! are mapped through static, key-free messages.
+//! A key this module UNWRAPS from the keystore (the parent CA's, in
+//! `create_sub_ca`) lives in the protected arena for exactly one use —
+//! the keystore's per-use shape wipes the reservation when the use
+//! ends. A key this module MINTS exists in memory only inside
+//! [`Zeroizing`] buffers or the internal [`ZeroizingKey`] wrapper, whose
+//! drop zeroizes rcgen's serialized PKCS#8 copy on every exit path
+//! including `?` errors (the mint hands its product to the keystore and
+//! the caller in ordinary zeroizing buffers — ring's key objects have
+//! no Drop of their own, a documented residual). At rest the key
+//! appears only inside the keystore's two-layer AEAD envelope. No error
+//! variant ever carries key material: `rsa` failures are mapped through
+//! static, key-free messages.
 //!
 //! # `create_sub_ca` caller contract
 //!
 //! The caller supplies the parent's certificate PEM together with the
-//! parent's DER private key (PKCS#8, as loaded from the keystore), and the
-//! two must belong to the same CA: the child's issuer DN and AKI are taken
-//! from the certificate while the signature is produced by the key, so a
-//! mismatched pair would silently produce a broken chain.
-//! [`create_sub_ca`] therefore verifies the key's public half against the
-//! certificate's subject public key before signing and fails with
-//! [`CaError::X509`] on mismatch.
+//! parent's keystore id; the engine unwraps the parent's DER private key
+//! (PKCS#8) per use inside `KeyStore::with_ca_key` — the arena
+//! reservation is wiped the moment the mint ends, success or failure
+//! alike. The certificate and the key must belong to the same CA: the
+//! child's issuer DN and AKI are taken from the certificate while the
+//! signature is produced by the key, so a mismatched pair would
+//! silently produce a broken chain. [`create_sub_ca`] therefore
+//! verifies the key's public half against the certificate's subject
+//! public key before signing and fails with [`CaError::X509`] on
+//! mismatch.
 
 use chrono::{Datelike, Utc};
 use rand::{rngs::SysRng, TryRng};
@@ -129,10 +138,10 @@ pub struct CreatedCa {
 /// (critical), SKI per rcgen defaults. AKI is omitted, which RFC 5280
 /// permits for self-signed certificates.
 ///
-/// The keystore must already have a master key — call
-/// [`KeyStore::ensure_master_key`] during bootstrap; per the keystore's
-/// contract, storing without one fails with [`CaError::Corrupt`] rather
-/// than silently generating a master.
+/// The keystore must hold the unlocked master
+/// ([`KeyStore::open_unlocked`]); per the keystore's contract, a sealed
+/// store fails with [`CaError::Sealed`] rather than silently generating
+/// a master.
 pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, CaError> {
     let key_pair = ZeroizingKey(generate_key_pair(spec.key_type)?);
     // A root is self-signed: there is no issuer to clamp against.
@@ -151,7 +160,7 @@ pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, 
 }
 
 /// Create a sub-CA signed by the parent CA (`parent_cert_pem` +
-/// `parent_key_der`, see the module docs for the pairing contract),
+/// `parent_key_id`, see the module docs for the pairing contract),
 /// storing the sub-CA's own private key encrypted in `keystore`.
 ///
 /// The sub-CA is an issuing intermediate: BasicConstraints `CA:TRUE,
@@ -159,16 +168,36 @@ pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, 
 /// KeyUsage `keyCertSign | cRLSign` (critical, no digitalSignature), and
 /// an AuthorityKeyIdentifier equal to the parent's SubjectKeyIdentifier.
 ///
-/// The keystore must already have a master key — call
-/// [`KeyStore::ensure_master_key`] during bootstrap; per the keystore's
-/// contract, storing without one fails with [`CaError::Corrupt`] rather
-/// than silently generating a master.
+/// The keystore must hold the unlocked master
+/// ([`KeyStore::open_unlocked`]); per the keystore's contract, a sealed
+/// store fails with [`CaError::Sealed`] rather than silently generating
+/// a master.
 pub fn create_sub_ca(
     parent_cert_pem: &str,
-    parent_key_der: &[u8],
+    parent_key_id: &Uuid,
     spec: &CaSpec,
     keystore: &mut KeyStore,
 ) -> Result<CreatedCa, CaError> {
+    // One per-use unwrap: the parent's key exists in the arena for
+    // exactly the mint of this child, and the reservation is wiped the
+    // moment the mint ends — success and failure alike. `build_sub_ca`
+    // holds the whole issuance flow so the wipe covers it end to end.
+    let (key_pair, cert) = keystore.with_ca_key(parent_key_id, |parent_key_der| {
+        build_sub_ca(parent_cert_pem, parent_key_der, spec)
+    })?;
+    persist(&key_pair, cert, keystore)
+}
+
+/// Build the sub-CA's key pair and certificate under the parent: the
+/// whole issuance flow, pure of keystore access, so [`create_sub_ca`]
+/// can run it inside one per-use unwrap of the parent's key. Every
+/// validation of the parent (pairing, CA-ness, path length, expiry
+/// cap) happens here, inside the unwrap.
+fn build_sub_ca(
+    parent_cert_pem: &str,
+    parent_key_der: &[u8],
+    spec: &CaSpec,
+) -> Result<(ZeroizingKey, Certificate), CaError> {
     let parent_key = ZeroizingKey(KeyPair::try_from(parent_key_der)?);
     ensure_parent_key_matches_cert(parent_cert_pem, &parent_key)?;
     // The parent must be a CA that is ALLOWED to have a CA below it: a
@@ -192,7 +221,7 @@ pub fn create_sub_ca(
     params.use_authority_key_identifier_extension = true;
 
     let cert = params.signed_by(&key_pair, &issuer)?;
-    persist(&key_pair, cert, keystore)
+    Ok((key_pair, cert))
 }
 
 /// The issuer-side facts a CA certificate carries, extracted once so the
@@ -423,9 +452,10 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
 ///
 /// `pub(crate)`, and returning the PKCS#8 DER (in a [`Zeroizing`] buffer)
 /// alongside the rcgen key pair: [`crate::leafkey::generate_leaf_key`]
-/// shares exactly this helper and needs the plaintext DER for the
-/// encrypted setup-key slot — re-serializing the pair instead would mint
-/// a second plaintext copy the wrapper cannot reach.
+/// shares exactly this helper and its callers hand the plaintext DER
+/// straight into a protected-arena reservation — re-serializing the
+/// pair instead would mint a second plaintext copy the wrapper cannot
+/// reach.
 ///
 /// Error mapping (no variant carries key material; `rsa`'s error Display
 /// is static text): generation failure maps to [`CaError::Io`] — the
@@ -641,9 +671,9 @@ pub(crate) fn ensure_parent_key_matches_cert(
 /// The key is written to the keystore before success is reported, so a
 /// returned [`CreatedCa`] always implies an envelope exists under
 /// `key_pair_id`. The keystore's master-key precondition applies: the
-/// caller must have run [`KeyStore::ensure_master_key`] (or be reusing a
-/// store that has one), since storing without a master key is
-/// [`CaError::Corrupt`], never a silent master generation. If the store
+/// caller must hold the unlocked master ([`KeyStore::open_unlocked`]),
+/// since storing on a sealed store is [`CaError::Sealed`], never a
+/// silent master generation. If the store
 /// fails, the error propagates and every in-memory copy of the key drops
 /// zeroized.
 fn persist(

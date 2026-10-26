@@ -1,0 +1,32 @@
+[package]
+name = "ws-secmem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# memfd_secret(2)/mmap/mlock/prctl/setrlimit: the whole crate is a thin,
+# audited wrapper over these syscalls, so the raw libc bindings are a direct
+# dependency rather than a transitive one.
+libc = { workspace = true }
+# argon2::Block is the unit the locked KDF/password slots hand out, so the
+# slot API is typed in argon2's own vocabulary (see slots.rs). The workspace
+# pin carries the `zeroize` feature, which this crate's promise depends on:
+# the slot guard wipes the pool, but only argon2 itself can wipe the prehash
+# and blockhash copies it keeps on the stack. No crate here re-declares
+# argon2's features — the workspace pin is the single home for them.
+argon2 = { workspace = true }
+# Volatile, non-elidable wipes of arena buffers and argon2 slots on drop.
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# Ruling 4: a read-only test accessor (`SecMem::peek_for_test`) into the
+# protected mapping, behind `#[cfg(any(test, feature = "test-peek"))]`.
+# It is enabled ONLY through a dev-dependency of a test suite (never a
+# normal dependency), so no production build of any dependent ever sees
+# a path that reads the pool from outside.
+test-peek = []
+
+[dev-dependencies]
+libc = { workspace = true }

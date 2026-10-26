@@ -5,9 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Bump from 1.85: JwtKeys::load_or_create serializes virgin-volume key
-# creation across the ui/api processes with std's file locks (File::lock /
-# try_lock), which need a newer MSRV than 1.85.
+# Bump from 1.85: the legacy plaintext JWT loader (std's
+# File::lock / try_lock) is gone and no std file lock remains, but
+# lowering an MSRV is a deliberate, separately-verified change rather
+# than a deletion side effect — the floor stays at 1.89.
 rust-version = "1.89"
 
 # Shared dependency versions. Exact caret pins chosen for the Plan 1 tech stack;
@@ -18,8 +19,24 @@ rust-version = "1.89"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154" }
 
-# Database (numbered sqlx migrations; REQUIRED_MIGRATION_COUNT convention)
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres"] }
+# Database (numbered sqlx migrations; REQUIRED_MIGRATION_COUNT convention).
+# `tls-rustls-ring` (Task 10, D5): the external-DB policy admits TCP URLs
+# with sslmode=verify-full only, so the driver must actually own a TLS
+# stack — this feature wires sqlx to rustls with the `ring` provider
+# (via tls-rustls-ring-webpki; plain `tls-rustls` is just its alias).
+# The aws-lc-rs variant is a separate feature and never enabled — the
+# same graph-wide constraint ws-web's rustls pins record. webpki-roots
+# enters via sqlx-core as pure data, no crypto provider.
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls-ring"] }
+
+# `log::LevelFilter::Off` for sqlx's statement-logging suppression
+# (ws-core db::connect_options_with_statement_logging_off — the
+# rotation's ALTER inlines the fresh SCRAM verifier into the statement
+# text and sqlx logs statement text at TRACE / slow statements at WARN;
+# the Global Constraint is level-absolute). sqlx does not re-export the
+# log crate. Already compiled in the graph transitively via sqlx — the
+# pin adds the direct edge, not new code.
+log = "0.4.34"
 
 # Async runtime
 tokio = { version = "1.54.0", features = ["full"] }
@@ -36,14 +53,77 @@ der = { version = "0.8.2" }
 # Crypto: envelope encryption (XChaCha20-Poly1305 DEK under master KEK)
 chacha20poly1305 = { version = "0.11.0" }
 rand = { version = "0.10.3" }
-argon2 = { version = "0.6.0" }
+# argon2 0.6 is pinned for its externally-supplied-memory API:
+# `hash_password_into_with_memory`/`fill_memory` take `impl AsMut<[Block]>`,
+# which is what lets ws-secmem run every argon2 pass inside a pre-locked
+# `memfd_secret` slot instead of a fresh heap allocation (ws-auth's password
+# hashing and the master-key KDF both borrow those slots). `Block` is a
+# 1 KiB `#[repr(align(64))]` value, so m_cost KiB == one block per KiB.
+#
+# The `zeroize` feature is NOT a default and is load-bearing here: it is what
+# makes argon2 wipe the state it keeps on its own STACK, which a locked slot
+# cannot reach. Without it argon2 leaves the Blake2b prehash `H0`
+# (`lib.rs:389-390`) and `finalize`'s 1 KiB blockhash copy
+# (`lib.rs:553-574`) lying in the caller's frame — and `H0` plus the salt and
+# parameters, both of which are public in the envelope and the PHC string,
+# recompute the master KEK outright. zeroize 1.9.1 is the pin below, so the
+# feature adds no new crate to the graph.
+argon2 = { version = "0.6.0", features = ["zeroize"] }
+# Volatile, non-elidable wipes. ws-secmem leans on `Zeroize for [u8]` to wipe
+# arena buffers and argon2 slots on drop; the compiler must not optimise
+# those stores away, which a plain `fill(0)` permits.
 zeroize = { version = "1.9.1" }
+# Raw syscall bindings for ws-secmem: memfd_secret(2) (syscall 447 — no libc
+# wrapper exists, so it goes through `syscall(SYS_memfd_secret, …)`),
+# mmap/madvise, prctl(PR_SET_DUMPABLE), and get/setrlimit for the core-dump
+# and memlock budgets. Already resolved in the lock transitively.
+libc = { version = "0.2.191" }
 base64 = { version = "0.23.1" }
 # RSA key generation: rcgen's default ring backend can parse and sign RSA
 # keys but cannot generate them (rcgen::Error::KeyGenerationUnavailable), so
 # RSA-2048/3072 CA keys are minted with the pure-Rust rsa crate and imported
 # into rcgen as PKCS#8 DER. Already resolved in the lock via sqlx-mysql.
+# ws-web's arena-backed TLS signer (Task 8) re-uses the same pin for RSA
+# serving leaves: its PKCS#8 decode (`RsaPrivateKey::from_pkcs8_der`) rides
+# rsa's unconditional pkcs8 dependency, and the consumer-side `getrandom`
+# feature (ws-web's dep entry) gates the PSS `Signer` impl's OS-entropy
+# salt.
 rsa = { version = "0.9.10" }
+
+# The lock-free pointer swap ws-web's serving-certificate resolver (Task 8)
+# hot-reloads through: SwapResolver holds the live leaf under an
+# ArcSwapOption, so the TLS surface switches certificates with no
+# re-listen (the same crate axum-server's own RustlsConfig reload uses
+# internally). Already resolved in the lock transitively; the root pin
+# records the now-direct dependency.
+arc-swap = "1.9.3"
+
+# rustls-webpki — the crate rustls aliases as `webpki` for its own ring
+# provider's verification statics. Fix round 1's PKCS#1 v1.5 handshake pin
+# (tls_signer_test's restricted client): the client builds its
+# signature-verification set from the SAME `webpki::ring` statics, so
+# exactly ONE webpki stays in the graph — the 0.103.x line rustls 0.23.46
+# already locks. The `ring` feature exposes the module those statics
+# live in. DEV-ONLY at the consumer (a dev-dependency of ws-web's test
+# suite; no production binary gains it).
+webpki = { version = "0.103.16", package = "rustls-webpki", features = ["ring"] }
+
+# The ECDSA P-256/P-384 serving leaves (Task 8): every TLS signature
+# reconstructs the RustCrypto SigningKey from the arena's PKCS#8 DER and
+# drops it (ZeroizeOnDrop — the key exists for exactly one `sign`
+# call), so the `pkcs8` feature's `from_pkcs8_der` (the blanket
+# DecodePrivateKey over the TryFrom<PrivateKeyInfo> impl) is the
+# load-bearing entry. Already resolved in the lock transitively.
+p256 = { version = "0.13.2", features = ["pkcs8"] }
+p384 = { version = "0.13.1", features = ["pkcs8"] }
+
+# ring for the DB credential's SCRAM-SHA-256 verifier derivation
+# (ws-core dbcred, Task 4): PBKDF2-HMAC-SHA-256 (RFC 7677's
+# SaltedPassword), HMAC-SHA-256 (ClientKey/ServerKey), SHA-256
+# (StoredKey). Defaults are fine; already resolved in the lock via
+# rustls's `ring` provider, and the same pin keeps aws-lc-rs out —
+# the graph-wide constraint ws-web's rustls pins record.
+ring = "0.17.14"
 
 # SHA-256 for the ws-ca creation tests' serial-number regression pin
 # (recomputing rcgen's legacy default serial); never used by production
@@ -74,6 +154,8 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Ed25519 keypair generation for the JWT signing/verification key pair (the
 # `pkcs8` feature provides the PKCS#8/SPKI encoders; keys stay in PEM form).
+# ws-web's arena-backed TLS signer (Task 8) re-uses the same pin for Ed25519
+# serving leaves — the same `pkcs8` feature provides `from_pkcs8_der`.
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 
 # PKCS#8/SPKI DER encoding for the JWT key pair. The `pem` feature provides

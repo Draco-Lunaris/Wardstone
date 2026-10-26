@@ -1,5 +1,6 @@
-//! The setup TLS: the self-signed certificate the UI serves while no CA
-//! exists, keyed in the keystore's setup slot (`ca/setup.key`).
+//! The setup TLS: the certificates the UI serves before the unlock — the
+//! first-run page's RAM-only mint ([`first_run_certificate`]) and the
+//! locked page's sealed ephemeral mint ([`sealed_certificate`]).
 
 use chrono::{Datelike, Utc};
 use rand::{rngs::SysRng, TryRng};
@@ -8,7 +9,6 @@ use rcgen::{
 };
 use sha2::{Digest, Sha256};
 use ws_ca::error::CaError;
-use ws_ca::keystore::KeyStore;
 use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
 use zeroize::Zeroizing;
 
@@ -19,33 +19,19 @@ use zeroize::Zeroizing;
 /// field feeds the CA-issued leaf that replaces it at the end of setup.
 pub const PLACEHOLDER_SAN: &str = "wardstone-setup.local";
 
-/// Mint the setup certificate for `san` (the configured instance hostname,
-/// or [`PLACEHOLDER_SAN`]), store ITS PRIVATE KEY in the keystore's setup
-/// slot, and return `(PEM, sha256-fingerprint-hex)`.
-///
-/// The fingerprint is over the certificate's DER (what the page displays,
-/// and what the operator verifies out of band against the certificate the
-/// TLS listener hands the browser). The certificate is SELF-SIGNED — the
-/// root CA does not exist yet — and minted fresh per call: a new key and
-/// serial each time, so two calls yield two different certificates and
-/// fingerprints (the plan deliberately does not pin fingerprint stability
-/// across calls; the binary calls this once, before the form is filled
-/// in, and restarts regenerate once — while setup is still uncompleted).
-///
-/// The keystore's master key is generated here when absent (`ensure_master_key`
-/// generates on a virgin volume), and the setup slot's envelope write
-/// requires it (`store_setup_key` is `Corrupt` without one). The setup key
-/// counts towards `has_stored_keys`, so a store holding ONLY the setup key
-/// never silently gets a fresh master either.
-pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, String), CaError> {
-    keystore.ensure_master_key()?;
-
-    // An ECDSA P-256 leaf key. The setup certificate is strictly temporary
-    // (replaced by the CA-issued leaf at the end of setup, living only long
-    // enough for the operator to complete the form) — but its consumer is
-    // the operator's BROWSER, and browsers do not support Ed25519 TLS
-    // certificates (curl/openssl do, which hid the gap from server-side
-    // probes). P-256 keeps instant generation AND universal browser support.
+/// The FIRST-RUN certificate (Task 7's boot rule): the same mint as
+/// [`sealed_certificate`] (ECDSA P-256, the operator's browser is the
+/// consumer, the same pins) but for the boot that found NO
+/// `master.envelope` — self-signed and keyed ONLY in RAM (a ws-secmem
+/// arena reservation): no keystore open, no master key, no setup slot,
+/// no file, no database. The first-run boot writes NOTHING to the keys
+/// volume and dials nothing; the setup page echoes the returned
+/// SHA-256 fingerprint for the operator's out-of-band check, and the
+/// setup commit's TLS reload replaces the certificate in place (the
+/// resume contract). The validity window is the setup page's week
+/// ([`validity_window`]): the certificate must outlive the operator's
+/// completing the form.
+pub fn first_run_certificate(san: &str) -> Result<(String, ws_secmem::SecretBuf, String), CaError> {
     let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
     let private_key_der = Zeroizing::new(private_key_der);
 
@@ -54,9 +40,6 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
     dn.push(rcgen::DnType::CommonName, "Wardstone Setup");
     params.distinguished_name = dn;
     params.subject_alt_names = vec![san_type(san)?];
-    // An end-entity certificate: explicitly not a CA, serverAuth only,
-    // and the usages a TLS server needs (the same pins as the built-in
-    // web-server profile's RSA line).
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -64,36 +47,37 @@ pub fn setup_certificate(keystore: &mut KeyStore, san: &str) -> Result<(String, 
     ];
     params.extended_key_usages = vec![RcgensEku::ServerAuth];
     params.serial_number = Some(setup_serial()?);
-    // A generous one-week window (midnight-UTC day bounds, one day of
-    // clock-skew margin at the front, the house validity shape): the
-    // certificate only has to outlive the operator's completing setup.
     let (not_before, not_after) = validity_window();
     params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
     params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
-
     let certificate = params.self_signed(&key_pair)?;
-
-    // The key lands in the setup slot BEFORE anything is reported, so a
-    // returned PEM always implies its key is recoverable after a restart.
-    // The envelope replaces any previous setup slot contents (a
-    // re-generated setup certificate simply replaces the last one's key;
-    // the old certificate is worthless once the browser reloads).
-    keystore.store_setup_key(&private_key_der)?;
-
     let fingerprint = hex::encode(Sha256::digest(certificate.der().as_ref()));
-    Ok((certificate.pem(), fingerprint))
+    // The private key crosses to the caller in RAM custody only: the
+    // arena reservation is the one plaintext copy (the Zeroizing
+    // original above dies at this scope's end), so the first-run boot
+    // hands it to the listener without any intermediate heap buffer —
+    // and without leaving anything on the volume a restart would
+    // have to trust.
+    let key = ws_secmem::global()
+        .and_then(|mem| mem.alloc_copy(&private_key_der))
+        .map_err(|e| CaError::Worker(format!("tls: the protected key arena: {e}")))?;
+    Ok((certificate.pem(), key, fingerprint))
 }
 
 /// The SEALED-MODE certificate: the same mint as
-/// [`setup_certificate`] (ECDSA P-256, the operator's browser is the
+/// [`first_run_certificate`] (ECDSA P-256, the operator's browser is the
 /// consumer, the same pins) but EPHEMERAL — no keystore access (the
 /// instance is sealed; no key material exists in this process yet), no
 /// setup-slot write, and a validity of hours: the certificate lives only
 /// long enough for the operator to read the unlock page and enter the
 /// master passphrase, after which the TLS reload presents the real leaf.
-/// The fingerprint returns for the unlock page's out-of-band hint.
-pub fn sealed_certificate(san: &str) -> Result<(String, Vec<u8>, String), CaError> {
+/// The private key returns as a `ws_secmem::SecretBuf` — born straight
+/// into the protected arena (no heap copy, no file; wiped with the arena
+/// reservation when the caller drops it). The fingerprint returns for
+/// the unlock page's out-of-band hint.
+pub fn sealed_certificate(san: &str) -> Result<(String, ws_secmem::SecretBuf, String), CaError> {
     let (key_pair, private_key_der) = generate_leaf_key(LeafKeyType::EcdsaP256)?;
+    let private_key_der = Zeroizing::new(private_key_der);
 
     let mut params = rcgen::CertificateParams::default();
     let mut dn = rcgen::DistinguishedName::new();
@@ -125,7 +109,14 @@ pub fn sealed_certificate(san: &str) -> Result<(String, Vec<u8>, String), CaErro
 
     let certificate = params.self_signed(&key_pair)?;
     let fingerprint = hex::encode(Sha256::digest(certificate.der().as_ref()));
-    Ok((certificate.pem(), private_key_der.to_vec(), fingerprint))
+    // The private key crosses to the caller in RAM custody only: the
+    // arena reservation is the one plaintext copy (the Zeroizing
+    // original above dies at this scope's end), so the sealed boot can
+    // hand it to the listener without any intermediate heap buffer.
+    let key = ws_secmem::global()
+        .and_then(|mem| mem.alloc_copy(&private_key_der))
+        .map_err(|e| CaError::Worker(format!("tls: the protected key arena: {e}")))?;
+    Ok((certificate.pem(), key, fingerprint))
 }
 
 /// The SAN from `san`: an IP address becomes an `iPAddress`, anything else

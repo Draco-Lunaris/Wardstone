@@ -38,7 +38,6 @@ pub const REFRESH_TTL_HOURS: i64 = 1;
 ///
 /// [`token`](RefreshToken::token) is the only copy of the plaintext that
 /// will ever exist; storage holds just the verifier hash.
-#[derive(Debug)]
 pub struct RefreshToken {
     /// The row's id — also `AccessClaims::sid`, the revocable session id.
     pub id: Uuid,

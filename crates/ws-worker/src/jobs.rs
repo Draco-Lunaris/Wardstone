@@ -34,6 +34,7 @@ use ws_core::models::ocsp::OcspResponseModel;
 use ws_core::repo::audit_repo::AuditRepo;
 use ws_core::repo::certificate_repo::CertificateRepo;
 use ws_core::repo::ocsp_repo::OcspRepo;
+use ws_secmem::SecretBuf;
 use x509_parser::prelude::FromDer;
 use x509_parser::revocation_list::CertificateRevocationList;
 
@@ -88,6 +89,25 @@ enum CaPlan {
     },
 }
 
+/// The source of one CA's unwrapped private key for a revocation batch:
+/// the worker's seam over [`KeyStore`], so the job is generic over the
+/// keystore and a test stand-in can count the unwraps.
+///
+/// Implementations hand out an arena reservation (wiped on drop); the
+/// job is a batch signer — one of the two shapes allowed to hold an
+/// unwrapped CA key across operations. Every other key use goes through
+/// `KeyStore::with_ca_key`.
+pub trait CaKeySource {
+    /// Unwrap the CA private key for `ca_id` into the protected arena.
+    fn unwrap_ca_key(&self, ca_id: &Uuid) -> Result<SecretBuf, CaError>;
+}
+
+impl CaKeySource for KeyStore {
+    fn unwrap_ca_key(&self, ca_id: &Uuid) -> Result<SecretBuf, CaError> {
+        KeyStore::unwrap_ca_key(self, ca_id)
+    }
+}
+
 /// Make the published revocation state of every CA match the database's
 /// truth, and return the number of CAs for which something was
 /// published.
@@ -132,7 +152,10 @@ enum CaPlan {
 /// is logged (with the CA id) and the job continues with the next CA; the
 /// first failure is nevertheless reported to the caller, so the scheduler
 /// logs the job as failed and the next tick retries.
-pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u64, WorkerError> {
+pub async fn regen_crl_and_ocsp<K: CaKeySource>(
+    pool: &PgPool,
+    keystore: &K,
+) -> Result<u64, WorkerError> {
     let cas = list_all_cas(pool).await?;
     let certs = CertificateRepo::new();
     let ocsp = OcspRepo::new();
@@ -160,9 +183,9 @@ pub async fn regen_crl_and_ocsp(pool: &PgPool, keystore: &KeyStore) -> Result<u6
 }
 
 /// Publish what one CA needs, and report whether anything was published.
-async fn regen_one_ca(
+async fn regen_one_ca<K: CaKeySource>(
     pool: &PgPool,
-    keystore: &KeyStore,
+    keystore: &K,
     ca: &CaModel,
     certs: &CertificateRepo,
     ocsp: &OcspRepo,
@@ -236,7 +259,11 @@ async fn regen_one_ca(
     //
     // Every other key error (a damaged key file, a master key that does
     // not match) is data damage, and is a failure in both cases.
-    let ca_key = match keystore.load_ca_key(&ca.id) {
+    //
+    // Exactly ONE unwrap per CA per tick: the arena reservation serves
+    // the CRL and every OCSP response in this batch, and is wiped when
+    // the batch ends — the batch-signer allowance.
+    let ca_key = match keystore.unwrap_ca_key(&ca.id) {
         Ok(key) => key,
         Err(CaError::NotFound) => {
             if revoked.is_empty() && published_crl.is_none() {
@@ -267,7 +294,7 @@ async fn regen_one_ca(
 
         let crl = build_crl(
             &ca.cert_pem,
-            ca_key.as_slice(),
+            &ca_key,
             &CrlSpec {
                 revocations,
                 next_update: VALIDITY,
@@ -324,7 +351,7 @@ async fn regen_one_ca(
             .ok_or_else(|| WorkerError::Config("OCSP validity window out of range".to_owned()))?;
         let response = build_ocsp_response(
             &ca.cert_pem,
-            ca_key.as_slice(),
+            &ca_key,
             cert.cert.serial,
             &OcspResponseSpec {
                 status: OcspStatus::Revoked,

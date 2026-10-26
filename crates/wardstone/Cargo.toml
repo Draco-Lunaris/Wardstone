@@ -26,7 +26,8 @@ thiserror = { workspace = true }
 sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
 # The domain layer: migrations, pool connect, repos, models.
 ws-core = { path = "../ws-core" }
-# Authentication primitives: the JWT key pair lifecycle (`load_or_create`).
+# Authentication primitives: the JWT key pair lifecycle (the sealed
+# envelope mint/open).
 ws-auth = { path = "../ws-auth" }
 # The REST surface: `router(AppState)` and the config vocabulary.
 ws-api = { path = "../ws-api" }
@@ -35,16 +36,30 @@ ws-api = { path = "../ws-api" }
 futures-util = { workspace = true }
 # The sealed boot's TLS reload wraps the leaf key's DER as PKCS#8 PEM.
 base64 = { workspace = true }
-# The TLS front door: `web_router`, `serve_tls`, the setup certificate.
+# The TLS front door: `web_router`, `serve_tls`, the first-run certificate.
 ws-web = { path = "../ws-web" }
-# The CA engine: the keystore (setup slot, per-certificate key envelopes).
+# The CA engine: the keystore (per-certificate key envelopes).
 ws-ca = { path = "../ws-ca" }
-# The keystore loaders return zeroizing key bytes; named so
-# `resolve_serving_leaf`'s loader signature can spell the type out.
+# Zeroizing custody for the boot's transient plaintexts (the sealed
+# certificate's key, the master bytes on their way into the protected
+# arena) — everything the keystore holds long-term is a ws-secmem
+# reservation now.
 zeroize = { workspace = true }
+# The protected arena: the unlocked keystore's master-key custody and
+# `resolve_serving_leaf`'s serving-key loader both hold SecretBuf
+# reservations.
+ws-secmem = { path = "../ws-secmem" }
 
 [dev-dependencies]
 # Model ids and the created_at clock for the serving-leaf selection tests
 # (workspace pins; the workspace uuid pin carries `v4`).
 uuid = { workspace = true }
 chrono = { workspace = true }
+# The boot tests' process probes: HTTPS against the children's TLS front
+# doors — their self-signed first-run/sealed certificates are accepted
+# deliberately, the tests assert behavior, not the certificate chain —
+# plus plain-HTTP healthz polls of the api child (the workspace pin
+# carries rustls-tls + json, so no new features enter the graph).
+reqwest = { workspace = true }
+# The unlock/healthz JSON bodies those probes send and read.
+serde_json = { workspace = true }

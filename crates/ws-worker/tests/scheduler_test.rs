@@ -119,17 +119,22 @@ fn temp_keystore_dir(test_name: &str) -> PathBuf {
     dir
 }
 
-/// A fresh key store in a fresh directory.
+/// A fresh key store in a fresh directory (the seal-at-creation custody:
+/// the master is minted straight into the protected arena — no plaintext
+/// master file exists anywhere).
 fn temp_keystore(test_name: &str) -> KeyStore {
     open_keystore(&temp_keystore_dir(test_name))
 }
 
-/// A key store in an existing directory (the master key is created if it
-/// is not there yet).
+/// A fresh unlocked key store in `dir`.
 fn open_keystore(dir: &Path) -> KeyStore {
-    let mut ks = KeyStore::open(dir).expect("open the test key store");
-    ks.ensure_master_key().expect("create the master key");
-    ks
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    KeyStore::open_unlocked(
+        dir,
+        mem.alloc_copy(&[7u8; 32])
+            .expect("the arena holds the test master"),
+    )
+    .expect("open the unlocked test key store")
 }
 
 /// The Ed25519 root CA every test's certificates are issued by.
@@ -1230,4 +1235,121 @@ async fn test_regen_fails_for_ca_with_corrupt_key() {
         "unexpected error: {err:?}"
     );
     assert_eq!(crls, 0, "nothing is published for the damaged CA");
+}
+
+/// A keystore wrapper counting every `unwrap_ca_key` call that reaches
+/// the inner store — the test seam for the one-unwrap-per-batch
+/// contract: the job is generic over [`ws_worker::jobs::CaKeySource`]
+/// (the trait `KeyStore` itself implements), so the wrapper observes
+/// the production unwrap count without touching the job's flow.
+struct CountingKeys {
+    inner: KeyStore,
+    unwraps: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingKeys {
+    fn unwraps(&self) -> usize {
+        self.unwraps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ws_worker::jobs::CaKeySource for CountingKeys {
+    fn unwrap_ca_key(
+        &self,
+        ca_id: &uuid::Uuid,
+    ) -> Result<ws_secmem::SecretBuf, ws_ca::error::CaError> {
+        self.unwraps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.unwrap_ca_key(ca_id)
+    }
+}
+
+/// Task 5 (the seal-at-creation plan): one CA's whole batch — the CRL
+/// and every OCSP response it owes — runs on a SINGLE unwrap of the CA
+/// key: the job unwraps the envelope into the protected arena once per
+/// CA per tick and reuses the plaintext for every document in that
+/// CA's batch, wiping it when the batch ends. Three revoked
+/// certificates make a batch of one CRL plus three OCSP responses.
+/// Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_crl_batch_unwraps_the_ca_key_once() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY).await;
+
+    sweep_worker_rows(&pool).await;
+
+    let mut keystore = temp_keystore("one-unwrap-per-batch");
+    let root = create_root(&root_spec(), &mut keystore).expect("create the test root CA");
+
+    let tenant = ws_core::repo::tenant_repo::TenantRepo::new()
+        .insert(&pool, WORKER_TENANT)
+        .await
+        .expect("insert the test tenant");
+    let ca = CaModel {
+        id: root.key_pair_id,
+        tenant_id: tenant.id,
+        name: WORKER_CA_NAME.to_string(),
+        subject: "CN=Wardstone Test Worker Root".to_string(),
+        is_root: true,
+        parent_id: None,
+        key_type: KeyType::Ed25519,
+        not_before: chrono::Utc::now() - chrono::Duration::days(1),
+        not_after: chrono::Utc::now() + chrono::Duration::days(365),
+        cert_pem: root.cert_pem.clone(),
+        key_file: "keystore://ca".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+    CaRepo::new()
+        .insert(&pool, &ca)
+        .await
+        .expect("insert the test CA row");
+
+    // Three revoked certificates: one batch = one CRL carrying all
+    // three serials plus three OCSP answers.
+    for offset in 0u128..3 {
+        insert_revoked_cert(&pool, tenant.id, ca.id, LEAF_SERIAL + offset).await;
+    }
+
+    let counting = CountingKeys {
+        inner: keystore,
+        unwraps: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let regenerated = regen_crl_and_ocsp(&pool, &counting).await;
+
+    // Read the results before the cleanup.
+    let crl_count: i64 = sqlx::query_scalar("SELECT count(*) FROM crls WHERE ca_id = $1")
+        .bind(ca.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count the CA's CRL rows");
+    let ocsp_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ocsp_responses WHERE ca_id = $1")
+            .bind(ca.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count the CA's OCSP rows");
+
+    // Cleanup BEFORE asserting.
+    delete_worker_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY).await;
+
+    assert_eq!(
+        regenerated.expect("the batch job succeeds"),
+        1,
+        "the one CA with work is regenerated"
+    );
+    assert_eq!(crl_count, 1, "the batch publishes one CRL");
+    assert_eq!(
+        ocsp_count, 3,
+        "the batch publishes an OCSP response per revoked certificate"
+    );
+    assert_eq!(
+        counting.unwraps(),
+        1,
+        "the whole batch runs on exactly one unwrap of the CA key"
+    );
 }

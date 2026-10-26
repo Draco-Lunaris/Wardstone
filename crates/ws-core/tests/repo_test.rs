@@ -1628,7 +1628,8 @@ fn oidc_config_model(tenant_id: uuid::Uuid) -> OidcConfigModel {
         display_name: "Corp SSO".to_string(),
         discovery_url: "https://idp.example.test/.well-known/openid-configuration".to_string(),
         client_id: "wardstone".to_string(),
-        client_secret: String::new(),
+        client_secret_ciphertext: None,
+        client_secret_nonce: None,
         redirect_uri: "https://wardstone.example.test/api/oidc/callback".to_string(),
         scopes: "openid profile email".to_string(),
     }
@@ -2302,7 +2303,8 @@ async fn oidc_config_roundtrip() {
     second.provider_type = "azure".to_string();
     second.display_name = "Changed Corp SSO".to_string();
     second.client_id = "wardstone-2".to_string();
-    second.client_secret = "s3cret".to_string();
+    second.client_secret_ciphertext = Some(b"s3cret-ciphertext".to_vec());
+    second.client_secret_nonce = Some(b"s3cret-nonce".to_vec());
     second.discovery_url = "https://login.microsoft.com/common/discovery".to_string();
     let second_upsert = repo.upsert(&pool, &second).await;
     let after_upsert = repo.get(&pool, tenant.id).await;
@@ -2335,6 +2337,81 @@ async fn oidc_config_roundtrip() {
     assert_eq!(
         row_count, 1,
         "upsert never leaves a second config row per tenant"
+    );
+}
+
+/// The OIDC client secret is never stored in the clear: a row upserted
+/// with a secret carries no sentinel bytes anywhere in its `row_to_json`
+/// form, and the stored seal opens back to the exact secret the login
+/// flow's exchange path receives. Cleans up before asserting.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn the_oidc_secret_is_never_stored_in_the_clear() {
+    let _db = lock_db().await;
+    let pool = connect(&database_url())
+        .await
+        .expect("connect should succeed and apply the embedded migrations");
+    let mut advisory = lock_advisory(&pool, ADVISORY_KEY_AUTH).await;
+
+    sweep_auth_rows(&pool, AUTH_TENANT).await;
+    let tenant = TenantRepo::new()
+        .insert(&pool, AUTH_TENANT)
+        .await
+        .expect("insert test tenant for the OIDC secret row");
+
+    // The write side's shape: the typed secret sealed under the
+    // instance's secret-encryption key — the same SecretBox pair the
+    // TOTP credential stores — never a plaintext column.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[3u8; 32])
+            .expect("the arena holds the test secret-encryption key"),
+    );
+    let (ciphertext, nonce) = secret_box
+        .seal(b"oidc-sentinel-7f3a")
+        .expect("seal the sentinel secret");
+
+    let mut config = oidc_config_model(tenant.id);
+    config.client_secret_ciphertext = Some(ciphertext);
+    config.client_secret_nonce = Some(nonce);
+    let upsert = OidcConfigRepo::new().upsert(&pool, &config).await;
+    let row_json: String =
+        sqlx::query_scalar("SELECT row_to_json(o)::text FROM oidc_config o WHERE tenant_id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the stored row's json form");
+    let fetched = OidcConfigRepo::new().get(&pool, tenant.id).await;
+
+    // Cleanup BEFORE asserting.
+    delete_auth_rows(&pool, tenant.id).await;
+    release_advisory(&mut advisory, ADVISORY_KEY_AUTH).await;
+
+    upsert.expect("upsert the config with the sentinel secret");
+    assert!(
+        !row_json.contains("oidc-sentinel-7f3a"),
+        "the stored oidc row must not carry the client secret in the clear: {row_json}"
+    );
+    // The exchange path's read side: the stored pair opens back to the
+    // exact typed secret (an AEAD failure here would mean the row was
+    // stored under a different key or damaged).
+    let row = fetched
+        .expect("get the stored row")
+        .expect("the row is present after upsert");
+    let opened = secret_box
+        .open(
+            row.client_secret_ciphertext
+                .as_deref()
+                .expect("the ciphertext half is stored"),
+            row.client_secret_nonce
+                .as_deref()
+                .expect("the nonce half is stored"),
+        )
+        .expect("the stored pair opens under the sealing key");
+    assert_eq!(
+        opened.as_slice(),
+        &b"oidc-sentinel-7f3a"[..],
+        "the exchange path receives the exact secret that was typed"
     );
 }
 

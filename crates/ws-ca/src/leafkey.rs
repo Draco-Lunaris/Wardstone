@@ -97,8 +97,8 @@ impl LeafKeyType {
 
 /// Generate a fresh leaf key of `key_type`: the rcgen key pair and its
 /// PKCS#8 DER serialization (the exact bytes the caller is expected to
-/// hand to [`crate::keystore::KeyStore::store_setup_key`] — or to sign a
-/// CSR with before storing them).
+/// hand to the keystore's envelope store — or to sign a CSR with before
+/// storing them).
 ///
 /// RSA goes through [`crate::ca::generate_rsa`] (the `rsa` crate); the
 /// other three algorithms are generated inside rcgen. The DER is the

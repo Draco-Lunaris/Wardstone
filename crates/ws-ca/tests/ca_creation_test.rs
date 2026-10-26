@@ -21,14 +21,20 @@ use x509_parser::pem::parse_x509_pem;
 
 /// Per-test temp keystore, mirroring the keystore suite's pattern: unique
 /// per test name and process id, swept before use so stale runs can't
-/// interfere.
+/// interfere. The store is UNLOCKED (the seal-at-creation custody): the
+/// master is minted straight into the protected arena — no plaintext
+/// master file exists anywhere.
 fn temp_keystore(test_name: &str) -> KeyStore {
     let dir =
         std::env::temp_dir().join(format!("ws-ca-creation-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let mut ks = KeyStore::open(&dir).unwrap();
-    ks.ensure_master_key().unwrap();
-    ks
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    KeyStore::open_unlocked(
+        &dir,
+        mem.alloc_copy(&[7u8; 32])
+            .expect("the arena holds the test master"),
+    )
+    .expect("open the unlocked test key store")
 }
 
 /// The certificate's SubjectKeyIdentifier bytes (parsed extension).
@@ -158,8 +164,8 @@ fn test_create_root_ed25519_roundtrip() {
 
     // The key was stored encrypted under the returned key-pair id, and the
     // stored bytes are exactly the returned DER (roundtrip).
-    let loaded = ks.load_ca_key(&created.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), created.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&created.key_pair_id).unwrap();
+    assert_eq!(&*loaded, created.private_key_der.as_slice());
 }
 
 #[test]
@@ -174,9 +180,9 @@ fn test_create_sub_ca_signed_by_root() {
     };
     let root = create_root(&root_spec, &mut ks).unwrap();
 
-    // The documented caller contract: load the parent key from the
-    // keystore and pass its DER bytes next to the parent cert PEM.
-    let parent_key = ks.load_ca_key(&root.key_pair_id).unwrap();
+    // The documented caller contract: the parent's certificate PEM and
+    // its key-pair id travel together — `create_sub_ca` performs the
+    // per-use unwrap of the parent key itself.
 
     let sub_spec = CaSpec {
         name: "issuing".to_owned(),
@@ -184,7 +190,7 @@ fn test_create_sub_ca_signed_by_root() {
         key_type: KeyType::Ed25519,
         lifetime: CaLifetime::SubCa,
     };
-    let sub = create_sub_ca(&root.cert_pem, parent_key.as_slice(), &sub_spec, &mut ks).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec, &mut ks).unwrap();
 
     assert!(sub.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert_ne!(sub.key_pair_id, root.key_pair_id);
@@ -225,8 +231,8 @@ fn test_create_sub_ca_signed_by_root() {
     );
 
     // The sub-CA's own key is stored under its own id (roundtrip)
-    let loaded = ks.load_ca_key(&sub.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), sub.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&sub.key_pair_id).unwrap();
+    assert_eq!(&*loaded, sub.private_key_der.as_slice());
 }
 
 #[test]
@@ -271,8 +277,8 @@ fn test_create_root_rsa2048() {
     );
 
     // Key stored encrypted under the returned id (roundtrip)
-    let loaded = ks.load_ca_key(&created.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), created.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&created.key_pair_id).unwrap();
+    assert_eq!(&*loaded, created.private_key_der.as_slice());
 }
 
 #[test]
@@ -355,9 +361,7 @@ fn end_entity_cert(ks: &mut KeyStore) -> (String, Vec<u8>) {
 fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
     let mut ks = temp_keystore("sub-under-pathlen0");
     let root = create_root(&root_spec(), &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks).unwrap();
-    let sub_key = ks.load_ca_key(&sub.key_pair_id).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks).unwrap();
 
     // The sub-CA carries pathlen:0, so it may not have a CA below it.
     let (_, sub_pem) = parse_x509_pem(sub.cert_pem.as_bytes()).unwrap();
@@ -373,7 +377,7 @@ fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
     );
 
     // A sub-sub-CA under it must be refused with a typed error.
-    let err = create_sub_ca(&sub.cert_pem, sub_key.as_slice(), &sub_spec(), &mut ks)
+    let err = create_sub_ca(&sub.cert_pem, &sub.key_pair_id, &sub_spec(), &mut ks)
         .expect_err("a pathlen-0 parent must not be allowed to create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -389,8 +393,13 @@ fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
 fn test_create_sub_ca_under_non_ca_parent_is_refused() {
     let mut ks = temp_keystore("sub-under-non-ca");
     let (leaf_pem, leaf_key) = end_entity_cert(&mut ks);
+    // The parent's key must live in the keystore for the per-use unwrap:
+    // an end-entity's key stored under a fresh id carries the pairing
+    // check, and the CA-ness refusal then fires on the real bytes.
+    let leaf_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&leaf_key_id, &leaf_key).unwrap();
 
-    let err = create_sub_ca(&leaf_pem, &leaf_key, &sub_spec(), &mut ks)
+    let err = create_sub_ca(&leaf_pem, &leaf_key_id, &sub_spec(), &mut ks)
         .expect_err("an end-entity parent must not be allowed to create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -408,8 +417,7 @@ fn test_create_sub_ca_permitted_parents_are_allowed() {
     let mut ks = temp_keystore("sub-permitted-parents");
     // A root has NO pathLenConstraint: any depth below it is permitted.
     let root = create_root(&root_spec(), &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks)
         .expect("a root parent must permit a sub-CA");
     assert!(sub.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
 
@@ -425,9 +433,15 @@ fn test_create_sub_ca_permitted_parents_are_allowed() {
     let permissive_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let permissive_cert = permissive.self_signed(&permissive_key).unwrap();
 
+    // The permissive parent's rcgen key must live in the keystore for the
+    // per-use unwrap: stored under a fresh id, its bytes carry the
+    // pairing check and the pathlen>=1 permission fires on the real cert.
+    let permissive_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&permissive_key_id, &permissive_key.serialize_der())
+        .unwrap();
     let err = create_sub_ca(
         &permissive_cert.pem(),
-        &permissive_key.serialize_der(),
+        &permissive_key_id,
         &sub_spec(),
         &mut ks,
     );
@@ -461,9 +475,7 @@ fn test_create_sub_ca_validity_is_clamped_to_parent_not_after() {
         lifetime: CaLifetime::Leaf,
     };
     let root = create_root(&short_lived_root_spec, &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks)
         .expect("create the sub-CA");
 
     let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
@@ -543,7 +555,13 @@ fn test_issuer_without_key_cert_sign_is_refused() {
     let mut ks = temp_keystore("issuer-without-key-cert-sign");
 
     // As a parent for a sub-CA: refused.
-    let err = create_sub_ca(&cert.pem(), &key.serialize_der(), &sub_spec(), &mut ks)
+    // The fixture issuer's key must live in the keystore for the per-use
+    // unwrap: stored under a fresh id, the pairing check passes on the
+    // real bytes and the keyCertSign refusal fires on the real cert.
+    let parent_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&parent_key_id, &key.serialize_der())
+        .unwrap();
+    let err = create_sub_ca(&cert.pem(), &parent_key_id, &sub_spec(), &mut ks)
         .expect_err("an issuer without keyCertSign must not create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -583,102 +601,6 @@ fn test_issuer_without_key_cert_sign_is_refused() {
         ),
         other => panic!("expected a typed CaError::X509, got {other:?}"),
     }
-}
-
-/// The setup-key slot: the setup certificate's private key stored as an
-/// ordinary envelope under `<dir>/ca/setup.key` — encrypted at rest under
-/// the master KEK exactly like a CA key — and loadable back by the byte.
-#[test]
-fn test_setup_key_round_trips() {
-    let mut ks = temp_keystore("setup-key-roundtrip");
-    // Any DER bytes work for the envelope; the keystore sees an opaque
-    // plaintext.
-    let der: Vec<u8> = (0u8..=63).collect();
-    ks.store_setup_key(&der).unwrap();
-
-    // The slot lives INSIDE the `ca/` directory `has_stored_keys` scans,
-    // with a `.key` suffix — that is what makes it visible to
-    // `ensure_master_key`'s populated-store guard.
-    let path = ks.setup_key_path();
-    assert!(
-        path.ends_with(std::path::Path::new("ca/setup.key")),
-        "the setup key must live at <dir>/ca/setup.key, got {}",
-        path.display()
-    );
-    assert!(path.exists(), "the envelope must be on disk after storing");
-
-    // Round-trip: the exact bytes come back (zeroized on drop).
-    let loaded = ks.load_setup_key().unwrap();
-    assert_eq!(loaded.as_slice(), der.as_slice());
-
-    // Mode 0600, like every key-store file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-}
-
-/// Storing a setup key makes the store POPULATED: deleting `master.key`
-/// afterwards must make `ensure_master_key` refuse (`Corrupt`) rather
-/// than mint a fresh master — which would silently orphan the setup key
-/// (every future load of it would fail with `WrongKey` for data that was
-/// never wrong).
-#[test]
-fn test_ensure_master_key_refuses_when_only_setup_key_exists() {
-    let mut ks = temp_keystore("setup-key-refuse-regen");
-    let der: Vec<u8> = (0u8..=63).collect();
-    ks.store_setup_key(&der).unwrap();
-
-    fs::remove_file(ks.master_key_path()).unwrap();
-
-    assert!(
-        matches!(ks.ensure_master_key(), Err(CaError::Corrupt)),
-        "the setup key visible to has_stored_keys must stop a fresh master"
-    );
-
-    // The refusal must not have "repaired" anything: the envelope is
-    // untouched on disk.
-    assert!(ks.setup_key_path().exists());
-}
-
-/// The setup envelope's associated data is NOT a CA id — it is the fixed
-/// literal `wardstone-setup-key/v1` — so an envelope pasted into a CA
-/// slot (or vice versa) fails decryption as `Corrupt` instead of silently
-/// loading the wrong key.
-#[test]
-fn test_setup_envelope_will_not_load_as_a_ca_key() {
-    use uuid::Uuid;
-
-    let mut ks = temp_keystore("setup-key-aad");
-    let ca_id = Uuid::new_v4();
-    let ca_der: Vec<u8> = (128u8..=191).collect();
-    let setup_der: Vec<u8> = (64u8..=127).collect();
-    ks.store_ca_key(&ca_id, &ca_der).unwrap();
-    ks.store_setup_key(&setup_der).unwrap();
-
-    // Paste the setup envelope into the CA slot, and the CA envelope into
-    // the setup slot — both loads must fail typed.
-    let setup_env = std::fs::read_to_string(ks.setup_key_path()).unwrap();
-    let ca_env = {
-        let mut p = ks.master_key_path();
-        p.pop();
-        p.join("ca").join(format!("{ca_id}.key"))
-    };
-    let ca_env_bytes = std::fs::read(&ca_env).unwrap();
-    std::fs::write(ks.setup_key_path(), &ca_env_bytes).unwrap();
-    std::fs::write(&ca_env, setup_env.as_bytes()).unwrap();
-
-    assert!(
-        matches!(ks.load_setup_key(), Err(CaError::Corrupt)),
-        "a CA key envelope in the setup slot must fail decryption"
-    );
-    assert!(
-        matches!(ks.load_ca_key(&ca_id), Err(CaError::Corrupt)),
-        "a setup envelope in a CA slot must fail decryption"
-    );
 }
 
 /// An ECDSA P-256 root: generated natively in rcgen (the leaf-key path's

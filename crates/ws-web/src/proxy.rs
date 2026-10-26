@@ -7,6 +7,16 @@
 //! exact path-and-query, and the full body. The response streams back
 //! with the upstream status and headers, minus the same hop-by-hop set.
 //!
+//! Custody boundary: the session store's tokens are arena-only AT REST,
+//! never arena-only in flight. The relay hands a materialized
+//! (`Zeroizing`) bearer to `forward_one`, and `reqwest` then copies it
+//! into a plain `HeaderValue` plus its serialization buffers — un-wiped
+//! heap plaintext for the request's lifetime — and the inbound
+//! direction holds the response in reqwest's buffer before serde reads
+//! it. That transient class is inherent to header-based proxying
+//! through reqwest; the load-bearing guarantee is the at-rest one: no
+//! token sits outside the protected arena while the STORE holds it.
+//!
 //! The `/acme*` surface forwards under the exact same contract — the
 //! RFC 8555 headers (`Replay-Nonce`, `Location`, `Link`, the
 //! `application/problem+json` content type) cross untouched — but it
@@ -32,8 +42,9 @@ use thiserror::Error;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::PeerIpKeyExtractor;
 use tower_governor::GovernorLayer;
+use zeroize::Zeroizing;
 
-use crate::session::relay::{rotate_once, RotationOutcome};
+use crate::session::relay::{access_token_of, rotate_once, RotationOutcome};
 use crate::session::store::SessionStore;
 use crate::session::{self, CSRF_HEADER_NAME, CSRF_HEADER_VALUE};
 
@@ -108,8 +119,8 @@ pub fn api_router_with_auth_limit(
             // The layer rides the TWO auth routes' own sub-router (applied
             // to it BEFORE the merge), so the `/api/v1` catch-all and the
             // exact `/api/v1` route never pass through the governor. The
-            // peer IP is `ConnectInfo` — `serve_tls`'s make service
-            // attaches the real client address to every request and
+            // peer IP is `ConnectInfo` — `serve_tls_with_config`'s make
+            // service attaches the real client address to every request and
             // ws-web IS the edge, exactly as on the relay nest.
             let limited_auth = Router::new()
                 .route("/api/v1/auth/login", any(proxy_request))
@@ -235,7 +246,8 @@ pub fn acme_router(api_base_url: &str, rate_limit: Option<ws_api::AuthRateLimit>
             // The layer rides the enrollment route's OWN sub-router
             // (applied to it BEFORE the merge), so the catch-alls never
             // pass through the governor. The peer IP is `ConnectInfo` —
-            // `serve_tls`'s make service attaches the real client address
+            // `serve_tls_with_config`'s make service attaches the real
+            // client address
             // to every request and ws-web IS the edge, exactly as on the
             // proxied-auth nest.
             let limited_enrollment = Router::new()
@@ -356,8 +368,12 @@ async fn proxy_request(
 
     // Expiry FIRST (the cheap local check): a fresh token is injected and
     // forwarded; a stale one skips straight to the rotation section below.
-    let injected: Option<String> = session.as_ref().and_then(|(_, _, entry)| {
-        (entry.access_expires_at > Instant::now()).then(|| entry.access_token.clone())
+    // The injected bearer: a TRANSIENT wiped-on-drop materialization of
+    // the stored access token (`access_token_of`) — one copy per
+    // request, gone with the forward; the at-rest plaintext stays
+    // arena-only.
+    let injected: Option<Zeroizing<String>> = session.as_ref().and_then(|(_, _, entry)| {
+        (entry.access_expires_at > Instant::now()).then(|| access_token_of(entry))
     });
 
     // Stale per bookkeeping: rotate BEFORE forwarding. At most ONE forward
@@ -369,14 +385,15 @@ async fn proxy_request(
                 store,
                 *id,
                 entry,
-                &entry.access_token,
+                &entry.access_token[..],
                 client,
                 &backend.base,
             )
             .await
             {
                 RotationOutcome::Died => Ok(session_expired_response()),
-                RotationOutcome::Fresh { access } => {
+                RotationOutcome::Fresh { entry: fresh } => {
+                    let bearer = access_token_of(&fresh);
                     forward_one(
                         client,
                         &backend.base,
@@ -384,7 +401,7 @@ async fn proxy_request(
                         &path_and_query,
                         &headers,
                         body.clone(),
-                        Some(&access),
+                        Some(bearer.as_str()),
                     )
                     .await
                 }
@@ -399,7 +416,7 @@ async fn proxy_request(
         &path_and_query,
         &headers,
         body.clone(),
-        injected.as_deref(),
+        injected.as_deref().map(String::as_str),
     )
     .await?;
 
@@ -412,10 +429,14 @@ async fn proxy_request(
     if response.status() != StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
-    let observed: &str = injected.as_deref().unwrap_or(entry.access_token.as_str());
+    let observed: &[u8] = injected
+        .as_deref()
+        .map(|token| token.as_bytes())
+        .unwrap_or(&entry.access_token[..]);
     match rotate_once(&store, id, &entry, observed, client, &backend.base).await {
         RotationOutcome::Died => Ok(session_expired_response()),
-        RotationOutcome::Fresh { access } => {
+        RotationOutcome::Fresh { entry: fresh } => {
+            let bearer = access_token_of(&fresh);
             forward_one(
                 client,
                 &backend.base,
@@ -423,7 +444,7 @@ async fn proxy_request(
                 &path_and_query,
                 &headers,
                 body,
-                Some(&access),
+                Some(bearer.as_str()),
             )
             .await
         }

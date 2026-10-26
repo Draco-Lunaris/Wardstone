@@ -41,12 +41,12 @@ use sqlx::PgPool;
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use x509_parser::pem::parse_x509_pem;
-use zeroize::Zeroizing;
 
 use ws_ca::keystore::KeyStore;
 use ws_core::db::connect;
 use ws_web::setup::{tls, SetupFields, SetupState};
 use ws_web::{run_setup, setup};
+use zeroize::Zeroizing;
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST" (0x5741445354)
 /// plus the suite marker 0x0010.
@@ -65,7 +65,7 @@ const HOSTNAME: &str = "wardstone-ui.test";
 const LEAF_HOSTNAME: &str = "ui.wardstone.test";
 
 /// A display-only fingerprint placeholder (the real one comes from
-/// `setup_certificate`; the page only echoes the state it was given).
+/// `first_run_certificate`; the page only echoes the state it was given).
 const PAGE_FINGERPRINT: &str = "abcd";
 
 /// In-process serialization, the whole-body lock pattern of the ws-core
@@ -160,6 +160,7 @@ fn test_fields() -> SetupFields {
         default_domain: "wardstone.test".to_string(),
         admin_cidrs: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
         server_hostname: LEAF_HOSTNAME.to_string(),
+        db_password: Zeroizing::new("wardstone".to_string()),
         master_passphrase: "the-master-passphrase".to_string(),
         master_passphrase_confirm: "the-master-passphrase".to_string(),
     }
@@ -179,20 +180,49 @@ struct Fixture {
     net: RestoreNet,
 }
 
+/// The modeled no-api world's relay socket (Task 10, D8): a path whose
+/// relay directory does not exist, so the setup commit's unlock relay
+/// fails at the nonce mint and logs its WARN — the best-effort
+/// contract, never a failed setup.
+fn no_relay_socket() -> PathBuf {
+    std::env::temp_dir().join("ws-web-setup-no-relay/relay.sock")
+}
+
 /// The state the setup handlers need, from the fixture.
 fn setup_state(fixture: &Fixture) -> SetupState {
     SetupState {
-        pool: fixture.pool.clone(),
         keys_dir: fixture.keys_dir.clone(),
         fingerprint: PAGE_FINGERPRINT.to_string(),
         hostname: HOSTNAME.to_string(),
         tls_reload: None,
         // No api process exists in this suite's world: the setup commit's
-        // relay finds a closed port and logs its WARN — the modeled
+        // relay finds no socket and logs its WARN — the modeled
         // best-effort path, never a failed setup.
-        api_base_url: "http://127.0.0.1:9".to_string(),
+        relay_socket: no_relay_socket(),
         database_url: database_url(),
     }
+}
+
+/// The fixed 16-byte salt the shared role's restore verifier uses
+/// (Task 4's ruling: NO plaintext ALTER on the test side either — the
+/// restore sets the verifier form of `wardstone`'s bootstrap password,
+/// and a fixed salt keeps that verifier deterministic across every
+/// suite that restores the shared role).
+const FIXED_TEST_SALT: [u8; 16] = *b"0123456789abcdef";
+
+/// The shared test role's restore statement: the SCRAM-SHA-256
+/// verifier of the bootstrap password `wardstone` — Postgres stores
+/// the verifier as-is and the plaintext behind it logs in, so every
+/// suite's `wardstone:wardstone` connect keeps working.
+fn restore_statement() -> String {
+    format!(
+        "ALTER USER wardstone PASSWORD '{}'",
+        ws_core::dbcred::scram_verifier(
+            b"wardstone",
+            &FIXED_TEST_SALT,
+            ws_core::dbcred::SCRAM_ITERATIONS,
+        )
+    )
 }
 
 impl Fixture {
@@ -210,7 +240,7 @@ impl Fixture {
             // end of cleanup, after this restore — unreachable.
             panic!("the advisory connection must be held through the restore");
         };
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&mut **conn)
             .await
             .expect("restore the shared test role's password");
@@ -290,9 +320,7 @@ fn spawn_restore_net(url: &str) -> RestoreNet {
         }
         // Phase 3: the restore, over the connection this runtime made.
         runtime.block_on(async {
-            let _ = sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
-                .execute(&mut conn)
-                .await;
+            let _ = sqlx::query(&restore_statement()).execute(&mut conn).await;
         });
         let _ = tx.send(());
     });
@@ -520,42 +548,39 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         }
         None => String::new(),
     };
-    // The sealed-volume contract: the conversion wraps every plaintext
-    // original into passphrase envelopes and deletes the originals, so
-    // the legacy file-read store must refuse on this volume now — and
-    // the passphrase-opened store must load the very same keys.
-    let legacy_refused = KeyStore::open(&fixture.keys_dir)
-        .and_then(|store| store.load_ca_key(&ca_id).map(|_| ()))
-        .is_err();
     let unlocked_store = {
         let master = ws_core::crypto::KeyEnvelope::open_envelope(
             &fixture.keys_dir.join(setup::MASTER_ENVELOPE_FILE),
             &fields.master_passphrase,
         )
         .expect("open the master envelope with the setup passphrase");
-        let mut master_bytes = [0u8; 32];
-        master_bytes.copy_from_slice(&master);
-        KeyStore::open_unlocked(&fixture.keys_dir, Zeroizing::new(master_bytes))
-            .expect("open the unlocked store")
+        KeyStore::open_unlocked(
+            &fixture.keys_dir,
+            ws_secmem::global()
+                .unwrap()
+                .alloc_copy(&master[..])
+                .unwrap(),
+        )
+        .expect("open the unlocked store")
     };
-    let root_key_loaded = unlocked_store.load_ca_key(&ca_id).is_ok();
+    let root_key_loaded = unlocked_store.unwrap_ca_key(&ca_id).is_ok();
     let leaf_key_loaded = certs
         .first()
-        .map(|row| unlocked_store.load_ca_key(&row.0).is_ok())
+        .map(|row| unlocked_store.unwrap_ca_key(&row.0).is_ok())
         .unwrap_or(false);
     let secret_key_exists = fixture
         .keys_dir
         .join(ws_api::state::SECRET_KEY_FILE)
         .exists();
-    // The envelopes this volume actually holds: master (the keystore
-    // minted it), secret-encryption (run_setup minted it), and the DB
-    // credential (the rotation always seals one). The JWT pair is the
-    // api process's to mint — no api runs in this test's world, so the
-    // conversion correctly leaves no jwt envelope behind; the e2e suite
-    // pins that arm where the api actually shares the volume.
+    // The envelopes this volume holds after the seal-at-creation setup:
+    // master (written LAST — the sealed marker), secret-encryption and
+    // the JWT pair (both minted straight into their envelopes), the DB
+    // credential (the rotation always seals one), and the keystore's
+    // own CA key envelopes under ca/.
     let envelopes_exist = [
         setup::MASTER_ENVELOPE_FILE,
-        "secret-encryption.envelope",
+        setup::SECRET_ENVELOPE_FILE,
+        setup::JWT_ENVELOPE_FILE,
         setup::DB_CREDENTIAL_ENVELOPE_FILE,
     ]
     .iter()
@@ -577,10 +602,6 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert!(
         root_key_loaded,
         "the root's key loads under the master passphrase"
-    );
-    assert!(
-        legacy_refused,
-        "the legacy file-read store must refuse on a converted volume"
     );
     assert!(
         envelopes_exist,
@@ -720,6 +741,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -743,14 +765,19 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         "setup routes before setup"
     );
 
-    // The setup submit itself runs through the pinned run_setup call.
+    // The setup submit itself runs through the pinned run_setup call —
+    // the seal-at-creation flow: the pool rides the typed password, the
+    // envelopes land master-last, and the rotation follows the commit.
     {
         let keys_dir = fixture.keys_dir.clone();
-        let mut keystore = KeyStore::open(&keys_dir).expect("open the keystore");
-        run_setup(&fields, &fixture.pool, &mut keystore)
+        run_setup(&fields, &database_url(), &keys_dir)
             .await
             .expect("run_setup completes");
     }
+    // The rotation retired the shared bootstrap credential: restore it
+    // over the fixture's dedicated connection before the post-rotation
+    // reads below (the self-cleaning contract).
+    fixture.restore_role_password().await;
 
     // After setup: rebuilding the front door leaves the setup route out —
     // 404, not 403.
@@ -761,6 +788,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -804,21 +832,18 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
     fixture.cleanup().await;
 }
 
-/// The setup certificate is self-signed, carries the configured SAN, its
-/// returned fingerprint equals the SHA-256 of its own DER, and two calls
-/// yield two different certificates (each is minted fresh; the plan does
-/// NOT pin fingerprint stability across calls).
-#[tokio::test]
-#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
-async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_san() {
-    let _db = lock_db().await;
-    let mut fixture = fixture().await;
-
-    let mut keystore = KeyStore::open(&fixture.keys_dir).expect("open the keystore");
-    let (pem1, fingerprint_hex1) =
-        tls::setup_certificate(&mut keystore, HOSTNAME).expect("mint the setup certificate");
-    let (pem2, fingerprint_hex2) =
-        tls::setup_certificate(&mut keystore, HOSTNAME).expect("re-mint the setup certificate");
+/// The first-run certificate is self-signed, carries the configured SAN,
+/// its returned fingerprint equals the SHA-256 of its own DER, and two
+/// calls yield two different certificates (each is minted fresh; the plan
+/// does NOT pin fingerprint stability across calls). The mint is
+/// RAM-only: it takes no directory and writes nothing — each private
+/// key comes back as a protected-arena reservation, never as a file.
+#[test]
+fn first_run_certificate_is_self_signed_matches_fingerprint_and_carries_the_san() {
+    let (pem1, key1, fingerprint_hex1) =
+        tls::first_run_certificate(HOSTNAME).expect("mint the first-run certificate");
+    let (pem2, key2, fingerprint_hex2) =
+        tls::first_run_certificate(HOSTNAME).expect("re-mint the first-run certificate");
 
     let (_, pem) = parse_x509_pem(pem1.as_bytes()).expect("the certificate is valid PEM");
     let der = pem.contents.clone();
@@ -834,24 +859,25 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         cert.subject(),
         "the certificate is self-signed"
     );
-    // The setup certificate's consumer is the operator's BROWSER: browsers
-    // do not support Ed25519 TLS certificates (curl/openssl do — the gap
-    // surfaced as ERR_SSL_PROTOCOL_ERROR in real deployment), so the mint
-    // must stay on a browser-universal algorithm (ECDSA P-256).
+    // The first-run certificate's consumer is the operator's BROWSER:
+    // browsers do not support Ed25519 TLS certificates (curl/openssl do
+    // — the gap surfaced as ERR_SSL_PROTOCOL_ERROR in real deployment),
+    // so the mint must stay on a browser-universal algorithm (ECDSA
+    // P-256).
     assert_eq!(
         cert.signature_algorithm.algorithm.to_id_string(),
         "1.2.840.10045.4.3.2",
-        "the setup cert's signature is ecdsa-with-SHA256, not Ed25519 (1.3.101.112)"
+        "the first-run cert's signature is ecdsa-with-SHA256, not Ed25519 (1.3.101.112)"
     );
     assert_eq!(
         cert.public_key().algorithm.algorithm.to_id_string(),
         "1.2.840.10045.2.1",
-        "the setup cert's public key is ECDSA (id-ecPublicKey), not Ed25519 (1.3.101.100) or RSA"
+        "the first-run cert's public key is ECDSA (id-ecPublicKey), not Ed25519 (1.3.101.100) or RSA"
     );
     let san = cert
         .subject_alternative_name()
         .expect("the extensions parse")
-        .expect("the setup certificate carries the SAN");
+        .expect("the first-run certificate carries the SAN");
     let dns_names: Vec<String> = san
         .value
         .general_names
@@ -864,7 +890,7 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
     assert_eq!(
         dns_names,
         vec![HOSTNAME.to_string()],
-        "the setup certificate carries the configured SAN"
+        "the first-run certificate carries the configured SAN"
     );
 
     let (_, pem) = parse_x509_pem(pem2.as_bytes()).expect("the second PEM parses");
@@ -876,16 +902,14 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         fingerprint_hex1, fingerprint_hex2,
         "the fingerprints differ along with the certificates"
     );
-
+    // The RAM-only custody, compared through a precomputed boolean so a
+    // failure can never echo key material: each mint holds its own
+    // protected-arena reservation.
+    let keys_differ = *key1 != *key2;
     assert!(
-        keystore.master_key_path().exists(),
-        "the keystore master key is generated before the setup key is stored"
+        keys_differ,
+        "two mints hold two different arena reservations"
     );
-    keystore
-        .load_setup_key()
-        .expect("the setup slot holds the freshly minted key");
-
-    fixture.cleanup().await;
 }
 
 /// Task 9 (Plan-2 I-3): a `server_hostname` the built-in `web-server`
@@ -945,6 +969,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         HOSTNAME.to_string(),
         None,                 // no listener to swap in the router suites
         "http://127.0.0.1:9", // intentionally nothing listens here
+        &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
@@ -1158,9 +1183,15 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
     // bootstrap the operator set), a fresh credential is minted, the
     // role ALTER'd to it, and the envelope sealed at the volume's
     // generation.
-    let fresh = setup::reseed_db_credential(&keys_dir, "the-master-passphrase", &database_url(), 0)
-        .await
-        .expect("the recovery re-seed succeeds");
+    let fresh = setup::recover_db_credential(
+        &keys_dir,
+        b"the-master-passphrase",
+        &database_url(),
+        b"wardstone",
+        0,
+    )
+    .await
+    .expect("the recovery re-seal succeeds");
 
     // The envelope is back, sealed under the volume's passphrase at the
     // volume's generation, and holds exactly the fresh credential.
@@ -1171,7 +1202,7 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
     .expect("the re-seeded envelope opens with the volume passphrase");
     assert_eq!(
         String::from_utf8_lossy(&resealed).into_owned(),
-        fresh.clone(),
+        String::from_utf8_lossy(&fresh).into_owned(),
         "the re-sealed envelope holds exactly the fresh credential"
     );
     assert_eq!(
@@ -1190,7 +1221,8 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
         .map(|_| false)
         .unwrap_or(true);
     let fresh_connects = sqlx::PgPool::connect(&format!(
-        "postgres://wardstone:{fresh}@localhost:5432/wardstone_test"
+        "postgres://wardstone:{}@localhost:5432/wardstone_test",
+        String::from_utf8_lossy(&fresh)
     ))
     .await
     .is_ok();
@@ -1207,17 +1239,17 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
-async fn the_setup_commit_rotates_the_urls_login_role_not_a_constant() {
+async fn the_setup_connect_rides_the_urls_login_role_not_a_constant() {
     // F5 (the final review): the External deployment variant — a
     // DATABASE_URL whose login role is not the compose default. The
-    // rotation must derive its target from the URL (the same
-    // db_role_of derivation the INIT door and the api's unlock builder
-    // use); a hardcoded role would ALTER the compose default and leave
-    // the URL's real role stranded on its bootstrap password. A URL
-    // naming a nonexistent role pins the derivation from the refusal
-    // side: the rotation fails naming THAT role, the anchor never
-    // lands (the master is written last, so the volume stays
-    // convertible), and the real role keeps its bootstrap password.
+    // setup POST builds its own pool from the URL's role plus the typed
+    // password; a URL naming a nonexistent role pins the connect side:
+    // Postgres answers it with the same 28P01 as a wrong password, so
+    // the refusal is the 400 wrong-password copy (a compile-time
+    // "wardstone" role with the typed password would have CONNECTED and
+    // the setup would have run), nothing is generated or written (the
+    // keys directory never comes to exist), and the real role keeps its
+    // bootstrap password.
     let _db = lock_db().await;
     let mut fixture = fixture().await;
     let mut state = setup_state(&fixture);
@@ -1229,42 +1261,430 @@ async fn the_setup_commit_rotates_the_urls_login_role_not_a_constant() {
     let response = post_setup(router, &fields).await;
     let status = response.status();
     let body = body_string(response).await;
+    // Postgres deliberately answers a nonexistent role with the same
+    // 28P01 it answers a wrong password, so the page cannot — and must
+    // not — distinguish the two. The 400 itself pins the connect's
+    // role derivation: a compile-time "wardstone" role with the typed
+    // password would have CONNECTED, and the setup would have run.
     assert_eq!(
         status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the conversion refuses when the URL's role cannot rotate: {body}"
+        StatusCode::BAD_REQUEST,
+        "the setup refuses when the URL's role cannot connect: {body}"
     );
     assert!(
-        body.contains("wardstone_missing"),
-        "the rotation targeted the URL's login role, not a compile-time          constant: {body}"
+        body.contains("the database rejected that password"),
+        "the connect rode the URL's login role, not a compile-time constant: {body}"
     );
-    // The true crash-window shape (the master seals FIRST, the DB
-    // rotation rides LAST): the volume is sealed but the DB-credential
-    // envelope never landed — the §8 recovery state the unlock's
-    // re-seed arm exists to heal.
+    // The refusal writes nothing: the keys directory never came to
+    // exist (the connect fails before the first envelope), no tenant
+    // row landed, and the real role keeps its bootstrap password.
     assert!(
-        fixture
-            .keys_dir
-            .join(ws_core::crypto::MASTER_ENVELOPE_FILE)
-            .exists(),
-        "the master envelope seals before the rotation runs"
+        !fixture.keys_dir.exists()
+            || std::fs::read_dir(&fixture.keys_dir)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+        "the refused connect leaves the keys volume empty"
     );
-    assert!(
-        !fixture.keys_dir.join("master.key").exists(),
-        "the plaintext master is gone: the volume is sealed"
-    );
-    assert!(
-        !fixture
-            .keys_dir
-            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
-            .exists(),
-        "the refused rotation leaves no DB-credential envelope: the \
-         recovery state the unlock's re-seed arm heals"
-    );
-    // The real role keeps its bootstrap password — nothing rotated.
+    let tenant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants WHERE name = $1")
+        .bind(setup::DEFAULT_TENANT_NAME)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the setup tenant");
+    assert_eq!(tenant_count, 0, "the refused connect writes no rows at all");
     sqlx::PgPool::connect(&real)
         .await
-        .expect("the real login role is untouched by the refused rotation");
+        .expect("the real login role is untouched by the refused connect");
     fixture.restore_role_password().await;
+    fixture.cleanup().await;
+}
+
+/// The seal-at-creation D1 order, pinned at nanosecond mtime precision:
+/// the master envelope is the sealed marker and lands LAST among the
+/// envelope writes that precede the rotation — later than every envelope
+/// the bootstrap minted before the marker (the root CA's keystore
+/// envelope, secret-encryption, the JWT pair, and the leaf's keystore
+/// envelope written inside the setup transaction). The db-credential
+/// envelope is EXCLUDED from that ordering on purpose: the rotation runs
+/// after the marker by design, so its mtime must be ≥ the master's
+/// (asserted separately) — its absence is the D5 locked state the
+/// unlock's recovery arm heals, never a torn volume.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_writes_master_envelope_last() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = test_fields();
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+    fixture.restore_role_password().await;
+
+    let keys_dir = fixture.keys_dir.clone();
+    let mtime = |name: &str| {
+        std::fs::metadata(keys_dir.join(name))
+            .expect("the envelope exists")
+            .modified()
+            .expect("the platform carries mtimes")
+    };
+    let master = mtime(setup::MASTER_ENVELOPE_FILE);
+
+    // Every envelope minted BEFORE the marker.
+    let mut earlier = vec![
+        mtime(setup::SECRET_ENVELOPE_FILE),
+        mtime(setup::JWT_ENVELOPE_FILE),
+    ];
+    // The keystore's CA key envelopes (the root's, written first of all,
+    // and the leaf's, written inside the setup transaction).
+    let ca_files: Vec<std::path::PathBuf> = std::fs::read_dir(keys_dir.join("ca"))
+        .expect("the keystore's ca directory exists")
+        .map(|entry| entry.expect("read the ca directory").path())
+        .collect();
+    assert_eq!(ca_files.len(), 2, "the root's and the leaf's key envelopes");
+    for path in &ca_files {
+        earlier.push(
+            std::fs::metadata(path)
+                .expect("the CA envelope exists")
+                .modified()
+                .expect("the platform carries mtimes"),
+        );
+    }
+    for (index, stamp) in earlier.iter().enumerate() {
+        assert!(
+            master >= *stamp,
+            "the master envelope lands after every earlier envelope ({index})"
+        );
+    }
+    // A coarse-mtime filesystem cannot make the >= pins vacuous: the
+    // master must be STRICTLY newer than at least the earliest sealed
+    // envelope (the order is real, not an equal-timestamp artifact).
+    let earliest = earlier.iter().min().expect("the earlier envelopes exist");
+    assert!(
+        master > *earliest,
+        "the master envelope is strictly newer than the earliest envelope"
+    );
+
+    // The rotation's envelope lands AFTER the marker, by design.
+    let db_credential = mtime(setup::DB_CREDENTIAL_ENVELOPE_FILE);
+    assert!(
+        db_credential >= master,
+        "the db-credential envelope is minted after the master (the D5 \
+         locked state, not a torn volume)"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// The seal-at-creation core invariant (G2/G5): a fresh install never
+/// writes a plaintext key file AT ALL. Walking the keys directory after
+/// a direct `run_setup`: every file is an envelope (JSON carrying a
+/// `version` key), no file carries the leaf key's DER bytes, and none
+/// of the legacy plaintext names exists. The relay-nonce file is NOT
+/// written by `run_setup` (it belongs to the page's relay step), so the
+/// walk never sees it.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_writes_no_plaintext_file() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = test_fields();
+    let outcome = run_setup(&fields, &database_url(), &fixture.keys_dir)
+        .await
+        .expect("run_setup completes");
+    fixture.restore_role_password().await;
+
+    let leaf_key: Vec<u8> = outcome.leaf_key[..].to_vec();
+    // Files only: the `ca/` entry is a directory and is walked
+    // separately below.
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&fixture.keys_dir)
+        .expect("the setup created the keys directory")
+        .map(|entry| entry.expect("read the keys directory").path())
+        .filter(|path| path.is_file())
+        .collect();
+    files.extend(
+        std::fs::read_dir(fixture.keys_dir.join("ca"))
+            .expect("the keystore created its directory")
+            .map(|entry| entry.expect("read the ca directory").path()),
+    );
+    assert!(!files.is_empty(), "the setup wrote its envelopes");
+    for path in &files {
+        let bytes = std::fs::read(path).expect("read the file");
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{} is not an envelope: {e}", path.display()));
+        // Both envelope families are self-describing versioned JSON:
+        // ws-core's files carry a `version` key, the ws-ca keystore's
+        // envelopes carry the same idea as `v`.
+        assert!(
+            parsed.get("version").is_some() || parsed.get("v").is_some(),
+            "{} must carry the envelope format's version key",
+            path.display()
+        );
+        assert!(
+            !bytes
+                .windows(leaf_key.len())
+                .any(|window| window == leaf_key),
+            "{} must not carry the leaf key's DER bytes",
+            path.display()
+        );
+    }
+    for legacy in [
+        "master.key",
+        ws_api::state::SECRET_KEY_FILE,
+        "jwt-signing-key.pem",
+        "jwt-verify-key.pem",
+        ws_core::crypto::RELAY_NONCE_FILE,
+    ] {
+        assert!(
+            !fixture.keys_dir.join(legacy).exists(),
+            "the seal-at-creation setup never writes {legacy}"
+        );
+    }
+
+    fixture.cleanup().await;
+}
+
+/// The wrong-typed-password refusal (D1 step 2): a wrong `db_password`
+/// is answered with the page's wrong-password copy and a 400, and it
+/// writes NOTHING — no envelope, no keystore file, no tenant, no
+/// profile, no cert row; the keys directory never even comes to exist
+/// (the connect refuses before the first write).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_wrong_db_password_writes_nothing() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = SetupFields {
+        db_password: Zeroizing::new("not-the-password".to_string()),
+        ..test_fields()
+    };
+    let router = setup::setup_router(setup_state(&fixture));
+
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    let parsed = serde_json::from_str::<Value>(&body).expect("the error body is JSON");
+    let error = parsed
+        .get("error")
+        .and_then(Value::as_str)
+        .expect("the error body carries an `error` message");
+    assert_eq!(
+        error, "the database rejected that password",
+        "the wrong-password refusal renders the page's exact copy"
+    );
+
+    // Nothing was written: the keys directory never came to exist, and
+    // no tenant row landed.
+    assert!(
+        !fixture.keys_dir.exists(),
+        "the refused connect never creates the keys directory"
+    );
+    let tenant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants WHERE name = $1")
+        .bind(setup::DEFAULT_TENANT_NAME)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count the setup tenant");
+    assert_eq!(tenant_count, 0, "the refusal writes no rows at all");
+
+    fixture.cleanup().await;
+}
+
+/// The restored-database refusal (D1 step 3): a tenant row beside an
+/// empty keys volume is refused BEFORE anything is generated or
+/// written — a 409 carrying the design's exact copy, with the keys
+/// directory still absent afterwards (the refusal precedes even the
+/// OS-entropy draws).
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn an_existing_tenant_beside_an_empty_volume_is_refused_before_generation() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // The restored database: the install's tenant row, and no keys
+    // volume at all (the fixture's keys directory does not exist yet).
+    sqlx::query("INSERT INTO tenants (name) VALUES ($1)")
+        .bind(setup::DEFAULT_TENANT_NAME)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed the restored install's tenant row");
+
+    let fields = test_fields();
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_string(response).await;
+    let parsed = serde_json::from_str::<Value>(&body).expect("the error body is JSON");
+    let error = parsed
+        .get("error")
+        .and_then(Value::as_str)
+        .expect("the error body carries an `error` message");
+    assert_eq!(
+        error,
+        "the database already holds an install but the keys volume is \
+         empty — restore the matching keys volume, or remove both \
+         volumes and run setup again",
+        "the refusal renders the design's exact copy"
+    );
+
+    // Nothing was written: the keys volume was never touched.
+    assert!(
+        !fixture.keys_dir.exists(),
+        "the refusal writes nothing to the keys volume"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// Stray envelopes from a crashed earlier attempt (no master envelope
+/// ever landed, so the volume was never sealed) are OVERWRITTEN: the
+/// seal-at-creation setup treats the volume as fresh and every write is
+/// a crash-atomic replace. The junk jwt and secret-encryption envelopes
+/// below become the real ones, openable with the passphrase.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn stray_envelopes_without_a_master_are_overwritten() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // A crashed attempt's strays: junk envelopes, no master marker.
+    std::fs::create_dir_all(&fixture.keys_dir).unwrap();
+    std::fs::write(
+        fixture.keys_dir.join(setup::JWT_ENVELOPE_FILE),
+        b"not an envelope at all",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.keys_dir.join(setup::SECRET_ENVELOPE_FILE),
+        b"neither is this",
+    )
+    .unwrap();
+    assert!(!fixture.keys_dir.join(setup::MASTER_ENVELOPE_FILE).exists());
+
+    let fields = test_fields();
+    let router = setup::setup_router(setup_state(&fixture));
+    let response = post_setup(router, &fields).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the setup overwrites the strays"
+    );
+    fixture.restore_role_password().await;
+
+    // The strays became the real envelopes: both open with the
+    // passphrase (the junk bytes are gone).
+    let jwt = ws_auth::jwt::load_sealed(
+        &fixture.keys_dir.join(setup::JWT_ENVELOPE_FILE),
+        fields.master_passphrase.as_bytes(),
+    )
+    .expect("the overwritten JWT envelope opens with the passphrase");
+    assert!(!jwt.signing_key.is_empty());
+    let secret = ws_core::crypto::KeyEnvelope::open_envelope(
+        &fixture.keys_dir.join(setup::SECRET_ENVELOPE_FILE),
+        &fields.master_passphrase,
+    )
+    .expect("the overwritten secret-encryption envelope opens with the passphrase");
+    assert_eq!(secret.len(), 32, "the secret-encryption key is 32 bytes");
+
+    fixture.cleanup().await;
+}
+
+/// The relay ordering (D1 step 6's successor): the api relay fires only
+/// AFTER the setup's rotation, so the api's unlock opens the ROTATED
+/// credential. The fake api below is a plain Unix-socket listener
+/// (Task 10, D8: the relay rides the local socket): it asserts, at the
+/// moment the relay request arrives, that the db-credential envelope
+/// already exists on the volume and that the request body carries the
+/// master passphrase — then answers 200 so the relay lands.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn setup_relays_after_rotation() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // The fake api: one Unix-socket listener in a scratch relay
+    // directory, a worker thread that answers the ONE relay POST the
+    // setup commit sends.
+    let relay_dir =
+        std::env::temp_dir().join(format!("ws-web-relay-rotation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&relay_dir);
+    std::fs::create_dir_all(&relay_dir).expect("create the fake relay directory");
+    let socket_path = relay_dir.join("relay.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let keys_dir = fixture.keys_dir.clone();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Result<(bool, String), String>>();
+    std::thread::spawn(move || {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = seen_tx.send(Err(format!("the fake api's accept: {e}")));
+                return;
+            }
+        };
+        use std::io::{Read, Write};
+        // Read until the body ends: headers plus Content-Length bytes.
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(headers_end) = text.find("\r\n\r\n") {
+                        let content_length = text
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= headers_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = seen_tx.send(Err(format!("the fake api's read: {e}")));
+                    return;
+                }
+            }
+        }
+        let body = String::from_utf8_lossy(&raw).into_owned();
+        // The rotation has already landed when the relay fires.
+        let rotation_landed = keys_dir
+            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+            .exists();
+        let response =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\nok";
+        if stream.write_all(response.as_bytes()).is_err() {
+            let _ = seen_tx.send(Err("the fake api's write failed".to_string()));
+            return;
+        }
+        let _ = seen_tx.send(Ok((rotation_landed, body)));
+    });
+
+    let mut state = setup_state(&fixture);
+    state.relay_socket = socket_path;
+    let fields = test_fields();
+    let router = setup::setup_router(state);
+    let response = post_setup(router, &fields).await;
+    assert_eq!(response.status(), StatusCode::OK, "the setup POST succeeds");
+    fixture.restore_role_password().await;
+
+    let (rotation_landed, relay_body) = seen_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the fake api answered the relay")
+        .expect("the fake api served the relay cleanly");
+    assert!(
+        rotation_landed,
+        "the db-credential envelope exists when the relay fires: the \
+         rotation precedes the relay"
+    );
+    assert!(
+        relay_body.contains("the-master-passphrase"),
+        "the relay carries the master passphrase to the api"
+    );
+    let _ = std::fs::remove_dir_all(&relay_dir);
+
     fixture.cleanup().await;
 }

@@ -540,6 +540,9 @@ struct Env {
     tenant_id: Uuid,
     web: axum::Router,
     keys_dir: PathBuf,
+    /// The arena-held master the fixture's unlocked custody was opened
+    /// with; the root-CA seed reopens the same custody with it.
+    master: ws_secmem::SecretBuf,
     stub: ChallengeStub,
     fetcher: Arc<StubFetcher>,
     resolver: Arc<StaticTxtResolver>,
@@ -610,11 +613,22 @@ async fn env() -> Env {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let mut keystore = KeyStore::open(&keys_dir).expect("open the fixture keystore");
-    keystore.ensure_master_key().expect("ensure the master key");
-    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
-        .expect("create the secret-encryption key");
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written. The master is held in the
+    // Env so the root-CA seed can reopen the same unlocked custody.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let master_for_state = mem
+        .alloc_copy(&master)
+        .expect("the arena holds the master copy");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let stub = spawn_challenge_stub("placeholder");
     let fetcher = Arc::new(StubFetcher::new());
@@ -626,7 +640,13 @@ async fn env() -> Env {
         tos_url: None,
         acme_account_limit: None,
     };
-    let mut state = AppState::new(pool.clone(), Arc::new(jwt), config);
+    let mut state = AppState::new_unlocked(
+        pool.clone(),
+        Arc::new(jwt),
+        config,
+        master_for_state,
+        secret_box,
+    );
     // The challenge-verification seams are swapped in BEFORE the router
     // wraps the state (the router clones it — a later mutation would not
     // reach it).
@@ -644,6 +664,9 @@ async fn env() -> Env {
         E2E_DOMAIN.to_owned(),
         None, // no listener to swap in the router suites
         &api_base,
+        // Never unlocked here: an absent relay directory keeps the
+        // unlock relay inert (Task 10, D8).
+        &std::env::temp_dir().join("ws-web-acme-no-relay/relay.sock"),
         database_url(),
         store,
         None, // the front-door limiters key on ConnectInfo, absent for a oneshot
@@ -656,6 +679,7 @@ async fn env() -> Env {
         tenant_id,
         web,
         keys_dir,
+        master,
         stub,
         fetcher,
         resolver,
@@ -863,7 +887,14 @@ async fn seed_issuing_profile(env: &Env) {
 /// the `cas` row the CA choice needs. Returns the root certificate PEM —
 /// the chain tail the download body must carry.
 async fn seed_root_ca(env: &Env) -> String {
-    let mut keystore = KeyStore::open(&env.keys_dir).expect("open the fixture keystore");
+    let mut keystore = KeyStore::open_unlocked(
+        &env.keys_dir,
+        ws_secmem::global()
+            .expect("the protected pool initializes")
+            .alloc_copy(&env.master)
+            .expect("the arena holds the held master"),
+    )
+    .expect("open the fixture keystore");
     let created = create_root(
         &CaSpec {
             name: "e2e-test-root".to_owned(),

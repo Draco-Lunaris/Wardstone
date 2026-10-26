@@ -25,11 +25,32 @@
 # envelopes and the database credential is rotated at EVERY unlock — no
 # long-term secret sits in either service's environment. On a sealed
 # volume both processes boot LOCKED: the ui serves its unlock page (and
-# /healthz), the api serves /api/v1/healthz and the internal unlock
-# endpoint; the master passphrase, entered once at the ui, relays to the
-# api and both surfaces resume in place. The healthchecks below are
+# /healthz), the api serves /api/v1/healthz; the master passphrase,
+# entered once at the ui, relays to the api over their shared Unix
+# socket and both surfaces resume in place. The healthchecks below are
 # LIVENESS by contract — every boot state answers 200 with a state
 # field, so a correctly-locked instance is never churned.
+#
+# Local links over Unix sockets (D8, Task 10): the database traffic
+# rides the shared socket at /run/wardstone/pg (the db binds NO TCP
+# port), and the unlock relay rides /run/wardstone/relay/relay.sock
+# (the api binds it mode 0600 and admits only its own uid —
+# SO_PEERCRED; no network listener carries the relay at all). Both
+# directories are bind-mounted from the docker HOST's /run (tmpfs,
+# RAM-backed), NOT named volumes: compose mounts those PER-CONTAINER,
+# so a shared tmpfs volume would silently give each service its own
+# private mount. `type: none, o: bind` fails loudly when the host dir
+# is absent — the short bind syntax would silently auto-create it as
+# root:root. The operator pre-step must therefore run once per HOST
+# BOOT (host /run is wiped at reboot — D6 spirit: documented, not
+# automated; docker/README.md owns the runbook):
+#
+#   install -d -m 0770 -o 70 -g 70 /run/wardstone/pg
+#   install -d -m 0770 -o 10001 -g 10001 /run/wardstone/relay
+#
+# postgres (uid 70 in the image) creates the 0770 socket; ui/api
+# traverse via group_add. The relay dir belongs to the fixed image
+# identity (Dockerfile's uid/gid 10001).
 #
 # Usage:
 #
@@ -96,18 +117,23 @@ services:
     restart: unless-stopped
     command: ["wardstone", "ui"]
     environment:
-      # The Postgres URL. The ui is the SEEDING consumer: this password —
-      # the compose bootstrap credential, the same single
-      # WARDSTONE_DB_PASSWORD the `db` service is built from — is read
-      # only by the first-run boot, whose setup transaction seeds the
-      # tenant. The conversion that ends setup rotates the database
-      # role's password, retiring this credential for good; every later
-      # ui boot is sealed and substitutes the CURRENT credential from the
-      # db-credential envelope into this URL, never reading the env
-      # password again. In the Bundled variant it points at the `db`
-      # service below; the External variant replaces this with the
-      # operator's own database (docker/README.md).
-      DATABASE_URL: postgres://wardstone:${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}@db:5432/wardstone
+      # The Postgres URL, password-less BY CONTRACT (Task 10, ruling
+      # 28e): the compose bootstrap credential leaves DATABASE_URL
+      # entirely — WARDSTONE_DB_PASSWORD remains only the `db`
+      # service's POSTGRES_PASSWORD, and the FIRST-RUN boot's setup
+      # page reads it from the operator's typed db_password field (the
+      # conversion that ends setup seals the ROTATED credential, and
+      # every later ui boot substitutes the CURRENT one from the
+      # db-credential envelope). The socket-host form is the bundled
+      # link (D8): local traffic rides /run/wardstone/pg, no TCP; the
+      # External variant (docker/README.md) replaces this with the
+      # operator's own database, verify-full required. The socket
+      # rides the URL's authority percent-encoded: sqlx (and the
+      # binary's password splice) cannot parse the libpq empty-host
+      # spelling `user@/db?host=/path`, so the percent-encoded form is
+      # the one every consumer parses (Task 10 deviation from ruling
+      # 28e — same role, database, and socket directory).
+      DATABASE_URL: postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone
       # The keystore directory: master KEK, CA key envelopes, the setup
       # slot, the JWT key pair, and the secret-encryption key file all
       # live under it — the SAME volume for BOTH Wardstone services, so
@@ -121,6 +147,11 @@ services:
       # network (the binary's default, spelled out so the pairing of the
       # two services is legible without reading the binary).
       WARDSTONE_API_URL: http://ws-api:8080
+      # The unlock relay's socket (Task 10, D8): the ui's relay DIALS it
+      # once the unlock (or the first-run setup commit) succeeds; the
+      # api service BINDS the same path. The binary's default, spelled
+      # out so the pairing of the two services is legible.
+      WARDSTONE_RELAY_SOCKET: /run/wardstone/relay/relay.sock
       # The api mode's own default bind is 0.0.0.0:8080 to match the
       # WARDSTONE_API_URL default; the ui binds its TLS port. (One
       # variable, per-service values — the binary's contract.)
@@ -138,6 +169,22 @@ services:
       # compose only has to provide the directory (see the image contract
       # in docker/README.md for why the volume starts out usable).
       - wardstone-keys:/var/lib/wardstone/keys
+      # The shared local links (the header's pre-step owns the host
+      # side): the database socket the first-run setup page and every
+      # recovery dials, and the unlock relay socket this process's
+      # relay dials.
+      - ws-pgsock:/run/wardstone/pg
+      - ws-relay:/run/wardstone/relay
+    # Postgres (uid 70 in the image) owns the socket dir's group: the ui
+    # joins it to connect through the 0770 socket (D8's local link).
+    group_add: ["70"]
+    # The protected-memory arena (ws-secmem) mlocks its pages; the
+    # 512 MiB memlock budget is the production pool's ceiling
+    # (ws_secmem::PRODUCTION_POOL), granted here rather than assumed.
+    ulimits:
+      memlock:
+        soft: 536870912
+        hard: 536870912
     depends_on:
       db:
         condition: service_healthy
@@ -175,15 +222,24 @@ services:
       # credential exists in this process's environment at all. The api
       # boots as the sealed shell — on a fresh volume the absent password
       # is itself the boot signal — and the unlock relay (the ui, after
-      # the operator's passphrase) opens the db-credential envelope,
-      # rotates the role's password, and connects with the fresh value.
-      # This URL names only the ROLE and host to authenticate as.
-      DATABASE_URL: postgres://wardstone@db:5432/wardstone
+      # the operator's passphrase, over the shared socket) opens the
+      # db-credential envelope, rotates the role's password, and
+      # connects with the fresh value. This URL names only the ROLE and
+      # the local socket to authenticate at (Task 10, ruling 28e: the
+      # bundled form — D8's local link, no TCP), with the socket
+      # percent-encoded in the authority — the one spelling sqlx
+      # parses (see the ui service's DATABASE_URL note).
+      DATABASE_URL: postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone
       WARDSTONE_KEYS_DIR: /var/lib/wardstone/keys
       WARDSTONE_SERVER_HOSTNAME: ${WARDSTONE_SERVER_HOSTNAME:?set WARDSTONE_SERVER_HOSTNAME (the certificate SAN, e.g. ca.example.test)}
       # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
       # the binary ignores the variable in this mode.
       WARDSTONE_BIND: 0.0.0.0:8080
+      # The unlock relay's socket (Task 10, D8): the api BINDS it, mode
+      # 0600, and admits only its own uid (SO_PEERCRED) — the ui's relay
+      # is the only client. The binary's default, spelled out so the
+      # pairing of the two services is legible.
+      WARDSTONE_RELAY_SOCKET: /run/wardstone/relay/relay.sock
       # UI logins reach ws-api from one loopback IP (ws-web's proxy), so
       # the per-IP limiter would throttle ALL operators collectively; the
       # front door carries the per-client limit instead — on /auth/ui/*
@@ -215,6 +271,22 @@ services:
     # this file — see "The External variant" in docker/README.md.
     volumes:
       - wardstone-keys:/var/lib/wardstone/keys
+      # The shared local links (the header's pre-step owns the host
+      # side): the database socket every unlock-rotated credential
+      # connects through, and the relay socket this process binds.
+      - ws-pgsock:/run/wardstone/pg
+      - ws-relay:/run/wardstone/relay
+    # Postgres (uid 70 in the image) owns the socket dir's group: the
+    # api joins it to connect through the 0770 socket (D8's local
+    # link).
+    group_add: ["70"]
+    # The protected-memory arena (ws-secmem) mlocks its pages; the
+    # 512 MiB memlock budget is the production pool's ceiling
+    # (ws_secmem::PRODUCTION_POOL), granted here rather than assumed.
+    ulimits:
+      memlock:
+        soft: 536870912
+        hard: 536870912
     depends_on:
       db:
         condition: service_healthy
@@ -245,6 +317,16 @@ services:
       POSTGRES_USER: wardstone
       POSTGRES_PASSWORD: ${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}
       POSTGRES_DB: wardstone
+    # D8's local link (Task 10): the database binds NO TCP listener at
+    # all (listen_addresses is empty) — the only way in is the shared
+    # socket at /run/wardstone/pg, mode 0770 so ui/api (group_add'ed to
+    # postgres's group) may connect. The pinned hba/ident (mounted
+    # read-only at /etc/wardstone below) carry the app's SCRAM line and
+    # the recovery peer+ident line; the initdb temp server the
+    # entrypoint runs on a virgin volume uses its OWN generated hba,
+    # so the first-run POSTGRES_USER/POSTGRES_PASSWORD init is
+    # unaffected (ruling 28c).
+    command: postgres -c listen_addresses='' -c unix_socket_directories=/run/wardstone/pg -c unix_socket_permissions=0770 -c hba_file=/etc/wardstone/pg_hba.conf -c ident_file=/etc/wardstone/pg_ident.conf
     volumes:
       # PERSISTENT, unlike the dev bundle: this volume holds the CA. It is
       # NOT dropped by a redeploy; `docker compose down` keeps it, and
@@ -258,19 +340,25 @@ services:
       # start when it finds data at the old path. Mounting the parent
       # directory is what the image's own guidance asks for.
       - wardstone-pgdata:/var/lib/postgresql
+      # The shared socket dir (the header's pre-step owns the host
+      # side): the final server creates its socket here.
+      - ws-pgsock:/run/wardstone/pg
+      # Wardstone's own auth rules, read-only (the command above points
+      # postgres at both; docker/postgres/ in the bundle is their home).
+      - ./postgres/pg_hba.conf:/etc/wardstone/pg_hba.conf:ro
+      - ./postgres/pg_ident.conf:/etc/wardstone/pg_ident.conf:ro
     healthcheck:
-      # `pg_isready` over TCP, deliberately auth-INDEPENDENT: the sealed
-      # world rotates the `wardstone` role's password at every unlock
-      # (spec §5.6), so any check authenticating with the compose-known
-      # `POSTGRES_PASSWORD` would start failing the moment the first
-      # setup commits — and a healthcheck must never depend on a
-      # credential the product exists to retire. TCP, not the unix
-      # socket: readiness for the services means the final server
-      # accepting TCP, which the image's entrypoint only reaches after
-      # its init phase (pg_isready against a temporarily-started
-      # init server never sees the port). No init scripts ride this
-      # bundle, so "accepting connections" on the TCP port IS ready.
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "wardstone", "-d", "wardstone"]
+      # `pg_isready` over the SHARED SOCKET, deliberately auth-INDEPENDENT
+      # (the sealed world rotates the `wardstone` role's password at
+      # every unlock, spec §5.6, so any check authenticating with the
+      # compose-known POSTGRES_PASSWORD would start failing the moment
+      # the first setup commits — and a healthcheck must never depend
+      # on a credential the product exists to retire). The socket, not
+      # TCP: the final server binds NO TCP port (listen_addresses=''
+      # above), so the shared socket IS the service's only listener —
+      # and the image's entrypoint only starts it after its init
+      # phase, so "accepting connections" on the socket means ready.
+      test: ["CMD", "pg_isready", "-h", "/run/wardstone/pg"]
       interval: 5s
       timeout: 5s
       retries: 24
@@ -293,3 +381,24 @@ volumes:
     name: wardstone-keys
   wardstone-pgdata:
     name: wardstone-pgdata
+  # The shared local links (Task 10, ruling 28a/b): NOT tmpfs-backed
+  # named volumes — compose mounts those PER-CONTAINER, so a shared
+  # one would silently give each service its own private tmpfs. The
+  # backing is a bind mount of a directory on the docker HOST's /run
+  # (tmpfs, RAM-backed — G1-consistent, and every container sees the
+  # same inodes). `type: none, o: bind` FAILS LOUDLY at `up` when the
+  # host dir is absent (the short bind syntax would silently
+  # auto-create it as root:root); the header's pre-step owns the
+  # creation, and docker/README.md owns the runbook.
+  ws-pgsock:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /run/wardstone/pg
+  ws-relay:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /run/wardstone/relay
