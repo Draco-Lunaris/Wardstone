@@ -201,8 +201,9 @@ is [`docker/README.md`](docker/README.md).
 - **Lost or broken JWT key material is a loud stop, not a heal.** The
   processes refuse to silently re-key (that would invalidate every
   outstanding token while looking normal): a missing or corrupt
-  `jwt-keys.envelope` fails the unlock loudly — checked before any
-  secret is unwrapped or the database touched — and there is no
+  `jwt-keys.envelope` fails the unlock loudly — on a consistent
+  volume, checked before any secret is unwrapped or the database
+  touched — and there is no
   in-product re-key. Recovery is restoring the keys volume from a
   backup (with the database-credential runbook from the manual if the
   restored envelope predates the role's current password), or wiping
@@ -320,7 +321,7 @@ assumes these operator-side habits:
 - **Swap encrypted or disabled** — defence in depth: arena pages never
   swap, but ordinary process memory can.
 - **Keep Docker's default seccomp profile** — it permits
-  `memfd_secret` (verified on Docker 29.9.2 / containerd 242); a
+  `memfd_secret` (verified on Docker 29.9.2); a
   custom profile must allow the syscall explicitly.
 - The session store holds at most **1,024 concurrent sessions** —
   beyond that the least-recently-touched session is evicted and its

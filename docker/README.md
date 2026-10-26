@@ -33,8 +33,8 @@ the database and the database never contains private keys**: backing up
 the instance means backing up BOTH volumes, and restoring one without
 the other does not yield a half-working instance — the mismatch is
 refused loudly (by the setup POST when the database holds an install
-beside an empty keys volume; by the boot when a sealed keys volume has
-no install behind it).
+beside an empty keys volume; by the unlock POST — a fatal 409 — when
+a sealed keys volume has no install behind it).
 
 Setup:
 
@@ -321,9 +321,12 @@ that image is:
    that user **owns `/var/lib/wardstone/keys`** in the image, so an empty
    named volume first mounted there inherits the correct ownership. The
    `wardstone` processes then write the volume's files themselves: every
-   file is a passphrase-sealed envelope written by the setup flow or
-   the credential rotation, all owned by the container user — never
-   world-readable, never root-owned, and never a plaintext key.
+   file is a passphrase-sealed envelope written by the setup flow, the
+   per-unlock credential rotation (including the recovery runbook's
+   re-seal), the admin surface's passphrase change and its completion
+   rewrap, or a root/sub-CA created through the unlocked api, all
+   owned by the container user — never world-readable, never
+   root-owned, and never a plaintext key.
 3. `wardstone-keys` is a named volume mounted at `/var/lib/wardstone/keys`
    on **both** Wardstone services. Before setup the volume is
    legitimately EMPTY — the first-run boot touches neither database nor
@@ -450,9 +453,12 @@ outstanding token while looking perfectly normal. On a sealed volume
 (every install after setup) the pair lives only in `jwt-keys.envelope`,
 and the api's unlock REFUSES a missing one — a sealed volume always
 carries it (setup writes it before the sealed marker) — with the typed
-`jwt_envelope_missing` refusal, checked BEFORE any secret is unwrapped
-or the database is touched: a failed attempt leaves zero side effects
-(no rotation ran, nothing re-sealed). A corrupt envelope fails the
+`jwt_envelope_missing` refusal. On a consistent volume it is checked
+BEFORE any secret is unwrapped or the database is touched, so a failed
+attempt leaves zero side effects (no rotation ran, nothing re-sealed);
+the one pre-gate write is the passphrase-change completion, which
+re-wraps a half-finished volume's present envelopes first, and the
+refusal comes after that re-wrap. A corrupt envelope fails the
 unlock loudly the same way. Recovery, documented and loud:
 
 1. Restore the keys volume from a backup of the sealed instance —
