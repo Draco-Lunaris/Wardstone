@@ -121,9 +121,9 @@ ed25519-dalek = { workspace = true }
 # PSS key can sign without the caller plumbing an RNG. PKCS#1 v1.5 needs
 # no feature (its `Signer` impl is unconditional).
 rsa = { workspace = true, features = ["getrandom"] }
-# `DecodePrivateKey` in scope for all four stack-construction sites (the
-# p256/p384/ed25519-dalek/rsa `from_pkcs8_der` constructors); the same
-# 0.10 line every backend already depends on, root-pinned.
+# `DecodePrivateKey` in scope for all four per-signature construction
+# sites (the p256/p384/ed25519-dalek/rsa `from_pkcs8_der` constructors);
+# the same 0.10 line every backend already depends on, root-pinned.
 pkcs8 = { workspace = true }
 
 [dev-dependencies]

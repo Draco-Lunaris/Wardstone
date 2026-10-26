@@ -1,7 +1,8 @@
 //! Task 8's arena-backed TLS signer: the serving key never leaves the
 //! protected arena — [`ws_web::tls_signer::ArenaKey`] holds its PKCS#8 DER
 //! in a ws-secmem reservation, and every signature reconstructs the
-//! RustCrypto key on the stack from that DER and drops it again.
+//! RustCrypto key from that DER and drops it again (where each backend
+//! keeps its key during `sign` is the module doc's custody contract).
 //!
 //! The suite exercises the REAL TLS stack: for every pinnable
 //! [`LeafKeyType`] it mints a self-signed certificate (ws-ca's own
@@ -219,8 +220,8 @@ fn fingerprint(cert: &rustls::pki_types::CertificateDer<'static>) -> String {
 /// Every pinnable leaf key type completes a TLS handshake served from the
 /// protected arena: the certificate is minted per kind, the key crosses
 /// as an [`ArenaKey`], and the ring-provider client both VERIFIES the
-/// handshake signature and echoes data over the channel — so a kind whose
-/// stack-built key signs wrongly fails here, not in production.
+/// handshake signature and echoes data over the channel — so a kind
+/// whose per-signature key signs wrongly fails here, not in production.
 #[tokio::test]
 async fn each_leaf_key_type_completes_a_handshake() {
     for kind in ALL_LEAF_KEY_TYPES {
