@@ -267,6 +267,16 @@ async fn verify_totp_of_user(
     }
 }
 
+/// `JwtKeys` carries its TTL as `u64` (the custody shape Task 5 pinned);
+/// the claim-minting arithmetic is `i64`. A TTL beyond `i64::MAX` seconds
+/// cannot be configured on any real volume, so the conversion cannot
+/// fail in practice — the house default (15 minutes,
+/// `DEFAULT_ACCESS_TTL_SECS`) is the fallback so the claim's `exp` can
+/// never wrap into a negative timestamp.
+fn claim_ttl_secs(keys: &ws_auth::jwt::JwtKeys) -> i64 {
+    i64::try_from(keys.ttl_secs).unwrap_or(900)
+}
+
 /// The refresh body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -309,7 +319,7 @@ async fn refresh(
         &user.username,
         user.role.as_str(),
         Some(refresh.id),
-        state.jwt.ttl_secs,
+        claim_ttl_secs(&state.jwt),
     );
     let access = issue_access_token(&claims, &state.jwt).map_err(ApiError::from)?;
     Ok(Json(SessionTokens {
@@ -338,7 +348,7 @@ async fn mint_session(state: &AppState, user: &UserModel) -> Result<SessionToken
         &user.username,
         user.role.as_str(),
         Some(refresh.id),
-        state.jwt.ttl_secs,
+        claim_ttl_secs(&state.jwt),
     );
     let access = issue_access_token(&claims, &state.jwt).map_err(ApiError::from)?;
     Ok(SessionTokens {

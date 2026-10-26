@@ -158,8 +158,8 @@ fn test_create_root_ed25519_roundtrip() {
 
     // The key was stored encrypted under the returned key-pair id, and the
     // stored bytes are exactly the returned DER (roundtrip).
-    let loaded = ks.load_ca_key(&created.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), created.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&created.key_pair_id).unwrap();
+    assert_eq!(&*loaded, created.private_key_der.as_slice());
 }
 
 #[test]
@@ -174,9 +174,9 @@ fn test_create_sub_ca_signed_by_root() {
     };
     let root = create_root(&root_spec, &mut ks).unwrap();
 
-    // The documented caller contract: load the parent key from the
-    // keystore and pass its DER bytes next to the parent cert PEM.
-    let parent_key = ks.load_ca_key(&root.key_pair_id).unwrap();
+    // The documented caller contract: the parent's certificate PEM and
+    // its key-pair id travel together — `create_sub_ca` performs the
+    // per-use unwrap of the parent key itself.
 
     let sub_spec = CaSpec {
         name: "issuing".to_owned(),
@@ -184,7 +184,7 @@ fn test_create_sub_ca_signed_by_root() {
         key_type: KeyType::Ed25519,
         lifetime: CaLifetime::SubCa,
     };
-    let sub = create_sub_ca(&root.cert_pem, parent_key.as_slice(), &sub_spec, &mut ks).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec, &mut ks).unwrap();
 
     assert!(sub.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert_ne!(sub.key_pair_id, root.key_pair_id);
@@ -225,8 +225,8 @@ fn test_create_sub_ca_signed_by_root() {
     );
 
     // The sub-CA's own key is stored under its own id (roundtrip)
-    let loaded = ks.load_ca_key(&sub.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), sub.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&sub.key_pair_id).unwrap();
+    assert_eq!(&*loaded, sub.private_key_der.as_slice());
 }
 
 #[test]
@@ -271,8 +271,8 @@ fn test_create_root_rsa2048() {
     );
 
     // Key stored encrypted under the returned id (roundtrip)
-    let loaded = ks.load_ca_key(&created.key_pair_id).unwrap();
-    assert_eq!(loaded.as_slice(), created.private_key_der.as_slice());
+    let loaded = ks.unwrap_ca_key(&created.key_pair_id).unwrap();
+    assert_eq!(&*loaded, created.private_key_der.as_slice());
 }
 
 #[test]
@@ -355,9 +355,7 @@ fn end_entity_cert(ks: &mut KeyStore) -> (String, Vec<u8>) {
 fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
     let mut ks = temp_keystore("sub-under-pathlen0");
     let root = create_root(&root_spec(), &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks).unwrap();
-    let sub_key = ks.load_ca_key(&sub.key_pair_id).unwrap();
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks).unwrap();
 
     // The sub-CA carries pathlen:0, so it may not have a CA below it.
     let (_, sub_pem) = parse_x509_pem(sub.cert_pem.as_bytes()).unwrap();
@@ -373,7 +371,7 @@ fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
     );
 
     // A sub-sub-CA under it must be refused with a typed error.
-    let err = create_sub_ca(&sub.cert_pem, sub_key.as_slice(), &sub_spec(), &mut ks)
+    let err = create_sub_ca(&sub.cert_pem, &sub.key_pair_id, &sub_spec(), &mut ks)
         .expect_err("a pathlen-0 parent must not be allowed to create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -389,8 +387,13 @@ fn test_create_sub_ca_under_pathlen_zero_parent_is_refused() {
 fn test_create_sub_ca_under_non_ca_parent_is_refused() {
     let mut ks = temp_keystore("sub-under-non-ca");
     let (leaf_pem, leaf_key) = end_entity_cert(&mut ks);
+    // The parent's key must live in the keystore for the per-use unwrap:
+    // an end-entity's key stored under a fresh id carries the pairing
+    // check, and the CA-ness refusal then fires on the real bytes.
+    let leaf_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&leaf_key_id, &leaf_key).unwrap();
 
-    let err = create_sub_ca(&leaf_pem, &leaf_key, &sub_spec(), &mut ks)
+    let err = create_sub_ca(&leaf_pem, &leaf_key_id, &sub_spec(), &mut ks)
         .expect_err("an end-entity parent must not be allowed to create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -408,8 +411,7 @@ fn test_create_sub_ca_permitted_parents_are_allowed() {
     let mut ks = temp_keystore("sub-permitted-parents");
     // A root has NO pathLenConstraint: any depth below it is permitted.
     let root = create_root(&root_spec(), &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks)
         .expect("a root parent must permit a sub-CA");
     assert!(sub.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
 
@@ -425,9 +427,15 @@ fn test_create_sub_ca_permitted_parents_are_allowed() {
     let permissive_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let permissive_cert = permissive.self_signed(&permissive_key).unwrap();
 
+    // The permissive parent's rcgen key must live in the keystore for the
+    // per-use unwrap: stored under a fresh id, its bytes carry the
+    // pairing check and the pathlen>=1 permission fires on the real cert.
+    let permissive_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&permissive_key_id, &permissive_key.serialize_der())
+        .unwrap();
     let err = create_sub_ca(
         &permissive_cert.pem(),
-        &permissive_key.serialize_der(),
+        &permissive_key_id,
         &sub_spec(),
         &mut ks,
     );
@@ -461,9 +469,7 @@ fn test_create_sub_ca_validity_is_clamped_to_parent_not_after() {
         lifetime: CaLifetime::Leaf,
     };
     let root = create_root(&short_lived_root_spec, &mut ks).unwrap();
-    let root_key = ks.load_ca_key(&root.key_pair_id).unwrap();
-
-    let sub = create_sub_ca(&root.cert_pem, root_key.as_slice(), &sub_spec(), &mut ks)
+    let sub = create_sub_ca(&root.cert_pem, &root.key_pair_id, &sub_spec(), &mut ks)
         .expect("create the sub-CA");
 
     let (_, root_pem) = parse_x509_pem(root.cert_pem.as_bytes()).unwrap();
@@ -543,7 +549,13 @@ fn test_issuer_without_key_cert_sign_is_refused() {
     let mut ks = temp_keystore("issuer-without-key-cert-sign");
 
     // As a parent for a sub-CA: refused.
-    let err = create_sub_ca(&cert.pem(), &key.serialize_der(), &sub_spec(), &mut ks)
+    // The fixture issuer's key must live in the keystore for the per-use
+    // unwrap: stored under a fresh id, the pairing check passes on the
+    // real bytes and the keyCertSign refusal fires on the real cert.
+    let parent_key_id = uuid::Uuid::new_v4();
+    ks.store_ca_key(&parent_key_id, &key.serialize_der())
+        .unwrap();
+    let err = create_sub_ca(&cert.pem(), &parent_key_id, &sub_spec(), &mut ks)
         .expect_err("an issuer without keyCertSign must not create a sub-CA");
     match err {
         CaError::X509(msg) => assert!(
@@ -609,7 +621,7 @@ fn test_setup_key_round_trips() {
 
     // Round-trip: the exact bytes come back (zeroized on drop).
     let loaded = ks.load_setup_key().unwrap();
-    assert_eq!(loaded.as_slice(), der.as_slice());
+    assert_eq!(&*loaded, der.as_slice());
 
     // Mode 0600, like every key-store file.
     #[cfg(unix)]
@@ -676,7 +688,7 @@ fn test_setup_envelope_will_not_load_as_a_ca_key() {
         "a CA key envelope in the setup slot must fail decryption"
     );
     assert!(
-        matches!(ks.load_ca_key(&ca_id), Err(CaError::Corrupt)),
+        matches!(ks.unwrap_ca_key(&ca_id), Err(CaError::Corrupt)),
         "a setup envelope in a CA slot must fail decryption"
     );
 }

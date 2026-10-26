@@ -206,6 +206,23 @@ impl SecMem {
     pub fn arena_free(&self) -> usize {
         self.pool.arena_free()
     }
+
+    /// Read `len` bytes at absolute address `addr` back out of the
+    /// protected arena.
+    ///
+    /// TEST-ONLY observability: it exists so a test can prove a dropped
+    /// [`SecretBuf`]'s reservation reads as zero — the wipe its `Drop`
+    /// promises — and nothing in production may read the pool through a
+    /// raw pointer. Ruling 4: gated behind `test` builds and the
+    /// `test-peek` cargo feature, which is enabled only through a
+    /// dev-dependency of a test suite, never a normal dependency, so no
+    /// production build of any dependent ever sees the accessor.
+    ///
+    /// `None` when `[addr, addr + len)` is not wholly inside the arena.
+    #[cfg(any(test, feature = "test-peek"))]
+    pub fn peek_for_test(&self, addr: *const u8, len: usize) -> Option<Vec<u8>> {
+        self.pool.peek(addr, len)
+    }
 }
 
 static INSTANCE: OnceLock<SecMem> = OnceLock::new();
@@ -325,5 +342,42 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// Task 5 (seal-at-creation): a dropped `SecretBuf`'s reservation reads
+    /// back as zero through the test-only peek — the volatile wipe its
+    /// `Drop` promises, proven on a small dedicated pool. It cannot use
+    /// `global()`: `the_pool_descriptor_is_close_on_exec` maps a second
+    /// full production spec in a parallel test thread, and the host's
+    /// 512 MiB memlock budget holds one 400 MiB pool, never two — and
+    /// the wipe is a property of `SecretBuf`'s `Drop`, identical on any
+    /// real `memfd_secret` pool. The production pool's own coverage runs
+    /// alone in the ws-ca keystore suite's binary.
+    #[test]
+    fn a_dropped_buffer_reads_zero_through_the_peek() {
+        let pool = std::sync::Arc::new(
+            Pool::build(PoolSpec {
+                kdf_slots: 1,
+                kdf_slot_bytes: 64,
+                hash_slots: 1,
+                hash_slot_bytes: 64,
+                arena_bytes: 4096,
+            })
+            .expect("a small pool must build on this host"),
+        );
+
+        let mut buf = pool.alloc(13).expect("the arena serves a small buffer");
+        buf.copy_from_slice(b"wiped-on-drop");
+        let addr = buf.as_ptr();
+        let len = buf.len();
+        drop(buf);
+
+        let bytes = pool
+            .peek(addr, len)
+            .expect("the dropped region stays inside the arena");
+        assert!(
+            bytes.iter().all(|b| *b == 0),
+            "a dropped SecretBuf's reservation must read as zero"
+        );
     }
 }

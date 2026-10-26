@@ -355,6 +355,41 @@ impl Pool {
             cap,
         })
     }
+
+    /// Volatile read-back of `[addr, addr + len)` translated into the
+    /// arena's range — the engine behind [`SecMem::peek_for_test`]
+    /// (test-only, Ruling 4). `None` when the range is not wholly inside
+    /// the arena.
+    ///
+    /// The reads are volatile so a release build cannot fold them away,
+    /// exactly like the mapping probe. They expose nothing production
+    /// code could not already read through a live view of the same
+    /// region: the accessor exists so a test can prove a dropped
+    /// [`SecretBuf`]'s reservation reads as zero — the wipe its `Drop`
+    /// promises — and it is compiled out of every normal dependent.
+    #[cfg(any(test, feature = "test-peek"))]
+    pub(crate) fn peek(&self, addr: *const u8, len: usize) -> Option<Vec<u8>> {
+        let arena_start = self.map.base.as_ptr() as usize + self.arena.base;
+        let addr = addr as usize;
+        if addr < arena_start {
+            return None;
+        }
+        let offset = addr - arena_start;
+        let available = self.arena.len.checked_sub(offset)?;
+        if len > available {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        for byte in 0..len {
+            // SAFETY: `offset + len <= self.arena.len`, and the arena
+            // lies inside the mapping — the same bound
+            // `SecretBuf::as_ptr_mut` computes for its own views.
+            out.push(unsafe {
+                ptr::read_volatile(self.map.base.as_ptr().add(self.arena.base + offset + byte))
+            });
+        }
+        Some(out)
+    }
 }
 
 /// A buffer of secret memory.

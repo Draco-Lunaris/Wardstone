@@ -109,7 +109,7 @@ fn load_or_create_on_a_missing_directory_generates_the_key_pair() {
     assert!(dir.exists(), "a virgin volume must gain the keys directory");
     assert!(dir.join(SIGNING_KEY_FILE).exists());
     assert!(dir.join(VERIFY_KEY_FILE).exists());
-    assert!(!keys.signing_key_pem.trim().is_empty());
+    assert!(!keys.signing_key.is_empty());
     assert!(!keys.verification_key_pem.trim().is_empty());
 }
 
@@ -119,7 +119,7 @@ fn a_second_load_returns_the_same_keys() {
     let first = JwtKeys::load_or_create(&dir).unwrap();
     let second = JwtKeys::load_or_create(&dir).unwrap();
 
-    assert_eq!(first.signing_key_pem, second.signing_key_pem);
+    assert_eq!(&*first.signing_key, &*second.signing_key);
     assert_eq!(first.verification_key_pem, second.verification_key_pem);
 }
 
@@ -163,14 +163,17 @@ fn a_mixed_key_pair_fails_the_load_loudly() {
     // system (each file whole, the pair useless). The load must refuse it,
     // not silently sign tokens nothing can verify.
     let dir_a = temp_keys_dir("mixed-a");
-    let pair_a = JwtKeys::load_or_create(&dir_a).unwrap();
+    JwtKeys::load_or_create(&dir_a).unwrap();
     let dir_b = temp_keys_dir("mixed-b");
-    let pair_b = JwtKeys::load_or_create(&dir_b).unwrap();
+    JwtKeys::load_or_create(&dir_b).unwrap();
 
+    // Task 5: the signing half is arena DER now, so the mixed pair is
+    // planted from the plaintext FILES the legacy loader wrote — the
+    // exact shape the deployed torn volume had.
     let dir = temp_keys_dir("mixed-pair");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join(SIGNING_KEY_FILE), &pair_a.signing_key_pem).unwrap();
-    fs::write(dir.join(VERIFY_KEY_FILE), &pair_b.verification_key_pem).unwrap();
+    fs::copy(dir_a.join(SIGNING_KEY_FILE), dir.join(SIGNING_KEY_FILE)).unwrap();
+    fs::copy(dir_b.join(VERIFY_KEY_FILE), dir.join(VERIFY_KEY_FILE)).unwrap();
 
     let err = JwtKeys::load_or_create(&dir)
         .expect_err("a mixed key pair must be refused, not loaded as authentic");
@@ -222,7 +225,7 @@ fn racing_creators_serialize_into_one_consistent_pair() {
     for (i, result) in results.iter().enumerate() {
         let keys = result.as_ref().unwrap();
         assert_eq!(
-            keys.signing_key_pem, first.signing_key_pem,
+            &*keys.signing_key, &*first.signing_key,
             "racing creator {i} holds a different signing key than creator 0"
         );
         assert_eq!(
@@ -234,7 +237,7 @@ fn racing_creators_serialize_into_one_consistent_pair() {
     // The disk pair the winners left behind must itself load cleanly —
     // a mixed two-file residue would fail the loader's own pair check.
     let disk = JwtKeys::load_or_create(&dir).unwrap();
-    assert_eq!(disk.signing_key_pem, first.signing_key_pem);
+    assert_eq!(&*disk.signing_key, &*first.signing_key);
     assert_eq!(disk.verification_key_pem, first.verification_key_pem);
 }
 
@@ -249,7 +252,7 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
     let envelope = dir.join("jwt-keys.envelope");
 
     let minted =
-        ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase", 0).unwrap();
+        ws_auth::jwt::load_or_create_sealed(&envelope, b"the-master-passphrase", 0).unwrap();
     assert!(
         !dir.join("jwt-signing-key.pem").exists() && !dir.join("jwt-verify-key.pem").exists(),
         "a fresh sealed install never writes the pair as plaintext"
@@ -257,9 +260,9 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
     assert!(envelope.exists(), "the fresh pair is sealed on disk");
 
     let reloaded =
-        ws_auth::jwt::load_or_create_sealed(&envelope, "the-master-passphrase", 0).unwrap();
+        ws_auth::jwt::load_or_create_sealed(&envelope, b"the-master-passphrase", 0).unwrap();
     assert_eq!(
-        reloaded.signing_key_pem, minted.signing_key_pem,
+        &*reloaded.signing_key, &*minted.signing_key,
         "the second load returns the minted pair, not a fresh one"
     );
     assert_eq!(
@@ -267,7 +270,7 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
         "the second load returns the minted pair, not a fresh one"
     );
 
-    let refused = ws_auth::jwt::load_or_create_sealed(&envelope, "wrong", 0);
+    let refused = ws_auth::jwt::load_or_create_sealed(&envelope, b"wrong", 0);
     assert!(
         refused.is_err(),
         "a wrong passphrase must not mint over or open the existing envelope"
@@ -283,32 +286,96 @@ fn a_mixed_sealed_pair_fails_the_load_loudly() {
     // any later corruption — must refuse at the LOAD with the re-key
     // hint, never boot with a key whose tokens fail their own
     // verification on first use.
-    let pair_a = ws_auth::jwt::load_or_create_sealed(
-        &temp_keys_dir("jwt-sealed-mixed-a").join("jwt-keys.envelope"),
-        "the-master-passphrase",
-        0,
-    )
-    .unwrap();
-    let pair_b = ws_auth::jwt::load_or_create_sealed(
-        &temp_keys_dir("jwt-sealed-mixed-b").join("jwt-keys.envelope"),
-        "the-master-passphrase",
-        0,
-    )
-    .unwrap();
-    let mixed = ws_auth::jwt::JwtKeys {
-        signing_key_pem: pair_a.signing_key_pem,
-        verification_key_pem: pair_b.verification_key_pem,
-        ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
-    };
+    //
+    // Task 5: the custody shape changed (the signing half is arena DER,
+    // never a field a test can set), so the mixed envelope is built from
+    // the legacy plaintext files' contents directly — the deployed
+    // payload format — and sealed with the core envelope engine.
+    let pair_a_dir = temp_keys_dir("jwt-sealed-mixed-a");
+    JwtKeys::load_or_create(&pair_a_dir).unwrap();
+    let pair_b_dir = temp_keys_dir("jwt-sealed-mixed-b");
+    JwtKeys::load_or_create(&pair_b_dir).unwrap();
+    let signing_a = fs::read_to_string(pair_a_dir.join(SIGNING_KEY_FILE)).unwrap();
+    let verification_b = fs::read_to_string(pair_b_dir.join(VERIFY_KEY_FILE)).unwrap();
+
+    let mixed = serde_json::json!({
+        "signing": signing_a,
+        "verification": verification_b,
+    })
+    .to_string();
     let dir = temp_keys_dir("jwt-sealed-mixed-pair");
     fs::create_dir_all(&dir).unwrap();
     let envelope = dir.join("jwt-keys.envelope");
-    ws_auth::jwt::write_sealed(&envelope, "the-master-passphrase", &mixed, 0).unwrap();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &envelope,
+        "the-master-passphrase",
+        mixed.as_bytes(),
+        ws_core::crypto::PROD_KDF_PARAMS,
+        0,
+    )
+    .unwrap();
 
-    let err = ws_auth::jwt::load_sealed(&envelope, "the-master-passphrase")
+    let err = ws_auth::jwt::load_sealed(&envelope, b"the-master-passphrase")
         .expect_err("the mixed sealed pair must refuse the load");
     assert!(
         err.to_string().contains("mixed or invalid"),
         "the refusal names the pair probe, not a downstream token failure: {err}"
+    );
+}
+
+/// Task 5 (the seal-at-creation plan): the sealed pair round trip —
+/// `generate` mints the pair with its signing key in the protected
+/// arena (no plaintext file is ever written), `write_sealed` seals it,
+/// and `load_sealed` hands back a pair that still mints tokens its own
+/// verification half accepts.
+#[test]
+fn a_sealed_pair_round_trips_and_mints() {
+    let dir = temp_keys_dir("sealed-round-trip");
+    fs::create_dir_all(&dir).unwrap();
+    let envelope = dir.join("jwt-keys.envelope");
+
+    let minted = ws_auth::jwt::JwtKeys::generate(900).expect("generate the pair into the arena");
+    assert!(
+        !dir.join(SIGNING_KEY_FILE).exists() && !dir.join(VERIFY_KEY_FILE).exists(),
+        "generating for the sealed form never writes the pair as plaintext"
+    );
+    ws_auth::jwt::write_sealed(&envelope, b"the-master-passphrase", &minted, 0)
+        .expect("seal the minted pair");
+
+    let loaded = ws_auth::jwt::load_sealed(&envelope, b"the-master-passphrase")
+        .expect("the sealed pair loads");
+    assert_eq!(
+        loaded.verification_key_pem, minted.verification_key_pem,
+        "the public half survives the round trip unchanged"
+    );
+
+    let sid = Uuid::new_v4();
+    let claims = fresh_claims("carol", "admin", Some(sid), 900);
+    let token = issue_access_token(&claims, &loaded).expect("the loaded pair mints");
+    let decoded = validate_access_token(&token, &loaded)
+        .expect("the token validates against the loaded pair");
+    assert_eq!(decoded.user_id, claims.user_id);
+    assert_eq!(decoded.sid, Some(sid));
+}
+
+/// Task 5: the Debug rendering of JwtKeys carries no key material — no
+/// PEM framing, no PEM body of the public half, and none of the DER the
+/// signing half holds in the protected arena.
+#[test]
+fn jwt_keys_debug_shows_no_key_material() {
+    let keys = ws_auth::jwt::JwtKeys::generate(900).expect("generate the pair");
+
+    let rendered = format!("{keys:?}");
+    assert!(
+        !rendered.contains("-----BEGIN") && !rendered.contains("-----END"),
+        "the Debug rendering carries no PEM framing: {rendered}"
+    );
+    assert!(
+        !keys.verification_key_pem.is_empty() && !rendered.contains(&keys.verification_key_pem),
+        "the Debug rendering omits the public half's PEM text"
+    );
+    assert!(
+        !rendered.contains("PRIVATE KEY") && !rendered.contains("PUBLIC KEY"),
+        "the Debug rendering names no key kind: {rendered}"
     );
 }

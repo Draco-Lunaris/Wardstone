@@ -459,7 +459,10 @@ pub async fn run_setup(
     let serial = allocate_serial(root_ca.id, tenant.id, &mut *tx).await?;
 
     let ca_cert_pem = root_ca.cert_pem.clone();
-    let ca_key_der = keystore.load_ca_key(&root_ca.id)?;
+    // The root's key, unwrapped once for this issuance into the protected
+    // arena — the serving-leaf mint rides the serving-key holder's
+    // allowance, and the reservation wipes when the issuance completes.
+    let ca_key_der = keystore.unwrap_ca_key(&root_ca.id)?;
     let hostname = fields.server_hostname.clone();
     let sans_for_issuance = sans.clone();
     let lifetime = chrono::Duration::days(i64::from(template.lifetime_days));
@@ -788,7 +791,12 @@ pub async fn seal_keys_volume(
         std::fs::remove_file(&secret_path).map_err(CaError::Io)?;
     }
 
-    // The JWT pair: one envelope holding the combined JSON form.
+    // The JWT pair: one envelope holding the combined JSON form. The pair
+    // wraps AS-IS — the volume may hold a torn pair from a crash mid-mint,
+    // and `JwtKeys` cannot represent an invalid pair, so the seal goes
+    // through the envelope writer directly; `load_sealed`'s pair probe is
+    // what refuses a torn pair loudly at boot (the re-key runbook), and
+    // the seal must not pre-judge it.
     let signing_path = keys_dir.join("jwt-signing-key.pem");
     let verify_path = keys_dir.join("jwt-verify-key.pem");
     if signing_path.exists() || verify_path.exists() {
@@ -799,18 +807,14 @@ pub async fn seal_keys_volume(
             "verification": verification,
         })
         .to_string();
-        ws_auth::jwt::write_sealed(
+        KeyEnvelope::write_envelope(
             &keys_dir.join(JWT_ENVELOPE_FILE),
             passphrase,
-            &ws_auth::jwt::JwtKeys {
-                signing_key_pem: signing,
-                verification_key_pem: verification,
-                ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
-            },
+            combined.as_bytes(),
+            PROD_KDF_PARAMS,
             0,
         )
         .map_err(|e| CaError::Worker(format!("the jwt envelope: {e}")))?;
-        let _ = combined;
         if signing_path.exists() {
             std::fs::remove_file(&signing_path).map_err(CaError::Io)?;
         }
@@ -902,14 +906,21 @@ pub fn heal_keys_volume(keys_dir: &Path, passphrase: &str) -> Result<(), CaError
         } else {
             let signing_pem = std::fs::read_to_string(&signing).unwrap_or_default();
             let verification_pem = std::fs::read_to_string(&verify).unwrap_or_default();
-            ws_auth::jwt::write_sealed(
+            // The pair wraps AS-IS, exactly as the seal does: `JwtKeys`
+            // cannot represent a torn (invalid) pair, so the envelope
+            // writer carries the verbatim combined JSON and the sealed
+            // loader's pair probe refuses a torn pair loudly at boot
+            // (the documented re-key runbook).
+            let combined = serde_json::json!({
+                "signing": signing_pem,
+                "verification": verification_pem,
+            })
+            .to_string();
+            ws_core::crypto::KeyEnvelope::write_envelope(
                 &keys_dir.join(JWT_ENVELOPE_FILE),
                 passphrase,
-                &ws_auth::jwt::JwtKeys {
-                    signing_key_pem: signing_pem,
-                    verification_key_pem: verification_pem,
-                    ttl_secs: ws_auth::jwt::DEFAULT_ACCESS_TTL_SECS,
-                },
+                combined.as_bytes(),
+                ws_core::crypto::PROD_KDF_PARAMS,
                 generation,
             )
             .map_err(|e| CaError::Worker(format!("the heal's jwt envelope: {e}")))?;

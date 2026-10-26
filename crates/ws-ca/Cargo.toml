@@ -32,6 +32,10 @@ thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 ws-core = { path = "../ws-core" }
+# The protected arena: the CA master key and every per-use CA-key unwrap
+# live in the process's `memfd_secret` pool, wiped on drop — never on
+# the heap (Task 5, the seal-at-creation plan).
+ws-secmem = { path = "../ws-secmem" }
 # "verify" enables x509-parser's ring-backed signature verification (used
 # for the CSR proof-of-possession check in issue.rs); rcgen's ring feature
 # also enables it transitively, declared here explicitly for the direct API.
@@ -56,3 +60,8 @@ tokio = { workspace = true }
 # ws-ca -> ws-core with no edge to ws-worker, and the dev edge creates no
 # cycle (ws-worker depends on ws-ca's library, not on its test targets).
 ws-worker = { path = "../ws-worker" }
+# ws-secmem's read-only test accessor lets the Task-5 custody test read
+# the arena region a wiped CA key left behind. Ruling 4: the `test-peek`
+# feature is enabled ONLY here, via a dev-dependency — a normal dependent
+# of ws-ca never sees the accessor.
+ws-secmem = { path = "../ws-secmem", features = ["test-peek"] }

@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_core::crypto::KeyEnvelope;
-use zeroize::Zeroizing;
 
 const LEGACY_ENVELOPE: &str = "master.envelope";
 
@@ -37,10 +36,7 @@ fn legacy_file_mode_keeps_the_existing_store_working() -> Result<(), CaError> {
     let ca_bytes = b"a-ca-private-key-der".to_vec();
     let ca_id = uuid::Uuid::new_v4();
     ks.store_ca_key(&ca_id, &ca_bytes).unwrap();
-    assert_eq!(
-        ks.load_ca_key(&ca_id).unwrap().as_slice(),
-        ca_bytes.as_slice()
-    );
+    assert_eq!(&*ks.unwrap_ca_key(&ca_id).unwrap(), ca_bytes.as_slice());
     Ok(())
 }
 
@@ -50,7 +46,7 @@ fn legacy_file_mode_keeps_the_existing_store_working() -> Result<(), CaError> {
 fn sealed_store_refuses_key_operations() -> Result<(), CaError> {
     let dir = temp_dir("sealed");
     let ks = KeyStore::open_sealed(&dir)?;
-    let err = ks.load_ca_key(&uuid::Uuid::new_v4()).unwrap_err();
+    let err = ks.unwrap_ca_key(&uuid::Uuid::new_v4()).unwrap_err();
     assert!(
         matches!(err, CaError::Sealed),
         "a sealed store must answer Sealed, got {err:?}"
@@ -70,15 +66,12 @@ fn unlocked_ram_mode_serves_without_any_master_file() -> Result<(), CaError> {
         cheap_params(),
     )
     .unwrap();
-    let kek_zeroizing = master.into_kek().unwrap();
-    let mut ks = KeyStore::open_unlocked(&dir, kek_zeroizing)?;
+    let kek = master.into_kek();
+    let mut ks = KeyStore::open_unlocked(&dir, kek)?;
     let ca_id = uuid::Uuid::new_v4();
     let ca_bytes = b"ram-custody-ca-key".to_vec();
     ks.store_ca_key(&ca_id, &ca_bytes).unwrap();
-    assert_eq!(
-        ks.load_ca_key(&ca_id).unwrap().as_slice(),
-        ca_bytes.as_slice()
-    );
+    assert_eq!(&*ks.unwrap_ca_key(&ca_id).unwrap(), ca_bytes.as_slice());
     // NO plaintext master.key exists after the unlock-time conversion —
     // store_ca_key in unlocked mode must not have written one.
     assert!(
@@ -115,9 +108,13 @@ fn conversion_wraps_the_legacy_master_and_deletes_the_plaintext() -> Result<(), 
     // passphrase, take custody of the SAME key bytes, and load an
     // existing envelope.
     let opened = KeyEnvelope::open_envelope(&master_env, "the-operator-passphrase").unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&opened);
-    let ks = KeyStore::open_unlocked(&dir, Zeroizing::new(key))?;
+    let ks = KeyStore::open_unlocked(
+        &dir,
+        ws_secmem::global()
+            .unwrap()
+            .alloc_copy(&opened[..])
+            .unwrap(),
+    )?;
     assert_eq!(
         ks.master_key_bytes().unwrap().as_slice(),
         master.as_slice(),

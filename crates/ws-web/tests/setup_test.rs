@@ -41,7 +41,6 @@ use sqlx::PgPool;
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 use x509_parser::pem::parse_x509_pem;
-use zeroize::Zeroizing;
 
 use ws_ca::keystore::KeyStore;
 use ws_core::db::connect;
@@ -545,7 +544,7 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     // the legacy file-read store must refuse on this volume now — and
     // the passphrase-opened store must load the very same keys.
     let legacy_refused = KeyStore::open(&fixture.keys_dir)
-        .and_then(|store| store.load_ca_key(&ca_id).map(|_| ()))
+        .and_then(|store| store.unwrap_ca_key(&ca_id).map(|_| ()))
         .is_err();
     let unlocked_store = {
         let master = ws_core::crypto::KeyEnvelope::open_envelope(
@@ -553,15 +552,19 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
             &fields.master_passphrase,
         )
         .expect("open the master envelope with the setup passphrase");
-        let mut master_bytes = [0u8; 32];
-        master_bytes.copy_from_slice(&master);
-        KeyStore::open_unlocked(&fixture.keys_dir, Zeroizing::new(master_bytes))
-            .expect("open the unlocked store")
+        KeyStore::open_unlocked(
+            &fixture.keys_dir,
+            ws_secmem::global()
+                .unwrap()
+                .alloc_copy(&master[..])
+                .unwrap(),
+        )
+        .expect("open the unlocked store")
     };
-    let root_key_loaded = unlocked_store.load_ca_key(&ca_id).is_ok();
+    let root_key_loaded = unlocked_store.unwrap_ca_key(&ca_id).is_ok();
     let leaf_key_loaded = certs
         .first()
-        .map(|row| unlocked_store.load_ca_key(&row.0).is_ok())
+        .map(|row| unlocked_store.unwrap_ca_key(&row.0).is_ok())
         .unwrap_or(false);
     let secret_key_exists = fixture
         .keys_dir

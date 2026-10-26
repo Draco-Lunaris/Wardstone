@@ -3368,6 +3368,7 @@ dependencies = [
  "ws-auth",
  "ws-ca",
  "ws-core",
+ "ws-secmem",
  "ws-web",
  "zeroize",
 ]
@@ -3789,6 +3790,7 @@ dependencies = [
  "ws-auth",
  "ws-ca",
  "ws-core",
+ "ws-secmem",
  "zeroize",
 ]
 
@@ -3840,6 +3842,7 @@ dependencies = [
  "tokio",
  "uuid",
  "ws-core",
+ "ws-secmem",
  "ws-worker",
  "x509-parser",
  "zeroize",
@@ -3909,6 +3912,7 @@ dependencies = [
  "ws-auth",
  "ws-ca",
  "ws-core",
+ "ws-secmem",
  "x509-parser",
  "zeroize",
 ]
@@ -3926,6 +3930,7 @@ dependencies = [
  "uuid",
  "ws-ca",
  "ws-core",
+ "ws-secmem",
  "x509-parser",
 ]
 

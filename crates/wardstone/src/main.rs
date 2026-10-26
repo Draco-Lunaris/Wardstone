@@ -22,8 +22,9 @@
 //! [`run_ui`] / [`run_api`]. The process lifecycle the binary owns:
 //! open the pool (`ws_core::db::connect` runs the migrations), load OR
 //! create the JWT key pair (`JwtKeys::load_or_create` — on a virgin volume
-//! the keys must exist before the setup page can be served), open the
-//! keystore, then serve.
+//! the keys must exist before the setup page can be served; the
+//! transitional plaintext loader the seal-at-creation plan's Task 7
+//! removes), open the keystore, then serve.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
 use ws_core::error::CoreError;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
+use ws_secmem::SecretBuf;
 use zeroize::Zeroizing;
 
 /// The listen address when `WARDSTONE_BIND` is unset (the brief's pin).
@@ -553,7 +555,7 @@ fn rate_limit_from(
 ///   once setup commits the tenant (the in-place TLS resume).
 /// - tenant with an active `web-server` leaf: the CA-issued leaf — the
 ///   certificates row's PEM plus the key envelope under the certificate
-///   id (the leaf is a first-class issuance: `load_ca_key(cert.id)`).
+///   id (the leaf is a first-class issuance: `unwrap_ca_key(cert.id)`).
 /// - tenant WITHOUT an active leaf — the pinned torn state of a crash
 ///   between setup's bootstrap commit and the leaf-issuance transaction:
 ///   a fresh setup certificate keeps TLS SERVING (see [`resolve_serving_leaf`]'s
@@ -654,7 +656,7 @@ fn unlocked_web_build(
                 &passphrase,
             )
             .map_err(|e| err(format!("the master envelope: {e}")))?;
-            let mut master_bytes = [0u8; 32];
+            let mut master_bytes = Zeroizing::new([0u8; 32]);
             master_bytes.copy_from_slice(&master);
             // The crashed-seal heal (F3, spec §3's per-file
             // contract): the setup seal goes file by file, and a crash
@@ -664,9 +666,15 @@ fn unlocked_web_build(
             // before anything else opens. Idempotent on a clean volume.
             ws_web::setup::heal_keys_volume(&keys_dir, &passphrase)
                 .map_err(|e| err(format!("the volume heal: {e}")))?;
-            let keystore =
-                ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, Zeroizing::new(master_bytes))
-                    .map_err(|e| err(format!("the keystore: {e}")))?;
+            // The unlocked keystore holds its master as a ws-secmem arena
+            // reservation: the envelope's Zeroizing plaintext dies at this
+            // scope's end and only the protected copy crosses into the
+            // keystore's custody.
+            let master_buf = ws_secmem::global()
+                .and_then(|mem| mem.alloc_copy(&master_bytes[..]))
+                .map_err(|e| err(format!("the master key's protected arena: {e}")))?;
+            let keystore = ws_ca::keystore::KeyStore::open_unlocked(&keys_dir, master_buf)
+                .map_err(|e| err(format!("the keystore: {e}")))?;
 
             // The ui's own pool: the db credential (read-only unwrap
             // per the spec — the api rotates, the ui re-reads). One
@@ -727,7 +735,7 @@ fn unlocked_web_build(
                 .list_by_tenant(&pool, tenant.id, 0, 500)
                 .await
                 .map_err(|e| err(format!("the certificate listing: {e}")))?;
-            let leaf = resolve_serving_leaf(&certs, |leaf| keystore.load_ca_key(&leaf.id))
+            let leaf = resolve_serving_leaf(&certs, |leaf| keystore.unwrap_ca_key(&leaf.id))
                 .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
             match leaf {
                 Some((leaf_row, key_der)) => {
@@ -1033,12 +1041,14 @@ fn serving_leaf_candidates(certs: &[CertificateModel]) -> Vec<&CertificateModel>
 /// silently serving an older leaf over a broken keystore would mask the
 /// damage the operator needs to see.
 /// The walk's resolution when a leaf is servable: the row paired with the
-/// key bytes its envelope loaded.
-type ServedLeaf<'a> = (&'a CertificateModel, Zeroizing<Vec<u8>>);
+/// key its envelope unwrapped — a protected-arena reservation (a ws-secmem
+/// `SecretBuf`), the serving-key holder's custody, wiped once the TLS
+/// reload has taken its PEM.
+type ServedLeaf<'a> = (&'a CertificateModel, SecretBuf);
 
 fn resolve_serving_leaf(
     certs: &[CertificateModel],
-    load_key: impl Fn(&CertificateModel) -> Result<Zeroizing<Vec<u8>>, CaError>,
+    load_key: impl Fn(&CertificateModel) -> Result<SecretBuf, CaError>,
 ) -> Result<Option<ServedLeaf<'_>>, CaError> {
     for leaf in serving_leaf_candidates(certs) {
         match load_key(leaf) {
@@ -1401,15 +1411,18 @@ mod tests {
         let old_active = cert(CertStatus::Active, 100);
         let new_active = cert(CertStatus::Active, 10);
         let table = [old_active, new_active.clone()];
+        let mem = ws_secmem::global().expect("the pool must initialize on this host");
         let (leaf, key) = resolve_serving_leaf(&table, |c| {
-            Ok(Zeroizing::new(c.id.to_string().into_bytes()))
+            Ok(mem
+                .alloc_copy(c.id.to_string().as_bytes())
+                .expect("the arena serves the tiny key"))
         })
         .expect("the walk must not abort the boot when keys load")
         .expect("candidates exist");
         assert_eq!(leaf.id, new_active.id, "the newest candidate wins");
         assert_eq!(
-            *key,
-            new_active.id.to_string().into_bytes(),
+            &*key,
+            new_active.id.to_string().as_bytes(),
             "the served key is the loaded one for the served leaf"
         );
     }
@@ -1439,12 +1452,15 @@ mod tests {
         let new_active = cert(CertStatus::Active, 10);
         let table = [old_active.clone(), new_active.clone()];
         let loaded = std::cell::RefCell::new(Vec::new());
+        let mem = ws_secmem::global().expect("the pool must initialize on this host");
         let (leaf, key) = resolve_serving_leaf(&table, |c| {
             loaded.borrow_mut().push(c.id);
             if c.id == new_active.id {
                 Err(CaError::NotFound)
             } else {
-                Ok(Zeroizing::new(c.id.to_string().into_bytes()))
+                Ok(mem
+                    .alloc_copy(c.id.to_string().as_bytes())
+                    .expect("the arena serves the tiny key"))
             }
         })
         .expect("a missing envelope must not abort the boot")
@@ -1454,8 +1470,8 @@ mod tests {
             "the walk serves the next-newest leaf after the unenveloped one"
         );
         assert_eq!(
-            *key,
-            old_active.id.to_string().into_bytes(),
+            &*key,
+            old_active.id.to_string().as_bytes(),
             "the served key is the loaded one for the served leaf"
         );
         assert_eq!(
@@ -1475,7 +1491,11 @@ mod tests {
         let table = [foreign];
 
         let load = |_: &CertificateModel| {
-            Result::<Zeroizing<Vec<u8>>, CaError>::Ok(Zeroizing::new(Vec::new()))
+            Result::<SecretBuf, CaError>::Ok(
+                ws_secmem::global()
+                    .and_then(|mem| mem.alloc_copy(b""))
+                    .expect("the arena serves the empty key"),
+            )
         };
         assert!(
             resolve_serving_leaf(&table, load)

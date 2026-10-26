@@ -422,13 +422,11 @@ async fn test_end_to_end_ca_forest() {
     let mut keystore = open_keystore(&keys_dir);
     let root = create_root(&root_spec(), &mut keystore).expect("create the root CA");
     // The documented caller contract: the parent's certificate PEM and
-    // its DER private key travel together.
-    let root_key = keystore
-        .load_ca_key(&root.key_pair_id)
-        .expect("load the root CA key from the key store");
+    // its key-pair id travel together; `create_sub_ca` performs the
+    // per-use unwrap of the parent key itself.
     let sub = create_sub_ca(
         &root.cert_pem,
-        root_key.as_slice(),
+        &root.key_pair_id,
         &sub_spec(),
         &mut keystore,
     )
@@ -654,7 +652,7 @@ async fn test_end_to_end_ca_forest() {
     drop(keystore);
     let restarted = KeyStore::open(&keys_dir).expect("reopen the key store");
     let reloaded_sub_key = restarted
-        .load_ca_key(&sub.key_pair_id)
+        .unwrap_ca_key(&sub.key_pair_id)
         .expect("the sub-CA key survives the restart");
     let master_key_after = fs::read(restarted.master_key_path()).expect("read the master key");
 
@@ -885,7 +883,7 @@ async fn test_end_to_end_ca_forest() {
 
     // --- The key store survives a restart ------------------------------
     assert_eq!(
-        reloaded_sub_key.as_slice(),
+        &*reloaded_sub_key,
         sub.private_key_der.as_slice(),
         "the reopened key store returns the sub-CA's own key"
     );

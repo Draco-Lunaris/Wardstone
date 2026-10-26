@@ -157,16 +157,13 @@ fn envelope_open_is_in_memory_only() {
 fn kek_derive_is_deterministic_per_salt_and_params() {
     let a = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek()
-        .unwrap();
+        .into_kek();
     let b = KeyEnvelope::derive_kek("passphrase-1", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek()
-        .unwrap();
+        .into_kek();
     let c = KeyEnvelope::derive_kek("passphrase-2", b"salt-salt-salt-salt", cheap_params())
         .unwrap()
-        .into_kek()
-        .unwrap();
+        .into_kek();
     assert_eq!(&*a, &*b, "same passphrase+salt+params derive the same KEK");
     assert_ne!(&*a, &*c, "a different passphrase derives a different KEK");
 }
@@ -549,7 +546,7 @@ fn derive_kek_matches_the_heap_reference() {
         .expect("derive in the locked KDF slot");
 
     assert_eq!(
-        derived.secrets().unwrap().as_slice(),
+        &*derived.secrets().unwrap(),
         reference.as_slice(),
         "the locked-slot KEK must equal argon2's heap output at the same parameters"
     );
@@ -568,7 +565,7 @@ fn derive_kek_matches_the_heap_reference() {
     // accidentally keyed on the salt alone).
     let other = KeyEnvelope::derive_kek("a different master passphrase", salt, params)
         .expect("derive in the locked KDF slot");
-    assert_ne!(other.secrets().unwrap().as_slice(), reference.as_slice());
+    assert_ne!(&*other.secrets().unwrap(), reference.as_slice());
 }
 
 #[test]

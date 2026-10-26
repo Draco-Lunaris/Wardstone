@@ -54,8 +54,12 @@ ws-auth = { path = "../ws-auth" }
 # The CA engine: CSR validation, leaf signing, CA creation, keystore, the
 # serial allocator, leaf-key generation.
 ws-ca = { path = "../ws-ca" }
-# The unlocked custody's master-key type (Zeroizing<[u8; 32]> held in
-# RAM for the sealed instance's post-unlock service).
+# The unlocked custodies' key types (SecretBuf / SecretBox over the
+# protected arena) for the sealed instance's post-unlock service.
+ws-secmem = { path = "../ws-secmem" }
+# Zeroizing buffers for the transitional plaintext boot shapes the
+# seal-at-creation plan removes in Tasks 6-7 (the unlocked custodies
+# themselves are ws-secmem arena reservations now).
 zeroize = { workspace = true }
 # The ACME (RFC 8555) JOSE floor: JWS verification for the protocol's POST
 # bodies, the anti-replay nonce store, and RFC 7638 account-key

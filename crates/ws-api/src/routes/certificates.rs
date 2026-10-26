@@ -496,8 +496,6 @@ async fn spawn_signing(
     let subject_cn = subject_cn.to_string();
     let sans = sans.to_vec();
     tokio::task::spawn_blocking(move || {
-        let ca_key_der = keystore.load_ca_key(&ca.id).map_err(ApiError::from)?;
-
         let (csr_pem, private_key_pem) = match csr_pem {
             Some(csr_pem) => (csr_pem, None),
             None => {
@@ -514,8 +512,14 @@ async fn spawn_signing(
         };
 
         let spec = leaf_spec(&revision, &subject_cn, &sans, serial)?;
-        let issued =
-            sign_leaf_with(&ca.cert_pem, &ca_key_der, &csr_pem, &spec).map_err(ApiError::from)?;
+        // One per-use unwrap: the CA key's live custody is exactly the
+        // signing call — `with_ca_key` wipes the arena reservation the
+        // moment `sign_leaf_with` returns, success or failure alike.
+        let issued = keystore
+            .with_ca_key(&ca.id, |ca_key_der| {
+                sign_leaf_with(&ca.cert_pem, ca_key_der, &csr_pem, &spec)
+            })
+            .map_err(ApiError::from)?;
         Ok::<_, ApiError>(SignOutcome {
             issued,
             private_key_pem,

@@ -1,11 +1,20 @@
-//! Ed25519 (EdDSA) access-token issuing and validation, plus the on-disk
-//! signing/verification key pair.
+//! Ed25519 (EdDSA) access-token issuing and validation, plus the key pair
+//! that signs them.
 //!
-//! The house keeps exactly two key files: the signing key's PEM (mode 0600)
-//! and the verification key's PEM. `jsonwebtoken`'s `DecodingKey::from_ed_pem`
-//! accepts only an Ed25519 *public*-key PEM — a private PKCS#8 PEM is rejected
-//! with `InvalidKeyFormat` — so the private key cannot double as the
-//! verification key and the two-file layout is required.
+//! The signing half lives in the process's protected arena (`ws_secmem`:
+//! never swapped, never in a core dump, volatilely wiped on drop) as
+//! PKCS#8 DER — minted there by [`JwtKeys::generate`], parsed there from
+//! the sealed envelope's payload, and fed to `EncodingKey::from_ed_der`
+//! per mint.
+//!
+//! The legacy two-file layout (the signing key's PEM at mode 0600 and the
+//! verification key's PEM) is [TRANSITIONAL — the seal-at-creation plan
+//! removes it in Task 7, with the boot paths that read it]; on a sealed
+//! volume the pair's only on-disk form is `jwt-keys.envelope`.
+//! `jsonwebtoken`'s `DecodingKey::from_ed_pem` accepts only an Ed25519
+//! *public*-key PEM — a private PKCS#8 PEM is rejected with
+//! `InvalidKeyFormat` — so the verification half stays a public PEM in
+//! every form, sealed or legacy.
 
 use std::collections::HashSet;
 use std::fs;
@@ -13,7 +22,7 @@ use std::io::Write;
 use std::path::Path;
 
 use chrono::{Duration, Utc};
-use ed25519_dalek::pkcs8::{EncodePublicKey, KeypairBytes};
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePublicKey, KeypairBytes};
 use ed25519_dalek::SigningKey;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -21,16 +30,19 @@ use pkcs8::{EncodePrivateKey, LineEnding};
 use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use ws_secmem::SecretBuf;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::AuthError;
 
 /// The token algorithm: EdDSA over Curve25519 (Ed25519).
 const TOKEN_ALGORITHM: Algorithm = Algorithm::EdDSA;
 
-/// Access-token lifetime applied when claims are minted without an explicit
-/// TTL (house default: 15 minutes).
-pub const DEFAULT_ACCESS_TTL_SECS: i64 = 900;
+/// Access-token lifetime applied when the pair is loaded or minted without
+/// an explicit TTL (house default: 15 minutes). Carried as `u64` — the
+/// [`JwtKeys`] custody shape; the claim-minting arithmetic converts at its
+/// own edge.
+pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
 
 /// Clock-skew tolerance for `exp` checks, in seconds (house value).
 const CLOCK_SKEW_LEEWAY_SECS: u64 = 5;
@@ -120,29 +132,90 @@ impl RefreshClaims {
 
 /// The Ed25519 key pair Wardstone signs access tokens with.
 ///
-/// Never print this: the signing key's PEM is the authentication material and
-/// `Debug` redacts it.
-#[derive(Clone)]
+/// The signing half is the PKCS#8 DER private key held in the process's
+/// protected arena (a `ws_secmem::SecretBuf`: never swapped, never in a
+/// core dump, volatilely wiped on drop) — the authentication material
+/// never sits on the heap. Never print any of it: `Debug` redacts BOTH
+/// halves (the public PEM too — it names the instance's key, and a
+/// rendered Debug must give nothing away).
+///
+/// Deliberately not `Clone` — a copy would be a second plaintext of the
+/// signing key, and the arena's promise is that exactly one exists.
+/// Shared custody is `Arc<JwtKeys>` (what `AppState` holds).
 pub struct JwtKeys {
-    /// Ed25519 private key, PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-    pub signing_key_pem: String,
+    /// Ed25519 private key, PKCS#8 DER, in the protected arena.
+    pub signing_key: SecretBuf,
     /// Ed25519 public key, SPKI PEM (`-----BEGIN PUBLIC KEY-----`).
     pub verification_key_pem: String,
     /// Access-token lifetime in seconds, for claim minting by the login flow.
-    pub ttl_secs: i64,
+    pub ttl_secs: u64,
 }
 
 impl std::fmt::Debug for JwtKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JwtKeys")
-            .field("signing_key_pem", &"<redacted>")
-            .field("verification_key_pem", &self.verification_key_pem)
+            .field("signing_key", &"<redacted>")
+            .field("verification_key_pem", &"<redacted>")
             .field("ttl_secs", &self.ttl_secs)
             .finish()
     }
 }
 
 impl JwtKeys {
+    /// Mint a fresh Ed25519 pair for the sealed custody: the signing key
+    /// is born straight into the protected arena as PKCS#8 DER (no PEM
+    /// form and no plaintext file ever exists), and the public half is
+    /// the matching SPKI PEM. The caller seals the pair with
+    /// [`write_sealed`] under the volume's generation.
+    ///
+    /// The minted pair is proven usable by the sealed loaders before it
+    /// is trusted ([`assert_pair_usable`]) — this constructor only draws
+    /// the key material.
+    pub fn generate(ttl_secs: u64) -> Result<Self, AuthError> {
+        let (signing_der, verification_pem) = generate_der_and_verification_pem()?;
+        let signing_key = arena_copy(signing_der.as_slice())?;
+        Ok(JwtKeys {
+            signing_key,
+            verification_key_pem: verification_pem,
+            ttl_secs,
+        })
+    }
+
+    /// Build the pair from its PEM forms — the engine behind the legacy
+    /// plaintext loaders and the sealed loaders' parse of the envelope
+    /// payload (whose deployed format is PEM halves, unchanged). The
+    /// signing PEM is parsed to its canonical PKCS#8 DER — deterministic
+    /// per PEM, so the same PEM always yields the same DER — and copied
+    /// into the protected arena; the public PEM is carried as-is.
+    ///
+    /// The pair is NOT probed here: every loader probes what it reads or
+    /// writes ([`assert_pair_usable`]) before trusting it.
+    pub fn from_pem_pair(
+        signing_pem: &str,
+        verification_pem: &str,
+        ttl_secs: u64,
+    ) -> Result<Self, AuthError> {
+        let keypair = KeypairBytes::from_pkcs8_pem(signing_pem).map_err(|e| {
+            AuthError::Crypto(format!(
+                "the JWT signing key does not parse as Ed25519 PKCS#8 private key material: {e}"
+            ))
+        })?;
+        let der = keypair.to_pkcs8_der().map_err(|e| {
+            AuthError::Crypto(format!("the JWT signing key's DER encoding failed: {e}"))
+        })?;
+        let signing_key = arena_copy(der.as_bytes())?;
+        Ok(JwtKeys {
+            signing_key,
+            verification_key_pem: verification_pem.to_owned(),
+            ttl_secs,
+        })
+    }
+
+    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
+    /// plaintext two-file loader in Task 7, together with the boot paths
+    /// that call it; on a sealed volume the pair's only on-disk form is
+    /// `jwt-keys.envelope`, minted or opened by `load_or_create_sealed`.]
+    ///
     /// Load the key pair from `dir`, or — on a virgin volume — generate it.
     ///
     /// The binary loads the keys **before** the setup form exists, so a fresh
@@ -196,11 +269,11 @@ impl JwtKeys {
         match (signing_key_pem, verification_key_pem) {
             (Some(signing_key_pem), Some(verification_key_pem)) => {
                 assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
-                Ok(Self {
-                    signing_key_pem,
-                    verification_key_pem,
-                    ttl_secs: DEFAULT_ACCESS_TTL_SECS,
-                })
+                Self::from_pem_pair(
+                    &signing_key_pem,
+                    &verification_key_pem,
+                    DEFAULT_ACCESS_TTL_SECS,
+                )
             }
             (None, None) => {
                 let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
@@ -209,11 +282,11 @@ impl JwtKeys {
                 // Prove what was written forms the working pair — defense in
                 // depth against a future write-path defect, at probe cost.
                 assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
-                Ok(Self {
-                    signing_key_pem,
-                    verification_key_pem,
-                    ttl_secs: DEFAULT_ACCESS_TTL_SECS,
-                })
+                Self::from_pem_pair(
+                    &signing_key_pem,
+                    &verification_key_pem,
+                    DEFAULT_ACCESS_TTL_SECS,
+                )
             }
             _ => Err(AuthError::Config(format!(
                 "incomplete JWT key pair in {}: '{}' and '{}' must both be present; \
@@ -325,26 +398,69 @@ fn assert_pair_usable(
     Ok(())
 }
 
+/// Copy bytes into the protected arena — the one boundary the JWT signing
+/// key crosses into custody. The source stays the caller's to wipe; the
+/// arena copy is wiped on drop.
+fn arena_copy(bytes: &[u8]) -> Result<SecretBuf, AuthError> {
+    let mem = ws_secmem::global()
+        .map_err(|e| AuthError::Crypto(format!("protected memory for the JWT signing key: {e}")))?;
+    mem.alloc_copy(bytes)
+        .map_err(|e| AuthError::Crypto(format!("protected memory for the JWT signing key: {e}")))
+}
+
+/// The signing key's PEM form, derived from the arena DER copy. The
+/// deployed envelope payload (and the legacy two-file layout) speak PEM,
+/// so this is the one place the DER crosses back; the returned `String`
+/// is ordinary heap memory a `String` cannot wipe, so it must never
+/// outlive the single operation that needs it.
+fn signing_pem_of(keys: &JwtKeys) -> Result<String, AuthError> {
+    let keypair = KeypairBytes::from_pkcs8_der(&keys.signing_key).map_err(|e| {
+        AuthError::Crypto(format!(
+            "the JWT signing key does not parse as Ed25519 PKCS#8 private key material: {e}"
+        ))
+    })?;
+    let pem = keypair.to_pkcs8_pem(LineEnding::LF).map_err(|e| {
+        AuthError::Crypto(format!("the JWT signing key's PEM encoding failed: {e}"))
+    })?;
+    Ok(pem.to_string())
+}
+
+/// The envelope KDF takes the passphrase as UTF-8 (argon2's input is a
+/// `&str`); the byte-shaped callers hand the relayed raw bytes through.
+/// A non-UTF-8 passphrase is a typed configuration refusal — the
+/// message names the condition, never the passphrase.
+fn utf8_passphrase(passphrase: &[u8]) -> Result<&str, AuthError> {
+    std::str::from_utf8(passphrase)
+        .map_err(|_| AuthError::Config("the master passphrase is not valid UTF-8".to_string()))
+}
+
 /// Write BOTH PEMs as ONE sealed envelope (`jwt-keys.envelope`): the pair
 /// travels under the operator's KeyEnvelope and exists on disk ONLY as
 /// inert ciphertext. The legacy plaintext pair's re-key-by-deletion
 /// recovery becomes a post-unlock operator action. The `generation` is
 /// the volume's passphrase epoch (the conversion seals at 0; a changed
 /// passphrase re-wraps this envelope at epoch + 1 like every other).
+///
+/// The payload format — `{"signing": <PEM>, "verification": <PEM>}` — is
+/// the deployed-volume contract and is UNCHANGED: the signing PEM is
+/// derived here from the arena's DER copy, so an envelope written by an
+/// earlier build opens byte for byte. The passphrase arrives as raw
+/// bytes (the relay's shape); only its UTF-8 view feeds the KDF.
 pub fn write_sealed(
     path: &Path,
-    passphrase: &str,
+    passphrase: &[u8],
     keys: &JwtKeys,
     generation: u64,
 ) -> Result<(), crate::error::AuthError> {
+    let signing_pem = signing_pem_of(keys)?;
     let combined = serde_json::json!({
-        "signing": keys.signing_key_pem.as_str(),
+        "signing": signing_pem,
         "verification": keys.verification_key_pem,
     })
     .to_string();
     ws_core::crypto::KeyEnvelope::write_envelope(
         path,
-        passphrase,
+        utf8_passphrase(passphrase)?,
         combined.as_bytes(),
         ws_core::crypto::PROD_KDF_PARAMS,
         generation,
@@ -357,9 +473,9 @@ pub fn write_sealed(
 /// A torn PAIR (one plaintext file present, or an envelope whose stored
 /// JSON lost one half) is the same typed torn-state failure as ever —
 /// sealing never heals what the loader refuses.
-pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::error::AuthError> {
-    let opened =
-        ws_core::crypto::KeyEnvelope::open_envelope(path, passphrase).map_err(|e| match e {
+pub fn load_sealed(path: &Path, passphrase: &[u8]) -> Result<JwtKeys, crate::error::AuthError> {
+    let opened = ws_core::crypto::KeyEnvelope::open_envelope(path, utf8_passphrase(passphrase)?)
+        .map_err(|e| match e {
             ws_core::error::CoreError::Crypto(m) if m.contains("master passphrase") => {
                 crate::error::AuthError::Crypto(
                     "the master passphrase is wrong for the jwt key envelope".to_string(),
@@ -398,15 +514,12 @@ pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::erro
     // first use.
     let dir = path.parent().unwrap_or(path);
     assert_pair_usable(signing, verification, dir)?;
-    Ok(JwtKeys {
-        signing_key_pem: signing.to_string(),
-        verification_key_pem: verification.to_string(),
-        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
-    })
+    JwtKeys::from_pem_pair(signing, verification, DEFAULT_ACCESS_TTL_SECS)
 }
 
 /// The sealed boot's load-or-create: open the envelope when it exists;
-/// mint a fresh pair IN RAM and seal it as the envelope when it does
+/// mint a fresh pair IN the protected arena and seal it as the envelope
+/// when it does
 /// not. A fresh password-less install has no plaintext pair to convert
 /// (nothing ever minted one), so the pair is BORN sealed — no plaintext
 /// file is ever written. The minted pair is proven usable before it is
@@ -416,11 +529,12 @@ pub fn load_sealed(path: &Path, passphrase: &str) -> Result<JwtKeys, crate::erro
 /// from a foreign epoch.
 pub fn load_or_create_sealed(
     path: &Path,
-    passphrase: &str,
+    passphrase: &[u8],
     generation: u64,
 ) -> Result<JwtKeys, crate::error::AuthError> {
+    let passphrase = utf8_passphrase(passphrase)?;
     if path.exists() {
-        return load_sealed(path, passphrase);
+        return load_sealed(path, passphrase.as_bytes());
     }
     let dir = path
         .parent()
@@ -437,21 +551,26 @@ pub fn load_or_create_sealed(
         #[cfg(unix)]
         force_mode(&dir, 0o700)?;
     }
-    let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
-    assert_pair_usable(&signing_key_pem, &verification_key_pem, &dir)?;
-    let keys = JwtKeys {
-        signing_key_pem,
-        verification_key_pem,
-        ttl_secs: DEFAULT_ACCESS_TTL_SECS,
-    };
-    write_sealed(path, passphrase, &keys, generation)?;
+    // Mint straight into the protected arena — no signing-key PEM ever
+    // exists on this path — then prove the pair usable (the same probe
+    // the legacy loader runs on what it writes) before sealing it.
+    let keys = JwtKeys::generate(DEFAULT_ACCESS_TTL_SECS)?;
+    assert_pair_usable(&signing_pem_of(&keys)?, &keys.verification_key_pem, &dir)?;
+    write_sealed(path, passphrase.as_bytes(), &keys, generation)?;
     Ok(keys)
 }
 
 /// Sign the given claims as a compact EdDSA JWT.
+///
+/// The `EncodingKey` is built from the arena's DER copy per mint and
+/// dropped as soon as `encode` returns — jsonwebtoken's `EncodingKey`
+/// derives `ZeroizeOnDrop`, so its own copy of the key is wiped on drop
+/// (verified against the registry source for this task's zeroization
+/// table). Holding the key material any longer than one mint would pin
+/// an arena granule per outstanding token; building per mint keeps the
+/// live custody exactly one reservation (the `JwtKeys` itself).
 pub fn issue_access_token(claims: &AccessClaims, keys: &JwtKeys) -> Result<String, AuthError> {
-    let key = EncodingKey::from_ed_pem(keys.signing_key_pem.as_bytes())
-        .map_err(|e| AuthError::Crypto(format!("invalid JWT signing key: {e}")))?;
+    let key = EncodingKey::from_ed_der(&keys.signing_key);
     encode(&Header::new(TOKEN_ALGORITHM), claims, &key)
         .map_err(|e| AuthError::Crypto(format!("access-token encoding failed: {e}")))
 }
@@ -471,6 +590,11 @@ pub fn validate_access_token(token: &str, keys: &JwtKeys) -> Result<AccessClaims
         })
 }
 
+/// [TRANSITIONAL — the legacy plaintext loader's generation path; Task 7
+/// of the seal-at-creation plan removes it with the loader. The sealed
+/// path generates DER directly (`generate_der_and_verification_pem`)
+/// and never materializes a signing-key PEM.]
+///
 /// Draw a fresh Ed25519 key pair with the pinned `rand` 0.10's OS entropy.
 ///
 /// [`SigningKey::generate`] is gated on ed25519-dalek's `rand_core` feature,
@@ -504,6 +628,35 @@ fn generate_key_pair() -> Result<(String, String), AuthError> {
 
     seed.zeroize();
     Ok((signing_pem, verification_pem))
+}
+
+/// Mint the signing key straight as PKCS#8 DER — the sealed custody's
+/// form; no signing-key PEM ever exists on that path — plus the matching
+/// verification SPKI PEM. Same entropy story as [`generate_key_pair`];
+/// the DER travels in a zeroizing buffer until `arena_copy` takes it
+/// into the pool.
+fn generate_der_and_verification_pem() -> Result<(Zeroizing<Vec<u8>>, String), AuthError> {
+    let mut seed = [0u8; 32];
+    SysRng.try_fill_bytes(&mut seed).map_err(|e| {
+        AuthError::Crypto(format!("os entropy unavailable for the JWT key pair: {e}"))
+    })?;
+
+    let signing_key = SigningKey::from_bytes(&seed);
+    let keypair = KeypairBytes {
+        secret_key: seed,
+        public_key: None,
+    };
+    let der = keypair
+        .to_pkcs8_der()
+        .map_err(|e| AuthError::Crypto(format!("signing-key encoding failed: {e}")))?;
+
+    let verification_pem = signing_key
+        .verifying_key()
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| AuthError::Crypto(format!("verification-key encoding failed: {e}")))?;
+
+    seed.zeroize();
+    Ok((Zeroizing::new(der.as_bytes().to_vec()), verification_pem))
 }
 
 /// Read a key file, distinguishing "absent" (the virgin-volume case) from

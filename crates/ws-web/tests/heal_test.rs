@@ -141,7 +141,11 @@ fn the_heal_seals_a_whole_jwt_pair_that_reloads() {
     let minted = ws_auth::jwt::JwtKeys::load_or_create(&mint_dir).expect("mint a real pair");
     let dir = temp_volume("jwt-whole");
     write_anchor(&dir, PASSPHRASE);
-    std::fs::write(dir.join("jwt-signing-key.pem"), &minted.signing_key_pem).unwrap();
+    std::fs::copy(
+        mint_dir.join("jwt-signing-key.pem"),
+        dir.join("jwt-signing-key.pem"),
+    )
+    .unwrap();
     std::fs::write(dir.join("jwt-verify-key.pem"), &minted.verification_key_pem).unwrap();
 
     ws_web::setup::heal_keys_volume(&dir, PASSPHRASE).expect("the heal seals the pair");
@@ -150,10 +154,12 @@ fn the_heal_seals_a_whole_jwt_pair_that_reloads() {
         !dir.join("jwt-signing-key.pem").exists() && !dir.join("jwt-verify-key.pem").exists(),
         "both plaintext originals are deleted"
     );
-    let loaded =
-        ws_auth::jwt::load_sealed(&dir.join(ws_core::crypto::JWT_ENVELOPE_FILE), PASSPHRASE)
-            .expect("the healed pair loads");
-    assert_eq!(loaded.signing_key_pem, minted.signing_key_pem);
+    let loaded = ws_auth::jwt::load_sealed(
+        &dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        PASSPHRASE.as_bytes(),
+    )
+    .expect("the healed pair loads");
+    assert_eq!(&*loaded.signing_key, &*minted.signing_key);
     assert_eq!(loaded.verification_key_pem, minted.verification_key_pem);
 }
 
@@ -165,10 +171,16 @@ fn the_heal_keeps_a_torn_jwt_pair_loud() {
     // — deleting the plaintext so the volume is inert — and the sealed
     // LOAD refuses loudly, pointing at the re-key runbook.
     let mint_dir = temp_volume("jwt-torn-source");
-    let minted = ws_auth::jwt::JwtKeys::load_or_create(&mint_dir).expect("mint a real pair");
+    // The mint's PRODUCT is the plaintext pair on disk; the binding goes
+    // unused because the torn arm copies the signing file, not the value.
+    let _minted = ws_auth::jwt::JwtKeys::load_or_create(&mint_dir).expect("mint a real pair");
     let dir = temp_volume("jwt-torn");
     write_anchor(&dir, PASSPHRASE);
-    std::fs::write(dir.join("jwt-signing-key.pem"), &minted.signing_key_pem).unwrap();
+    std::fs::copy(
+        mint_dir.join("jwt-signing-key.pem"),
+        dir.join("jwt-signing-key.pem"),
+    )
+    .unwrap();
 
     ws_web::setup::heal_keys_volume(&dir, PASSPHRASE).expect("the heal seals even the torn pair");
 
@@ -180,8 +192,10 @@ fn the_heal_keeps_a_torn_jwt_pair_loud() {
         dir.join(ws_core::crypto::JWT_ENVELOPE_FILE).exists(),
         "the torn pair is sealed as-is"
     );
-    let refused =
-        ws_auth::jwt::load_sealed(&dir.join(ws_core::crypto::JWT_ENVELOPE_FILE), PASSPHRASE);
+    let refused = ws_auth::jwt::load_sealed(
+        &dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
+        PASSPHRASE.as_bytes(),
+    );
     assert!(
         refused.is_err(),
         "the torn pair stays loud at the load — the re-key runbook, never a silent boot"

@@ -105,6 +105,12 @@ jsonwebtoken = { workspace = true }
 # same canonical answers. Test-only: ws-web's production graph stays
 # acyclic without it.
 ws-acme = { path = "../ws-acme" }
+# The unlock-state fixtures (e2e_test, setup_test, heal_test) build the
+# unlocked custodies over the protected arena (SecretBuf / SecretBox)
+# exactly as the sealed boot does. Dev-only: ws-web's production graph
+# keeps no key custody of its own beyond the per-use unwrap it borrows
+# from ws-ca.
+ws-secmem = { path = "../ws-secmem" }
 
 # The fixture keypair's modulus bytes → the JWK `n` (base64url).
 # (base64 itself is a regular dependency above; the URL-safe engine rides

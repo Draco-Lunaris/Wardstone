@@ -763,7 +763,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
     // production shape.
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &fixture.keys_dir.join(ws_web::setup::JWT_ENVELOPE_FILE),
-        SETUP_PASSPHRASE,
+        SETUP_PASSPHRASE.as_bytes(),
         0,
     )
     .expect("mint the JWT pair straight into its envelope");
@@ -777,22 +777,23 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         SETUP_PASSPHRASE,
     )
     .expect("open the master envelope the conversion sealed");
-    let mut master_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    master_bytes.copy_from_slice(&master);
     let secret = ws_core::crypto::KeyEnvelope::open_envelope(
         &fixture.keys_dir.join(ws_web::setup::SECRET_ENVELOPE_FILE),
         SETUP_PASSPHRASE,
     )
     .expect("open the secret-encryption envelope the conversion sealed");
-    let mut secret_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    secret_bytes.copy_from_slice(&secret);
     let config = ApiConfig::new(DOMAIN.to_string(), fixture.keys_dir.clone());
+    let mem = ws_secmem::global().expect("the protected pool initializes");
     let state = AppState::new_unlocked(
         fixture.pool.clone(),
         Arc::new(jwt),
         config,
-        zeroize::Zeroizing::new(master_bytes),
-        ws_core::crypto::SecretBox::from_key(zeroize::Zeroizing::new(secret_bytes)),
+        mem.alloc_copy(&master[..])
+            .expect("the arena holds the master"),
+        ws_core::crypto::SecretBox::from_key(
+            mem.alloc_copy(&secret[..])
+                .expect("the arena holds the secret key"),
+        ),
     );
     let router = ws_api::router(state);
 

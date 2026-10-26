@@ -321,18 +321,22 @@ async fn sealed_fixture() -> Fixture {
     // production shape (no plaintext pair ever exists on a sealed volume).
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
-        PASSPHRASE,
+        PASSPHRASE.as_bytes(),
         0,
     )
     .expect("mint the JWT pair into its envelope");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
+    let mem = ws_secmem::global().expect("the protected pool initializes");
     let state = AppState::new_unlocked(
         pool.clone(),
         std::sync::Arc::new(jwt),
         config,
-        zeroize::Zeroizing::new(master),
-        ws_core::crypto::SecretBox::from_key(zeroize::Zeroizing::new(secret)),
+        mem.alloc_copy(&master).expect("the arena holds the master"),
+        ws_core::crypto::SecretBox::from_key(
+            mem.alloc_copy(&secret)
+                .expect("the arena holds the secret key"),
+        ),
     );
     let router = ws_api::router(state.clone());
 
@@ -4955,7 +4959,7 @@ async fn master_key_change_rewraps_the_volume_and_audits() {
     // either — the envelope above is the pair's only home.
     let jwt_err = ws_auth::jwt::load_sealed(
         &fx.keys_dir.join(ws_core::crypto::JWT_ENVELOPE_FILE),
-        "the-current-master-passphrase",
+        "the-current-master-passphrase".as_bytes(),
     )
     .unwrap_err();
     assert!(

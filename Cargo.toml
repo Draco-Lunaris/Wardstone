@@ -5,9 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Bump from 1.85: JwtKeys::load_or_create serializes virgin-volume key
-# creation across the ui/api processes with std's file locks (File::lock /
-# try_lock), which need a newer MSRV than 1.85.
+# Bump from 1.85: JwtKeys::load_or_create (the transitional plaintext
+# loader the seal-at-creation plan removes in Task 7) serializes
+# virgin-volume key creation across the ui/api processes with std's
+# file locks (File::lock / try_lock), which need a newer MSRV than 1.85.
 rust-version = "1.89"
 
 # Shared dependency versions. Exact caret pins chosen for the Plan 1 tech stack;

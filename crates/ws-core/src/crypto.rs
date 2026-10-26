@@ -34,14 +34,25 @@ const KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 extended-nonce length in bytes.
 const NONCE_LEN: usize = 24;
 
-/// Holds the 32-byte secret-encryption key (zeroized on drop) and seals
-/// secrets under fresh XChaCha20-Poly1305 nonces.
-#[derive(Clone)]
+/// Holds the 32-byte secret-encryption key in the process's protected
+/// arena (a `ws_secmem::SecretBuf`: never swapped, never in a core dump,
+/// volatilely wiped on drop) and seals secrets under fresh
+/// XChaCha20-Poly1305 nonces.
+///
+/// Deliberately not `Clone` — a copy would be a second plaintext of the
+/// same key, and the arena's whole point is that exactly one exists.
+/// Shared custody is `Arc<SecretBox>`.
 pub struct SecretBox {
-    key: Zeroizing<[u8; KEY_LEN]>,
+    key: SecretBuf,
 }
 
 impl SecretBox {
+    /// [TRANSITIONAL — the seal-at-creation plan removes this plaintext
+    /// file-read loader in Task 7, together with the boot path that calls
+    /// it; a sealed volume's SecretBox key exists only as
+    /// `secret-encryption.envelope`, opened at the unlock handshake and
+    /// carried through [`SecretBox::from_key`].]
+    ///
     /// Read the secret-encryption key from `<path>`: exactly
     /// [`KEY_LEN`] bytes.
     ///
@@ -71,18 +82,32 @@ impl SecretBox {
                 raw.len()
             )));
         }
-        let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        key.as_mut().copy_from_slice(raw.as_slice());
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        let key = mem
+            .alloc_copy(raw.as_slice())
+            .map_err(protected_memory_failure)?;
         Ok(SecretBox { key })
     }
 
-    /// Construct from an ALREADY-UNWRAPPED key (the sealed-at-rest unlock
-    /// flow: the SecretBox key comes from its envelope under the operator
-    /// passphrase-KEK and lives zeroized in RAM).
-    pub fn from_key(key: Zeroizing<[u8; KEY_LEN]>) -> Self {
+    /// Construct from an ALREADY-UNWRAPPED key held in the protected
+    /// arena (the sealed-at-rest unlock flow: the SecretBox key comes
+    /// from its envelope under the operator passphrase-KEK and lives in
+    /// the process's `memfd_secret` pool for the process's life, wiped on
+    /// drop).
+    ///
+    /// The buffer must be exactly [`KEY_LEN`] bytes; a different length
+    /// is refused at use time (seal/open fail with a typed crypto error),
+    /// because the constructor is infallible by design — the unlock
+    /// handshake has no recovery path a fallible form would serve.
+    pub fn from_key(key: SecretBuf) -> Self {
         SecretBox { key }
     }
 
+    /// [TRANSITIONAL — the seal-at-creation plan removes this plaintext
+    /// key-file creator with the setup flow in Task 6; a sealed volume
+    /// mints the SecretBox key into its envelope at setup instead, and
+    /// Task 7 removes the boot path that reads the file back.]
+    ///
     /// Guarantee a secret-encryption key exists: if the file is present,
     /// load and validate it (a second `create` must never mint a different
     /// key over data already sealed with the first); if it is absent,
@@ -94,7 +119,11 @@ impl SecretBox {
         }
         let key = random_key()?;
         write_private(path, key.as_slice())?;
-        Ok(SecretBox { key })
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        let buf = mem
+            .alloc_copy(key.as_slice())
+            .map_err(protected_memory_failure)?;
+        Ok(SecretBox { key: buf })
     }
 
     /// Seal `plaintext` under a fresh 24-byte OS-entropy nonce, returning
@@ -177,13 +206,16 @@ pub fn consume_relay_nonce(keys_dir: &Path, nonce: &str) -> Result<(), CoreError
     Ok(())
 }
 
-/// Build an XChaCha20-Poly1305 cipher from the 32-byte key.
+/// Build an XChaCha20-Poly1305 cipher from the key bytes, which must be
+/// exactly 32 long — a different length cannot come from a well-formed
+/// key source and is refused as a typed crypto error rather than a
+/// panic.
 ///
 /// The transient `Key` copy is zeroized the moment the cipher has taken
 /// its own; the cipher's retained copy is zeroized on drop via the
 /// `chacha20poly1305` `zeroize` feature.
-fn cipher_for(key: &[u8; KEY_LEN]) -> Result<XChaCha20Poly1305, CoreError> {
-    let mut key = Key::try_from(key.as_slice())
+fn cipher_for(key: &[u8]) -> Result<XChaCha20Poly1305, CoreError> {
+    let mut key = Key::try_from(key)
         .map_err(|_| CoreError::Crypto("secret-encryption key is not 32 bytes".to_string()))?;
     let cipher = XChaCha20Poly1305::new(&key);
     Zeroize::zeroize(&mut *key);
@@ -601,37 +633,28 @@ impl KeyEnvelope {
         open_bytes(kek.kek_bytes()?, &nonce, &ciphertext)
     }
 
-    /// The KEK as a 32-byte secret-encryption key: the SecretBox consumer
-    /// (TOTP/OIDC seals) takes custody of it at unlock and zeroizes on
-    /// drop.
-    ///
-    /// This copies the key out of protected memory into the caller's own
-    /// `Zeroizing` custody, which is weaker than the pool it came from.
-    /// The custody type is held as it was so this task stays a swap of
-    /// argon2's memory; Task 5 retargets the custody types and these
-    /// consumers with them.
+    /// The KEK as a fresh 32-byte reservation in the protected arena (a
+    /// compatibility accessor for callers that hold a borrowed envelope;
+    /// the production custody paths move the buffer instead, via
+    /// [`KeyEnvelope::into_kek`], adding no copy). The caller's buffer is
+    /// wiped on drop; the envelope keeps its own.
     ///
     /// # Errors
     ///
-    /// [`CoreError::Crypto`] if the held buffer is not [`KEY_LEN`] bytes.
-    /// It is, by construction — [`KeyEnvelope::derive_kek`] is the only
-    /// constructor and reserves exactly that — so this arm is unreachable
-    /// today. It is an error rather than a zero-padded short key because a
-    /// truncated KEK fails open: it would seal and unseal perfectly well
-    /// against itself while being far weaker than the passphrase behind it.
-    pub fn secrets(&self) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-        Ok(Zeroizing::new(*self.kek_bytes()?))
+    /// [`CoreError::Crypto`] if the protected arena cannot serve the
+    /// copy (it never falls back to the heap).
+    pub fn secrets(&self) -> Result<SecretBuf, CoreError> {
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        mem.alloc_copy(&self.kek).map_err(protected_memory_failure)
     }
 
-    /// The KEK as its raw 32 bytes (for callers that re-wrap it into their
-    /// own custody handling, e.g. the keystore conversion). Copies out of
-    /// protected memory — see [`KeyEnvelope::secrets`].
-    ///
-    /// # Errors
-    ///
-    /// As [`KeyEnvelope::secrets`].
-    pub fn into_kek(self) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-        self.secrets()
+    /// The KEK moved out of the envelope into the caller's arena custody
+    /// (e.g. the keystore conversion): the reservation transfers whole —
+    /// no copy is made, and the move is infallible by construction
+    /// ([`KeyEnvelope::derive_kek`] is the only constructor and reserves
+    /// exactly [`KEY_LEN`] bytes).
+    pub fn into_kek(self) -> SecretBuf {
+        self.kek
     }
 }
 

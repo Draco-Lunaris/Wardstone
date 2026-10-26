@@ -211,7 +211,6 @@ pub async fn unlocked_router_from_envelopes(
         substitute_db_password, KeyEnvelope, DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE,
         MASTER_ENVELOPE_FILE, SECRET_ENVELOPE_FILE,
     };
-    use zeroize::Zeroizing;
 
     // The master envelope: the keystore's unwrapped custody. Its absence
     // IS the unsealed state (the boot predicate's other half) — there is
@@ -279,15 +278,27 @@ pub async fn unlocked_router_from_envelopes(
         }
         (false, None) => (passphrase, volume_generation),
     };
+    // The unwrapped keys' live custody starts here: each envelope's
+    // plaintext crosses straight into the protected arena, and the
+    // zeroizing heap copy the envelope's KDF produced is wiped at the
+    // end of its statement. (The flow is unchanged — only the custody
+    // type the router receives.)
+    let mem = ws_secmem::global()
+        .map_err(ws_ca::keystore::protected_memory_failure)
+        .map_err(ApiError::from)?;
     let master = KeyEnvelope::open_envelope(&keys_dir.join(MASTER_ENVELOPE_FILE), passphrase)?;
-    let mut master_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    master_bytes.copy_from_slice(&master);
+    let master = mem
+        .alloc_copy(&master)
+        .map_err(ws_ca::keystore::protected_memory_failure)
+        .map_err(ApiError::from)?;
     // The secret-encryption key: same treatment (the TOTP/OIDC
-    // SecretBox's key, held zeroized in RAM for the process's life).
+    // SecretBox's key, held in the arena for the process's life).
     let secret = KeyEnvelope::open_envelope(&keys_dir.join(SECRET_ENVELOPE_FILE), passphrase)?;
-    let mut secret_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
-    secret_bytes.copy_from_slice(&secret);
-    let secret_box = ws_core::crypto::SecretBox::from_key(Zeroizing::new(secret_bytes));
+    let secret = mem
+        .alloc_copy(&secret)
+        .map_err(ws_ca::keystore::protected_memory_failure)
+        .map_err(ApiError::from)?;
+    let secret_box = ws_core::crypto::SecretBox::from_key(secret);
     // The DB credential: the envelope holds the CURRENT one, and a
     // `.pending` sibling — a rotation that crashed between its ALTER
     // and its promote — may hold the one the ALTER already made live.
@@ -351,14 +362,14 @@ pub async fn unlocked_router_from_envelopes(
     // above.
     let jwt = ws_auth::jwt::load_or_create_sealed(
         &keys_dir.join(JWT_ENVELOPE_FILE),
-        passphrase,
+        passphrase.as_bytes(),
         volume_generation,
     )?;
     Ok(crate::router(crate::AppState::new_unlocked(
         pool,
         Arc::new(jwt),
         config.clone(),
-        Zeroizing::new(master_bytes),
+        master,
         secret_box,
     )))
 }

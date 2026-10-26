@@ -20,5 +20,13 @@ argon2 = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Ruling 4: a read-only test accessor (`SecMem::peek_for_test`) into the
+# protected mapping, behind `#[cfg(any(test, feature = "test-peek"))]`.
+# It is enabled ONLY through a dev-dependency of a test suite (never a
+# normal dependency), so no production build of any dependent ever sees
+# a path that reads the pool from outside.
+test-peek = []
+
 [dev-dependencies]
 libc = { workspace = true }

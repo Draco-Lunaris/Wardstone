@@ -19,8 +19,9 @@
 //! populated-store guard: a store holding only a setup key never
 //! silently gets a fresh master either.
 //!
-//! Error contract of [`KeyStore::load_ca_key`], so operators can tell key
-//! loss from file damage:
+//! Error contract of [`KeyStore::unwrap_ca_key`] and
+//! [`KeyStore::with_ca_key`] (the unwrap APIs every key use goes
+//! through), so operators can tell key loss from file damage:
 //! - wrong master key (outer AEAD fails to authenticate) →
 //!   [`CaError::WrongKey`]
 //! - damaged store (truncated file, malformed JSON or base64, wrong nonce,
@@ -45,6 +46,7 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use ws_secmem::SecretBuf;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CaError;
@@ -108,16 +110,44 @@ pub struct KeyStore {
 }
 
 /// Where the master key currently lives for THIS keystore handle.
-#[derive(Clone)]
+///
+/// Not `Clone`: the unlocked custody is the process's ONE master-key
+/// plaintext outside its envelope — a copy would be a second plaintext,
+/// and the arena's promise is that exactly one exists.
 enum MasterCustody {
     /// No master key is available in RAM: key operations refuse.
     Sealed,
-    /// The legacy file-read mode: `master.key` exists as plaintext and is
-    /// read per operation (pre-sealing stores; the conversion migrates
-    /// away from it).
+    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
+    /// file-read mode with the boot paths in Task 7 (the setup paths
+    /// that mint the plaintext file go in Task 6).] `master.key` exists
+    /// as plaintext and is read per operation (pre-sealing stores; the
+    /// conversion migrates away from it).
     LegacyFile,
-    /// The unlocked master key, held zeroized in RAM.
-    Unlocked(Zeroizing<[u8; 32]>),
+    /// The unlocked master key, held in the protected arena (never
+    /// swapped, never in a core dump, volatilely wiped on drop).
+    Unlocked(SecretBuf),
+}
+
+/// A master key viewed without copying it when it already lives in the
+/// arena: the unlocked custody is lent by reference, and only the
+/// legacy file-read mode carries an owned, zeroizing copy. Derefs to
+/// the 32 KEK bytes either way.
+enum MasterView<'a> {
+    /// The arena custody, lent by reference.
+    Borrowed(&'a [u8]),
+    /// The legacy file-read mode's zeroizing copy.
+    Owned(Zeroizing<[u8; MASTER_KEY_LEN]>),
+}
+
+impl std::ops::Deref for MasterView<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            MasterView::Borrowed(bytes) => bytes,
+            MasterView::Owned(kek) => kek.as_slice(),
+        }
+    }
 }
 
 impl KeyStore {
@@ -147,6 +177,11 @@ impl KeyStore {
     /// directory that cannot be protected is a hard error, never a
     /// warning: continuing with a permissive directory would hand the
     /// master KEK to every local user.
+    ///
+    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
+    /// file-read open with the setup paths in Task 6 and the boot paths
+    /// in Task 7; a converted volume opens through `open_sealed` (boot)
+    /// or `open_unlocked` (post-unlock service).]
     pub fn open(dir: &Path) -> Result<Self, CaError> {
         Self::with_mode(dir, MasterCustody::LegacyFile)
     }
@@ -158,10 +193,20 @@ impl KeyStore {
         Self::with_mode(dir, MasterCustody::Sealed)
     }
 
-    /// Open with the unlocked master key held zeroized in RAM (the
+    /// Open with the unlocked master key held in the protected arena (the
     /// unlocked-at-rest design: the envelope was opened at the unlock
     /// handshake; no master file is read here).
-    pub fn open_unlocked(dir: &Path, master: Zeroizing<[u8; 32]>) -> Result<Self, CaError> {
+    ///
+    /// The master arrives as the arena reservation the unlock handshake
+    /// produced (a `ws_secmem::SecretBuf`) — never a heap copy — and this
+    /// open takes ownership of it: the handle is the one custody of the
+    /// plaintext master for its lifetime. A master whose length is not
+    /// [`MASTER_KEY_LEN`] cannot have come from a well-formed envelope
+    /// and is `Corrupt`.
+    pub fn open_unlocked(dir: &Path, master: SecretBuf) -> Result<Self, CaError> {
+        if master.len() != MASTER_KEY_LEN {
+            return Err(CaError::Corrupt);
+        }
         Self::with_mode(dir, MasterCustody::Unlocked(master))
     }
 
@@ -198,13 +243,26 @@ impl KeyStore {
         Ok(keystore)
     }
 
+    /// [TRANSITIONAL — the seal-at-creation plan removes this accessor
+    /// with the boot paths in Task 7: the unlocked custody is an arena
+    /// reservation now, and this copies it back out to the heap shape
+    /// the old boot code expects.]
+    ///
     /// The master key bytes as currently held (the legacy file read, the
-    /// RAM custody, or a `Sealed` error for the locked state) — the test
-    /// pins that the unlocked-from-envelope bytes match the legacy ones.
+    /// arena custody copied out, or a `Sealed` error for the locked
+    /// state) — the test pins that the unlocked-from-envelope bytes match
+    /// the legacy ones.
     pub fn master_key_bytes(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, CaError> {
-        self.read_master_key()
+        let view = self.read_master_key()?;
+        let mut out = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        out.as_mut().copy_from_slice(&view);
+        Ok(out)
     }
 
+    /// [TRANSITIONAL — the seal-at-creation plan removes the plaintext
+    /// master file with the boot paths in Task 7 (the setup mint of it
+    /// goes in Task 6).]
+    ///
     /// Path of the master KEK file (`<dir>/master.key`).
     pub fn master_key_path(&self) -> PathBuf {
         self.dir.join(MASTER_FILE)
@@ -227,6 +285,10 @@ impl KeyStore {
     /// that would silently orphan every stored key, turning the next load
     /// into `WrongKey` for data that was never wrong. Recovery from a lost
     /// master key is an explicit operator decision, not a bootstrap step.
+    ///
+    /// [TRANSITIONAL — the seal-at-creation plan removes this plaintext
+    /// master mint with the setup paths in Task 6; a converted volume's
+    /// master exists only inside its envelope.]
     pub fn ensure_master_key(&mut self) -> Result<(), CaError> {
         let path = self.master_key_path();
         if path.exists() {
@@ -274,7 +336,7 @@ impl KeyStore {
             return Err(CaError::Sealed);
         }
         let kek = self.read_master_key()?;
-        let wrap = cipher_for(kek.as_slice())?;
+        let wrap = cipher_for(&kek)?;
 
         let dek = random_bytes::<DEK_LEN>()?;
         let nonce_dek = random_bytes::<NONCE_LEN>()?;
@@ -322,8 +384,8 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Load and decrypt the CA private key stored for `ca_id`, returning it
-    /// zeroized-on-drop.
+    /// Unwrap the CA private key stored for `ca_id` into the protected
+    /// arena, and return the reservation.
     ///
     /// Error contract (see module docs): outer AEAD failure — the master key
     /// does not match — is [`CaError::WrongKey`]; every damage signature
@@ -332,14 +394,45 @@ impl KeyStore {
     /// AEAD failure including an envelope sitting in the wrong CA slot) is
     /// [`CaError::Corrupt`]; a missing envelope is [`CaError::NotFound`].
     /// A failed load never writes anything.
-    pub fn load_ca_key(&self, ca_id: &Uuid) -> Result<Zeroizing<Vec<u8>>, CaError> {
+    ///
+    /// Allowed callers: the serving-key holder (`wardstone`'s boot TLS
+    /// leaf) and the worker's revocation batch signer — the two shapes
+    /// that must hold the unwrapped key across several operations. Every
+    /// other key use goes through [`with_ca_key`](Self::with_ca_key),
+    /// which wipes the reservation the moment the use ends.
+    pub fn unwrap_ca_key(&self, ca_id: &Uuid) -> Result<SecretBuf, CaError> {
         self.load_envelope(&self.ca_key_path(ca_id), &aad_for(ca_id))
     }
 
+    /// Run `f` with one CA's unwrapped private key, wiping the arena
+    /// reservation the moment `f` returns — success and failure alike.
+    ///
+    /// The one-call shape every key use except the serving-key holder and
+    /// the worker's batch signer must take: the unwrapped key's live
+    /// custody is exactly the body of `f`, never a value that can be
+    /// stored, cloned, or outlived. `f` sees the DER bytes and returns
+    /// its own typed error, which passes through untouched — after the
+    /// wipe.
+    pub fn with_ca_key<R>(
+        &self,
+        ca_id: &Uuid,
+        f: impl FnOnce(&[u8]) -> Result<R, CaError>,
+    ) -> Result<R, CaError> {
+        let key = self.unwrap_ca_key(ca_id)?;
+        let out = f(&key);
+        // `key` drops here on both arms: the SecretBuf's Drop is the
+        // volatile wipe plus the arena release, and it runs before the
+        // result leaves this frame.
+        out
+    }
+
     /// Load one envelope: the engine behind
-    /// [`load_ca_key`](Self::load_ca_key) and
-    /// [`load_setup_key`](Self::load_setup_key) alike.
-    fn load_envelope(&self, path: &Path, aad: &str) -> Result<Zeroizing<Vec<u8>>, CaError> {
+    /// [`unwrap_ca_key`](Self::unwrap_ca_key) and
+    /// [`load_setup_key`](Self::load_setup_key) alike. The plaintext
+    /// crosses into the protected arena before it is returned; the
+    /// zeroizing heap copy the AEAD produced is wiped when this frame
+    /// ends.
+    fn load_envelope(&self, path: &Path, aad: &str) -> Result<SecretBuf, CaError> {
         // Fail-closed BEFORE reading any envelope file: a sealed store
         // refuses without disclosing whether the file even exists (the
         // NotFound-vs-Sealed distinction would leak existence to a sealed
@@ -358,7 +451,7 @@ impl KeyStore {
         }
 
         let kek = self.read_master_key()?;
-        let wrap = cipher_for(kek.as_slice())?;
+        let wrap = cipher_for(&kek)?;
         let nonce_dek = decode_nonce(&envelope.nonce_dek)?;
         let wrapped_dek = STANDARD
             .decode(&envelope.wrapped_dek)
@@ -392,10 +485,15 @@ impl KeyStore {
                 aad: aad.as_bytes(),
             },
         ) {
-            Ok(plaintext) => plaintext,
+            Ok(plaintext) => Zeroizing::new(plaintext),
             Err(_) => return Err(CaError::Corrupt),
         };
-        Ok(Zeroizing::new(plaintext))
+        // The key's live custody starts here: the DER crosses into the
+        // arena, and the zeroizing heap copy the AEAD just produced is
+        // wiped when this frame ends.
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        mem.alloc_copy(plaintext.as_slice())
+            .map_err(protected_memory_failure)
     }
 
     /// Store the setup certificate's private key under
@@ -411,19 +509,30 @@ impl KeyStore {
     /// fresh master over it (`Corrupt`), exactly as it does over CA key
     /// envelopes. The master key must already exist, as for
     /// [`store_ca_key`](Self::store_ca_key).
+    /// [TRANSITIONAL — the seal-at-creation plan removes the setup key
+    /// slot with the setup paths in Task 6 (the last read of it goes in
+    /// Task 7).]
     pub fn store_setup_key(&mut self, der: &[u8]) -> Result<(), CaError> {
         self.store_envelope(&self.setup_key_path(), SETUP_KEY_AAD, der)
     }
 
-    /// Load and decrypt the setup certificate's private key. Error
-    /// contract identical to [`load_ca_key`](Self::load_ca_key): an
-    /// envelope that fails the inner AEAD (wrong slot, wrong master key,
-    /// damage) is `Corrupt`/`WrongKey`; a missing envelope is
+    /// Load and decrypt the setup certificate's private key into the
+    /// protected arena. Error contract identical to
+    /// [`unwrap_ca_key`](Self::unwrap_ca_key): an envelope that fails the
+    /// inner AEAD (wrong slot, wrong master key, damage) is
+    /// `Corrupt`/`WrongKey`; a missing envelope is
     /// [`CaError::NotFound`]. A failed load never writes anything.
-    pub fn load_setup_key(&self) -> Result<Zeroizing<Vec<u8>>, CaError> {
+    ///
+    /// [TRANSITIONAL — the seal-at-creation plan removes the setup key
+    /// slot with the setup paths in Task 6 (the last read of it goes in
+    /// Task 7).]
+    pub fn load_setup_key(&self) -> Result<SecretBuf, CaError> {
         self.load_envelope(&self.setup_key_path(), SETUP_KEY_AAD)
     }
 
+    /// [TRANSITIONAL — as `store_setup_key`: Task 6 removes the slot,
+    /// Task 7 the last read.]
+    ///
     /// Path of the setup-key envelope file (`<dir>/ca/setup.key`).
     pub fn setup_key_path(&self) -> PathBuf {
         self.dir.join(CA_SUBDIR).join(SETUP_FILE)
@@ -434,16 +543,18 @@ impl KeyStore {
         self.dir.join(CA_SUBDIR).join(format!("{ca_id}.key"))
     }
 
-    /// Read the master KEK: its first 32 bytes, zeroized on drop.
+    /// Read the master KEK as a borrow-view: the arena custody is lent by
+    /// reference (no copy), and only the legacy file-read mode
+    /// materializes an owned, zeroizing copy.
     ///
     /// A missing or too-short master file is `Corrupt` — this is only
     /// called from operations that require a master key to exist, so
     /// "absent" means the store is inconsistent, not empty.
-    fn read_master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, CaError> {
+    fn read_master_key(&self) -> Result<MasterView<'_>, CaError> {
         match &self.master {
-            MasterCustody::Unlocked(kek) => Ok(kek.clone()),
+            MasterCustody::Unlocked(kek) => Ok(MasterView::Borrowed(kek)),
             MasterCustody::Sealed => Err(CaError::Sealed),
-            MasterCustody::LegacyFile => self.read_legacy_master_key(),
+            MasterCustody::LegacyFile => Ok(MasterView::Owned(self.read_legacy_master_key()?)),
         }
     }
 
@@ -487,6 +598,16 @@ impl KeyStore {
         }
         Ok(false)
     }
+}
+
+/// Map a protected-memory failure onto the keystore's typed `Io` error —
+/// the one mapping every custody crossing in this crate (and the one
+/// `ws-api` and `wardstone` import for theirs) uses, so the condition a
+/// `SecMemError` names (arena full, pool unavailable) reads identically
+/// wherever a key tries to cross into the arena. The error text names
+/// the pool condition, never key material.
+pub fn protected_memory_failure(error: ws_secmem::SecMemError) -> CaError {
+    CaError::Io(std::io::Error::other(error))
 }
 
 /// Build an XChaCha20-Poly1305 cipher from a 32-byte key.
@@ -644,8 +765,8 @@ mod tests {
             );
         }
 
-        let loaded = ks.load_ca_key(&ca_id).unwrap();
-        assert_eq!(loaded.as_slice(), der.as_slice());
+        let loaded = ks.unwrap_ca_key(&ca_id).unwrap();
+        assert_eq!(&*loaded, der.as_slice());
     }
 
     #[test]
@@ -665,7 +786,7 @@ mod tests {
             .set_len(half)
             .unwrap();
 
-        assert!(matches!(ks.load_ca_key(&ca_id), Err(CaError::Corrupt)));
+        assert!(matches!(ks.unwrap_ca_key(&ca_id), Err(CaError::Corrupt)));
     }
 
     #[test]
@@ -681,7 +802,7 @@ mod tests {
         let envelope_before = fs::read(&path).unwrap();
         fs::write(ks.master_key_path(), random_bytes::<32>()).unwrap();
 
-        assert!(matches!(ks.load_ca_key(&ca_id), Err(CaError::WrongKey)));
+        assert!(matches!(ks.unwrap_ca_key(&ca_id), Err(CaError::WrongKey)));
         // A failed load must never rewrite or "repair" the key file.
         assert_eq!(fs::read(&path).unwrap(), envelope_before);
     }
@@ -719,7 +840,7 @@ mod tests {
 
         assert_ne!(first.nonce_dek, second.nonce_dek);
         assert_ne!(first.nonce_inner, second.nonce_inner);
-        assert_eq!(ks.load_ca_key(&ca_id).unwrap().as_slice(), der.as_slice());
+        assert_eq!(&*ks.unwrap_ca_key(&ca_id).unwrap(), der.as_slice());
     }
 
     #[test]
@@ -747,7 +868,7 @@ mod tests {
         let dir = temp_keys_dir("missing");
         let mut ks = KeyStore::open(&dir).unwrap();
         ks.ensure_master_key().unwrap();
-        let err = ks.load_ca_key(&Uuid::new_v4()).unwrap_err();
+        let err = ks.unwrap_ca_key(&Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, CaError::NotFound));
     }
 
@@ -852,8 +973,8 @@ mod tests {
         fs::write(&path_one, &env_two).unwrap();
         fs::write(&path_two, &env_one).unwrap();
 
-        assert!(matches!(ks.load_ca_key(&ca_one), Err(CaError::Corrupt)));
-        assert!(matches!(ks.load_ca_key(&ca_two), Err(CaError::Corrupt)));
+        assert!(matches!(ks.unwrap_ca_key(&ca_one), Err(CaError::Corrupt)));
+        assert!(matches!(ks.unwrap_ca_key(&ca_two), Err(CaError::Corrupt)));
     }
 
     #[test]
@@ -887,7 +1008,7 @@ mod tests {
         envelope.wrapped_dek = STANDARD.encode([0u8; TAG_LEN]);
         fs::write(&path, serde_json::to_string(&envelope).unwrap()).unwrap();
 
-        assert!(matches!(ks.load_ca_key(&ca_id), Err(CaError::Corrupt)));
+        assert!(matches!(ks.unwrap_ca_key(&ca_id), Err(CaError::Corrupt)));
     }
 
     #[test]
@@ -899,6 +1020,6 @@ mod tests {
         let ca_id = Uuid::new_v4();
         let der = random_bytes::<32>();
         ks.store_ca_key(&ca_id, &der).unwrap();
-        assert_eq!(ks.load_ca_key(&ca_id).unwrap().as_slice(), der.as_slice());
+        assert_eq!(&*ks.unwrap_ca_key(&ca_id).unwrap(), der.as_slice());
     }
 }
