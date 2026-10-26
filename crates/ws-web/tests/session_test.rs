@@ -288,10 +288,20 @@ async fn env(ttl: Duration) -> TestEnv {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let jwt =
-        Arc::new(JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair"));
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = Arc::new(JwtKeys::generate(900).expect("mint the JWT key pair"));
     let config = ApiConfig::new("wardstone-relay.test".to_owned(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), jwt.clone(), config);
+    let state = AppState::new_unlocked(pool.clone(), jwt.clone(), config, master, secret_box);
     let refresh_counter = Arc::new(AtomicUsize::new(0));
     // Built ONCE: one clone serves the loopback listener, one stays in the
     // env for direct (bypass-ws-web) oneshot calls — both share the

@@ -138,10 +138,10 @@ pub struct CreatedCa {
 /// (critical), SKI per rcgen defaults. AKI is omitted, which RFC 5280
 /// permits for self-signed certificates.
 ///
-/// The keystore must already have a master key — call
-/// [`KeyStore::ensure_master_key`] during bootstrap; per the keystore's
-/// contract, storing without one fails with [`CaError::Corrupt`] rather
-/// than silently generating a master.
+/// The keystore must hold the unlocked master
+/// ([`KeyStore::open_unlocked`]); per the keystore's contract, a sealed
+/// store fails with [`CaError::Sealed`] rather than silently generating
+/// a master.
 pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, CaError> {
     let key_pair = ZeroizingKey(generate_key_pair(spec.key_type)?);
     // A root is self-signed: there is no issuer to clamp against.
@@ -168,10 +168,10 @@ pub fn create_root(spec: &CaSpec, keystore: &mut KeyStore) -> Result<CreatedCa, 
 /// KeyUsage `keyCertSign | cRLSign` (critical, no digitalSignature), and
 /// an AuthorityKeyIdentifier equal to the parent's SubjectKeyIdentifier.
 ///
-/// The keystore must already have a master key — call
-/// [`KeyStore::ensure_master_key`] during bootstrap; per the keystore's
-/// contract, storing without one fails with [`CaError::Corrupt`] rather
-/// than silently generating a master.
+/// The keystore must hold the unlocked master
+/// ([`KeyStore::open_unlocked`]); per the keystore's contract, a sealed
+/// store fails with [`CaError::Sealed`] rather than silently generating
+/// a master.
 pub fn create_sub_ca(
     parent_cert_pem: &str,
     parent_key_id: &Uuid,
@@ -452,9 +452,10 @@ fn generate_key_pair(key_type: KeyType) -> Result<KeyPair, CaError> {
 ///
 /// `pub(crate)`, and returning the PKCS#8 DER (in a [`Zeroizing`] buffer)
 /// alongside the rcgen key pair: [`crate::leafkey::generate_leaf_key`]
-/// shares exactly this helper and needs the plaintext DER for the
-/// encrypted setup-key slot — re-serializing the pair instead would mint
-/// a second plaintext copy the wrapper cannot reach.
+/// shares exactly this helper and its callers hand the plaintext DER
+/// straight into a protected-arena reservation — re-serializing the
+/// pair instead would mint a second plaintext copy the wrapper cannot
+/// reach.
 ///
 /// Error mapping (no variant carries key material; `rsa`'s error Display
 /// is static text): generation failure maps to [`CaError::Io`] — the
@@ -670,9 +671,9 @@ pub(crate) fn ensure_parent_key_matches_cert(
 /// The key is written to the keystore before success is reported, so a
 /// returned [`CreatedCa`] always implies an envelope exists under
 /// `key_pair_id`. The keystore's master-key precondition applies: the
-/// caller must have run [`KeyStore::ensure_master_key`] (or be reusing a
-/// store that has one), since storing without a master key is
-/// [`CaError::Corrupt`], never a silent master generation. If the store
+/// caller must hold the unlocked master ([`KeyStore::open_unlocked`]),
+/// since storing on a sealed store is [`CaError::Sealed`], never a
+/// silent master generation. If the store
 /// fails, the error propagates and every in-memory copy of the key drops
 /// zeroized.
 fn persist(

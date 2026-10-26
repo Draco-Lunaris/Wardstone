@@ -65,7 +65,6 @@ use ws_api::routes::acme::{ChallengeFetch, TxtResolver};
 use ws_api::{AcmeConfig, ApiConfig, AppState, AuthRateLimit, VerificationDeps};
 use ws_auth::jwt::JwtKeys;
 use ws_ca::ca::{create_root, CaLifetime, CaSpec};
-use ws_ca::keystore::KeyStore;
 use ws_ca::KeyType;
 use ws_core::db::connect;
 use ws_core::models::acme::{
@@ -149,6 +148,7 @@ fn database_url() -> String {
 /// A per-test fixture: the built router, the fixture tenant, and the held
 /// advisory-lock connection.
 struct Fixture {
+    state: AppState,
     router: axum::Router,
     pool: PgPool,
     tenant_id: Uuid,
@@ -241,11 +241,18 @@ async fn fixture_with(config: FixtureConfig<'_>) -> Fixture {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
-    keystore.ensure_master_key().expect("ensure master key");
-    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
-        .expect("create the secret-encryption key");
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let mut api_config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
     api_config.acme = AcmeConfig {
@@ -257,7 +264,13 @@ async fn fixture_with(config: FixtureConfig<'_>) -> Fixture {
         acme_account_limit: config.rate_limit,
     };
     api_config.auth_rate_limit = config.rate_limit;
-    let mut state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), api_config);
+    let mut state = AppState::new_unlocked(
+        pool.clone(),
+        std::sync::Arc::new(jwt),
+        api_config,
+        master,
+        secret_box,
+    );
     // The challenge-verification seams a test swaps in BEFORE the router
     // wraps the state (the router clones it — a later mutation would not
     // reach it).
@@ -267,6 +280,7 @@ async fn fixture_with(config: FixtureConfig<'_>) -> Fixture {
     let router = ws_api::router(state.clone());
 
     Fixture {
+        state,
         router,
         pool,
         tenant_id,
@@ -4275,7 +4289,7 @@ async fn seed_issuing_profile(fixture: &Fixture, name: &str) {
 /// loads it back) plus the `cas` row `choose_ca` needs. Returns the root
 /// certificate PEM — the chain tail the download body must carry.
 async fn seed_root_ca(fixture: &Fixture) -> String {
-    let mut keystore = KeyStore::open(&fixture.keys_dir).expect("open the fixture keystore");
+    let mut keystore = fixture.state.keystore().expect("open the fixture keystore");
     let created = create_root(
         &CaSpec {
             name: "acme-test-root".to_owned(),

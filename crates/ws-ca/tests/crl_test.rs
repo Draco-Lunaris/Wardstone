@@ -57,13 +57,19 @@ const REASONS: [Option<CrlReason>; 3] = [
 
 /// Per-test temp keystore, mirroring the keystore and creation suites'
 /// pattern: unique per test name and process id, swept before use so stale
-/// runs can't interfere.
+/// runs can't interfere. The store is UNLOCKED (the seal-at-creation
+/// custody): the master is minted straight into the protected arena — no
+/// plaintext master file exists anywhere.
 fn temp_keystore(test_name: &str) -> KeyStore {
     let dir = std::env::temp_dir().join(format!("ws-ca-crl-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let mut ks = KeyStore::open(&dir).unwrap();
-    ks.ensure_master_key().unwrap();
-    ks
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    KeyStore::open_unlocked(
+        &dir,
+        mem.alloc_copy(&[7u8; 32])
+            .expect("the arena holds the test master"),
+    )
+    .expect("open the unlocked test key store")
 }
 
 /// The Ed25519 root CA every test builds its CRL against.

@@ -1,15 +1,11 @@
-//! The sealed-at-rest custody tests: the three master-key residency modes
-//! (legacy file, RAM-unlocked, sealed), the conversion (legacy plaintext →
-//! envelope, the plaintext deleted), and the sealed fail-closed behavior.
+//! The sealed-at-rest custody tests: the master-key residency modes
+//! (RAM-unlocked, sealed) and the sealed fail-closed behavior.
 
 use std::fs;
 use std::path::PathBuf;
 
 use ws_ca::error::CaError;
 use ws_ca::keystore::KeyStore;
-use ws_core::crypto::KeyEnvelope;
-
-const LEGACY_ENVELOPE: &str = "master.envelope";
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ws-ca-custody-{name}-{}", std::process::id()));
@@ -23,21 +19,6 @@ fn cheap_params() -> ws_core::crypto::KdfParams {
         t_cost: 2,
         p_cost: 1,
     }
-}
-
-/// The LEGACY file-read mode reproduces the pre-sealing behavior: a
-/// plaintext master.key beside CA envelopes loads them exactly as before
-/// (the conversion is opt-in, never forced).
-#[test]
-fn legacy_file_mode_keeps_the_existing_store_working() -> Result<(), CaError> {
-    let dir = temp_dir("legacy");
-    let mut ks = KeyStore::open(&dir)?;
-    ks.ensure_master_key().unwrap();
-    let ca_bytes = b"a-ca-private-key-der".to_vec();
-    let ca_id = uuid::Uuid::new_v4();
-    ks.store_ca_key(&ca_id, &ca_bytes).unwrap();
-    assert_eq!(&*ks.unwrap_ca_key(&ca_id).unwrap(), ca_bytes.as_slice());
-    Ok(())
 }
 
 /// The sealed store refuses every key operation with the typed variant —
@@ -77,48 +58,6 @@ fn unlocked_ram_mode_serves_without_any_master_file() -> Result<(), CaError> {
     assert!(
         !dir.join("master.key").exists(),
         "the unlocked keystore must not materialize a plaintext master.key"
-    );
-    Ok(())
-}
-
-/// The conversion: a legacy plaintext master.key wraps into a KeyEnvelope
-/// file and the plaintext original is DELETED — the disk then holds only
-/// the inert envelope, and the unlocked keystore runs from the envelope's
-/// key bytes.
-#[test]
-fn conversion_wraps_the_legacy_master_and_deletes_the_plaintext() -> Result<(), CaError> {
-    let dir = temp_dir("convert");
-    {
-        let mut ks = KeyStore::open(&dir)?;
-        ks.ensure_master_key().unwrap();
-    }
-    let master = fs::read(dir.join("master.key")).unwrap();
-    let master_env = dir.join(LEGACY_ENVELOPE);
-    KeyEnvelope::write_envelope(
-        &master_env,
-        "the-operator-passphrase",
-        &master,
-        cheap_params(),
-        0,
-    )
-    .unwrap();
-    fs::remove_file(dir.join("master.key")).unwrap();
-
-    // The unlocked keystore then runs from the ENVELOPE: open with the
-    // passphrase, take custody of the SAME key bytes, and load an
-    // existing envelope.
-    let opened = KeyEnvelope::open_envelope(&master_env, "the-operator-passphrase").unwrap();
-    let ks = KeyStore::open_unlocked(
-        &dir,
-        ws_secmem::global()
-            .unwrap()
-            .alloc_copy(&opened[..])
-            .unwrap(),
-    )?;
-    assert_eq!(
-        ks.master_key_bytes().unwrap().as_slice(),
-        master.as_slice(),
-        "unlocked-from-envelope == the legacy plaintext key"
     );
     Ok(())
 }

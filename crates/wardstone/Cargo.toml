@@ -26,7 +26,8 @@ thiserror = { workspace = true }
 sqlx = { workspace = true, features = ["uuid", "chrono", "ipnet"] }
 # The domain layer: migrations, pool connect, repos, models.
 ws-core = { path = "../ws-core" }
-# Authentication primitives: the JWT key pair lifecycle (`load_or_create`).
+# Authentication primitives: the JWT key pair lifecycle (the sealed
+# envelope mint/open).
 ws-auth = { path = "../ws-auth" }
 # The REST surface: `router(AppState)` and the config vocabulary.
 ws-api = { path = "../ws-api" }
@@ -35,9 +36,9 @@ ws-api = { path = "../ws-api" }
 futures-util = { workspace = true }
 # The sealed boot's TLS reload wraps the leaf key's DER as PKCS#8 PEM.
 base64 = { workspace = true }
-# The TLS front door: `web_router`, `serve_tls`, the setup certificate.
+# The TLS front door: `web_router`, `serve_tls`, the first-run certificate.
 ws-web = { path = "../ws-web" }
-# The CA engine: the keystore (setup slot, per-certificate key envelopes).
+# The CA engine: the keystore (per-certificate key envelopes).
 ws-ca = { path = "../ws-ca" }
 # Zeroizing custody for the boot's transient plaintexts (the sealed
 # certificate's key, the master bytes on their way into the protected

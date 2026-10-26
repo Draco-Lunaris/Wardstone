@@ -166,12 +166,21 @@ fn temp_keystore_dir() -> PathBuf {
     dir
 }
 
-/// A fresh key store in `dir` (the master key is created if it is not
-/// there yet).
-fn open_keystore(dir: &Path) -> KeyStore {
-    let mut ks = KeyStore::open(dir).expect("open the test key store");
-    ks.ensure_master_key().expect("create the master key");
-    ks
+/// A fresh unlocked key store in `dir` plus the arena-held master it was
+/// opened with (the seal-at-creation custody: no plaintext master file
+/// exists, so a reopen of the same volume needs the master re-supplied).
+fn open_keystore(dir: &Path) -> (KeyStore, ws_secmem::SecretBuf) {
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let store = KeyStore::open_unlocked(
+        dir,
+        mem.alloc_copy(&master)
+            .expect("the arena holds the master copy"),
+    )
+    .expect("open the unlocked test key store");
+    (store, master)
 }
 
 /// The Ed25519 root CA of the forest.
@@ -419,7 +428,7 @@ async fn test_end_to_end_ca_forest() {
     // is reused verbatim by the restart simulation at the end of the
     // test.
     let keys_dir = temp_keystore_dir();
-    let mut keystore = open_keystore(&keys_dir);
+    let (mut keystore, master) = open_keystore(&keys_dir);
     let root = create_root(&root_spec(), &mut keystore).expect("create the root CA");
     // The documented caller contract: the parent's certificate PEM and
     // its key-pair id travel together; `create_sub_ca` performs the
@@ -647,14 +656,22 @@ async fn test_end_to_end_ca_forest() {
         .await
         .expect("list the tenant's audit entries");
     // The restart simulation: the in-process key store goes away
-    // entirely, and a brand new one is opened on the same directory.
-    let master_key_before = fs::read(keystore.master_key_path()).expect("read the master key");
+    // entirely, and a brand new one is opened on the same directory with
+    // the SAME held master (the seal-at-creation custody: the master
+    // lives in the protected arena, so a "restart" re-supplies it rather
+    // than reading a file).
     drop(keystore);
-    let restarted = KeyStore::open(&keys_dir).expect("reopen the key store");
+    let restarted = KeyStore::open_unlocked(
+        &keys_dir,
+        ws_secmem::global()
+            .expect("the protected pool initializes")
+            .alloc_copy(&master)
+            .expect("the arena holds the master"),
+    )
+    .expect("reopen the key store");
     let reloaded_sub_key = restarted
         .unwrap_ca_key(&sub.key_pair_id)
         .expect("the sub-CA key survives the restart");
-    let master_key_after = fs::read(restarted.master_key_path()).expect("read the master key");
 
     // --- Cleanup BEFORE asserting -------------------------------------
     delete_smoke_rows(&pool, tenant.id).await;
@@ -887,9 +904,9 @@ async fn test_end_to_end_ca_forest() {
         sub.private_key_der.as_slice(),
         "the reopened key store returns the sub-CA's own key"
     );
-    assert_eq!(
-        master_key_before, master_key_after,
-        "the master key was read, not regenerated"
+    assert!(
+        !keys_dir.join("master.key").exists(),
+        "the unlocked custody keeps no plaintext master key on the volume"
     );
 }
 

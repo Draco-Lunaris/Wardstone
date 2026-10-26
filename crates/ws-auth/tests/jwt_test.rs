@@ -1,6 +1,7 @@
 //! Ed25519 JWT issuing/validation tests: the access-token round trip, the
-//! error taxonomy (`TokenInvalid` / `TokenExpired`), and the on-disk key pair
-//! that `JwtKeys::load_or_create` generates on a virgin volume.
+//! error taxonomy (`TokenInvalid` / `TokenExpired`), the sealed key pair
+//! lifecycle (mint into the protected arena, seal, reload), and the pair
+//! probe's mixed-pair refusal.
 
 use std::fs;
 use std::path::PathBuf;
@@ -10,7 +11,9 @@ use uuid::Uuid;
 use ws_auth::error::AuthError;
 use ws_auth::jwt::{issue_access_token, validate_access_token, AccessClaims, JwtKeys};
 
-/// On-disk location of the JWT key pair (layout: `<dir>/jwt-{signing,verify}-key.pem`).
+/// The legacy plaintext pair's file names. Nothing writes them anymore;
+/// the sealed-boot tests assert their ABSENCE from a fresh volume (the
+/// pair's only on-disk form is the envelope).
 const SIGNING_KEY_FILE: &str = "jwt-signing-key.pem";
 const VERIFY_KEY_FILE: &str = "jwt-verify-key.pem";
 
@@ -27,8 +30,7 @@ fn fresh_claims(username: &str, role: &str, sid: Option<Uuid>, ttl_secs: i64) ->
 
 #[test]
 fn access_token_validates_and_carries_its_claims() {
-    let dir = temp_keys_dir("roundtrip");
-    let keys = JwtKeys::load_or_create(&dir).unwrap();
+    let keys = JwtKeys::generate(900).unwrap();
 
     let sid = Uuid::new_v4();
     let claims = fresh_claims("carol", "issuer", Some(sid), 900);
@@ -46,10 +48,8 @@ fn access_token_validates_and_carries_its_claims() {
 
 #[test]
 fn token_signed_with_a_different_key_is_token_invalid() {
-    let dir_a = temp_keys_dir("wrong-key-a");
-    let keys_a = JwtKeys::load_or_create(&dir_a).unwrap();
-    let dir_b = temp_keys_dir("wrong-key-b");
-    let keys_b = JwtKeys::load_or_create(&dir_b).unwrap();
+    let keys_a = JwtKeys::generate(900).unwrap();
+    let keys_b = JwtKeys::generate(900).unwrap();
 
     let claims = fresh_claims("carol", "admin", None, 900);
     let token = issue_access_token(&claims, &keys_a).unwrap();
@@ -63,8 +63,7 @@ fn token_signed_with_a_different_key_is_token_invalid() {
 
 #[test]
 fn expired_token_is_token_expired() {
-    let dir = temp_keys_dir("expired");
-    let keys = JwtKeys::load_or_create(&dir).unwrap();
+    let keys = JwtKeys::generate(900).unwrap();
 
     let mut claims = fresh_claims("carol", "admin", None, 900);
     claims.exp = Utc::now().timestamp() - 3600;
@@ -79,8 +78,7 @@ fn expired_token_is_token_expired() {
 
 #[test]
 fn tampered_payload_is_token_invalid() {
-    let dir = temp_keys_dir("tampered");
-    let keys = JwtKeys::load_or_create(&dir).unwrap();
+    let keys = JwtKeys::generate(900).unwrap();
 
     let claims = fresh_claims("carol", "admin", None, 900);
     let token = issue_access_token(&claims, &keys).unwrap();
@@ -97,148 +95,6 @@ fn tampered_payload_is_token_invalid() {
         matches!(err, AuthError::TokenInvalid),
         "a tampered payload must map to TokenInvalid, got {err:?}"
     );
-}
-
-#[test]
-fn load_or_create_on_a_missing_directory_generates_the_key_pair() {
-    let dir = temp_keys_dir("generate");
-    assert!(!dir.exists(), "the fixture must start from nothing");
-
-    let keys = JwtKeys::load_or_create(&dir).unwrap();
-
-    assert!(dir.exists(), "a virgin volume must gain the keys directory");
-    assert!(dir.join(SIGNING_KEY_FILE).exists());
-    assert!(dir.join(VERIFY_KEY_FILE).exists());
-    assert!(!keys.signing_key.is_empty());
-    assert!(!keys.verification_key_pem.trim().is_empty());
-}
-
-#[test]
-fn a_second_load_returns_the_same_keys() {
-    let dir = temp_keys_dir("stable");
-    let first = JwtKeys::load_or_create(&dir).unwrap();
-    let second = JwtKeys::load_or_create(&dir).unwrap();
-
-    assert_eq!(&*first.signing_key, &*second.signing_key);
-    assert_eq!(first.verification_key_pem, second.verification_key_pem);
-}
-
-#[cfg(unix)]
-#[test]
-fn generated_signing_key_file_is_mode_0600() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = temp_keys_dir("mode");
-    let _keys = JwtKeys::load_or_create(&dir).unwrap();
-
-    let mode = fs::metadata(dir.join(SIGNING_KEY_FILE))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(
-        mode & 0o777,
-        0o600,
-        "the signing key holds private material and must be 0600"
-    );
-}
-
-#[test]
-fn a_token_signed_with_the_loaded_keys_validates() {
-    let dir = temp_keys_dir("loaded");
-    // First call generates; the second loads the same pair from disk.
-    let first = JwtKeys::load_or_create(&dir).unwrap();
-    let loaded = JwtKeys::load_or_create(&dir).unwrap();
-
-    let claims = fresh_claims("carol", "admin", None, 900);
-    let token = issue_access_token(&claims, &first).unwrap();
-    let decoded = validate_access_token(&token, &loaded).unwrap();
-    assert_eq!(decoded.username, "carol");
-}
-
-#[test]
-fn a_mixed_key_pair_fails_the_load_loudly() {
-    // Two real, independent pairs: the signing file from A, the
-    // verification file from B — the exact shape a concurrent virgin-volume
-    // boot race on a shared keys volume left on the deployed 2026-10-23
-    // system (each file whole, the pair useless). The load must refuse it,
-    // not silently sign tokens nothing can verify.
-    let dir_a = temp_keys_dir("mixed-a");
-    JwtKeys::load_or_create(&dir_a).unwrap();
-    let dir_b = temp_keys_dir("mixed-b");
-    JwtKeys::load_or_create(&dir_b).unwrap();
-
-    // Task 5: the signing half is arena DER now, so the mixed pair is
-    // planted from the plaintext FILES the legacy loader wrote — the
-    // exact shape the deployed torn volume had.
-    let dir = temp_keys_dir("mixed-pair");
-    fs::create_dir_all(&dir).unwrap();
-    fs::copy(dir_a.join(SIGNING_KEY_FILE), dir.join(SIGNING_KEY_FILE)).unwrap();
-    fs::copy(dir_b.join(VERIFY_KEY_FILE), dir.join(VERIFY_KEY_FILE)).unwrap();
-
-    let err = JwtKeys::load_or_create(&dir)
-        .expect_err("a mixed key pair must be refused, not loaded as authentic");
-
-    assert!(
-        matches!(err, AuthError::Config(ref msg) if msg.contains("remove both")),
-        "a mixed pair must fail as a configuration error carrying the \
-         remove-both re-key hint, got {err:?}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn racing_creators_serialize_into_one_consistent_pair() {
-    // Eight takers released into load_or_create on one virgin directory —
-    // the concurrent first boot of the ui and api processes on the shared
-    // keys volume. Every taker must succeed, hold the SAME pair, and the
-    // pair on disk must validate: the losers wait out the winner's complete
-    // two-file write instead of colliding with it.
-    use std::sync::{Arc, Barrier};
-
-    const RACERS: usize = 8;
-    let dir = temp_keys_dir("racing-creators");
-    let barrier = Arc::new(Barrier::new(RACERS));
-
-    let handles: Vec<_> = (0..RACERS)
-        .map(|_| {
-            let barrier = Arc::clone(&barrier);
-            let dir = dir.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                JwtKeys::load_or_create(&dir)
-            })
-        })
-        .collect();
-    let results: Vec<Result<JwtKeys, _>> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("a racing creator panicked"))
-        .collect();
-
-    for (i, result) in results.iter().enumerate() {
-        assert!(result.is_ok(), "racing creator {i} failed: {result:?}");
-    }
-    let first = results
-        .first()
-        .expect("at least one racer")
-        .as_ref()
-        .unwrap();
-    for (i, result) in results.iter().enumerate() {
-        let keys = result.as_ref().unwrap();
-        assert_eq!(
-            &*keys.signing_key, &*first.signing_key,
-            "racing creator {i} holds a different signing key than creator 0"
-        );
-        assert_eq!(
-            keys.verification_key_pem, first.verification_key_pem,
-            "racing creator {i} holds a different verification key than creator 0"
-        );
-    }
-
-    // The disk pair the winners left behind must itself load cleanly —
-    // a mixed two-file residue would fail the loader's own pair check.
-    let disk = JwtKeys::load_or_create(&dir).unwrap();
-    assert_eq!(&*disk.signing_key, &*first.signing_key);
-    assert_eq!(disk.verification_key_pem, first.verification_key_pem);
 }
 
 /// The fresh-install arm of the sealed boot: with no envelope on the
@@ -279,24 +135,30 @@ fn load_or_create_sealed_mints_seals_and_reloads_a_fresh_pair() {
 
 #[test]
 fn a_mixed_sealed_pair_fails_the_load_loudly() {
-    // F9 (the final review): the sealed loader must run the same pair
-    // probe the plaintext loader runs (`assert_pair_usable` — the
-    // sign-a-probe/verify roundtrip). An envelope whose halves came
-    // from different pairs — a conversion that sealed a torn volume, or
-    // any later corruption — must refuse at the LOAD with the re-key
-    // hint, never boot with a key whose tokens fail their own
-    // verification on first use.
+    // F9 (the final review): the sealed loader must run the pair probe
+    // (assert_pair_usable — the sign-a-probe/verify roundtrip). An
+    // envelope whose halves came from different pairs — any corruption —
+    // must refuse at the LOAD with the re-key hint, never boot with a
+    // key whose tokens fail their own verification on first use.
     //
-    // Task 5: the custody shape changed (the signing half is arena DER,
-    // never a field a test can set), so the mixed envelope is built from
-    // the legacy plaintext files' contents directly — the deployed
-    // payload format — and sealed with the core envelope engine.
-    let pair_a_dir = temp_keys_dir("jwt-sealed-mixed-a");
-    JwtKeys::load_or_create(&pair_a_dir).unwrap();
-    let pair_b_dir = temp_keys_dir("jwt-sealed-mixed-b");
-    JwtKeys::load_or_create(&pair_b_dir).unwrap();
-    let signing_a = fs::read_to_string(pair_a_dir.join(SIGNING_KEY_FILE)).unwrap();
-    let verification_b = fs::read_to_string(pair_b_dir.join(VERIFY_KEY_FILE)).unwrap();
+    // The custody shape (the signing half is arena DER, never a field a
+    // test can set) means the mixed envelope is minted from two
+    // independent generated pairs: the signing PEM derived in-test from
+    // the first pair's arena DER, the verification PEM taken from the
+    // second — the deployed payload format, sealed with the core
+    // envelope engine.
+    let pair_a = ws_auth::jwt::JwtKeys::generate(900).expect("mint the first pair");
+    let pair_b = ws_auth::jwt::JwtKeys::generate(900).expect("mint the second pair");
+    let signing_a = {
+        use ed25519_dalek::pkcs8::{DecodePrivateKey as _, KeypairBytes};
+        use pkcs8::{EncodePrivateKey as _, LineEnding};
+        KeypairBytes::from_pkcs8_der(&pair_a.signing_key)
+            .expect("the minted signing half parses")
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("the signing half's PEM encodes")
+            .to_string()
+    };
+    let verification_b = pair_b.verification_key_pem.clone();
 
     let mixed = serde_json::json!({
         "signing": signing_a,

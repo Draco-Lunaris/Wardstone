@@ -3,8 +3,8 @@
 //! - `password` — argon2id hashing and verification for user-chosen passwords
 //!   (the `users.credential_hash` column stores the PHC strings it produces).
 //! - `jwt` — Ed25519 (EdDSA) access-token issuing and validation, plus the
-//!   on-disk signing/verification key pair that `JwtKeys::load_or_create`
-//!   generates on a virgin volume.
+//!   sealed signing/verification key pair (`jwt-keys.envelope`) minted
+//!   into the protected arena and sealed on a virgin volume.
 //! - `mfa_totp` — TOTP MFA (RFC 6238 profile): secret generation, code
 //!   verification, and otpauth:// enrollment URIs.
 //! - `oidc` — generic OIDC SSO: discovery, authorization-code exchange, and

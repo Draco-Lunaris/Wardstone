@@ -1,24 +1,23 @@
 //! Secret-encryption helper: AEAD (XChaCha20-Poly1305) sealing of small
 //! secrets at rest — today the TOTP and WebAuthn secrets, encrypted in the
-//! `users` row with a key file created at setup under the keys volume,
+//! `users` row with a key that exists only as a protected-arena
+//! reservation (minted at setup straight into
+//! `secret-encryption.envelope`, opened at the unlock handshake),
 //! analogous to the house's `pm-core/src/crypto.rs` helper.
 //!
-//! The key is the file's content: [`SecretBox::create`] generates 32
-//! OS-entropy bytes and writes them mode 0600, crash-atomically (sibling
-//! `.tmp`, fsync, rename), if the file is absent; [`SecretBox::load`] reads
-//! and validates it (exactly 32 bytes). [`SecretBox::seal`] encrypts with a
-//! fresh 24-byte OS-entropy nonce and returns `(ciphertext, nonce)`;
-//! [`SecretBox::open`] decrypts, returning the plaintext zeroized on drop.
+//! [`SecretBox::from_key`] takes the ALREADY-UNWRAPPED arena buffer.
+//! [`SecretBox::seal`] encrypts with a fresh 24-byte OS-entropy nonce and
+//! returns `(ciphertext, nonce)`; [`SecretBox::open`] decrypts, returning
+//! the plaintext zeroized on drop.
 //!
-//! Error contract: key-file problems (missing, unreadable, wrong length,
-//! unwritable) are [`CoreError::Config`] — an operator/environment problem;
-//! cryptographic failures (os-entropy exhaustion, AEAD authentication
-//! failure on tampered or wrong-key ciphertext, wrong nonce length) are
-//! [`CoreError::Crypto`]. No error message ever carries key or plaintext
-//! material.
+//! Error contract: key-volume io problems (the relay-nonce claim's
+//! read/write/remove) are [`CoreError::Config`] — an operator/environment
+//! problem; cryptographic failures (os-entropy exhaustion, AEAD
+//! authentication failure on tampered or wrong-key ciphertext, wrong
+//! nonce length) are [`CoreError::Crypto`]. No error message ever carries
+//! key or plaintext material.
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use chacha20poly1305::aead::Aead;
@@ -29,7 +28,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CoreError;
 
-/// Key length in bytes (XChaCha20-Poly1305 key size).
+/// Key length in bytes (XChaCha20-Poly1305 key size): the
+/// secret-encryption key and the passphrase-derived envelope KEK.
 const KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 extended-nonce length in bytes.
 const NONCE_LEN: usize = 24;
@@ -47,83 +47,18 @@ pub struct SecretBox {
 }
 
 impl SecretBox {
-    /// [TRANSITIONAL — the seal-at-creation plan removes this plaintext
-    /// file-read loader in Task 7, together with the boot path that calls
-    /// it; a sealed volume's SecretBox key exists only as
-    /// `secret-encryption.envelope`, opened at the unlock handshake and
-    /// carried through [`SecretBox::from_key`].]
-    ///
-    /// Read the secret-encryption key from `<path>`: exactly
-    /// [`KEY_LEN`] bytes.
-    ///
-    /// A missing or unreadable file, or a file of any other length, is
-    /// [`CoreError::Config`] — a missing key file means setup did not run
-    /// (or was lost), not an empty store the caller could bootstrap.
-    pub fn load(path: &Path) -> Result<Self, CoreError> {
-        let raw = match fs::read(path) {
-            Ok(raw) => Zeroizing::new(raw),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(CoreError::Config(format!(
-                    "secret-encryption key file {} not found (run setup first)",
-                    path.display()
-                )));
-            }
-            Err(e) => {
-                return Err(CoreError::Config(format!(
-                    "secret-encryption key file {}: {e}",
-                    path.display()
-                )));
-            }
-        };
-        if raw.len() != KEY_LEN {
-            return Err(CoreError::Config(format!(
-                "secret-encryption key file {} must be exactly {KEY_LEN} bytes, got {}",
-                path.display(),
-                raw.len()
-            )));
-        }
-        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
-        let key = mem
-            .alloc_copy(raw.as_slice())
-            .map_err(protected_memory_failure)?;
-        Ok(SecretBox { key })
-    }
-
     /// Construct from an ALREADY-UNWRAPPED key held in the protected
     /// arena (the sealed-at-rest unlock flow: the SecretBox key comes
     /// from its envelope under the operator passphrase-KEK and lives in
     /// the process's `memfd_secret` pool for the process's life, wiped on
     /// drop).
     ///
-    /// The buffer must be exactly [`KEY_LEN`] bytes; a different length
+    /// The buffer must be exactly 32 bytes; a different length
     /// is refused at use time (seal/open fail with a typed crypto error),
     /// because the constructor is infallible by design — the unlock
     /// handshake has no recovery path a fallible form would serve.
     pub fn from_key(key: SecretBuf) -> Self {
         SecretBox { key }
-    }
-
-    /// [TRANSITIONAL — the seal-at-creation plan removes this plaintext
-    /// key-file creator with the setup flow in Task 6; a sealed volume
-    /// mints the SecretBox key into its envelope at setup instead, and
-    /// Task 7 removes the boot path that reads the file back.]
-    ///
-    /// Guarantee a secret-encryption key exists: if the file is present,
-    /// load and validate it (a second `create` must never mint a different
-    /// key over data already sealed with the first); if it is absent,
-    /// generate 32 OS-entropy bytes and write them mode 0600,
-    /// crash-atomically.
-    pub fn create(path: &Path) -> Result<Self, CoreError> {
-        if path.exists() {
-            return SecretBox::load(path);
-        }
-        let key = random_key()?;
-        write_private(path, key.as_slice())?;
-        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
-        let buf = mem
-            .alloc_copy(key.as_slice())
-            .map_err(protected_memory_failure)?;
-        Ok(SecretBox { key: buf })
     }
 
     /// Seal `plaintext` under a fresh 24-byte OS-entropy nonce, returning
@@ -229,18 +164,6 @@ fn cipher_for(key: &[u8]) -> Result<XChaCha20Poly1305, CoreError> {
 /// copy).
 pub(crate) fn protected_memory_failure(error: SecMemError) -> CoreError {
     CoreError::Crypto(format!("protected memory for the master-key KDF: {error}"))
-}
-
-/// 32 OS-entropy bytes for a fresh key file. The OS source failing is a
-/// typed error, never a panic.
-fn random_key() -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-    let mut key = Zeroizing::new([0u8; KEY_LEN]);
-    SysRng.try_fill_bytes(key.as_mut()).map_err(|e| {
-        CoreError::Crypto(format!(
-            "os entropy unavailable for the secret-encryption key: {e}"
-        ))
-    })?;
-    Ok(key)
 }
 
 /// Write a file containing key material, mode 0600 on unix, and

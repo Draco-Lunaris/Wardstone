@@ -119,17 +119,22 @@ fn temp_keystore_dir(test_name: &str) -> PathBuf {
     dir
 }
 
-/// A fresh key store in a fresh directory.
+/// A fresh key store in a fresh directory (the seal-at-creation custody:
+/// the master is minted straight into the protected arena — no plaintext
+/// master file exists anywhere).
 fn temp_keystore(test_name: &str) -> KeyStore {
     open_keystore(&temp_keystore_dir(test_name))
 }
 
-/// A key store in an existing directory (the master key is created if it
-/// is not there yet).
+/// A fresh unlocked key store in `dir`.
 fn open_keystore(dir: &Path) -> KeyStore {
-    let mut ks = KeyStore::open(dir).expect("open the test key store");
-    ks.ensure_master_key().expect("create the master key");
-    ks
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    KeyStore::open_unlocked(
+        dir,
+        mem.alloc_copy(&[7u8; 32])
+            .expect("the arena holds the test master"),
+    )
+    .expect("open the unlocked test key store")
 }
 
 /// The Ed25519 root CA every test's certificates are issued by.

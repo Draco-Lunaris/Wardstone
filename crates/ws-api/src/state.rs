@@ -423,53 +423,34 @@ pub struct AppState {
     /// disable does not reach it); spends one credit per authenticated
     /// ACME POST where the account resolves.
     pub acme_accounts: AcmeAccountLimiter,
-    /// The CA-keystore custody the routes open key operations through
-    /// (the sealed-at-rest design): the legacy file-read mode for
-    /// plaintext volumes, or the unlocked master held in the protected
-    /// arena for a sealed instance's post-unlock service — the routes
-    /// never touch the sealed-at-rest files themselves.
-    key_custody: KeyCustody,
-    /// The secret-encryption custody for the TOTP/OIDC routes: the
-    /// legacy per-request file read, or the arena-unlocked box the
-    /// sealed unlock opened from its envelope.
-    secret_custody: SecretCustody,
-}
-
-/// Where the CA-keystore master lives for THIS state.
-#[derive(Clone)]
-enum KeyCustody {
-    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
-    /// file-read mode with the boot paths in Task 7 (the setup paths
-    /// that mint the plaintext file go in Task 6).] The pre-sealing
-    /// mode: `master.key` is read from the keys directory per
-    /// operation.
-    LegacyFile,
-    /// The sealed instance's post-unlock service: the master opened
-    /// from its envelope at the unlock handshake, held in the protected
-    /// arena. `Arc` so the per-operation keystore opens share the one
-    /// reservation instead of copying it.
-    Unlocked(Arc<SecretBuf>),
-}
-
-/// Where the secret-encryption key lives for THIS state.
-#[derive(Clone)]
-enum SecretCustody {
-    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
-    /// per-request plaintext file read with the boot paths in Task 7.]
-    File,
-    /// The sealed instance's post-unlock service: the box built
-    /// (`SecretBox::from_key`) from the envelope the unlock opened,
-    /// held in the arena. `Arc` so every route shares the one box —
-    /// a copy would be a second plaintext of the key.
-    Unlocked(Arc<SecretBox>),
+    /// The CA-keystore master for the routes' key operations, opened
+    /// from its envelope at the unlock handshake and held in the
+    /// protected arena for the process's life — the routes never touch
+    /// the sealed-at-rest files themselves. `Arc` so the per-operation
+    /// keystore opens share the one reservation instead of copying it.
+    key_custody: Arc<SecretBuf>,
+    /// The secret-encryption box for the TOTP/OIDC routes, built
+    /// (`SecretBox::from_key`) from the envelope the unlock opened and
+    /// held in the arena. `Arc` so every route shares the one box — a
+    /// copy would be a second plaintext of the key.
+    secret_custody: Arc<SecretBox>,
 }
 
 impl AppState {
-    /// Build the state from the pool, the JWT key pair, and the config;
-    /// the mutable-by-product stores start empty. The custodies default
-    /// to the legacy file-read modes (a plaintext volume — or a test
-    /// world — serves exactly as before).
-    pub fn new(pool: PgPool, jwt: Arc<JwtKeys>, config: ApiConfig) -> Self {
+    /// Build the state for the unlocked service: the pool, the JWT key
+    /// pair, the config, and the custodies ALREADY UNWRAPPED from their
+    /// envelopes (the unlock handshake opened them; they live in the
+    /// protected arena for the process's life). The mutable-by-product
+    /// stores start empty. The routes reach both custodies through the
+    /// state instead of the sealed-at-rest files — the keys volume holds
+    /// no plaintext for them to read.
+    pub fn new_unlocked(
+        pool: PgPool,
+        jwt: Arc<JwtKeys>,
+        config: ApiConfig,
+        master: SecretBuf,
+        secret_box: SecretBox,
+    ) -> Self {
         let acme_accounts = AcmeAccountLimiter::new(config.acme.acme_account_limit);
         AppState {
             pool,
@@ -480,84 +461,43 @@ impl AppState {
             nonces: Arc::new(NonceStore::new()),
             verification: VerificationDeps::production(),
             acme_accounts,
-            key_custody: KeyCustody::LegacyFile,
-            secret_custody: SecretCustody::File,
+            key_custody: Arc::new(master),
+            secret_custody: Arc::new(secret_box),
         }
     }
 
-    /// Build the state for the sealed instance's post-unlock service:
-    /// the CA-keystore master and the secret-encryption key arrive
-    /// ALREADY UNWRAPPED from their envelopes (the unlock handshake
-    /// opened them; they live in the protected arena for the process's
-    /// life). The routes reach both through the state instead of the
-    /// sealed-at-rest files — a converted volume has no plaintext for
-    /// them to read.
-    pub fn new_unlocked(
-        pool: PgPool,
-        jwt: Arc<JwtKeys>,
-        config: ApiConfig,
-        master: SecretBuf,
-        secret_box: SecretBox,
-    ) -> Self {
-        let mut state = Self::new(pool, jwt, config);
-        state.key_custody = KeyCustody::Unlocked(Arc::new(master));
-        state.secret_custody = SecretCustody::Unlocked(Arc::new(secret_box));
-        state
-    }
-
-    /// Whether this state serves an unlocked sealed volume: the `me`
+    /// Whether this state serves a sealed volume: always true — the
+    /// custodies arrive only from the unlock handshake. The `me`
     /// response carries it so the SPA can gate its admin surface's
-    /// passphrase-change entry (the legacy file-read mode is not a
-    /// sealed volume).
+    /// passphrase-change entry.
     pub fn sealed_volume(&self) -> bool {
-        matches!(self.key_custody, KeyCustody::Unlocked(_))
+        true
     }
 
-    /// The keystore handle for a CA-key operation, in this state's
-    /// custody mode: the legacy file-read open for a plaintext volume,
-    /// the unlocked arena custody for a sealed instance. Opened per
-    /// operation (a directory probe and mode check), exactly as the
-    /// routes always have.
+    /// The keystore handle for a CA-key operation. Opened per operation
+    /// (a directory probe and mode check), exactly as the routes always
+    /// have.
     ///
-    /// The unlocked mode hands the keystore a per-operation arena copy
-    /// of the 32-byte master (a transient reservation, wiped when the
-    /// handle drops) — the state's own custody stays the one
-    /// process-lifetime reservation.
+    /// The keystore is handed a per-operation arena copy of the 32-byte
+    /// master (a transient reservation, wiped when the handle drops) —
+    /// the state's own custody stays the one process-lifetime
+    /// reservation.
     pub fn keystore(&self) -> Result<KeyStore, crate::error::ApiError> {
-        match &self.key_custody {
-            KeyCustody::LegacyFile => {
-                KeyStore::open(&self.config.keys_dir).map_err(crate::error::ApiError::from)
-            }
-            KeyCustody::Unlocked(master) => {
-                let mem = ws_secmem::global()
-                    .map_err(ws_ca::keystore::protected_memory_failure)
-                    .map_err(crate::error::ApiError::from)?;
-                let master = mem
-                    .alloc_copy(master)
-                    .map_err(ws_ca::keystore::protected_memory_failure)
-                    .map_err(crate::error::ApiError::from)?;
-                KeyStore::open_unlocked(&self.config.keys_dir, master)
-                    .map_err(crate::error::ApiError::from)
-            }
-        }
+        let mem = ws_secmem::global()
+            .map_err(ws_ca::keystore::protected_memory_failure)
+            .map_err(crate::error::ApiError::from)?;
+        let master = mem
+            .alloc_copy(&self.key_custody)
+            .map_err(ws_ca::keystore::protected_memory_failure)
+            .map_err(crate::error::ApiError::from)?;
+        KeyStore::open_unlocked(&self.config.keys_dir, master).map_err(crate::error::ApiError::from)
     }
 
-    /// The secret-encryption box for a TOTP/OIDC operation: the arena
-    /// custody when a sealed unlock supplied it, the plaintext file
-    /// read otherwise. The box is shared (`Arc`) — its key lives in the
-    /// arena exactly once, for the process's life; callers get a
-    /// reference, never a copy.
+    /// The secret-encryption box for a TOTP/OIDC operation. The box is
+    /// shared (`Arc`) — its key lives in the arena exactly once, for the
+    /// process's life; callers get a reference, never a copy.
     pub fn secret_box(&self) -> Result<Arc<SecretBox>, crate::error::ApiError> {
-        match &self.secret_custody {
-            SecretCustody::Unlocked(box_) => Ok(Arc::clone(box_)),
-            SecretCustody::File => {
-                // [TRANSITIONAL — Task 7 of the seal-at-creation plan
-                // removes this plaintext file read with the boot paths.]
-                let box_ = SecretBox::load(&self.secret_key_path())
-                    .map_err(crate::error::ApiError::from)?;
-                Ok(Arc::new(box_))
-            }
-        }
+        Ok(Arc::clone(&self.secret_custody))
     }
 
     /// The path of the secret-encryption key file (the TOTP and OIDC

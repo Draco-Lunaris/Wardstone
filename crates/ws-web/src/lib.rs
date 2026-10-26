@@ -366,8 +366,8 @@ pub fn rustls_server_config(
 
 /// Serve `router` under TLS from `cert_pem` + `key_der` (PKCS#8 DER) on
 /// `addr`. The Task 12 `ui` binary calls this on [`web_router`]'s output
-/// with EITHER the setup certificate (the keystore setup slot,
-/// `ca/setup.key`) while no tenant exists, OR the CA-issued server leaf
+/// with EITHER the first-run certificate (RAM-only, minted before the
+/// form exists) while no tenant exists, OR the CA-issued server leaf
 /// (cert: the `certificates` row, key: the envelope under the
 /// certificate's id) after setup — a process restart, not a hot reload,
 /// is the TLS switch between the two.

@@ -65,7 +65,7 @@ const HOSTNAME: &str = "wardstone-ui.test";
 const LEAF_HOSTNAME: &str = "ui.wardstone.test";
 
 /// A display-only fingerprint placeholder (the real one comes from
-/// `setup_certificate`; the page only echoes the state it was given).
+/// `first_run_certificate`; the page only echoes the state it was given).
 const PAGE_FINGERPRINT: &str = "abcd";
 
 /// In-process serialization, the whole-body lock pattern of the ws-core
@@ -540,13 +540,6 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
         }
         None => String::new(),
     };
-    // The sealed-volume contract: the conversion wraps every plaintext
-    // original into passphrase envelopes and deletes the originals, so
-    // the legacy file-read store must refuse on this volume now — and
-    // the passphrase-opened store must load the very same keys.
-    let legacy_refused = KeyStore::open(&fixture.keys_dir)
-        .and_then(|store| store.unwrap_ca_key(&ca_id).map(|_| ()))
-        .is_err();
     let unlocked_store = {
         let master = ws_core::crypto::KeyEnvelope::open_envelope(
             &fixture.keys_dir.join(setup::MASTER_ENVELOPE_FILE),
@@ -601,10 +594,6 @@ async fn setup_submit_creates_tenant_root_ca_admin_profiles_and_the_server_leaf(
     assert!(
         root_key_loaded,
         "the root's key loads under the master passphrase"
-    );
-    assert!(
-        legacy_refused,
-        "the legacy file-read store must refuse on a converted volume"
     );
     assert!(
         envelopes_exist,
@@ -833,21 +822,18 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
     fixture.cleanup().await;
 }
 
-/// The setup certificate is self-signed, carries the configured SAN, its
-/// returned fingerprint equals the SHA-256 of its own DER, and two calls
-/// yield two different certificates (each is minted fresh; the plan does
-/// NOT pin fingerprint stability across calls).
-#[tokio::test]
-#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
-async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_san() {
-    let _db = lock_db().await;
-    let mut fixture = fixture().await;
-
-    let mut keystore = KeyStore::open(&fixture.keys_dir).expect("open the keystore");
-    let (pem1, fingerprint_hex1) =
-        tls::setup_certificate(&mut keystore, HOSTNAME).expect("mint the setup certificate");
-    let (pem2, fingerprint_hex2) =
-        tls::setup_certificate(&mut keystore, HOSTNAME).expect("re-mint the setup certificate");
+/// The first-run certificate is self-signed, carries the configured SAN,
+/// its returned fingerprint equals the SHA-256 of its own DER, and two
+/// calls yield two different certificates (each is minted fresh; the plan
+/// does NOT pin fingerprint stability across calls). The mint is
+/// RAM-only: it takes no directory and writes nothing — each private
+/// key comes back as a protected-arena reservation, never as a file.
+#[test]
+fn first_run_certificate_is_self_signed_matches_fingerprint_and_carries_the_san() {
+    let (pem1, key1, fingerprint_hex1) =
+        tls::first_run_certificate(HOSTNAME).expect("mint the first-run certificate");
+    let (pem2, key2, fingerprint_hex2) =
+        tls::first_run_certificate(HOSTNAME).expect("re-mint the first-run certificate");
 
     let (_, pem) = parse_x509_pem(pem1.as_bytes()).expect("the certificate is valid PEM");
     let der = pem.contents.clone();
@@ -863,24 +849,25 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         cert.subject(),
         "the certificate is self-signed"
     );
-    // The setup certificate's consumer is the operator's BROWSER: browsers
-    // do not support Ed25519 TLS certificates (curl/openssl do — the gap
-    // surfaced as ERR_SSL_PROTOCOL_ERROR in real deployment), so the mint
-    // must stay on a browser-universal algorithm (ECDSA P-256).
+    // The first-run certificate's consumer is the operator's BROWSER:
+    // browsers do not support Ed25519 TLS certificates (curl/openssl do
+    // — the gap surfaced as ERR_SSL_PROTOCOL_ERROR in real deployment),
+    // so the mint must stay on a browser-universal algorithm (ECDSA
+    // P-256).
     assert_eq!(
         cert.signature_algorithm.algorithm.to_id_string(),
         "1.2.840.10045.4.3.2",
-        "the setup cert's signature is ecdsa-with-SHA256, not Ed25519 (1.3.101.112)"
+        "the first-run cert's signature is ecdsa-with-SHA256, not Ed25519 (1.3.101.112)"
     );
     assert_eq!(
         cert.public_key().algorithm.algorithm.to_id_string(),
         "1.2.840.10045.2.1",
-        "the setup cert's public key is ECDSA (id-ecPublicKey), not Ed25519 (1.3.101.100) or RSA"
+        "the first-run cert's public key is ECDSA (id-ecPublicKey), not Ed25519 (1.3.101.100) or RSA"
     );
     let san = cert
         .subject_alternative_name()
         .expect("the extensions parse")
-        .expect("the setup certificate carries the SAN");
+        .expect("the first-run certificate carries the SAN");
     let dns_names: Vec<String> = san
         .value
         .general_names
@@ -893,7 +880,7 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
     assert_eq!(
         dns_names,
         vec![HOSTNAME.to_string()],
-        "the setup certificate carries the configured SAN"
+        "the first-run certificate carries the configured SAN"
     );
 
     let (_, pem) = parse_x509_pem(pem2.as_bytes()).expect("the second PEM parses");
@@ -905,16 +892,14 @@ async fn setup_certificate_is_self_signed_matches_fingerprint_and_carries_the_sa
         fingerprint_hex1, fingerprint_hex2,
         "the fingerprints differ along with the certificates"
     );
-
+    // The RAM-only custody, compared through a precomputed boolean so a
+    // failure can never echo key material: each mint holds its own
+    // protected-arena reservation.
+    let keys_differ = *key1 != *key2;
     assert!(
-        keystore.master_key_path().exists(),
-        "the keystore master key is generated before the setup key is stored"
+        keys_differ,
+        "two mints hold two different arena reservations"
     );
-    keystore
-        .load_setup_key()
-        .expect("the setup slot holds the freshly minted key");
-
-    fixture.cleanup().await;
 }
 
 /// Task 9 (Plan-2 I-3): a `server_hostname` the built-in `web-server`

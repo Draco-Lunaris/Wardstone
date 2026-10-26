@@ -7,18 +7,14 @@
 //! the sealed envelope's payload, and fed to `EncodingKey::from_ed_der`
 //! per mint.
 //!
-//! The legacy two-file layout (the signing key's PEM at mode 0600 and the
-//! verification key's PEM) is [TRANSITIONAL — the seal-at-creation plan
-//! removes it in Task 7, with the boot paths that read it]; on a sealed
-//! volume the pair's only on-disk form is `jwt-keys.envelope`.
-//! `jsonwebtoken`'s `DecodingKey::from_ed_pem` accepts only an Ed25519
-//! *public*-key PEM — a private PKCS#8 PEM is rejected with
-//! `InvalidKeyFormat` — so the verification half stays a public PEM in
-//! every form, sealed or legacy.
+//! The pair's only on-disk form is the sealed envelope
+//! (`jwt-keys.envelope`). `jsonwebtoken`'s `DecodingKey::from_ed_pem`
+//! accepts only an Ed25519 *public*-key PEM — a private PKCS#8 PEM is
+//! rejected with `InvalidKeyFormat` — so the envelope payload and the
+//! in-memory verification half carry the public PEM form.
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use chrono::{Duration, Utc};
@@ -46,19 +42,6 @@ pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
 
 /// Clock-skew tolerance for `exp` checks, in seconds (house value).
 const CLOCK_SKEW_LEEWAY_SECS: u64 = 5;
-
-/// The Ed25519 **private** key PEM inside the keys directory. Mode 0600.
-const SIGNING_KEY_FILE: &str = "jwt-signing-key.pem";
-
-/// The Ed25519 **public** key PEM inside the keys directory. jsonwebtoken's
-/// decoder accepts only the public form, so the pair is stored separately.
-const VERIFY_KEY_FILE: &str = "jwt-verify-key.pem";
-
-/// Advisory lock against concurrent first-boot key generation, next to the
-/// key pair on the shared keys volume (`JwtKeys::load_or_create` holds it
-/// across the whole read-or-generate window, unix only).
-#[cfg(unix)]
-const KEY_LOCK_FILE: &str = "jwt-keys.lock";
 
 /// Standard claims of a Wardstone access token.
 ///
@@ -181,9 +164,9 @@ impl JwtKeys {
         })
     }
 
-    /// Build the pair from its PEM forms — the engine behind the legacy
-    /// plaintext loaders and the sealed loaders' parse of the envelope
-    /// payload (whose deployed format is PEM halves, unchanged). The
+    /// Build the pair from its PEM forms — the engine behind the sealed
+    /// loaders' parse of the envelope payload (whose deployed format is
+    /// PEM halves, unchanged). The
     /// signing PEM is parsed to its canonical PKCS#8 DER — deterministic
     /// per PEM, so the same PEM always yields the same DER — and copied
     /// into the protected arena; the public PEM is carried as-is.
@@ -210,166 +193,33 @@ impl JwtKeys {
             ttl_secs,
         })
     }
-
-    /// [TRANSITIONAL — the seal-at-creation plan removes this legacy
-    /// plaintext two-file loader in Task 7, together with the boot paths
-    /// that call it; on a sealed volume the pair's only on-disk form is
-    /// `jwt-keys.envelope`, minted or opened by `load_or_create_sealed`.]
-    ///
-    /// Load the key pair from `dir`, or — on a virgin volume — generate it.
-    ///
-    /// The binary loads the keys **before** the setup form exists, so a fresh
-    /// volume must be able to produce the pair here: when `dir` does not
-    /// exist it is created (mode 0700), and when both key files are absent a
-    /// new Ed25519 pair is written into it. When both files are present they
-    /// are proven to form one usable pair first (see
-    /// [`assert_pair_usable`]), so every boot signs with the same key and a
-    /// corrupted pair never silently pretends to authenticate.
-    ///
-    /// Concurrency is part of the deployment shape: the compose bundle's
-    /// `ui` and `api` processes boot simultaneously and share the keys
-    /// volume, so on unix every call holds an exclusive advisory lock on a
-    /// sibling lockfile across the whole read-or-generate window. A taker
-    /// that arrives mid-generation waits out the winner's complete two-file
-    /// write instead of generating its own divergent pair over it — the
-    /// collision that once left the deployed volume with a signing and a
-    /// verification key from two different pairs (every then-issued token
-    /// failed its own validation on first use). The lock is advisory:
-    /// closing the file releases it, so a crashed holder cannot wedge the
-    /// next boot.
-    ///
-    /// Exactly one of the two files present is a torn state (e.g. a restore
-    /// that only carried the signing key). It is surfaced as a typed
-    /// configuration error instead of being "healed": re-keying underneath
-    /// live sessions would silently invalidate every outstanding token, and
-    /// regenerating a mismatched verification key would disable *all*
-    /// validation. The operator restores the missing file, or removes both
-    /// to re-key.
-    pub fn load_or_create(dir: &Path) -> Result<Self, AuthError> {
-        let created = !dir.exists();
-        if created {
-            fs::create_dir_all(dir).map_err(|e| {
-                AuthError::Config(format!(
-                    "cannot create JWT key directory {}: {e}",
-                    dir.display()
-                ))
-            })?;
-            #[cfg(unix)]
-            force_mode(dir, 0o700)?;
-        }
-
-        // Held for the remainder of the call; dropping the file releases
-        // the lock before any result is built.
-        #[cfg(unix)]
-        let _creation_lock = lock_keys_dir(dir)?;
-
-        let signing_key_pem = read_key_file(&dir.join(SIGNING_KEY_FILE))?;
-        let verification_key_pem = read_key_file(&dir.join(VERIFY_KEY_FILE))?;
-
-        match (signing_key_pem, verification_key_pem) {
-            (Some(signing_key_pem), Some(verification_key_pem)) => {
-                assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
-                Self::from_pem_pair(
-                    &signing_key_pem,
-                    &verification_key_pem,
-                    DEFAULT_ACCESS_TTL_SECS,
-                )
-            }
-            (None, None) => {
-                let (signing_key_pem, verification_key_pem) = generate_key_pair()?;
-                write_key_file(&dir.join(SIGNING_KEY_FILE), &signing_key_pem, 0o600)?;
-                write_key_file(&dir.join(VERIFY_KEY_FILE), &verification_key_pem, 0o644)?;
-                // Prove what was written forms the working pair — defense in
-                // depth against a future write-path defect, at probe cost.
-                assert_pair_usable(&signing_key_pem, &verification_key_pem, dir)?;
-                Self::from_pem_pair(
-                    &signing_key_pem,
-                    &verification_key_pem,
-                    DEFAULT_ACCESS_TTL_SECS,
-                )
-            }
-            _ => Err(AuthError::Config(format!(
-                "incomplete JWT key pair in {}: '{}' and '{}' must both be present; \
-                 restore the missing file, or remove both to re-key",
-                dir.display(),
-                SIGNING_KEY_FILE,
-                VERIFY_KEY_FILE
-            ))),
-        }
-    }
 }
 
-/// Advisory cross-process serialization for [`JwtKeys::load_or_create`]
-/// (unix only): an exclusive, blocking file lock on `jwt-keys.lock` beside
-/// the key pair. A file lock is tied to the open file description, so each
-/// caller opens its own handle: concurrent callers block until the holder
-/// closes its file, and a crashed holder's handle closes with it — no
-/// stale-lock state can accumulate. The lockfile holds no bytes and is
-/// never removed; deleting it would break mutual exclusion for a caller
-/// holding a handle on the deleted inode.
-#[cfg(unix)]
-fn lock_keys_dir(dir: &Path) -> Result<fs::File, AuthError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let lock_path = dir.join(KEY_LOCK_FILE);
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|e| {
-            AuthError::Config(format!(
-                "cannot open the JWT keys lock file {}: {e}",
-                lock_path.display()
-            ))
-        })?;
-    force_mode(&lock_path, 0o600)?;
-    file.lock().map_err(|e| {
-        AuthError::Config(format!(
-            "cannot acquire the exclusive JWT keys lock on {}: {e}",
-            dir.display()
-        ))
-    })?;
-    Ok(file)
-}
-
-/// Prove the on-disk (or freshly generated) two-file pair is **usable**: a
-/// probe token signed with the signing PEM must decode under the
-/// verification PEM. This is deliberately the same `jsonwebtoken` path the
-/// runtime itself pays (`issue_access_token` → `validate_access_token`), so
-/// the check certifies exactly the property the service depends on rather
-/// than a structural stand-in for it.
+/// Prove the pair is **usable**: a probe token signed with the signing
+/// PEM must decode under the verification PEM. This is deliberately the
+/// same `jsonwebtoken` path the runtime itself pays (`issue_access_token`
+/// → `validate_access_token`), so the check certifies exactly the
+/// property the service depends on rather than a structural stand-in for
+/// it.
 ///
-/// The case it exists for: both files present, each individually intact,
-/// but written by two different `load_or_create` callers — a concurrent
-/// virgin-volume boot race on a shared keys volume. The mixed pair loads
-/// without error, makes every freshly minted token fail its own
-/// verification on first use, and turns the login flow into: issued → 401
-/// on the identity fetch, forever. It is refused as a configuration error
-/// carrying the recovery hint, mirroring the torn-state arm above; the
-/// operators re-key deliberately per the documented procedure.
-fn assert_pair_usable(
-    signing_pem: &str,
-    verification_pem: &str,
-    dir: &Path,
-) -> Result<(), AuthError> {
-    let hint = format!("remove both from {} to re-key", dir.display());
-
+/// The case it exists for: a mixed pair — halves from two different mints
+/// or epochs — loads without error, makes every freshly minted token fail
+/// its own verification on first use, and turns the login flow into:
+/// issued → 401 on the identity fetch, forever. It is refused as a typed
+/// error at the load (or before the first seal), so the operators re-key
+/// deliberately instead of booting on a key whose tokens fail their own
+/// verification on first use.
+fn assert_pair_usable(signing_pem: &str, verification_pem: &str) -> Result<(), AuthError> {
     let encoding = EncodingKey::from_ed_pem(signing_pem.as_bytes()).map_err(|e| {
         AuthError::Config(format!(
-            "the JWT signing key {} in {} does not parse as Ed25519 \
-             PKCS#8 private key material ({e}); remove both to re-key",
-            SIGNING_KEY_FILE,
-            dir.display()
+            "the JWT signing key does not parse as Ed25519 \
+             PKCS#8 private key material ({e})"
         ))
     })?;
     let decoding = DecodingKey::from_ed_pem(verification_pem.as_bytes()).map_err(|e| {
         AuthError::Config(format!(
-            "the JWT verification key {} in {} does not parse as Ed25519 \
-             public key material ({e}); remove both to re-key",
-            VERIFY_KEY_FILE,
-            dir.display()
+            "the JWT verification key does not parse as Ed25519 \
+             public key material ({e})"
         ))
     })?;
 
@@ -380,19 +230,13 @@ fn assert_pair_usable(
     let probe_token =
         encode(&Header::new(TOKEN_ALGORITHM), &probe_claims, &encoding).map_err(|e| {
             AuthError::Config(format!(
-                "the JWT signing key {} in {} cannot sign a probe token ({e}); \
-             remove both to re-key",
-                SIGNING_KEY_FILE,
-                dir.display()
+                "the JWT signing key cannot sign a probe token ({e})"
             ))
         })?;
     if let Err(e) = decode::<serde_json::Value>(&probe_token, &decoding, &validation) {
         return Err(AuthError::Config(format!(
-            "the JWT key pair in {} is mixed or invalid: a probe signed with \
-             '{}' does not verify under '{}' ({e}); {hint}",
-            dir.display(),
-            SIGNING_KEY_FILE,
-            VERIFY_KEY_FILE
+            "the JWT key pair is mixed or invalid: a probe signed with \
+             the signing key does not verify under the verification key ({e})"
         )));
     }
     Ok(())
@@ -436,10 +280,9 @@ fn utf8_passphrase(passphrase: &[u8]) -> Result<&str, AuthError> {
 
 /// Write BOTH PEMs as ONE sealed envelope (`jwt-keys.envelope`): the pair
 /// travels under the operator's KeyEnvelope and exists on disk ONLY as
-/// inert ciphertext. The legacy plaintext pair's re-key-by-deletion
-/// recovery becomes a post-unlock operator action. The `generation` is
-/// the volume's passphrase epoch (the conversion seals at 0; a changed
-/// passphrase re-wraps this envelope at epoch + 1 like every other).
+/// inert ciphertext. The `generation` is the volume's passphrase epoch
+/// (a changed passphrase re-wraps this envelope at epoch + 1 like every
+/// other).
 ///
 /// The payload format — `{"signing": <PEM>, "verification": <PEM>}` — is
 /// the deployed-volume contract and is UNCHANGED: the signing PEM is
@@ -470,9 +313,9 @@ pub fn write_sealed(
 
 /// Open the sealed pair from `path` with the passphrase.
 ///
-/// A torn PAIR (one plaintext file present, or an envelope whose stored
-/// JSON lost one half) is the same typed torn-state failure as ever —
-/// sealing never heals what the loader refuses.
+/// A torn payload (an envelope whose stored JSON lost one half) is the
+/// same typed torn-state failure as ever — sealing never heals what the
+/// loader refuses.
 pub fn load_sealed(path: &Path, passphrase: &[u8]) -> Result<JwtKeys, crate::error::AuthError> {
     let opened = ws_core::crypto::KeyEnvelope::open_envelope(path, utf8_passphrase(passphrase)?)
         .map_err(|e| match e {
@@ -505,15 +348,12 @@ pub fn load_sealed(path: &Path, passphrase: &[u8]) -> Result<JwtKeys, crate::err
             "the jwt key envelope payload lacks the verification key".to_string(),
         )
     })?;
-    // The pair probe (F9, the final review): the same check the
-    // plaintext loader runs (`assert_pair_usable`). Sealing must not
-    // launder a broken pair — a conversion that sealed a torn volume
-    // (one empty half) or an envelope whose halves came from different
-    // pairs refuses HERE, at the load, with the re-key hint, never
-    // boots with a key whose tokens fail their own verification on
-    // first use.
-    let dir = path.parent().unwrap_or(path);
-    assert_pair_usable(signing, verification, dir)?;
+    // The pair probe (F9, the final review): the same check run before
+    // the first seal. Sealing must not launder a broken pair — an
+    // envelope whose halves came from different pairs refuses HERE, at
+    // the load, never boots with a key whose tokens fail their own
+    // verification on first use.
+    assert_pair_usable(signing, verification)?;
     JwtKeys::from_pem_pair(signing, verification, DEFAULT_ACCESS_TTL_SECS)
 }
 
@@ -523,7 +363,7 @@ pub fn load_sealed(path: &Path, passphrase: &[u8]) -> Result<JwtKeys, crate::err
 /// not. A fresh password-less install has no plaintext pair to convert
 /// (nothing ever minted one), so the pair is BORN sealed — no plaintext
 /// file is ever written. The minted pair is proven usable before it is
-/// sealed (the same probe the plaintext loader runs on what it writes).
+/// sealed (the same probe the sealed open runs on what it reads).
 /// The mint stamps the volume's `generation` (the unlock reads it from
 /// the master envelope first), so a mid-change crash leaves no envelope
 /// from a foreign epoch.
@@ -553,9 +393,9 @@ pub fn load_or_create_sealed(
     }
     // Mint straight into the protected arena — no signing-key PEM ever
     // exists on this path — then prove the pair usable (the same probe
-    // the legacy loader runs on what it writes) before sealing it.
+    // the sealed open runs) before sealing it.
     let keys = JwtKeys::generate(DEFAULT_ACCESS_TTL_SECS)?;
-    assert_pair_usable(&signing_pem_of(&keys)?, &keys.verification_key_pem, &dir)?;
+    assert_pair_usable(&signing_pem_of(&keys)?, &keys.verification_key_pem)?;
     write_sealed(path, passphrase.as_bytes(), &keys, generation)?;
     Ok(keys)
 }
@@ -590,51 +430,14 @@ pub fn validate_access_token(token: &str, keys: &JwtKeys) -> Result<AccessClaims
         })
 }
 
-/// [TRANSITIONAL — the legacy plaintext loader's generation path; Task 7
-/// of the seal-at-creation plan removes it with the loader. The sealed
-/// path generates DER directly (`generate_der_and_verification_pem`)
-/// and never materializes a signing-key PEM.]
-///
-/// Draw a fresh Ed25519 key pair with the pinned `rand` 0.10's OS entropy.
-///
-/// [`SigningKey::generate`] is gated on ed25519-dalek's `rand_core` feature,
-/// which needs rand_core 0.6 and does not compile against the workspace's
-/// rand 0.10 — so the 32-byte seed is drawn directly and fed to
-/// [`SigningKey::from_bytes`], with no rand_core version involved.
-///
-/// The private key is written as a PKCS#8 v1 PEM, byte-compatible with the
-/// house's `openssl genpkey -algorithm ed25519` output, so a key generated
-/// here and a key generated by the house's scripts are interchangeable;
-/// the verification key is the matching SPKI PEM (`openssl pkey -pubout`).
-fn generate_key_pair() -> Result<(String, String), AuthError> {
-    let mut seed = [0u8; 32];
-    SysRng.try_fill_bytes(&mut seed).map_err(|e| {
-        AuthError::Crypto(format!("os entropy unavailable for the JWT key pair: {e}"))
-    })?;
-
-    let signing_key = SigningKey::from_bytes(&seed);
-    let signing_pem = KeypairBytes {
-        secret_key: seed,
-        public_key: None,
-    }
-    .to_pkcs8_pem(LineEnding::LF)
-    .map_err(|e| AuthError::Crypto(format!("signing-key encoding failed: {e}")))?
-    .to_string();
-
-    let verification_pem = signing_key
-        .verifying_key()
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| AuthError::Crypto(format!("verification-key encoding failed: {e}")))?;
-
-    seed.zeroize();
-    Ok((signing_pem, verification_pem))
-}
-
 /// Mint the signing key straight as PKCS#8 DER — the sealed custody's
 /// form; no signing-key PEM ever exists on that path — plus the matching
-/// verification SPKI PEM. Same entropy story as [`generate_key_pair`];
-/// the DER travels in a zeroizing buffer until `arena_copy` takes it
-/// into the pool.
+/// verification SPKI PEM. The 32-byte seed is drawn from the pinned
+/// `rand` 0.10's OS entropy and fed to [`SigningKey::from_bytes`]:
+/// `SigningKey::generate` is gated on ed25519-dalek's `rand_core`
+/// feature, which needs rand_core 0.6 and does not compile against the
+/// workspace's rand 0.10. The DER travels in a zeroizing buffer until
+/// `arena_copy` takes it into the pool.
 fn generate_der_and_verification_pem() -> Result<(Zeroizing<Vec<u8>>, String), AuthError> {
     let mut seed = [0u8; 32];
     SysRng.try_fill_bytes(&mut seed).map_err(|e| {
@@ -657,83 +460,6 @@ fn generate_der_and_verification_pem() -> Result<(Zeroizing<Vec<u8>>, String), A
 
     seed.zeroize();
     Ok((Zeroizing::new(der.as_bytes().to_vec()), verification_pem))
-}
-
-/// Read a key file, distinguishing "absent" (the virgin-volume case) from
-/// "present but unreadable" and "present but empty".
-fn read_key_file(path: &Path) -> Result<Option<String>, AuthError> {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            if contents.trim().is_empty() {
-                Err(AuthError::Config(format!(
-                    "key file {} is empty",
-                    path.display()
-                )))
-            } else {
-                Ok(Some(contents))
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(AuthError::Config(format!(
-            "cannot read key file {}: {e}",
-            path.display()
-        ))),
-    }
-}
-
-/// Write key material crash-atomically: the bytes land in a sibling `.tmp`
-/// file that is fsynced and renamed over the destination (house pattern, from
-/// ws-ca's keystore), so a crash mid-write can never leave a truncated key
-/// under the real name, and the exact mode is forced rather than relying on
-/// umask.
-#[cfg(unix)]
-fn write_key_file(path: &Path, contents: &str, mode: u32) -> Result<(), AuthError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let tmp = path.with_extension("tmp");
-    let write = || -> Result<(), AuthError> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)
-            .map_err(|e| AuthError::Config(format!("cannot create {}: {e}", tmp.display())))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|e| AuthError::Config(format!("cannot write {}: {e}", tmp.display())))?;
-        file.sync_all()
-            .map_err(|e| AuthError::Config(format!("cannot sync {}: {e}", tmp.display())))?;
-        drop(file);
-        force_mode(&tmp, mode)?;
-        fs::rename(&tmp, path).map_err(|e| {
-            AuthError::Config(format!("cannot rename into place {}: {e}", path.display()))
-        })?;
-        // Durability of the rename itself: without a parent-directory fsync,
-        // a power cut could roll the rename back — and with it the only copy
-        // of the signing key.
-        if let Some(parent) = path.parent() {
-            fs::File::open(parent)
-                .and_then(|p| p.sync_all())
-                .map_err(|e| {
-                    AuthError::Config(format!(
-                        "cannot sync key directory {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-        }
-        Ok(())
-    };
-    let result = write();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
-#[cfg(not(unix))]
-fn write_key_file(path: &Path, contents: &str, _mode: u32) -> Result<(), AuthError> {
-    fs::write(path, contents)
-        .map_err(|e| AuthError::Config(format!("cannot write {}: {e}", path.display())))
 }
 
 /// Force the exact permission bits (not umask-masked) on a path, unix only.

@@ -16,12 +16,13 @@ argon2 = { workspace = true }
 # iat/exp unix timestamps on the JWT claims (house pattern).
 chrono = { workspace = true }
 # Ed25519 keypair generation for the JWT signing/verification key pair
-# (keys are kept in PEM form, matching the house layout).
+# (the signing key lives in the protected arena as PKCS#8 DER; the sealed
+# envelope's payload speaks the pair's PEM forms).
 ed25519-dalek = { workspace = true }
 # JWT issuing/validation with the pure-Rust Ed25519 backend.
 jsonwebtoken = { workspace = true }
 # PKCS#8/SPKI encoders plus the `pem` feature (to_pkcs8_pem /
-# to_public_key_pem / LineEnding) for writing the key pair.
+# to_public_key_pem / LineEnding) for the pair's PEM forms.
 pkcs8 = { workspace = true }
 # OIDC discovery / code-exchange / JWKS HTTP fetches (rustls backend).
 reqwest = { workspace = true }

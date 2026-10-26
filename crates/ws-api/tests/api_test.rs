@@ -215,15 +215,27 @@ async fn fixture() -> Fixture {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let mut keystore = ws_ca::keystore::KeyStore::open(&keys_dir).expect("open keystore");
-    keystore.ensure_master_key().expect("ensure master key");
-    // The TOTP/OIDC secret-encryption envelope key (created at setup).
-    ws_core::crypto::SecretBox::create(&keys_dir.join("secret-encryption.key"))
-        .expect("create the secret-encryption key");
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), std::sync::Arc::new(jwt), config);
+    let state = AppState::new_unlocked(
+        pool.clone(),
+        std::sync::Arc::new(jwt),
+        config,
+        master,
+        secret_box,
+    );
     let router = ws_api::router(state.clone());
 
     Fixture {
@@ -1874,8 +1886,8 @@ async fn login_refresh_logout_lifecycle() {
     assert_eq!(me["actor_type"], "user");
     assert_eq!(me["username"], "operator");
     assert_eq!(
-        me["sealed_volume"], false,
-        "the legacy file-read state is not a sealed volume, got: {me}"
+        me["sealed_volume"], true,
+        "every volume is sealed at creation, got: {me}"
     );
 
     // Refresh rotates: the new pair works, the OLD refresh token is dead.

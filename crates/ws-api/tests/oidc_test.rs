@@ -200,10 +200,21 @@ async fn fixture() -> Fixture {
         std::process::id(),
         Uuid::new_v4()
     ));
-    let jwt = JwtKeys::load_or_create(&keys_dir).expect("load or create the JWT key pair");
+    // The seal-at-creation custody: the master, the secret-encryption
+    // key, and the JWT pair are minted straight into the protected arena
+    // — no plaintext key file is ever written.
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let master = mem
+        .alloc_copy(&[7u8; 32])
+        .expect("the arena holds the test master");
+    let secret_box = ws_core::crypto::SecretBox::from_key(
+        mem.alloc_copy(&[9u8; 32])
+            .expect("the arena holds the test secret key"),
+    );
+    let jwt = JwtKeys::generate(900).expect("mint the JWT key pair");
 
     let config = ApiConfig::new("wardstone.test".to_string(), keys_dir.clone());
-    let state = AppState::new(pool.clone(), Arc::new(jwt), config);
+    let state = AppState::new_unlocked(pool.clone(), Arc::new(jwt), config, master, secret_box);
     let router = ws_api::router(state.clone());
 
     Fixture {
