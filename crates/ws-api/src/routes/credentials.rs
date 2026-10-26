@@ -78,7 +78,7 @@ pub struct CreateServiceIdentityBody {
 }
 
 /// The mint response: the plaintext token appears exactly once.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ServiceIdentityCreated {
     pub id: Uuid,
@@ -262,7 +262,7 @@ pub struct CreateOneShotTokenBody {
 }
 
 /// The mint response: the plaintext token appears exactly once.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OneShotTokenCreated {
     pub id: Uuid,

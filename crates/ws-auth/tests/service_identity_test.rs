@@ -543,7 +543,10 @@ async fn api_token_capabilities_cannot_exceed_creator() {
     sweep(&pool, SI_TENANT).await;
     release_advisory(&mut advisory, ADVISORY_KEY).await;
 
-    let attempted = attempted.expect_err("minting above the creator's capabilities is an error");
+    let attempted = match attempted {
+        Err(err) => err,
+        Ok(_) => panic!("minting above the creator's capabilities is an error"),
+    };
     assert!(
         matches!(attempted, ws_auth::error::AuthError::Forbidden),
         "expected Forbidden, got {attempted:?}"

@@ -187,7 +187,7 @@ struct OidcPending {
 /// The store is process-local on purpose: a csrf state must not survive a
 /// restart or be shared between replicas (the binary is single-instance in
 /// v1), and a lost store just means the operator retries the login.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct OidcStateStore {
     states: Mutex<HashMap<String, OidcPending>>,
 }

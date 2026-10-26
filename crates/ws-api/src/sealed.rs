@@ -546,7 +546,7 @@ async fn healthz(State(sealed): State<Arc<SealedApi>>) -> Response {
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct UnlockBody {
     passphrase: String,
     /// Present only on the mixed-state completion (the unlock page

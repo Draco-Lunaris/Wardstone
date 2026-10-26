@@ -40,7 +40,6 @@ pub const TOKEN_PREFIX: &str = "ws_at_";
 /// will ever exist: storage holds just the verifier hash, so the caller
 /// must deliver it to the service's owner immediately (and never log it —
 /// Task 10's redaction contract).
-#[derive(Debug)]
 pub struct ServiceIdentity {
     /// The identity row's id (also the resolved Actor's `actor_id`).
     pub id: Uuid,

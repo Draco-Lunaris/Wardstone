@@ -61,7 +61,7 @@ const VOLUME_FILES: [&str; 4] = [
 /// The change body: the volume's present passphrase and its next one.
 /// The SPA collects `next` twice and confirms client-side (the setup
 /// page's own convention); the api takes the pair as-is.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ChangeMasterKeyBody {
     pub current: String,

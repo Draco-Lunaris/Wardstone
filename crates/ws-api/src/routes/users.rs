@@ -71,7 +71,7 @@ impl UserResponse {
 }
 
 /// The create body: a local account with a password (hashed argon2id).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateUserBody {
     pub username: String,
