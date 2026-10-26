@@ -456,3 +456,46 @@ fn relay_nonce_is_single_use_and_lives_only_in_the_volume() {
         "a consumed nonce cannot replay"
     );
 }
+
+#[test]
+fn derive_kek_matches_the_heap_reference() {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = cheap_params();
+    let salt = b"a-sixteen-byte!!";
+
+    // The locked-slot derivation must agree, byte for byte, with argon2's
+    // own heap-allocating `hash_password_into` at the same parameters: the
+    // envelopes already written to keys volumes have to keep opening.
+    let mut reference = [0u8; 32];
+    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+        .expect("the reference argon2id parameters");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
+        .hash_password_into(b"the operator master passphrase", salt, &mut reference)
+        .expect("the heap reference derives");
+
+    let derived = KeyEnvelope::derive_kek("the operator master passphrase", salt, params)
+        .expect("derive in the locked KDF slot");
+
+    assert_eq!(
+        derived.secrets().as_slice(),
+        reference.as_slice(),
+        "the locked-slot KEK must equal argon2's heap output at the same parameters"
+    );
+    assert_eq!(
+        derived.salt(),
+        salt,
+        "the envelope's salt is carried through"
+    );
+    assert_eq!(
+        derived.params(),
+        params,
+        "the parameters are carried through"
+    );
+
+    // A different passphrase derives a different KEK (the derivation is not
+    // accidentally keyed on the salt alone).
+    let other = KeyEnvelope::derive_kek("a different master passphrase", salt, params)
+        .expect("derive in the locked KDF slot");
+    assert_ne!(other.secrets().as_slice(), reference.as_slice());
+}

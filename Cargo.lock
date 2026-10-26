@@ -3814,6 +3814,7 @@ dependencies = [
  "totp-rs",
  "uuid",
  "ws-core",
+ "ws-secmem",
  "zeroize",
 ]
 
@@ -3859,6 +3860,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "ws-secmem",
  "zeroize",
 ]
 

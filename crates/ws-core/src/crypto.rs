@@ -24,6 +24,7 @@ use std::path::Path;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use rand::{rngs::SysRng, TryRng};
+use ws_secmem::{SecMemError, SecretBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CoreError;
@@ -187,6 +188,13 @@ fn cipher_for(key: &[u8; KEY_LEN]) -> Result<XChaCha20Poly1305, CoreError> {
     let cipher = XChaCha20Poly1305::new(&key);
     Zeroize::zeroize(&mut *key);
     Ok(cipher)
+}
+
+/// Map a protected-memory failure into the core vocabulary. `SecMemError`'s
+/// own `Display` names the protection that failed and the knob to turn, and
+/// carries no key or passphrase material by construction.
+fn protected_memory_failure(error: SecMemError) -> CoreError {
+    CoreError::Crypto(format!("protected memory for the master-key KDF: {error}"))
 }
 
 /// 32 OS-entropy bytes for a fresh key file. The OS source failing is a
@@ -420,7 +428,10 @@ pub async fn rotate_db_credential(
 }
 
 pub struct KeyEnvelope {
-    kek: Zeroizing<[u8; 32]>,
+    /// The derived key-encryption key, held in the process's
+    /// `memfd_secret` pool: never swapped, never in a core dump, and not
+    /// readable through `/proc/<pid>/mem`. Wiped when the envelope drops.
+    kek: SecretBuf,
     salt: Vec<u8>,
     params: KdfParams,
 }
@@ -429,19 +440,54 @@ impl KeyEnvelope {
     /// Derive the KEK from the passphrase with the stored salt + params.
     /// Deterministic per (passphrase, salt, params) — the envelope's own
     /// salt means every write re-randomizes.
+    ///
+    /// The argon2id pass runs in the pool's locked KDF slot, so neither the
+    /// 256 MiB of memory-hard scratch nor the derived key ever touches the
+    /// heap; there is no heap fallback, and an `m_cost` larger than the slot
+    /// is refused. Acquiring the slot **blocks the calling OS thread** (a
+    /// `Condvar` an async runtime cannot see), which is why every async
+    /// caller reaches this inside `tokio::task::spawn_blocking` — the
+    /// ~1 s CPU burn already required that.
     pub fn derive_kek(passphrase: &str, salt: &[u8], params: KdfParams) -> Result<Self, CoreError> {
         use argon2::{Algorithm, Argon2, Params, Version};
-        let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+        let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN))
             .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
-        let mut kek = Zeroizing::new([0u8; 32]);
+        // What argon2 will actually index: `m_cost` rounded to the
+        // lane/segment geometry. Leasing exactly that makes the
+        // slot-too-small refusal exact rather than approximate.
+        let blocks_needed = u32::try_from(argon_params.block_count())
+            .map_err(|_| CoreError::Crypto("argon2 parameters are out of range".to_string()))?;
+
+        let mem = ws_secmem::global().map_err(protected_memory_failure)?;
+        // The slot comes first, then the arena: both are finite pool
+        // resources, and taking them in one fixed order everywhere is what
+        // keeps a thread waiting for a slot while holding arena space from
+        // deadlocking against one holding a slot and waiting for arena
+        // space.
+        let mut slot = mem.kdf_slot();
+        let scratch = slot
+            .blocks(blocks_needed)
+            .map_err(protected_memory_failure)?;
+        let mut kek = mem.alloc(KEY_LEN).map_err(protected_memory_failure)?;
         Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
-            .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut())
+            .hash_password_into_with_memory(passphrase.as_bytes(), salt, &mut kek, scratch)
             .map_err(|e| CoreError::Crypto(format!("the master-key derivation failed: {e}")))?;
         Ok(Self {
             kek,
             salt: salt.to_vec(),
             params,
         })
+    }
+
+    /// The KEK's bytes as the fixed-size array the AEAD helpers take, read
+    /// straight out of protected memory — no copy. The length is
+    /// [`KEY_LEN`] by construction ([`KeyEnvelope::derive_kek`] is the only
+    /// constructor, and it reserves exactly that), so the error arm is a
+    /// belt-and-braces check rather than a reachable path — and a check
+    /// rather than an index, because the house style has no `unwrap`.
+    fn kek_bytes(&self) -> Result<&[u8; KEY_LEN], CoreError> {
+        <&[u8; KEY_LEN]>::try_from(&self.kek[..])
+            .map_err(|_| CoreError::Crypto("the derived KEK is not 32 bytes".to_string()))
     }
 
     /// The envelope's recorded salt: the unlock re-derivation reads it from
@@ -521,7 +567,7 @@ impl KeyEnvelope {
             CoreError::Crypto(format!("os entropy unavailable for the envelope salt: {e}"))
         })?;
         let kek = Self::derive_kek(passphrase, &salt, params)?;
-        let (ciphertext, nonce) = seal_bytes(&kek.kek, plaintext)?;
+        let (ciphertext, nonce) = seal_bytes(kek.kek_bytes()?, plaintext)?;
         let envelope = serde_json::json!({
             "version": ENVELOPE_VERSION,
             "kdf": "argon2id",
@@ -576,20 +622,34 @@ impl KeyEnvelope {
                 p_cost,
             },
         )?;
-        open_bytes(&kek.kek, &nonce, &ciphertext)
+        open_bytes(kek.kek_bytes()?, &nonce, &ciphertext)
     }
 
     /// The KEK as a 32-byte secret-encryption key: the SecretBox consumer
     /// (TOTP/OIDC seals) takes custody of it at unlock and zeroizes on
     /// drop.
-    pub fn secrets(&self) -> Zeroizing<[u8; 32]> {
-        self.kek.clone()
+    ///
+    /// This copies the key out of protected memory into the caller's own
+    /// `Zeroizing` custody, which is weaker than the pool it came from.
+    /// The signature is held fixed here so this change stays a swap of
+    /// argon2's memory; Task 5 retargets the custody types and these
+    /// consumers with them.
+    ///
+    /// The buffer is [`KEY_LEN`] long by construction, so the `min` is only
+    /// there to keep the copy panic-free, not to handle a reachable short
+    /// buffer.
+    pub fn secrets(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        let mut out = Zeroizing::new([0u8; KEY_LEN]);
+        let len = self.kek.len().min(KEY_LEN);
+        out[..len].copy_from_slice(&self.kek[..len]);
+        out
     }
 
     /// The KEK as its raw 32 bytes (for callers that re-wrap it into their
-    /// own custody handling, e.g. the keystore conversion).
-    pub fn into_kek(self) -> Zeroizing<[u8; 32]> {
-        self.kek
+    /// own custody handling, e.g. the keystore conversion). Copies out of
+    /// protected memory — see [`KeyEnvelope::secrets`].
+    pub fn into_kek(self) -> Zeroizing<[u8; KEY_LEN]> {
+        self.secrets()
     }
 }
 
@@ -672,10 +732,7 @@ pub fn rewrap_volume(
 }
 
 /// AEAD-seal bytes under a KEK (fresh entropy nonce; the tag appended).
-fn seal_bytes(
-    kek: &Zeroizing<[u8; 32]>,
-    plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+fn seal_bytes(kek: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
     let cipher = cipher_for(kek)?;
     let mut nonce = [0u8; NONCE_LEN];
     SysRng.try_fill_bytes(&mut nonce).map_err(|e| {
@@ -689,7 +746,7 @@ fn seal_bytes(
 
 /// AEAD-open bytes under a KEK; the plaintext is zeroized on drop.
 fn open_bytes(
-    kek: &Zeroizing<[u8; 32]>,
+    kek: &[u8; KEY_LEN],
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CoreError> {

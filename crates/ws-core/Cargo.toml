@@ -21,8 +21,14 @@ rand = { workspace = true }
 # The master-passphrase KEK derivation (KeyEnvelope): argon2id is the
 # memory-hard KDF that makes off-box brute force against the sealed
 # envelopes meet the unlock-latency budget (~1 s at the shipped params).
-# Workspace pin; the same argon2 ws-auth uses for credentials.
+# Workspace pin; the same argon2 ws-auth uses for credentials. The
+# derivation uses the externally-supplied-memory API so the 256 MiB of
+# memory-hard scratch comes from a locked ws-secmem slot, never the heap.
 argon2 = { workspace = true }
+# The locked KDF slot and the protected arena: the master-key derivation's
+# scratch and the derived KEK both live in the process's `memfd_secret`
+# pool (see KeyEnvelope::derive_kek).
+ws-secmem = { path = "../ws-secmem" }
 # The envelope file format carries base64 (standard) fields — the same
 # encoding idiom as the keystore envelope's JSON.
 base64 = { workspace = true }

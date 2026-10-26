@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Argon2id password hashing (workspace pin; default features enable the
-# auto-salted `PasswordHasher::hash_password`).
+# Argon2id password hashing (workspace pin). Production code uses the
+# externally-supplied-memory API (`hash_password_into_with_memory`) so every
+# pass runs in a locked ws-secmem slot; the default features are still on
+# for `password_hash::phc` — the PHC parser, and the B64 field encoders the
+# hand-built PHC string uses — and for the auto-salted
+# `PasswordHasher::hash_password`, which only the format-compatibility test
+# calls (it allocates its own argon2 memory on the heap).
 argon2 = { workspace = true }
 # iat/exp unix timestamps on the JWT claims (house pattern).
 chrono = { workspace = true }
@@ -55,6 +60,10 @@ uuid = { workspace = true, features = ["serde"] }
 # would be a Cargo cycle. Task 1 deferred this edge; re-exports it at the
 # crate root.
 ws-core = { path = "../ws-core" }
+# The locked argon2 slots and the protected arena: argon2id's 64 MiB of
+# scratch and the derived tag both live in the process's `memfd_secret`
+# pool, never on the heap (see password.rs).
+ws-secmem = { path = "../ws-secmem" }
 
 [dev-dependencies]
 # The TOTP test computes a code with an independent RFC 6238 HMAC-SHA1
