@@ -288,28 +288,63 @@ pub async fn unlocked_router_from_envelopes(
     let mut secret_bytes = [0u8; ws_ca::keystore::MASTER_KEY_LEN];
     secret_bytes.copy_from_slice(&secret);
     let secret_box = ws_core::crypto::SecretBox::from_key(Zeroizing::new(secret_bytes));
-    // The DB credential: the envelope holds the CURRENT one. Required
-    // too — the conversion mints it, and the password-less compose URL
-    // this process carries cannot connect with anything else.
+    // The DB credential: the envelope holds the CURRENT one, and a
+    // `.pending` sibling — a rotation that crashed between its ALTER
+    // and its promote — may hold the one the ALTER already made live.
+    // Required too: the conversion mints it, and the password-less
+    // compose URL this process carries cannot connect with anything
+    // else. The pending-first rule: try the pending; it connecting
+    // means PROMOTE it (it is the live one), its `28P01` refusal means
+    // the crash was BEFORE the ALTER — delete the stale pending and
+    // connect with the current one.
     let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
-    let current = KeyEnvelope::open_envelope(&db_credential_path, passphrase)?;
-    let connect_url = substitute_db_password(database_url, &String::from_utf8_lossy(&current));
-    let pool = ws_core::db::connect(&connect_url).await?;
+    let candidates =
+        ws_core::dbcred::open_db_credential(&db_credential_path, passphrase.as_bytes())?;
+    let current_connect_url =
+        substitute_db_password(database_url, &String::from_utf8_lossy(&candidates.current));
+    let pool = match &candidates.pending {
+        Some(pending) => {
+            let pending_url =
+                substitute_db_password(database_url, &String::from_utf8_lossy(pending));
+            match ws_core::db::connect(&pending_url).await {
+                Ok(pool) => {
+                    ws_core::dbcred::promote_pending(&db_credential_path)?;
+                    pool
+                }
+                Err(err) if invalid_password(&err) => {
+                    ws_core::dbcred::discard_pending(&db_credential_path)?;
+                    ws_core::db::connect(&current_connect_url).await?
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        None => ws_core::db::connect(&current_connect_url).await?,
+    };
     // The rotation (spec §5.6): the shared step
-    // ([`ws_core::crypto::rotate_db_credential`]) — fresh in-memory
-    // credential, ALTER over the just-opened connection, re-seal at the
+    // ([`ws_core::dbcred::rotate_db_credential`]) — fresh in-memory
+    // credential, the ALTER in VERIFIER form over a dedicated
+    // connection, the crash-safe pending envelope — sealed at the
     // volume's generation.
     let role = ws_core::crypto::db_role_of(database_url)?;
-    let fresh = ws_core::crypto::rotate_db_credential(
-        &pool,
+    let mut rotation_conn = pool
+        .acquire()
+        .await
+        .map_err(ws_core::error::CoreError::from)?;
+    let fresh = ws_core::dbcred::rotate_db_credential(
+        &mut rotation_conn,
         &role,
         &db_credential_path,
-        passphrase,
+        passphrase.as_bytes(),
         volume_generation,
     )
     .await?;
+    drop(rotation_conn);
     drop(pool);
-    let pool = ws_core::db::connect(&substitute_db_password(&connect_url, &fresh)).await?;
+    let pool = ws_core::db::connect(&substitute_db_password(
+        database_url,
+        &String::from_utf8_lossy(&fresh),
+    ))
+    .await?;
     // The JWT pair: mint-at-unlock on a fresh install (the envelope is
     // the pair's only form — plaintext never exists on a sealed volume),
     // the sealed load on a converted one. LAST, per the order contract
@@ -326,6 +361,17 @@ pub async fn unlocked_router_from_envelopes(
         Zeroizing::new(master_bytes),
         secret_box,
     )))
+}
+
+/// A Postgres `28P01` (invalid_password) refusal — the signal that a
+/// `.pending` db credential the rotation never made live is stale: the
+/// unlock deletes it and connects with the envelope's current one.
+fn invalid_password(err: &ws_core::error::CoreError) -> bool {
+    matches!(
+        err,
+        ws_core::error::CoreError::Database(db)
+            if db.as_database_error().and_then(|e| e.code()).as_deref() == Some("28P01")
+    )
 }
 
 /// Liveness is unconditional: a sealed instance answers 200 with its

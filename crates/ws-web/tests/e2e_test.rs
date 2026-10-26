@@ -227,6 +227,28 @@ struct Fixture {
     advisory: Option<PoolConnection<sqlx::Postgres>>,
 }
 
+/// The fixed 16-byte salt the shared role's restore verifier uses
+/// (Task 4's ruling: NO plaintext ALTER on the test side either — the
+/// restore sets the verifier form of `wardstone`'s bootstrap password,
+/// and a fixed salt keeps that verifier deterministic across every
+/// suite that restores the shared role).
+const FIXED_TEST_SALT: [u8; 16] = *b"0123456789abcdef";
+
+/// The shared test role's restore statement: the SCRAM-SHA-256
+/// verifier of the bootstrap password `wardstone` — Postgres stores
+/// the verifier as-is and the plaintext behind it logs in, so every
+/// suite's `wardstone:wardstone` connect keeps working.
+fn restore_statement() -> String {
+    format!(
+        "ALTER USER wardstone PASSWORD '{}'",
+        ws_core::dbcred::scram_verifier(
+            b"wardstone",
+            &FIXED_TEST_SALT,
+            ws_core::dbcred::SCRAM_ITERATIONS,
+        )
+    )
+}
+
 impl Fixture {
     /// Restore the shared login role's password IMMEDIATELY after a setup
     /// POST (the conversion — and the api's relayed unlock — rotate it):
@@ -234,7 +256,7 @@ impl Fixture {
     /// panic, so a mid-test failure can never leave the rotated password
     /// behind for the next suite's first connect.
     async fn restore_role_password(&self) {
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&self.pool)
             .await
             .expect("restore the shared test role's password");
@@ -251,7 +273,7 @@ impl Fixture {
     /// tests that never reach the seal.
     async fn cleanup(&mut self) {
         sweep_tenant(&self.pool, setup::DEFAULT_TENANT_NAME).await;
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&self.pool)
             .await
             .expect("restore the shared test role's password");

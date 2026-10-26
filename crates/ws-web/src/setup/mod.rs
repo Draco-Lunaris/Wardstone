@@ -820,14 +820,22 @@ pub async fn seal_keys_volume(
     }
 
     // The DB credential rotation (the shared step,
-    // [`ws_core::crypto::rotate_db_credential`]): fresh random, ALTER
-    // over the bootstrap connection, seal at the volume's zeroth
-    // generation. The env's embedded password retires here.
-    ws_core::crypto::rotate_db_credential(
-        pool,
+    // [`ws_core::dbcred::rotate_db_credential`]): fresh random, the
+    // ALTER in VERIFIER form over a dedicated connection, the crash-safe
+    // pending envelope promoted after the ALTER — sealed at the volume's
+    // zeroth generation. The env's embedded password retires here. A
+    // stale `.pending` a crashed earlier rotation left behind is
+    // overwritten by this rotation's own pending write and promote, so
+    // no separate cleanup arm is needed.
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| CaError::Worker(format!("the db rotation's connection: {e}")))?;
+    ws_core::dbcred::rotate_db_credential(
+        &mut conn,
         db_role,
         &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
-        passphrase,
+        passphrase.as_bytes(),
         0,
     )
     .await
@@ -960,32 +968,36 @@ fn heal_one(
 /// because the envelope's absence is the one thing that distinguishes
 /// recovery from every healthy boot. The step is the identical
 /// first-install one (the shared
-/// [`ws_core::crypto::rotate_db_credential`]): connect with the recovery
+/// [`ws_core::dbcred::rotate_db_credential`]): connect with the recovery
 /// URL's fresh credential, mint a random replacement, ALTER the login
-/// role to it, seal at the volume's generation. Returns the fresh
-/// credential so the caller connects with it (the api rotates again at
-/// its own unlock, exactly as on a healthy volume).
+/// role to it in verifier form, seal at the volume's generation.
+/// Returns the fresh credential so the caller connects with it (the
+/// api rotates again at its own unlock, exactly as on a healthy
+/// volume). A stale `.pending` a crashed earlier rotation left behind
+/// is overwritten by this rotation's own pending write and promote.
 pub async fn reseed_db_credential(
     keys_dir: &Path,
     passphrase: &str,
     database_url: &str,
     generation: u64,
 ) -> Result<String, CaError> {
+    use sqlx::Connection as _;
+
     let role = ws_core::crypto::db_role_of(database_url)
         .map_err(|e| CaError::Worker(format!("the recovery URL: {e}")))?;
-    let pool = sqlx::PgPool::connect(database_url)
+    let mut conn = sqlx::PgConnection::connect(database_url)
         .await
         .map_err(|e| CaError::Worker(format!("the recovery connection: {e}")))?;
-    let sealed = ws_core::crypto::rotate_db_credential(
-        &pool,
+    let sealed = ws_core::dbcred::rotate_db_credential(
+        &mut conn,
         &role,
         &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
-        passphrase,
+        passphrase.as_bytes(),
         generation,
     )
     .await;
-    pool.close().await;
-    sealed.map_err(|e| CaError::Worker(format!("the db re-seed: {e}")))
+    let sealed = sealed.map_err(|e| CaError::Worker(format!("the db re-seed: {e}")))?;
+    Ok(String::from_utf8_lossy(&sealed).into_owned())
 }
 
 /// The sealed-at-rest envelope names, re-exported from ws-core's single

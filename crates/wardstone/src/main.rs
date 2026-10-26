@@ -5,6 +5,12 @@
 //!   `/api/v1` proxy in every phase (all of the logic lives in `ws-web`).
 //! - `wardstone api` — the REST surface, served DIRECTLY as plain HTTP
 //!   for the internal network (the logic lives in `ws-api`).
+//! - `wardstone db-verifier` — a pure LOCAL mint (Task 4): a fresh
+//!   typeable database login credential with its Postgres
+//!   SCRAM-SHA-256 verifier for the operator to install in `.env`, or
+//!   (`--password-stdin`) the verifier of the operator's own chosen
+//!   password. No environment, no database, no keys volume; neither
+//!   value is ever logged.
 //!
 //! The separate-process anti-goal this shape realizes: the UI and the API
 //! are independently restartable — the compose bundle (a later task) runs
@@ -173,6 +179,10 @@ async fn main() -> std::process::ExitCode {
     match mode.as_deref() {
         Some("ui") => run_result(async { run_ui(config_from_env(BootMode::Ui)?).await }.await),
         Some("api") => run_result(async { run_api(config_from_env(BootMode::Api)?).await }.await),
+        // The db-verifier mint is pure-local: no env contract, no
+        // database, no keys volume — so no config parse, and no tracing
+        // on the path (its output is stdout-or-nothing by contract).
+        Some("db-verifier") => run_db_verifier(std::env::args().nth(2).as_deref()),
         Some("-h") | Some("--help") => {
             print!("{}", usage_text());
             std::process::ExitCode::SUCCESS
@@ -183,7 +193,7 @@ async fn main() -> std::process::ExitCode {
         _ => {
             eprint!("{}", usage_text());
             eprintln!(
-                "error: expected a mode (`ui` or `api`), got {}",
+                "error: expected a mode (`ui`, `api`, or `db-verifier`), got {}",
                 mode.map(|m| format!("`{m}`"))
                     .unwrap_or_else(|| "no argument".to_owned())
             );
@@ -204,6 +214,87 @@ fn run_result(result: Result<(), BootError>) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// The `db-verifier` mint (Task 4): a PURE-LOCAL subcommand — no
+/// environment contract, no database, no keys volume — that mints
+/// Postgres login material for the operator to install by hand.
+/// Default mode: a fresh 52-char typeable credential, its
+/// SCRAM-SHA-256 verifier, and the hint that only the VERIFIER belongs
+/// in `.env` (single-quoted; the plaintext behind it is what actually
+/// logs in). `--password-stdin`: the operator's own chosen password is
+/// read from stdin (one line, trailing newline stripped) and NEVER
+/// echoed — only the verifier and the hint print. An empty chosen
+/// password is refused loudly (an empty login credential would lock the
+/// role's owner out at the next connect, silently).
+///
+/// Neither value is logged at any level, anywhere: the output contract
+/// is stdout-or-nothing, and no tracing call sits on this path (a log
+/// line would outlive the operator's terminal).
+fn run_db_verifier(second: Option<&str>) -> std::process::ExitCode {
+    let salt = match ws_core::dbcred::fresh_scram_salt() {
+        Ok(salt) => salt,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match second {
+        None => {
+            let fresh = match ws_core::dbcred::generate_db_password() {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let verifier =
+                ws_core::dbcred::scram_verifier(&fresh, &salt, ws_core::dbcred::SCRAM_ITERATIONS);
+            println!("password: {}", String::from_utf8_lossy(&fresh));
+            println!("verifier: {verifier}");
+            print_verifier_hint(&verifier);
+        }
+        Some("--password-stdin") => {
+            use std::io::BufRead as _;
+
+            let mut chosen = String::new();
+            if let Err(err) = std::io::stdin().lock().read_line(&mut chosen) {
+                eprintln!("error: reading the chosen password from stdin: {err}");
+                return std::process::ExitCode::FAILURE;
+            }
+            let chosen = chosen.strip_suffix('\n').map_or(chosen.as_str(), |line| {
+                line.strip_suffix('\r').unwrap_or(line)
+            });
+            if chosen.is_empty() {
+                eprintln!("error: the chosen password read from stdin is empty");
+                return std::process::ExitCode::FAILURE;
+            }
+            let verifier = ws_core::dbcred::scram_verifier(
+                chosen.as_bytes(),
+                &salt,
+                ws_core::dbcred::SCRAM_ITERATIONS,
+            );
+            println!("verifier: {verifier}");
+            print_verifier_hint(&verifier);
+        }
+        Some(other) => {
+            eprint!("{}", usage_text());
+            eprintln!(
+                "error: expected no argument or `--password-stdin` after db-verifier, got `{other}`"
+            );
+            return std::process::ExitCode::from(2);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// The operator hint both mint modes print: ONLY the verifier belongs
+/// in `.env`, single-quoted (Postgres stores the verifier as-is; the
+/// plaintext behind it — not the verifier — is what logs in).
+fn print_verifier_hint(verifier: &str) {
+    println!(
+        "hint: put only the verifier in .env, single-quoted: WARDSTONE_DB_PASSWORD='{verifier}'"
+    );
 }
 
 /// Initialize the log subscriber: the fmt layer writing to stdout, the
@@ -229,6 +320,10 @@ fn usage_text() -> String {
          setup, the CA-issued server leaf after, and the /api/v1 proxy\n\
          \x20 api  serve the REST API directly (plain HTTP for the internal \
          network)\n\
+         \x20 db-verifier  mint a fresh database login credential with its \
+         Postgres SCRAM verifier for the operator to install in .env \
+         (local-only: no environment, no database, no keys volume; \
+         --password-stdin hashes a chosen password instead)\n\
          \n\
          Configuration (environment, both modes):\n\
          \x20 DATABASE_URL               required — the Postgres connection URL\n\

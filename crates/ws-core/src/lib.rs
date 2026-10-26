@@ -2,6 +2,7 @@
 
 pub mod crypto;
 pub mod db;
+pub mod dbcred;
 pub mod error;
 pub mod models;
 pub mod profile_match;

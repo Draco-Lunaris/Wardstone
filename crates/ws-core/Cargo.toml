@@ -17,6 +17,10 @@ zeroize = { workspace = true }
 # OS entropy for fresh secret-encryption keys and AEAD nonces (rand 0.10
 # SysRng, the house pattern).
 rand = { workspace = true }
+# The DB credential's SCRAM-SHA-256 verifier derivation (dbcred, Task 4):
+# PBKDF2-HMAC-SHA-256, HMAC-SHA-256, SHA-256 — the same ring the rustls
+# `ring` provider already resolves, so aws-lc-rs stays out.
+ring = { workspace = true }
 # jsonb decode/encode for the audit_log details column (migration 003).
 # The master-passphrase KEK derivation (KeyEnvelope): argon2id is the
 # memory-hard KDF that makes off-box brute force against the sealed
@@ -32,8 +36,8 @@ ws-secmem = { path = "../ws-secmem" }
 # The envelope file format carries base64 (standard) fields — the same
 # encoding idiom as the keystore envelope's JSON.
 base64 = { workspace = true }
-# Hex encoding of the DB-credential rotation's fresh random bytes (the
-# same encoding the opaque token family uses).
+# Hex encoding of the relay nonce's random bytes (the same encoding
+# the opaque token family uses).
 hex = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -50,3 +54,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 # Audit-entry fixtures (json! macro) in tests/repo_test.rs.
 serde_json = { workspace = true }
+# The rotation suite's statement-capture wrapper implements sqlx's
+# `Executor` trait, whose `fetch_many` return type is spelled with
+# `BoxStream` (futures-util re-exports futures-core's alias; resolved
+# transitively via sqlx already).
+futures-util = { workspace = true }

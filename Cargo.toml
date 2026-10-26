@@ -68,6 +68,14 @@ base64 = { version = "0.23.1" }
 # into rcgen as PKCS#8 DER. Already resolved in the lock via sqlx-mysql.
 rsa = { version = "0.9.10" }
 
+# ring for the DB credential's SCRAM-SHA-256 verifier derivation
+# (ws-core dbcred, Task 4): PBKDF2-HMAC-SHA-256 (RFC 7677's
+# SaltedPassword), HMAC-SHA-256 (ClientKey/ServerKey), SHA-256
+# (StoredKey). Defaults are fine; already resolved in the lock via
+# rustls's `ring` provider, and the same pin keeps aws-lc-rs out —
+# the graph-wide constraint ws-web's rustls pins record.
+ring = "0.17.14"
+
 # SHA-256 for the ws-ca creation tests' serial-number regression pin
 # (recomputing rcgen's legacy default serial); never used by production
 # code. Already resolved in the lock via sqlx.

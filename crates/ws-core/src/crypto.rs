@@ -131,9 +131,9 @@ impl SecretBox {
     }
 }
 
-/// `len` OS-entropy bytes, hex-encoded: the DB-credential rotation's
-/// fresh password material (and any future random-string need). The OS
-/// source failing is a typed error, never a panic.
+/// `len` OS-entropy bytes, hex-encoded: the relay nonce's material
+/// (and any future random-string need). The OS source failing is a
+/// typed error, never a panic.
 pub fn random_hex(len: usize) -> Result<String, CoreError> {
     let mut bytes = vec![0u8; len];
     SysRng
@@ -192,8 +192,10 @@ fn cipher_for(key: &[u8; KEY_LEN]) -> Result<XChaCha20Poly1305, CoreError> {
 
 /// Map a protected-memory failure into the core vocabulary. `SecMemError`'s
 /// own `Display` names the protection that failed and the knob to turn, and
-/// carries no key or passphrase material by construction.
-fn protected_memory_failure(error: SecMemError) -> CoreError {
+/// carries no key or passphrase material by construction. Shared with
+/// `dbcred`'s allocations (the generated login credential's protected
+/// copy).
+pub(crate) fn protected_memory_failure(error: SecMemError) -> CoreError {
     CoreError::Crypto(format!("protected memory for the master-key KDF: {error}"))
 }
 
@@ -357,11 +359,10 @@ pub fn substitute_db_password(url: &str, password: &str) -> String {
 
 /// The login role a `DATABASE_URL` authenticates as — the role whose
 /// password the rotation ALTERs. Validated to the strict
-/// alphanumeric+underscore shape (the interpolation counterpart of
-/// [`rotate_db_credential`]'s own check); a URL with no `userinfo@`
-/// names no role to rotate. The one home for the parse: the api's
-/// per-unlock rotation, the INIT conversion, and the ui's recovery
-/// re-seed all speak this exact shape.
+/// alphanumeric+underscore shape ([`is_safe_role_identifier`]); a URL
+/// with no `userinfo@` names no role to rotate. The one home for the
+/// parse: the api's per-unlock rotation, the INIT conversion, and the
+/// ui's recovery re-seed all speak this exact shape.
 pub fn db_role_of(url: &str) -> Result<String, CoreError> {
     let Some(scheme_end) = url.find("://") else {
         return Err(CoreError::Config(
@@ -379,7 +380,7 @@ pub fn db_role_of(url: &str) -> Result<String, CoreError> {
         .map(|i| i + auth_start)
         .unwrap_or(at);
     let role = &url[auth_start..user_end];
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !is_safe_role_identifier(role) {
         return Err(CoreError::Config(format!(
             "the database URL's login role {role:?} is not a safe identifier"
         )));
@@ -387,44 +388,12 @@ pub fn db_role_of(url: &str) -> Result<String, CoreError> {
     Ok(role.to_string())
 }
 
-/// Mint a fresh database login credential, ALTER `role` to it over an
-/// already-authenticated connection, and seal it under the volume's
-/// passphrase — the ONE home for the rotation step the setup
-/// conversion, the api's per-unlock rotation, and the ui's recovery
-/// re-seed all share. Postgres accepts no bind parameters in utility
-/// statements (`ALTER … PASSWORD $1` is a syntax error), so the
-/// statement interpolates both parts: the role is validated to the
-/// conservative identifier shape, and the credential is hex by
-/// construction — quote-doubled anyway, so the safety is local rather
-/// than resting on a distant generator's charset. Returns the fresh
-/// credential so the caller can reconnect with it.
-pub async fn rotate_db_credential(
-    executor: impl sqlx::PgExecutor<'_>,
-    role: &str,
-    envelope_path: &Path,
-    passphrase: &str,
-    generation: u64,
-) -> Result<String, CoreError> {
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(CoreError::Config(format!(
-            "the db login role name {role:?} is not a safe identifier"
-        )));
-    }
-    let fresh = random_hex(32)?;
-    sqlx::query(&format!(
-        "ALTER USER {role} PASSWORD '{}'",
-        fresh.replace('\'', "''")
-    ))
-    .execute(executor)
-    .await?;
-    KeyEnvelope::write_envelope(
-        envelope_path,
-        passphrase,
-        fresh.as_bytes(),
-        PROD_KDF_PARAMS,
-        generation,
-    )?;
-    Ok(fresh)
+/// The strict role-identifier shape every place that interpolates a
+/// role name into SQL requires ([`db_role_of`] and `dbcred`'s ALTER):
+/// non-empty ASCII alphanumeric + underscore — a role that cannot
+/// escape its identifier position or a single-quoted literal.
+pub(crate) fn is_safe_role_identifier(role: &str) -> bool {
+    !role.is_empty() && role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub struct KeyEnvelope {

@@ -318,13 +318,35 @@ struct Fixture {
     net: RestoreNet,
 }
 
+/// The fixed 16-byte salt the shared role's restore verifier uses
+/// (Task 4's ruling: NO plaintext ALTER on the test side either — the
+/// restore sets the verifier form of `wardstone`'s bootstrap password,
+/// and a fixed salt keeps that verifier deterministic across every
+/// suite that restores the shared role).
+const FIXED_TEST_SALT: [u8; 16] = *b"0123456789abcdef";
+
+/// The shared test role's restore statement: the SCRAM-SHA-256
+/// verifier of the bootstrap password `wardstone` — Postgres stores
+/// the verifier as-is and the plaintext behind it logs in, so every
+/// suite's `wardstone:wardstone` connect keeps working.
+fn restore_statement() -> String {
+    format!(
+        "ALTER USER wardstone PASSWORD '{}'",
+        ws_core::dbcred::scram_verifier(
+            b"wardstone",
+            &FIXED_TEST_SALT,
+            ws_core::dbcred::SCRAM_ITERATIONS,
+        )
+    )
+}
+
 impl Fixture {
     /// Restore the shared login role's password over the
     /// pre-rotation advisory connection (established connections
     /// survive the rotation), BEFORE any post-rotation read or
     /// assertion can panic. Idempotent.
     async fn restore_role_password(&mut self) {
-        sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
+        sqlx::query(&restore_statement())
             .execute(&mut *self.advisory)
             .await
             .expect("restore the shared test role's password");
@@ -374,9 +396,7 @@ fn spawn_restore_net(url: &str) -> RestoreNet {
             return;
         }
         runtime.block_on(async {
-            let _ = sqlx::query("ALTER USER wardstone PASSWORD 'wardstone'")
-                .execute(&mut conn)
-                .await;
+            let _ = sqlx::query(&restore_statement()).execute(&mut conn).await;
         });
         let _ = tx.send(());
     });
