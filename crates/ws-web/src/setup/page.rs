@@ -7,7 +7,6 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
-use zeroize::Zeroizing;
 
 use super::{run_setup, validate_hostname_permitted, SetupError, SetupFields, SetupState};
 
@@ -66,18 +65,18 @@ pub async fn submit_setup(
     }
 
     // The resume contract: the listener swaps onto the CA-issued leaf IN
-    // PLACE — no restart, no re-listen. The operator continues straight
-    // to the login on the same connection. The leaf key's PEM lives in a
-    // `Zeroizing` buffer until the reload consumes it (Task 8's resolver
-    // removes this interim PEM handoff).
-    if let Some(reload) = state.tls_reload.clone() {
-        let key_pem = pkcs8_pem_of(&outcome.leaf_key);
-        reload
-            .reload_from_pem(
-                outcome.leaf_cert_pem.clone().into_bytes(),
-                key_pem.as_str().as_bytes().to_vec(),
+    // PLACE — no restart, no re-listen — by publishing the pair onto the
+    // serving-certificate resolver: the very NEXT handshake serves the
+    // CA-issued leaf. The operator continues straight to the login on
+    // the same connection, and the leaf's private key crosses in ARENA
+    // custody inside the `ArenaKey` (the setup outcome's reservation
+    // moves; no PEM form and no heap copy exist at any point).
+    if let Some(resolver) = state.tls_reload.clone() {
+        resolver
+            .swap_pem(
+                &outcome.leaf_cert_pem,
+                crate::tls_signer::ArenaKey::new(outcome.leaf_key, outcome.leaf_key_kind),
             )
-            .await
             .map_err(|e| {
                 SubmitError::Setup(SetupError::Ca(ws_ca::error::CaError::Worker(format!(
                     "the TLS resume failed: {e}"
@@ -93,26 +92,6 @@ pub async fn submit_setup(
                     unlocks every future start of this instance. Continue to the login.",
         "hostname": fields.server_hostname,
     })))
-}
-
-/// A PKCS#8 DER private key as the PEM form the reload takes (the same
-/// 64-column wrapping the house uses). The returned buffer is
-/// `Zeroizing`: the leaf key's PEM form exists only for the reload's
-/// interim handoff (Task 8's resolver removes it).
-fn pkcs8_pem_of(der: &ws_secmem::SecretBuf) -> Zeroizing<String> {
-    use base64::Engine as _;
-
-    let body = base64::engine::general_purpose::STANDARD.encode(&der[..]);
-    let mut pem = Zeroizing::new(String::from("-----BEGIN PRIVATE KEY-----\n"));
-    let mut rest = body.as_str();
-    while !rest.is_empty() {
-        let (line, tail) = rest.split_at(rest.len().min(64));
-        pem.push_str(line);
-        pem.push('\n');
-        rest = tail;
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    pem
 }
 
 /// A setup-submit failure: the typed vocabulary the seal-at-creation

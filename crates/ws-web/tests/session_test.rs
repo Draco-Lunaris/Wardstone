@@ -58,7 +58,7 @@ use ws_auth::jwt::{issue_access_token, AccessClaims, JwtKeys};
 use ws_core::models::rbac::Role;
 use ws_core::models::user::UserModel;
 use ws_core::repo::user_repo::UserRepo;
-use ws_web::session::store::SessionStore;
+use ws_web::session::store::{SessionEntry, SessionStore, MAX_SESSIONS};
 use ws_web::session::{CSRF_HEADER_NAME, CSRF_HEADER_VALUE, SESSION_COOKIE};
 use ws_web::web_router_with_store;
 
@@ -546,7 +546,7 @@ async fn ui_login_sets_cookie_and_me() {
     assert_eq!(entry.username, "admin");
     assert_eq!(entry.role, "admin");
     assert!(!entry.access_token.is_empty());
-    assert!(entry.refresh_token.starts_with("ws_rt_"));
+    assert!(entry.refresh_token.starts_with(b"ws_rt_"));
 
     env.cleanup().await;
 }
@@ -664,7 +664,10 @@ async fn ui_logout_revokes_and_clears() {
             .get(login.session_id)
             .await
             .expect("the session still exists");
-        entry.refresh_token.clone()
+        // The store's arena custody, materialized once for the direct
+        // revocation below (the product materializes the same way, via
+        // the relay's `refresh_token_of`).
+        String::from_utf8_lossy(&entry.refresh_token[..]).into_owned()
     };
 
     // The real logout relays the revocation (Bearer + refresh body) and
@@ -962,7 +965,12 @@ async fn rotation_failure_kills_session_cleanly() {
             .get(login.session_id)
             .await
             .expect("the session exists pre-revocation");
-        (entry.access_token.clone(), entry.refresh_token.clone())
+        // The store's arena custody, materialized once for the direct
+        // ws-api logout below (the relay's own materialization shape).
+        (
+            String::from_utf8_lossy(&entry.access_token[..]).into_owned(),
+            String::from_utf8_lossy(&entry.refresh_token[..]).into_owned(),
+        )
     };
     let api = env.api.clone();
     let response = drive(
@@ -1136,4 +1144,164 @@ async fn logout_after_concurrent_rotation_leaves_no_live_refresh() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     env.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The arena-backed store (Task 8): capacity eviction — DB-free, real arena
+// ---------------------------------------------------------------------------
+
+/// A far-future idle window so ONLY the capacity eviction acts in the
+/// tests below (the idle clock's own semantics are the injected-clock
+/// unit tests' territory, in the store's own module).
+const NO_IDLE_EVICTION: Duration = Duration::from_secs(86400 * 365);
+
+/// The two capacity tests serialize against each other. BOTH hammer the
+/// process-global arena with ~2,050 claims apiece in the same first
+/// seconds of the test binary's life, and the wipe test's assertion
+/// reads the victim's just-RELEASED granules — a region the allocator is
+/// entitled to hand to ANY concurrent claim (first-fit picks the lowest
+/// free run, and the victim's are the lowest). The peer test's steady
+/// claim stream is exactly the interference that would make the peek
+/// read reused bytes instead of the wipe; the lock removes it, leaving
+/// the wipe test's microsecond observation window without a claimer
+/// (the DB tests claim through the same global arena, but their logins
+/// are seconds apart — orders of magnitude too slow to land in the
+/// window). The lock is a tokio mutex because the guard must sit across
+/// the tests' await points for the whole test body.
+static CAPACITY_SUITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One fresh entry: fixed identity fields, both tokens claimed straight
+/// into the protected arena (Ruling 20: the real global pool, no test
+/// stand-in). `index` keeps every entry's tokens distinct.
+fn arena_entry(mem: &ws_secmem::SecMem, index: usize) -> SessionEntry {
+    let access = mem
+        .alloc_copy(format!("ws_at_capacity-{index}").as_bytes())
+        .expect("the arena holds the access token");
+    let refresh = mem
+        .alloc_copy(format!("ws_rt_capacity-{index}").as_bytes())
+        .expect("the arena holds the refresh token");
+    SessionEntry::new(
+        Uuid::new_v4(),
+        format!("session-{index}"),
+        "admin".to_owned(),
+        access,
+        refresh,
+    )
+}
+
+/// Review Focus 3, pin 1: the store holds at most `MAX_SESSIONS`
+/// entries. The 1,025th insert evicts the least-recently-touched entry
+/// first — with sequential inserts that is the FIRST session, and the
+/// newest survives.
+#[tokio::test]
+async fn login_1025_evicts_the_oldest() {
+    // Serialized against the wipe test (see CAPACITY_SUITE).
+    let _suite = CAPACITY_SUITE.lock().await;
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let store = SessionStore::new(Duration::from_secs(900), NO_IDLE_EVICTION);
+
+    let mut first = None;
+    let mut newest = None;
+    for index in 0..=MAX_SESSIONS {
+        let id = store.insert(arena_entry(mem, index)).await;
+        if index == 0 {
+            first = Some(id);
+        }
+        newest = Some(id);
+    }
+
+    assert_eq!(
+        store.len().await,
+        MAX_SESSIONS,
+        "capacity holds at MAX_SESSIONS, never grows"
+    );
+    assert!(
+        store.get(first.expect("the first insert")).await.is_none(),
+        "the least-recently-touched session (the first) was evicted"
+    );
+    assert!(
+        store
+            .get(newest.expect("the newest insert"))
+            .await
+            .is_some(),
+        "the newest session survived"
+    );
+}
+
+/// Review Focus 3, pin 2: an evicted entry's token reservations read back
+/// ZERO through the test-only arena peek — the wipe the dropped
+/// `SecretBuf`'s `Drop` promises, on the real global pool. The addresses
+/// are recorded BEFORE the store takes custody, so the assertion reads
+/// exactly the buffers the evicted generation held.
+///
+/// Every filler pair is pre-claimed BEFORE any insert: `store.insert`
+/// takes no arena allocation of its own, so once the capacity eviction
+/// wipes and releases the victim's regions nothing allocates from the
+/// arena again before the peek. (Claiming the fillers lazily inside the
+/// insert loop would let a later `alloc_copy` legitimately REUSE the
+/// victim's just-released region — the allocator's right, but it would
+/// make this assertion read reused bytes instead of the wipe.)
+#[tokio::test]
+async fn an_evicted_sessions_tokens_are_wiped() {
+    // Serialized against the capacity test (see CAPACITY_SUITE): the
+    // assertion below reads freed-then-wiped granules, and this lock
+    // keeps the only heavy concurrent claimer out of the window.
+    let _suite = CAPACITY_SUITE.lock().await;
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let store = SessionStore::new(Duration::from_secs(900), NO_IDLE_EVICTION);
+
+    // The victim: the oldest entry, whose two token reservations' absolute
+    // addresses are recorded before the arena custody moves into the
+    // store.
+    let access = mem
+        .alloc_copy(b"ws_at_evict-me-access")
+        .expect("the arena holds the victim's access token");
+    let refresh = mem
+        .alloc_copy(b"ws_rt_evict-me-refresh")
+        .expect("the arena holds the victim's refresh token");
+    let access_addr = access.as_ptr();
+    let access_len = access.len();
+    let refresh_addr = refresh.as_ptr();
+    let refresh_len = refresh.len();
+    let victim = store
+        .insert(SessionEntry::new(
+            Uuid::new_v4(),
+            "victim".to_owned(),
+            "admin".to_owned(),
+            access,
+            refresh,
+        ))
+        .await;
+
+    // Fill to capacity + 1 from the PRE-CLAIMED pairs: the victim is the
+    // least-recently-touched, so the capacity eviction takes exactly it —
+    // and no insert after the eviction touches the arena at all.
+    let fillers: Vec<SessionEntry> = (1..=MAX_SESSIONS)
+        .map(|index| arena_entry(mem, index))
+        .collect();
+    for filler in fillers {
+        store.insert(filler).await;
+    }
+    assert_eq!(store.len().await, MAX_SESSIONS);
+    assert!(
+        store.get(victim).await.is_none(),
+        "the victim was evicted at capacity"
+    );
+
+    // The evicted generation's token `Arc`s died with the map slot: both
+    // reservations must read as zero.
+    let wiped_access = mem
+        .peek_for_test(access_addr, access_len)
+        .expect("the access reservation stays inside the arena");
+    assert!(
+        wiped_access.iter().all(|byte| *byte == 0),
+        "the evicted session's access token buffer is wiped"
+    );
+    let wiped_refresh = mem
+        .peek_for_test(refresh_addr, refresh_len)
+        .expect("the refresh reservation stays inside the arena");
+    assert!(
+        wiped_refresh.iter().all(|byte| *byte == 0),
+        "the evicted session's refresh token buffer is wiped"
+    );
 }

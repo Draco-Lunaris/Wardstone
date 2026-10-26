@@ -3886,17 +3886,23 @@ dependencies = [
 name = "ws-web"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "axum-server",
  "base64 0.23.1",
  "chrono",
+ "ed25519-dalek",
  "futures-util",
  "hex",
  "include_dir",
  "jsonwebtoken",
+ "p256",
+ "p384",
+ "pkcs8",
  "rand 0.10.3",
  "rcgen",
  "reqwest",
+ "rsa",
  "rustls",
  "serde",
  "serde_json",

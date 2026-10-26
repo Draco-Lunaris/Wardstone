@@ -34,9 +34,11 @@ use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
 use ws_ca::error::CaError;
+use ws_ca::leafkey::LeafKeyType;
 use ws_core::error::CoreError;
 use ws_core::models::certificate::{CertStatus, CertificateModel};
 use ws_secmem::SecretBuf;
+use ws_web::tls_signer::{ArenaKey, SwapResolver};
 use zeroize::Zeroizing;
 
 /// The listen address when `WARDSTONE_BIND` is unset (the brief's pin).
@@ -581,11 +583,17 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     // The ephemeral sealed certificate: hours of validity, no keystore.
     let (sealed_pem, sealed_key, sealed_fingerprint) =
         ws_web::setup::tls::sealed_certificate(&hostname)?;
-    // The sealed key exists only long enough to build the initial config
-    // (a ws-secmem arena reservation: RAM custody, wiped on drop — no
-    // intermediate heap copy).
-    let tls_config = ws_web::reloadable_tls_config(&sealed_pem, &sealed_key)?;
-    let reload_handle = tls_config.clone();
+    // The sealed key crosses into the resolver's custody exactly once (a
+    // ws-secmem arena reservation inside the `ArenaKey`: RAM custody,
+    // wiped when the resolver drops it — no intermediate heap or PEM
+    // copy), and the ONE resolver serves the sealed certificate now and
+    // the CA-issued leaf after the unlock: the swap IS the reload.
+    let resolver = std::sync::Arc::new(SwapResolver::new());
+    resolver.swap_pem(
+        &sealed_pem,
+        ArenaKey::new(sealed_key, LeafKeyType::EcdsaP256),
+    )?;
+    let reload_handle = resolver.clone();
 
     // The torn-state exit channel: a build that resolves the tenant and
     // finds none is a REFUSED boot (the process must not keep serving a
@@ -606,7 +614,7 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     // The serve loop races the fatal channel: whichever ends first wins —
     // a listener failure returns its error, a torn verdict exits the
     // process non-zero (`run_result` prints the copy on stderr).
-    let serve = ws_web::serve_tls_with_config(cfg.bind, tls_config, router);
+    let serve = ws_web::serve_tls_with_config(cfg.bind, resolver, router);
     tokio::pin!(serve);
     tokio::select! {
         result = &mut serve => result.map_err(BootError::from),
@@ -633,7 +641,7 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
 /// string makes the POST answer 409 with the same copy.
 fn unlocked_web_build(
     cfg: &BootConfig,
-    reload: ws_web::TlsReloadConfig,
+    reload: std::sync::Arc<ws_web::tls_signer::SwapResolver>,
     fatal: tokio::sync::mpsc::UnboundedSender<BootError>,
 ) -> ws_web::locked::LockedWebBuild {
     let keys_dir = cfg.keys_dir.clone();
@@ -823,13 +831,22 @@ fn unlocked_web_build(
                     .map_err(|e| err(format!("the serving-leaf walk: {e}")))?;
                 match leaf {
                     Some((leaf_row, key_der)) => {
-                        let key_pem = pkcs8_pem_of(&key_der);
+                        // The row's key_type names the algorithm the key
+                        // was minted as; the resolver's signer rebuilds
+                        // exactly that backend for every signature.
+                        let kind = LeafKeyType::from_str(&leaf_row.key_type).ok_or_else(|| {
+                            err(format!(
+                                "the serving leaf row pins an unusable key type {:?}",
+                                leaf_row.key_type
+                            ))
+                        })?;
+                        // The swap IS the reload: the resolver publishes
+                        // the CA-issued pair for the very NEXT handshake,
+                        // and the key's reservation moves into arena
+                        // custody inside the `ArenaKey` — no PEM form, no
+                        // heap copy, ever.
                         reload
-                            .reload_from_pem(
-                                leaf_row.cert_pem.clone().into_bytes(),
-                                key_pem.clone().into_bytes(),
-                            )
-                            .await
+                            .swap_pem(&leaf_row.cert_pem, ArenaKey::new(key_der, kind))
                             .map_err(|e| err(format!("the TLS reload: {e}")))?;
                         tracing::info!(
                             certificate_id = %leaf_row.id,
@@ -878,23 +895,6 @@ fn unlocked_web_build(
     )
 }
 
-/// A PKCS#8 DER private key as the PEM form rustls's reload takes (the
-/// same 64-column wrapping the house's `pem_from_der` uses).
-fn pkcs8_pem_of(der: &[u8]) -> String {
-    use base64::Engine as _;
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-    let mut rest = body.as_str();
-    while !rest.is_empty() {
-        let (line, tail) = rest.split_at(rest.len().min(64));
-        pem.push_str(line);
-        pem.push('\n');
-        rest = tail;
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    pem
-}
-
 /// The `ui` mode: the TLS front door. The boot dispatches on the sealed
 /// marker alone (`master.envelope`): present → the locked page
 /// ([`run_ui_sealed`]); absent → the FIRST-RUN setup page over a
@@ -932,10 +932,11 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     // protected arena, written NOWHERE — two boots before setup leave
     // the keys volume empty, and the boot dials no database. The setup
     // page echoes the fingerprint for the operator's out-of-band check;
-    // the setup commit's TLS reload replaces the certificate in place
-    // (the resume contract).
+    // the setup commit's resolver swap replaces the certificate in
+    // place (the resume contract — the swap IS the reload).
     let (cert_pem, key_der, fingerprint) = ws_web::setup::tls::first_run_certificate(&hostname)?;
-    let tls_config = ws_web::reloadable_tls_config(&cert_pem, &key_der)?;
+    let resolver = std::sync::Arc::new(SwapResolver::new());
+    resolver.swap_pem(&cert_pem, ArenaKey::new(key_der, LeafKeyType::EcdsaP256))?;
     tracing::info!(
         hostname = %hostname,
         fingerprint = %fingerprint,
@@ -949,13 +950,13 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         cfg.keys_dir.clone(),
         fingerprint,
         hostname,
-        Some(tls_config.clone()),
+        Some(resolver.clone()),
         &cfg.api_url,
         cfg.database_url.clone(),
         ws_web::DEFAULT_SESSION_TTL,
         cfg.web_rate_limit,
     );
-    Ok(ws_web::serve_tls_with_config(cfg.bind, tls_config, router).await?)
+    Ok(ws_web::serve_tls_with_config(cfg.bind, resolver, router).await?)
 }
 
 /// The `api` mode: ws-api's REST router served DIRECTLY as plain HTTP —
@@ -1182,8 +1183,9 @@ fn serving_leaf_candidates(certs: &[CertificateModel]) -> Vec<&CertificateModel>
 /// damage the operator needs to see.
 /// The walk's resolution when a leaf is servable: the row paired with the
 /// key its envelope unwrapped — a protected-arena reservation (a ws-secmem
-/// `SecretBuf`), the serving-key holder's custody, wiped once the TLS
-/// reload has taken its PEM.
+/// `SecretBuf`) that MOVES into the resolver's `ArenaKey` custody at the
+/// swap (the swap IS the reload; no PEM form exists at any point), or is
+/// wiped when this handle drops unused.
 type ServedLeaf<'a> = (&'a CertificateModel, SecretBuf);
 
 fn resolve_serving_leaf(

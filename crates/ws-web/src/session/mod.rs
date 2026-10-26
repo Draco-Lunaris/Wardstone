@@ -14,7 +14,7 @@ pub mod relay;
 pub mod store;
 
 pub use relay::{relay_router, RelayState};
-pub use store::{SessionEntry, SessionStore};
+pub use store::{SessionEntry, SessionStore, MAX_SESSIONS};
 
 use axum::http::{header, HeaderMap};
 use uuid::Uuid;

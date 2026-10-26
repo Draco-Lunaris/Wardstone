@@ -54,8 +54,12 @@ zeroize = { workspace = true, features = ["serde"] }
 # the house refuses it: ws-ca's `new_serial` documents why).
 rand = { workspace = true }
 # SHA-256 fingerprint of the setup certificate's DER (displayed on the
-# setup page so the operator verifies it out of band).
-sha2 = { workspace = true }
+# setup page so the operator verifies it out of band), and the SHA-2
+# digest types Task 8's RSA signer signs with. The `oid` feature gives
+# the digests their `AssociatedOid` impls — the bound
+# `rsa::pkcs1v15::SigningKey::<D>::new` carries — so the signer's
+# PKCS#1 v1.5 arms (Sha256/384/512) satisfy the constructor.
+sha2 = { workspace = true, features = ["oid"] }
 # The self-signed setup certificate is minted with rcgen; the feature set
 # matches ws-ca's pin exactly (x509-parser, zeroize).
 rcgen = { workspace = true, features = ["x509-parser", "zeroize"] }
@@ -99,6 +103,28 @@ futures-util = { workspace = true }
 # code in this crate now holds key custody, so the dependency is a
 # regular one (it was dev-only when only the test fixtures used it).
 ws-secmem = { path = "../ws-secmem" }
+# The lock-free swap slot the serving-certificate resolver (Task 8)
+# reloads through: SwapResolver holds the live leaf under an
+# ArcSwapOption so the TLS surface changes certificates with no
+# re-listen.
+arc-swap = { workspace = true }
+# The arena-backed TLS signer (Task 8): every signature constructs the
+# RustCrypto key on the stack from the arena's PKCS#8 DER and drops it —
+# these are the serving-key algorithm backends (ECDSA P-256/P-384,
+# Ed25519, RSA), mirroring ws-ca's leaf-key generation set.
+p256 = { workspace = true }
+p384 = { workspace = true }
+ed25519-dalek = { workspace = true }
+# The `getrandom` feature is load-bearing for the PSS signer: it gates
+# rsa's `impl Signer` for `pss::SigningKey` (the impl's OS-entropy source
+# for the PSS salt — rsa's defaults leave it off), so the stack-built PSS
+# key can sign without the caller plumbing an RNG. PKCS#1 v1.5 needs no
+# feature (its `Signer` impl is unconditional).
+rsa = { workspace = true, features = ["getrandom"] }
+# `DecodePrivateKey` in scope for all four stack-construction sites (the
+# p256/p384/ed25519-dalek/rsa `from_pkcs8_der` constructors); the same
+# 0.10 line every backend already depends on, root-pinned.
+pkcs8 = { workspace = true }
 
 [dev-dependencies]
 # Parsing the minted setup certificate in the tests (self-signedness,
@@ -110,6 +136,12 @@ x509-parser = { workspace = true }
 # workspace pin (ws-auth's own signer/verifier, `rust_crypto` feature),
 # DEV-ONLY: no production binary gains the signing dependency through it.
 jsonwebtoken = { workspace = true }
+# Test-only: ws-web's own arena-wipe pins (the session suite's
+# `an_evicted_sessions_tokens_are_wiped` reads the evicted entry's token
+# reservations back through the test-only accessor). Ruling 4: the
+# `test-peek` feature is enabled ONLY here, via a dev-dependency — a
+# normal dependent of ws-web never sees the accessor.
+ws-secmem = { path = "../ws-secmem", features = ["test-peek"] }
 # Task 11's acme_e2e_test suite: the TEST-side ACME client computes the
 # same values certbot would with ws-acme's own functions (the RFC 7638
 # `thumbprint`, `key_authorization`, `dns01_record_value`) rather than

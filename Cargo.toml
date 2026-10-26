@@ -67,7 +67,29 @@ base64 = { version = "0.23.1" }
 # keys but cannot generate them (rcgen::Error::KeyGenerationUnavailable), so
 # RSA-2048/3072 CA keys are minted with the pure-Rust rsa crate and imported
 # into rcgen as PKCS#8 DER. Already resolved in the lock via sqlx-mysql.
+# ws-web's arena-backed TLS signer (Task 8) re-uses the same pin for RSA
+# serving leaves: its PKCS#8 decode (`RsaPrivateKey::from_pkcs8_der`) rides
+# rsa's unconditional pkcs8 dependency, and the consumer-side `getrandom`
+# feature (ws-web's dep entry) gates the PSS `Signer` impl's OS-entropy
+# salt.
 rsa = { version = "0.9.10" }
+
+# The lock-free pointer swap ws-web's serving-certificate resolver (Task 8)
+# hot-reloads through: SwapResolver holds the live leaf under an
+# ArcSwapOption, so the TLS surface switches certificates with no
+# re-listen (the same crate axum-server's own RustlsConfig reload uses
+# internally). Already resolved in the lock transitively; the root pin
+# records the now-direct dependency.
+arc-swap = "1.9.3"
+
+# The ECDSA P-256/P-384 serving leaves (Task 8): every TLS signature
+# reconstructs the RustCrypto SigningKey on the STACK from the arena's
+# PKCS#8 DER and drops it (ZeroizeOnDrop), so the `pkcs8` feature's
+# `from_pkcs8_der` (the blanket DecodePrivateKey over the
+# TryFrom<PrivateKeyInfo> impl) is the load-bearing entry. Already
+# resolved in the lock transitively.
+p256 = { version = "0.13.2", features = ["pkcs8"] }
+p384 = { version = "0.13.1", features = ["pkcs8"] }
 
 # ring for the DB credential's SCRAM-SHA-256 verifier derivation
 # (ws-core dbcred, Task 4): PBKDF2-HMAC-SHA-256 (RFC 7677's
@@ -106,6 +128,8 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Ed25519 keypair generation for the JWT signing/verification key pair (the
 # `pkcs8` feature provides the PKCS#8/SPKI encoders; keys stay in PEM form).
+# ws-web's arena-backed TLS signer (Task 8) re-uses the same pin for Ed25519
+# serving leaves — the same `pkcs8` feature provides `from_pkcs8_der`.
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 
 # PKCS#8/SPKI DER encoding for the JWT key pair. The `pem` feature provides

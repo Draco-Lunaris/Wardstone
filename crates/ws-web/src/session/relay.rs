@@ -42,6 +42,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+use ws_secmem::SecretBuf;
+use zeroize::Zeroizing;
 
 use crate::proxy::{csrf_refusal, proxy_client, ProxyError};
 use crate::session::store::{SessionEntry, SessionStore};
@@ -63,10 +65,10 @@ pub struct RelayState {
 ///
 /// `rate_limit` is the Task 13 per-client GCRA on the nest (`None` mounts
 /// none — tests): the layer keys on the PEER IP (`ConnectInfo` — Task 12's
-/// `serve_tls` maker attaches the real client address to every request;
-/// ws-web IS the edge, so no forwarding headers are trusted), with the
-/// same tower_governor idiom and default 429 shape ws-api's auth router
-/// uses (`crates/ws-api/src/routes/auth.rs`) so the UI treats both
+/// `serve_tls_with_config` maker attaches the real client address to every
+/// request; ws-web IS the edge, so no forwarding headers are trusted),
+/// with the same tower_governor idiom and default 429 shape ws-api's auth
+/// router uses (`crates/ws-api/src/routes/auth.rs`) so the UI treats both
 /// limiters identically.
 pub fn relay_router(
     store: Arc<SessionStore>,
@@ -107,11 +109,15 @@ pub(crate) struct UiLoginBody {
 }
 
 /// The token-pair wire shape ws-api's login/refresh/callback/rotation
-/// responses carry.
-#[derive(Debug, Deserialize, Serialize)]
+/// responses carry. The strings are `Zeroizing`: this is WIRE custody
+/// only (the JSON from ws-api lands in wiped-on-drop buffers), and the
+/// pair's at-rest custody is the arena — the relay claims it through
+/// [`SessionStore::claim_tokens`] the moment the wire form is read. No
+/// `Debug` derive: a stray log line must never be able to print a token.
+#[derive(Deserialize, Serialize)]
 pub(crate) struct SessionTokensWire {
-    pub access_token: String,
-    pub refresh_token: String,
+    pub access_token: Zeroizing<String>,
+    pub refresh_token: Zeroizing<String>,
 }
 
 /// `POST /auth/ui/login` — the browser's login surface.
@@ -147,8 +153,20 @@ async fn ui_login(
             "the API login response was not the token shape: {err}"
         ))
     })?;
+    // The pair's at-rest custody: arena reservations, claimed here (the
+    // Zeroizing wire strings die with this handler's frame). A full arena
+    // fails the LOGIN closed — no heap fallback exists.
+    let (access_buf, refresh_buf) = relay
+        .store
+        .claim_tokens(&tokens.access_token, &tokens.refresh_token)
+        .await
+        .map_err(|err| {
+            ProxyError(format!(
+                "the session store could not take custody of the token pair: {err}"
+            ))
+        })?;
     let identity = fetch_identity(&client, &relay.base, &tokens.access_token).await?;
-    let entry = entry_from_identity(&identity, tokens.access_token.clone(), tokens.refresh_token)?;
+    let entry = entry_from_identity(&identity, access_buf, refresh_buf)?;
     let session_id = relay.store.insert(entry).await;
 
     // The browser gets the identity, the cookie, and nothing else.
@@ -253,8 +271,19 @@ async fn ui_oidc_callback(
             "the API callback response was not the token shape: {err}"
         ))
     })?;
+    // The same arena intake as the login path: the wire strings exist
+    // only until the claim takes custody.
+    let (access_buf, refresh_buf) = relay
+        .store
+        .claim_tokens(&tokens.access_token, &tokens.refresh_token)
+        .await
+        .map_err(|err| {
+            ProxyError(format!(
+                "the session store could not take custody of the token pair: {err}"
+            ))
+        })?;
     let identity = fetch_identity(&client, &relay.base, &tokens.access_token).await?;
-    let entry = entry_from_identity(&identity, tokens.access_token.clone(), tokens.refresh_token)?;
+    let entry = entry_from_identity(&identity, access_buf, refresh_buf)?;
     let session_id = relay.store.insert(entry).await;
 
     Ok((
@@ -320,7 +349,10 @@ async fn ui_logout(
 
     // ws-api's logout demands BOTH halves: the session's bearer access
     // (its handler resolves the actor and binds the body's token to the
-    // access token's sid) AND the refresh token in the body.
+    // access token's sid) AND the refresh token in the body. Both are
+    // materialized from arena custody for this one use — transient
+    // wiped-on-drop strings (see [`access_token_of`]); the reservations
+    // themselves never leave the arena.
     let revoke = |access: &str, refresh: &str| {
         client
             .post(format!("{}/api/v1/auth/logout", relay.base))
@@ -328,7 +360,9 @@ async fn ui_logout(
             .json(&json!({ "refresh_token": refresh }))
             .send()
     };
-    let relayed = revoke(&current.access_token, &current.refresh_token).await;
+    let current_access = access_token_of(&current);
+    let current_refresh = refresh_token_of(&current);
+    let relayed = revoke(current_access.as_str(), current_refresh.as_str()).await;
     let relayed = match relayed {
         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
             // The CURRENT access died mid-session (expired, or the sid
@@ -339,11 +373,17 @@ async fn ui_logout(
             // that would deadlock); `refresh_locked` performs the
             // identical ws-api exchange under the lock precondition.
             match refresh_locked(&relay.store, session_id, &current, &client, &relay.base).await {
-                Some(tokens) => Some(
-                    revoke(&tokens.access_token, &tokens.refresh_token)
-                        .await
-                        .map_err(|err| ProxyError(err.to_string()))?,
-                ),
+                Some(fresh) => {
+                    // The retry's fresh pair, materialized the same
+                    // transient way.
+                    let access = access_token_of(&fresh);
+                    let refresh = refresh_token_of(&fresh);
+                    Some(
+                        revoke(access.as_str(), refresh.as_str())
+                            .await
+                            .map_err(|err| ProxyError(err.to_string()))?,
+                    )
+                }
                 // The refresh was refused (revoked/expired): there is no
                 // live pair left to revoke server-side (the session was
                 // removed by refresh_locked); the local logout proceeds.
@@ -367,13 +407,13 @@ async fn ui_logout(
 // The shared rotation critical section
 // ---------------------------------------------------------------------------
 
-/// The outcome of one locked rotation attempt: the fresh ACCESS token to
-/// proceed with (`refresh` is store-internal after the rotation — no
-/// caller consumes it, the pair lives in the new generation), or `Died`
-/// (the session was removed — refresh refused or the store entry vanished
-/// under the lock).
+/// The outcome of one locked rotation attempt: the fresh generation's
+/// ENTRY (`refresh` is store-internal after the rotation — no caller
+/// consumes it, the pair lives in the entry's arena reservations), or
+/// `Died` (the session was removed — refresh refused or the store entry
+/// vanished under the lock).
 pub(crate) enum RotationOutcome {
-    Fresh { access: String },
+    Fresh { entry: Arc<SessionEntry> },
     Died,
 }
 
@@ -382,8 +422,9 @@ pub(crate) enum RotationOutcome {
 /// logout's rotate-and-retry. Under the entry's per-session lock:
 ///
 /// 1. re-read the CURRENT generation — if its access token differs from
-///    `observed_access`, another waiter already rotated: hand back ITS
-///    fresh pair without a second ws-api refresh (the once-only pin);
+///    `observed_access` (compared BYTES, straight off the arena
+///    reservation), another waiter already rotated: hand back ITS fresh
+///    generation without a second ws-api refresh (the once-only pin);
 /// 2. otherwise relay `POST /api/v1/auth/refresh` with the stored refresh
 ///    token (the only caller that holds the lock does this);
 /// 3. on success, swap the new pair in as the next generation and return
@@ -394,7 +435,7 @@ pub(crate) async fn rotate_once(
     store: &Arc<SessionStore>,
     session_id: Uuid,
     observed_entry: &Arc<SessionEntry>,
-    observed_access: &str,
+    observed_access: &[u8],
     client: &reqwest::Client,
     base: &str,
 ) -> RotationOutcome {
@@ -404,18 +445,14 @@ pub(crate) async fn rotate_once(
     let Some(current) = store.get(session_id).await else {
         return RotationOutcome::Died;
     };
-    if current.access_token != observed_access {
-        return RotationOutcome::Fresh {
-            access: current.access_token.clone(),
-        };
+    if &current.access_token[..] != observed_access {
+        return RotationOutcome::Fresh { entry: current };
     }
 
     // The lock holder relays the one refresh (refresh_locked takes the
     // lock as a PRECONDITION — we hold it; it can never re-take it).
     match refresh_locked(store, session_id, &current, client, base).await {
-        Some(tokens) => RotationOutcome::Fresh {
-            access: tokens.access_token,
-        },
+        Some(entry) => RotationOutcome::Fresh { entry },
         None => RotationOutcome::Died,
     }
 }
@@ -423,9 +460,12 @@ pub(crate) async fn rotate_once(
 /// The ws-api refresh exchange, run with the CALLER holding the session's
 /// rotation_lock (both `rotate_once`'s critical section and logout's locked
 /// revoke land here). Relays `POST /api/v1/auth/refresh` with the stored
-/// refresh plaintext; on success swaps the new pair in as the next
-/// generation and returns it; on ANY failure (ws-api refusal, transport
-/// error, bad shape) the session is REMOVED and `None` returned — fail
+/// refresh plaintext (materialized transiently from arena custody); on
+/// success CLAIMS the fresh pair into the arena
+/// ([`SessionStore::claim_tokens`]), swaps it in as the next generation,
+/// and returns that generation's entry; on ANY failure (ws-api refusal,
+/// transport error, bad shape, a claim the full arena refuses even after
+/// its evict-and-retry) the session is REMOVED and `None` returned — fail
 /// closed, the browser is logged out rather than left holding a zombie
 /// session.
 async fn refresh_locked(
@@ -434,10 +474,11 @@ async fn refresh_locked(
     current: &Arc<SessionEntry>,
     client: &reqwest::Client,
     base: &str,
-) -> Option<SessionTokensWire> {
+) -> Option<Arc<SessionEntry>> {
+    let refresh = refresh_token_of(current);
     let response = client
         .post(format!("{base}/api/v1/auth/refresh"))
-        .json(&json!({ "refresh_token": current.refresh_token }))
+        .json(&json!({ "refresh_token": refresh.as_str() }))
         .send()
         .await;
     let response = match response {
@@ -462,14 +503,27 @@ async fn refresh_locked(
     let tokens: Result<SessionTokensWire, _> = response.json().await;
     match tokens {
         Ok(tokens) => {
+            let (access_buf, refresh_buf) = match store
+                .claim_tokens(&tokens.access_token, &tokens.refresh_token)
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "the arena could not take custody of the refreshed pair; \
+                         killing the browser session"
+                    );
+                    store.remove(session_id).await;
+                    return None;
+                }
+            };
             store
-                .update_tokens(
-                    session_id,
-                    tokens.access_token.clone(),
-                    tokens.refresh_token.clone(),
-                )
+                .update_tokens(session_id, access_buf, refresh_buf)
                 .await;
-            Some(tokens)
+            // The freshly-swapped generation, read back from the map —
+            // the SAME `Arc` the store itself holds.
+            store.get(session_id).await
         }
         Err(err) => {
             tracing::warn!(error = %err, "the refresh response was not the token shape; killing the browser session");
@@ -510,14 +564,15 @@ async fn fetch_identity(
         .map_err(|err| ProxyError(err.to_string()))
 }
 
-/// Build the store entry from the `/me` identity bytes + the fresh token
-/// pair. Only the identity fields the store records are read; the body
-/// itself travels to the browser verbatim (no re-serialization, no shape
-/// coupling).
+/// Build the store entry from the `/me` identity bytes + a JUST-CLAIMED
+/// token pair (arena reservations — the caller took them through
+/// [`SessionStore::claim_tokens`]). Only the identity fields the store
+/// records are read; the body itself travels to the browser verbatim (no
+/// re-serialization, no shape coupling).
 fn entry_from_identity(
     identity: &Bytes,
-    access_token: String,
-    refresh_token: String,
+    access_token: SecretBuf,
+    refresh_token: SecretBuf,
 ) -> Result<SessionEntry, ProxyError> {
     let value: Value = serde_json::from_slice(identity)
         .map_err(|err| ProxyError(format!("the identity response was not JSON: {err}")))?;
@@ -546,6 +601,23 @@ fn entry_from_identity(
         access_token,
         refresh_token,
     ))
+}
+
+/// Materialize an entry's access token for ONE outbound use: a transient
+/// wiped-on-drop string copied out of the arena reservation — the relay's
+/// ONLY read sites for the token (the outbound `Authorization` header and
+/// the logout revoke), materialized per request so nothing outlives it.
+/// The at-rest plaintext stays arena-only; the "Bearer " prefix is added
+/// by the caller's `format!`, never stored.
+pub(crate) fn access_token_of(entry: &SessionEntry) -> Zeroizing<String> {
+    Zeroizing::new(String::from_utf8_lossy(&entry.access_token[..]).into_owned())
+}
+
+/// The refresh-token twin of [`access_token_of`]: the logout revoke's
+/// body and the rotation relay's request, transient and wiped on drop,
+/// arena-only at rest.
+pub(crate) fn refresh_token_of(entry: &SessionEntry) -> Zeroizing<String> {
+    Zeroizing::new(String::from_utf8_lossy(&entry.refresh_token[..]).into_owned())
 }
 
 /// The login's response to the browser: the identity body VERBATIM (the

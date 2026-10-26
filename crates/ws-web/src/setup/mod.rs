@@ -39,7 +39,10 @@
 //! `server_hostname` field names the CA-issued leaf that replaces it:
 //! [`run_setup`] mints that leaf sealed, and the page's TLS swap resumes
 //! the listener onto it IN PLACE (the resume contract — no restart, no
-//! re-listen).
+//! re-listen): the setup commit publishes the pair onto the
+//! serving-certificate resolver — the swap IS the reload, and the
+//! leaf's private key crosses in arena custody inside the
+//! [`crate::tls_signer::ArenaKey`], never as a PEM.
 
 pub mod page;
 pub mod tls;
@@ -139,9 +142,9 @@ pub struct SetupFields {
 /// The state the setup handlers need: the keys directory (the envelope
 /// volume), the SHA-256 fingerprint of the setup certificate the
 /// LISTENER serves (the binary computes it when it mounts the setup
-/// page), the configured instance hostname, the reloadable TLS config
-/// the commit swaps in place, the compose-internal api base URL, and
-/// the instance's `DATABASE_URL` — the setup POST builds its OWN pool
+/// page), the configured instance hostname, the serving-certificate
+/// resolver the commit swaps in place, the compose-internal api base URL,
+/// and the instance's `DATABASE_URL` — the setup POST builds its OWN pool
 /// from that URL plus the form's typed `db_password` (the D2 direction:
 /// no boot-time database connection belongs to the setup surface at
 /// all).
@@ -154,11 +157,13 @@ pub struct SetupState {
     /// The hostname the setup certificate carries (`WARDSTONE_SERVER_HOSTNAME`
     /// or [`tls::PLACEHOLDER_SAN`]).
     pub hostname: String,
-    /// The reloadable TLS config: the setup commit swaps the listener onto
-    /// the CA-issued leaf IN PLACE (the resume contract — the sealed design
-    /// removed the self-exit restart, so this is how the leaf takes over).
-    /// `None` in the tests (no listener to swap).
-    pub tls_reload: Option<axum_server::tls_rustls::RustlsConfig>,
+    /// The serving-certificate RESOLVER: the setup commit swaps the
+    /// listener onto the CA-issued leaf IN PLACE by publishing the pair
+    /// onto it (the resume contract — the sealed design removed the
+    /// self-exit restart, so this is how the leaf takes over; the swap
+    /// IS the reload, see [`crate::tls_signer`]). `None` in the tests
+    /// (no listener to swap).
+    pub tls_reload: Option<std::sync::Arc<crate::tls_signer::SwapResolver>>,
     /// The compose-internal api base URL: the setup commit relays the
     /// unlock to the api process once (the fresh-install flow — the
     /// api booted as the sealed shell and only the relay brings its
@@ -207,14 +212,19 @@ pub enum SetupError {
 
 /// What a completed setup hands its caller: the CA-issued leaf the
 /// listener resumes onto, its private key in RAM custody (a ws-secmem
-/// arena reservation — wiped when the caller drops it), and the
-/// hostname the leaf was minted for.
+/// arena reservation — wiped when the caller drops it), the ALGORITHM
+/// the key was minted as, and the hostname the leaf was minted for.
 #[derive(Debug)]
 pub struct SetupOutcome {
     /// The CA-issued leaf certificate, PEM.
     pub leaf_cert_pem: String,
     /// The leaf's PKCS#8 DER private key, in the protected arena.
     pub leaf_key: SecretBuf,
+    /// The leaf's key type — the algorithm the key was minted as
+    /// (mirrors the certificate row's `key_type` string; the page's
+    /// resolver swap pairs it with the key so the arena-backed signer
+    /// rebuilds the right backend per signature).
+    pub leaf_key_kind: LeafKeyType,
     /// The form's `server_hostname` — the leaf's SAN.
     pub hostname: String,
 }
@@ -835,6 +845,7 @@ pub async fn run_setup(
     Ok(SetupOutcome {
         leaf_cert_pem: issued.cert_pem,
         leaf_key,
+        leaf_key_kind: serial_key_type,
         hostname: fields.server_hostname.clone(),
     })
 }
