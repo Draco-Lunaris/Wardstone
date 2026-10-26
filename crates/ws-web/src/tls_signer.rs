@@ -1,7 +1,7 @@
 //! The arena-backed TLS signer (Task 8): the serving leaf's private key
 //! never leaves the protected arena, and every signature is taken by a
-//! RustCrypto key that exists ONLY on the stack, for the length of one
-//! `sign` call.
+//! RustCrypto key CONSTRUCTED from that DER for the length of one `sign`
+//! call — wiped on drop, never an arena-external resting place.
 //!
 //! # The custody contract
 //!
@@ -24,14 +24,17 @@
 //!    exactly as long as the [`CertifiedKey`] the [`SwapResolver`] holds.
 //!    A full arena fails the HANDSHAKE (`choose_scheme` answers `None`,
 //!    fail closed) — never the process, and never the heap.
-//! 2. **Per-signature stack construction.** [`ArenaSigner::sign`]
-//!    reconstructs the RustCrypto signing key from the mirror's DER on the
-//!    stack — `p256`/`p384` `ecdsa::SigningKey`,
-//!    `ed25519_dalek::SigningKey`, or `rsa::RsaPrivateKey` under PSS /
-//!    PKCS#1 v1.5 per the negotiated scheme — signs, and drops it. All
-//!    four key types are `ZeroizeOnDrop`, so the stack copy is wiped the
-//!    instant the signature exists: no key lives longer than one
-//!    signature, and none is ever on the heap.
+//! 2. **Per-signature construction.** [`ArenaSigner::sign`]
+//!    reconstructs the signing key from the mirror's DER, signs, and
+//!    drops the key before returning — `p256`/`p384` `ecdsa::SigningKey`
+//!    and `ed25519_dalek::SigningKey` keep their scalars inline in the
+//!    `sign` frame, while `rsa::RsaPrivateKey` (under PSS / PKCS#1 v1.5
+//!    per the negotiated scheme) holds its bigint components in
+//!    short-lived heap allocations for the call's length. Every backend
+//!    wipes its constructed key on drop — `ecdsa` and `ed25519-dalek`
+//!    through `ZeroizeOnDrop`, `rsa` through its own ungated `Drop` —
+//!    so no key material outlives one signature, and the arena
+//!    reservation remains the private key's ONLY resting place.
 //!
 //! # The swap is the reload
 //!
@@ -67,14 +70,14 @@ use ws_secmem::SecretBuf;
 ///
 /// The fields are private on purpose: the ONLY reads of `der` are the
 /// per-handshake arena mirror ([`ArenaKey::choose_scheme`]) and the
-/// per-signature stack constructions inside [`ArenaSigner::sign`] — no
+/// per-signature key constructions inside [`ArenaSigner::sign`] — no
 /// caller can copy the reservation out into plain memory, and no `Debug`
 /// output can ever print it.
 pub struct ArenaKey {
     /// The leaf's PKCS#8 DER, in the protected arena (wiped on drop).
     der: SecretBuf,
     /// The algorithm the leaf's key was minted as — selects the
-    /// RustCrypto backend every signature constructs on the stack.
+    /// RustCrypto backend every signature constructs from the mirror.
     kind: LeafKeyType,
 }
 
@@ -162,9 +165,12 @@ fn supported_schemes(kind: LeafKeyType) -> &'static [SignatureScheme] {
 }
 
 /// One handshake's signer: the per-handshake arena mirror of the serving
-/// key plus the negotiated scheme. Every `sign` constructs the RustCrypto
-/// key ON THE STACK from the mirror's DER and drops it — all four
-/// backends are `ZeroizeOnDrop`, so nothing outlives the signature.
+/// key plus the negotiated scheme. Every `sign` constructs the signing
+/// key from the mirror's DER and drops it before returning — the EC and
+/// Ed keys live inline in the `sign` frame, the RSA key's bigint
+/// components in short-lived allocations — so no key material outlives
+/// the signature (the module doc's custody contract names where each
+/// backend keeps its key during `sign`).
 struct ArenaSigner {
     /// The handshake's own arena reservation (wiped when the handshake's
     /// signer drops — the canonical reservation stays with the
@@ -244,10 +250,12 @@ fn sign_ed25519(der: &[u8], message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
     Ok(signature.to_bytes().to_vec())
 }
 
-/// One RSA signature: the stack-built private key, PSS or PKCS#1 v1.5
-/// padding per the negotiated scheme (the PSS signer takes its salt from
-/// the OS entropy source — rsa's `getrandom` feature, see the ws-web dep
-/// entry), the raw RSA signature out.
+/// One RSA signature: the private key constructed per signature from the
+/// mirror's DER (its bigint components are short-lived heap allocations,
+/// zeroized by `rsa`'s own ungated `Drop` when `sign` returns), PSS or
+/// PKCS#1 v1.5 padding per the negotiated scheme (the PSS signer takes
+/// its salt from the OS entropy source — rsa's `getrandom` feature, see
+/// the ws-web dep entry), the raw RSA signature out.
 fn sign_rsa(der: &[u8], scheme: SignatureScheme, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
     use rsa::signature::{SignatureEncoding as _, Signer as _};
     use sha2::{Sha256, Sha384, Sha512};

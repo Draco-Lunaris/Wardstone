@@ -109,17 +109,17 @@ ws-secmem = { path = "../ws-secmem" }
 # re-listen.
 arc-swap = { workspace = true }
 # The arena-backed TLS signer (Task 8): every signature constructs the
-# RustCrypto key on the stack from the arena's PKCS#8 DER and drops it —
-# these are the serving-key algorithm backends (ECDSA P-256/P-384,
-# Ed25519, RSA), mirroring ws-ca's leaf-key generation set.
+# RustCrypto key from the arena's PKCS#8 DER and drops it — these are
+# the serving-key algorithm backends (ECDSA P-256/P-384, Ed25519, RSA),
+# mirroring ws-ca's leaf-key generation set.
 p256 = { workspace = true }
 p384 = { workspace = true }
 ed25519-dalek = { workspace = true }
 # The `getrandom` feature is load-bearing for the PSS signer: it gates
 # rsa's `impl Signer` for `pss::SigningKey` (the impl's OS-entropy source
-# for the PSS salt — rsa's defaults leave it off), so the stack-built PSS
-# key can sign without the caller plumbing an RNG. PKCS#1 v1.5 needs no
-# feature (its `Signer` impl is unconditional).
+# for the PSS salt — rsa's defaults leave it off), so the per-signature
+# PSS key can sign without the caller plumbing an RNG. PKCS#1 v1.5 needs
+# no feature (its `Signer` impl is unconditional).
 rsa = { workspace = true, features = ["getrandom"] }
 # `DecodePrivateKey` in scope for all four stack-construction sites (the
 # p256/p384/ed25519-dalek/rsa `from_pkcs8_der` constructors); the same
@@ -149,3 +149,8 @@ ws-secmem = { path = "../ws-secmem", features = ["test-peek"] }
 # same canonical answers. Test-only: ws-web's production graph stays
 # acyclic without it.
 ws-acme = { path = "../ws-acme" }
+# Fix round 1's PKCS#1 v1.5 handshake pin (tls_signer_test): the
+# restricted TLS 1.2 client builds its signature-verification set from
+# the SAME rustls-webpki ring statics rustls's own ring provider uses,
+# so the graph keeps exactly one webpki. DEV-ONLY.
+webpki = { workspace = true }

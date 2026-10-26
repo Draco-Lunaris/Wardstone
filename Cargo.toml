@@ -82,12 +82,22 @@ rsa = { version = "0.9.10" }
 # records the now-direct dependency.
 arc-swap = "1.9.3"
 
+# rustls-webpki — the crate rustls aliases as `webpki` for its own ring
+# provider's verification statics. Fix round 1's PKCS#1 v1.5 handshake pin
+# (tls_signer_test's restricted client): the client builds its
+# signature-verification set from the SAME `webpki::ring` statics, so
+# exactly ONE webpki stays in the graph — the 0.103.x line rustls 0.23.46
+# already locks. The `ring` feature exposes the module those statics
+# live in. DEV-ONLY at the consumer (a dev-dependency of ws-web's test
+# suite; no production binary gains it).
+webpki = { version = "0.103.16", package = "rustls-webpki", features = ["ring"] }
+
 # The ECDSA P-256/P-384 serving leaves (Task 8): every TLS signature
-# reconstructs the RustCrypto SigningKey on the STACK from the arena's
-# PKCS#8 DER and drops it (ZeroizeOnDrop), so the `pkcs8` feature's
-# `from_pkcs8_der` (the blanket DecodePrivateKey over the
-# TryFrom<PrivateKeyInfo> impl) is the load-bearing entry. Already
-# resolved in the lock transitively.
+# reconstructs the RustCrypto SigningKey from the arena's PKCS#8 DER and
+# drops it (ZeroizeOnDrop — the key exists for exactly one `sign`
+# call), so the `pkcs8` feature's `from_pkcs8_der` (the blanket
+# DecodePrivateKey over the TryFrom<PrivateKeyInfo> impl) is the
+# load-bearing entry. Already resolved in the lock transitively.
 p256 = { version = "0.13.2", features = ["pkcs8"] }
 p384 = { version = "0.13.1", features = ["pkcs8"] }
 

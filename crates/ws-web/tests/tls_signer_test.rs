@@ -11,7 +11,12 @@
 //! listener, and completes a rustls handshake against it with a
 //! ring-provider client that trusts the minted certificate. The echo
 //! round-trip proves the handshake produced a usable data channel —
-//! i.e. the signature the ArenaKey produced verified client-side.
+//! i.e. the signature the ArenaKey produced verified client-side. One
+//! exchange goes further than the safe-default clients: a TLS
+//! 1.2-pinned client whose only verifiable scheme is
+//! `RSA_PKCS1_SHA256` forces the RSA PKCS#1 v1.5 signing arm (TLS 1.3
+//! is PSS-only, so the unrestricted handshakes always negotiate PSS
+//! and never reach that arm).
 //!
 //! DB-free by design: this suite takes no advisory-lock key (keys in
 //! the `0x0057_4144_5354_00xx` family belong to the database suites; the
@@ -22,6 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::SignatureScheme;
 use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ws_ca::leafkey::{generate_leaf_key, LeafKeyType, ALL_LEAF_KEY_TYPES};
@@ -61,25 +67,66 @@ fn mint_leaf(
     (certificate.der().clone(), der)
 }
 
-/// A ring-provider rustls client that trusts exactly `certs` and no
+/// The trust anchors for a handshake client: exactly `certs` and no
 /// other root (the handshakes must verify against the minted
 /// certificate, not any system store).
-fn client_connector(
-    certs: &[rustls::pki_types::CertificateDer<'static>],
-) -> tokio_rustls::TlsConnector {
+fn roots_trusting(certs: &[rustls::pki_types::CertificateDer<'static>]) -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
         roots
             .add(cert.clone())
             .expect("the minted certificate parses");
     }
+    roots
+}
+
+/// A ring-provider rustls client with the safe-default versions and
+/// schemes, trusting exactly `certs` and no other root.
+fn client_connector(
+    certs: &[rustls::pki_types::CertificateDer<'static>],
+) -> tokio_rustls::TlsConnector {
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .expect("the client protocol versions build")
-    .with_root_certificates(roots)
+    .with_root_certificates(roots_trusting(certs))
     .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+/// The restricted verification set: exactly `RSA_PKCS1_SHA256` over the
+/// same rustls-webpki ring static rustls's own default provider uses —
+/// pinned at the same 0.103.x so the graph keeps a single webpki. A
+/// named static because the provider's field is `&'static` (rustls
+/// builds its own `SUPPORTED_SIG_ALGS` the same way: an inline literal
+/// would need const promotion, and reads of `static`s don't promote).
+static PKCS1_ONLY_SIG_ALGS: rustls::crypto::WebPkiSupportedAlgorithms =
+    rustls::crypto::WebPkiSupportedAlgorithms {
+        all: &[webpki::ring::RSA_PKCS1_2048_8192_SHA256],
+        mapping: &[(
+            SignatureScheme::RSA_PKCS1_SHA256,
+            &[webpki::ring::RSA_PKCS1_2048_8192_SHA256],
+        )],
+    };
+
+/// The PKCS#1 v1.5 pin: a TLS 1.2-only client whose verification set
+/// contains exactly `RSA_PKCS1_SHA256`, so the server's `choose_scheme`
+/// must take the PKCS#1 v1.5 arm (TLS 1.3 is PSS-only, so the version
+/// pin is what makes that arm reachable at all). The restriction is the
+/// crypto provider's signature-verification filter — rustls offers the
+/// handshake only what that set can verify — so the offered-schemes
+/// list the server sees is exactly the one scheme.
+fn pkcs1_only_connector(
+    certs: &[rustls::pki_types::CertificateDer<'static>],
+) -> tokio_rustls::TlsConnector {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.signature_verification_algorithms = PKCS1_ONLY_SIG_ALGS;
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("the TLS 1.2-only client versions build")
+        .with_root_certificates(roots_trusting(certs))
+        .with_no_client_auth();
     tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
@@ -125,7 +172,13 @@ async fn exchange_fingerprint(
     addr: SocketAddr,
     certs: &[rustls::pki_types::CertificateDer<'static>],
 ) -> String {
-    let connector = client_connector(certs);
+    exchange_via(client_connector(certs), addr).await
+}
+
+/// [`exchange_fingerprint`] over a caller-built connector — the same
+/// connect, echo round-trip, and client-seen fingerprint (the wrapper
+/// exists for the safe-default client's fresh-config rule).
+async fn exchange_via(connector: tokio_rustls::TlsConnector, addr: SocketAddr) -> String {
     let exchange = async {
         let stream = tokio::net::TcpStream::connect(addr)
             .await
@@ -228,5 +281,28 @@ async fn a_swap_takes_effect_for_the_next_handshake() {
         seen_b,
         fingerprint(&cert_b),
         "the swap took effect for the very next handshake"
+    );
+}
+
+/// The RSA PKCS#1 v1.5 signing arm gets a real handshake: a TLS 1.2-only
+/// client whose ONLY verifiable scheme is `RSA_PKCS1_SHA256` (the
+/// provider's verification filter) forces `choose_scheme` onto the
+/// PKCS#1 v1.5 arm — TLS 1.3 being PSS-only, every safe-default
+/// handshake above always took PSS — and the echo round-trip proves the
+/// PKCS#1 v1.5 signature verified client-side.
+#[tokio::test]
+async fn a_pkcs1_v15_arm_completes_a_tls_1_2_handshake() {
+    let (cert, key) = mint_leaf(LeafKeyType::Rsa2048);
+    let resolver = Arc::new(SwapResolver::new());
+    resolver.swap(vec![cert.clone()], ArenaKey::new(key, LeafKeyType::Rsa2048));
+    let config =
+        rustls_server_config(resolver).expect("the server config builds for the RSA arena key");
+    let addr = spawn_tls_server(config).await;
+
+    let seen = exchange_via(pkcs1_only_connector(std::slice::from_ref(&cert)), addr).await;
+    assert_eq!(
+        seen,
+        fingerprint(&cert),
+        "the PKCS#1 v1.5 handshake completed against the minted RSA leaf"
     );
 }

@@ -1155,8 +1155,8 @@ async fn logout_after_concurrent_rotation_leaves_no_live_refresh() {
 /// unit tests' territory, in the store's own module).
 const NO_IDLE_EVICTION: Duration = Duration::from_secs(86400 * 365);
 
-/// The two capacity tests serialize against each other. BOTH hammer the
-/// process-global arena with ~2,050 claims apiece in the same first
+/// The capacity tests serialize against each other. Each hammers the
+/// process-global arena with ~2,050 claims in the same first
 /// seconds of the test binary's life, and the wipe test's assertion
 /// reads the victim's just-RELEASED granules — a region the allocator is
 /// entitled to hand to ANY concurrent claim (first-fit picks the lowest
@@ -1192,10 +1192,15 @@ fn arena_entry(mem: &ws_secmem::SecMem, index: usize) -> SessionEntry {
 /// Review Focus 3, pin 1: the store holds at most `MAX_SESSIONS`
 /// entries. The 1,025th insert evicts the least-recently-touched entry
 /// first — with sequential inserts that is the FIRST session, and the
-/// newest survives.
+/// newest survives. (No `get` call sits between the inserts: `get`
+/// TOUCHES its entry, so a mid-loop read would rewrite the touch order
+/// this test's eviction asserts depend on. The capacity boundary's
+/// pin — the 1,024th insert at len 1,023 evicts NOTHING — is the
+/// sibling test below, which makes no eviction assertions for the
+/// same reason.)
 #[tokio::test]
 async fn login_1025_evicts_the_oldest() {
-    // Serialized against the wipe test (see CAPACITY_SUITE).
+    // Serialized against the other capacity tests (see CAPACITY_SUITE).
     let _suite = CAPACITY_SUITE.lock().await;
     let mem = ws_secmem::global().expect("the protected pool initializes");
     let store = SessionStore::new(Duration::from_secs(900), NO_IDLE_EVICTION);
@@ -1228,6 +1233,48 @@ async fn login_1025_evicts_the_oldest() {
     );
 }
 
+/// Fix round 1, the capacity boundary pin: the guard fires AT capacity,
+/// not below it. 1,023 sessions → the 1,024th insert → the store holds
+/// exactly `MAX_SESSIONS` and EVERY session still resolves — the
+/// oldest and the boundary insert itself included. No eviction
+/// assertion follows: `get` TOUCHES its entry, so a post-`get` touch
+/// order would lie about which insert is least-recently-touched.
+#[tokio::test]
+async fn the_1024th_insert_at_len_1023_evicts_nothing() {
+    // Serialized against the other capacity tests (see CAPACITY_SUITE).
+    let _suite = CAPACITY_SUITE.lock().await;
+    let mem = ws_secmem::global().expect("the protected pool initializes");
+    let store = SessionStore::new(Duration::from_secs(900), NO_IDLE_EVICTION);
+
+    let mut first = None;
+    for index in 0..MAX_SESSIONS - 1 {
+        let id = store.insert(arena_entry(mem, index)).await;
+        if index == 0 {
+            first = Some(id);
+        }
+    }
+    assert_eq!(
+        store.len().await,
+        MAX_SESSIONS - 1,
+        "1,023 sessions sit one below capacity"
+    );
+
+    let boundary = store.insert(arena_entry(mem, MAX_SESSIONS - 1)).await;
+    assert_eq!(
+        store.len().await,
+        MAX_SESSIONS,
+        "the boundary insert brings the store to exactly MAX_SESSIONS"
+    );
+    assert!(
+        store.get(first.expect("the first insert")).await.is_some(),
+        "the 1,024th insert at len 1,023 evicts nothing"
+    );
+    assert!(
+        store.get(boundary).await.is_some(),
+        "the boundary insert itself stays live"
+    );
+}
+
 /// Review Focus 3, pin 2: an evicted entry's token reservations read back
 /// ZERO through the test-only arena peek — the wipe the dropped
 /// `SecretBuf`'s `Drop` promises, on the real global pool. The addresses
@@ -1243,9 +1290,9 @@ async fn login_1025_evicts_the_oldest() {
 /// make this assertion read reused bytes instead of the wipe.)
 #[tokio::test]
 async fn an_evicted_sessions_tokens_are_wiped() {
-    // Serialized against the capacity test (see CAPACITY_SUITE): the
-    // assertion below reads freed-then-wiped granules, and this lock
-    // keeps the only heavy concurrent claimer out of the window.
+    // Serialized against the other capacity tests (see CAPACITY_SUITE):
+    // the assertion below reads freed-then-wiped granules, and this lock
+    // keeps the heavy concurrent claimers out of the window.
     let _suite = CAPACITY_SUITE.lock().await;
     let mem = ws_secmem::global().expect("the protected pool initializes");
     let store = SessionStore::new(Duration::from_secs(900), NO_IDLE_EVICTION);

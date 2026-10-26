@@ -7,6 +7,16 @@
 //! exact path-and-query, and the full body. The response streams back
 //! with the upstream status and headers, minus the same hop-by-hop set.
 //!
+//! Custody boundary: the session store's tokens are arena-only AT REST,
+//! never arena-only in flight. The relay hands a materialized
+//! (`Zeroizing`) bearer to `forward_one`, and `reqwest` then copies it
+//! into a plain `HeaderValue` plus its serialization buffers — un-wiped
+//! heap plaintext for the request's lifetime — and the inbound
+//! direction holds the response in reqwest's buffer before serde reads
+//! it. That transient class is inherent to header-based proxying
+//! through reqwest; the load-bearing guarantee is the at-rest one: no
+//! token sits outside the protected arena while the STORE holds it.
+//!
 //! The `/acme*` surface forwards under the exact same contract — the
 //! RFC 8555 headers (`Replay-Nonce`, `Location`, `Link`, the
 //! `application/problem+json` content type) cross untouched — but it
