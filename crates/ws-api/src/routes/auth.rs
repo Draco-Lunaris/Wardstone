@@ -730,8 +730,9 @@ async fn oidc_callback(
 /// `provider_type` must equal the label in the path; anything else is a
 /// 404 (the provider is not configured). The stored client-secret seal
 /// opens into the protected arena inside the shared conversion
-/// (`routes::oidc::to_auth_config`), so the token exchange — and only
-/// it — receives the plaintext secret.
+/// (`routes::oidc::to_auth_config`); the login flow's token exchange
+/// and the saved-config probe (the test route) are the conversion's two
+/// consumers, and both receive the plaintext secret only in the arena.
 async fn provider_config(
     state: &AppState,
     tenant_id: Uuid,

@@ -167,9 +167,12 @@ pub async fn exchange_code(
     ];
     // House: an empty client_secret is a public client; it is then omitted
     // outright rather than sent as an empty credential. The confidential
-    // arm borrows the secret straight out of the protected arena buffer —
-    // no heap copy exists to wipe; a non-UTF-8 buffer cannot come from the
-    // JSON body the secret was typed into and is a typed config failure.
+    // arm borrows the secret from the arena buffer — no copy of the
+    // buffer is made — but reqwest's form serialization then writes it
+    // into its own heap request-body buffer for the request's lifetime,
+    // an un-wiped in-flight transient (the at-rest custody stays
+    // arena-only); a non-UTF-8 buffer cannot come from the JSON body the
+    // secret was typed into and is a typed config failure.
     if !config.client_secret.is_empty() {
         let secret = std::str::from_utf8(&config.client_secret)
             .map_err(|_| AuthError::Config("the client secret is not valid utf-8".to_string()))?;

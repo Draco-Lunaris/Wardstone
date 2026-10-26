@@ -15,8 +15,11 @@
 //!
 //! The `client_secret` never leaves the server — it is SEALED at rest
 //! under the instance's secret-encryption key (the TOTP pair's storage
-//! shape) on write, and is opened into the protected arena only where
-//! the login flow's exchange path consumes it: the read response carries
+//! shape) on write, and the stored seal opens into the protected arena
+//! only through the shared conversion (`to_auth_config`), whose two
+//! consumers are the login flow's token exchange and the saved-config
+//! probe on this module's test route (the probe runs `discover`, which
+//! itself never consumes the secret): the read response carries
 //! `client_secret_set: bool` only, and the audit details carry
 //! `provider_type` and `discovery_url` — never secret material.
 
