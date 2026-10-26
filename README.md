@@ -26,7 +26,9 @@ with every private key stored encrypted-at-rest outside the database.
 - **Web UI** — a first-run setup wizard that mints the tenant, root CA,
   admin, and the built-in profiles from one form, then swaps the
   self-signed setup certificate for a CA-issued leaf in place (no
-  restart) and seals every key under the master passphrase you set.
+  restart) and seals every key under the master passphrase you set —
+  each key's first write is its sealed envelope, so no plaintext key
+  file ever exists.
 - **Accounts and auth** — local accounts (argon2id), TOTP multi-factor,
   generic OIDC single sign-on, role-based capabilities, service API
   tokens, and one-shot pull tokens for scripted certificate retrieval.
@@ -43,7 +45,17 @@ with every private key stored encrypted-at-rest outside the database.
 
 The compose bundle is the supported deployment: one Wardstone image
 running the UI front door (`ws-web`) and the REST API (`ws-api`) as two
-separate processes, plus a bundled Postgres.
+separate processes, plus a bundled Postgres. The database and the two
+processes' unlock relay ride Unix sockets in directories bind-mounted
+from the host's `/run` (tmpfs), so once per host boot — before `up` —
+create them (the bundle refuses to start without them, loudly):
+
+```sh
+install -d -m 0770 -o 70 -g 70 /run/wardstone/pg
+install -d -m 0770 -o 10001 -g 10001 /run/wardstone/relay
+```
+
+Then:
 
 ```sh
 WARDSTONE_SERVER_HOSTNAME=ca.example.test \
@@ -55,10 +67,13 @@ docker compose -f docker/compose.yml up -d
 The first two variables are required by design — an unset hostname would
 serve the setup certificate with a placeholder SAN, and an unset password
 would make the bundled Postgres guessable. **`WARDSTONE_DB_PASSWORD` is a
-bootstrap-only value**: it initializes the bundled database and seeds the
-ui's seeding boot, and setup retires it as a login credential for good
-(the conversion rotates the database role's password under your master
-passphrase, and every unlock rotates it again). The image publish requires
+bootstrap-only value**: it initializes the bundled database, and the
+first-run setup page reads it once (its database-password field) and
+retires it as a login credential for good — setup rotates the database
+role's password under your master passphrase, and every unlock rotates
+it again. A plaintext value works; the recommended form is the SCRAM
+verifier minted by `wardstone db-verifier` (single-quoted in `.env` —
+see the [production manual](docker/README.md)). The image publish requires
 the GitHub package to be public
 (or an existing `docker login ghcr.io`).
 `WARDSTONE_IMAGE=wardstone:latest` is the default when you build locally.
@@ -69,7 +84,13 @@ the page for out-of-band verification), and fill the setup form: **set
 your master passphrase** (the key that seals every sensitive file on the
 instance — it exists nowhere on any disk, and it is not recoverable,
 store it in your password manager), then the admin username and password,
-default domain, optional admin CIDRs, and the server hostname. The UI
+default domain, optional admin CIDRs, the server hostname, and the
+database password — the login credential the database role carries today
+(for the bundled database, the value behind `WARDSTONE_DB_PASSWORD`; if
+you minted a verifier, the password printed beside it). Setup connects
+with it exactly once, rotates the role to a fresh random credential, and
+seals that one under the master passphrase — the typed password is never
+stored. The UI
 process **resumes in place** serving the CA-issued TLS leaf — no restart,
 no re-typing. Sign in with the admin account you just created — `POST
 /setup` now returns 404 forever.
@@ -147,11 +168,12 @@ share:
 
 | Variable | Required | Meaning |
 |----------|----------|---------|
-| `DATABASE_URL` | yes | Postgres connection URL |
+| `DATABASE_URL` | yes | Postgres connection URL. Refused if it carries a password (the credential lives in the sealed envelope — or, on a fresh install, the setup page's database-password field). A TCP URL (an external database) must carry BOTH `sslmode=verify-full` and `sslrootcert=<CA-bundle path>`; a unix-socket URL is the bundled local link |
 | `WARDSTONE_KEYS_DIR` | yes | The keystore directory (compose mounts it as a shared volume) |
 | `WARDSTONE_SERVER_HOSTNAME` | compose: yes | The setup certificate's SAN and the API's domain context |
 | `WARDSTONE_API_URL` | no | The UI's proxy target (default `http://ws-api:8080`) |
 | `WARDSTONE_BIND` | no | Listen address (UI `0.0.0.0:8443`, API `0.0.0.0:8080`) |
+| `WARDSTONE_RELAY_SOCKET` | no | The unlock relay's Unix socket (compose: `/run/wardstone/relay/relay.sock`): the ui relays the master passphrase to the api over it once per unlock; the api binds it mode 0600 and admits only its own uid (`SO_PEERCRED`) — no network listener carries the relay |
 | `WARDSTONE_PUBLIC_URL` | no | Absolute URL base for every ACME URL (unset → the ACME routes degrade to `serverInternal` problems) |
 | `WARDSTONE_RATE_LIMIT_PER_MILLIS` / `_BURST` | no | GCRA tuning (defaults: 1 credit per 500 ms, burst 20; a zero or unparsable value fails the boot) |
 | `WARDSTONE_AUTH_RATE_LIMIT_DISABLED` | no | API-only switch for the UI-fronted deployment shape (the UI's own limiter never reads it) |
@@ -178,12 +200,15 @@ is [`docker/README.md`](docker/README.md).
   keeps both named volumes.
 - **Lost or broken JWT key material is a loud stop, not a heal.** The
   processes refuse to silently re-key (that would invalidate every
-  outstanding token while looking normal). On a sealed volume the pair
-  lives only in `jwt-keys.envelope`: the documented recovery removes that
-  one envelope with the services stopped, and the next unlock mints a
-  fresh pair straight into a new one — every outstanding token is
-  invalid, everyone logs in again (the legacy pre-conversion path and its
-  pair-validation failure are in [`docker/README.md`](docker/README.md)).
+  outstanding token while looking normal): a missing or corrupt
+  `jwt-keys.envelope` fails the unlock loudly — checked before any
+  secret is unwrapped or the database touched — and there is no
+  in-product re-key. Recovery is restoring the keys volume from a
+  backup (with the database-credential runbook from the manual if the
+  restored envelope predates the role's current password), or wiping
+  both volumes and running setup again; either way every outstanding
+  token is invalid and everyone logs in again
+  ([`docker/README.md`](docker/README.md) carries the full procedure).
 - **Verify with `docker compose config`** before an upgrade; the compose
   file is the deployment contract.
 
@@ -236,21 +261,70 @@ docker build -f docker/Dockerfile -t wardstone:local .
 
 Key handling, issuance flows, and the web UI are security-sensitive by
 nature; the design treats them accordingly. The headline control is
-**sealed at rest**: every sensitive file on the instance (the CA key
-envelopes, the session-key pair, the second-factor seals, the database
-credential) is ciphertext under a key derived from **your master
-passphrase** — entered at the HTTPS front door when you unlock the
-instance, existing nowhere on any disk. A sealed instance is correctly
-unhealthy while locked; the disk copy of a running instance is inert
-until unlocked; a database copy carries no plaintext secrets. The stated
-residuals, plainly: a **host-root** attacker on the running instance
-reads unlocked memory (no software defends that); a **stolen passphrase**
-defeats the seal (keep it in your password manager, not on the same
-machine); and **losing the passphrase** loses the instance — its
-identities are re-issued from the offline root you control. Further
+**sealed at rest, sealed at creation**: every sensitive file on the
+instance (the CA key envelopes, the JWT key pair, the second-factor
+seals, the database credential) is ciphertext under a key derived from
+**your master passphrase** — entered at the HTTPS front door when you
+unlock the instance, existing nowhere on any disk — and no plaintext
+key file ever exists either: the first-run setup mints every key
+straight into its sealed envelope, and the database credential is
+rotated and re-sealed at every unlock. A sealed instance is a correct
+state, not an outage (the liveness endpoints answer 200 with the
+current state while locked); the disk copy of a running instance is
+inert until unlocked; a database copy carries no plaintext secrets. In
+RAM the unlocked keys live in a kernel-locked arena (`ws-secmem`):
+`memfd_secret(2)` pages that are never swapped, never written to core
+dumps, and invisible to `ptrace` and `/proc/<pid>/mem`.
+
+The stated residuals, plainly: a **host-root** attacker on the running
+instance reads unlocked memory (no software defends that); a **stolen
+passphrase** defeats the seal (keep it in your password manager, not on
+the same machine); and **losing the passphrase** loses the instance —
+its identities are re-issued from the offline root you control. Within
+RAM the residual is library-level key hygiene, verified per
+dependency: most of the tree's signing crypto wipes its key material by
+construction — the RustCrypto ECDSA keys (P-256/P-384) and
+jsonwebtoken's signing handles are zeroized on drop, `rsa`'s `Drop`
+wipes the private primes and precomputed values, the XChaCha20-Poly1305
+cipher (its zeroize feature pinned on) and ed25519-dalek (zeroize in its
+defaults) wipe their key material, and the arena volatile-wipes every
+buffer on drop. Two named exceptions: `ring` — the SCRAM verifier
+derivation and rcgen's signing backend — retains un-wiped key copies
+inside its own objects for the process's life (the surrounding
+Wardstone buffers are wiped; ring's internal copies are not), and any
+secret that crosses an HTTP request — an OIDC token exchange's form
+body, a bearer header — is serialized into ordinary heap buffers for
+that request's lifetime (at-rest custody stays arena-only). One upstream
+habit to know: sqlx logs an unrecognized `DATABASE_URL` query
+parameter's key AND value at WARN, and turning statement logging off
+does not cover connect-time parameter logging — so never put a
+credential in a query parameter; no Wardstone URL carries one
+(credentials ride the URL's userinfo, which is never logged). Further
 hardening habits (no forwarded-for trust, server-computed challenge
 verification, tokens never in browser state, tenancy enforced in the
 schema) ride along underneath.
+
+### Hardening the host
+
+Wardstone does not change host settings; the protected-memory design
+assumes these operator-side habits:
+
+- **Kernel 5.14+ with `memfd_secret` enabled** — the arena's syscall;
+  the boot names the cause if the kernel refuses it (too old, disabled
+  on the kernel command line, or blocked by a seccomp profile).
+- **A memlock budget of 512 MiB (536870912 bytes)** for both Wardstone
+  services — the compose bundle sets it; in an unprivileged LXC the
+  host must pass it through (`lxc.prlimit.memlock: 536870912`).
+- **`kernel.yama.ptrace_scope` = 3, or at least 2**, on the machine
+  running the containers — the hypervisor host in the LXC case.
+- **Swap encrypted or disabled** — defence in depth: arena pages never
+  swap, but ordinary process memory can.
+- **Keep Docker's default seccomp profile** — it permits
+  `memfd_secret` (verified on Docker 29.9.2 / containerd 242); a
+  custom profile must allow the syscall explicitly.
+- The session store holds at most **1,024 concurrent sessions** —
+  beyond that the least-recently-touched session is evicted and its
+  tokens wiped — and every session dies with its process.
 Please report potential vulnerabilities privately through GitHub's
 private vulnerability reporting rather than a public issue.
 

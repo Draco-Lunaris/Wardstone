@@ -1,6 +1,10 @@
 //! Secret-encryption helper: AEAD (XChaCha20-Poly1305) sealing of small
 //! secrets at rest — today the TOTP and WebAuthn secrets, encrypted in the
-//! `users` row with a key that exists only as a protected-arena
+//! `users` row, and the OIDC client secret, sealed in the provider
+//! configuration row and opened only through the shared `to_auth_config`
+//! conversion (its two consumers: the login flow's token exchange and
+//! the saved-config probe) — with a key that exists only as a
+//! protected-arena
 //! reservation (minted at setup straight into
 //! `secret-encryption.envelope`, opened at the unlock handshake),
 //! analogous to the house's `pm-core/src/crypto.rs` helper.
