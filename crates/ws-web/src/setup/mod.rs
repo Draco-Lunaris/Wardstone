@@ -1322,7 +1322,18 @@ pub async fn recover_db_credential_via_peer(
     let options = ws_core::db::peer_setup_connect_options(database_url)?;
     let mut peer = sqlx::PgConnection::connect_with(&options)
         .await
-        .map_err(|_| SetupError::HealDoorClosed)?;
+        .map_err(|reason| {
+            // The reason reaches the logs BEFORE the door-closed
+            // refusal swallows it: an operator whose database is
+            // merely down gets the connect's own story, not a silent
+            // conflation with a disarmed door. The reason text only —
+            // the bundled URL carries no credential for it to leak.
+            tracing::debug!(
+                error = %reason,
+                "the bundled heal's peer connect failed"
+            );
+            SetupError::HealDoorClosed
+        })?;
 
     // The rotation over the door's own connection (the shared
     // crash-safe routine): the fresh credential is minted, the URL's

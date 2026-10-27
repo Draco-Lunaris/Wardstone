@@ -630,6 +630,93 @@ async fn the_unlock_refusal_names_no_completion_pending() {
     );
 }
 
+/// The bundled heal's disarm-failed refusal, as the build surfaces it:
+/// `SetupError::DoorDisarmFailed`'s pinned copy wrapped in the build's
+/// `the db re-seal:` prefix — the words the unlock POST must answer
+/// with its own 409, never the generic 401 (whose "passphrase was
+/// refused; the instance is unchanged" copy is false on both counts
+/// there: the re-seal and the rotation landed, only the door's
+/// re-close failed).
+const DOOR_DISARM_FAILED_REFUSAL: &str = "the db re-seal: the database's setup door did not \
+ close after the credential was sealed: run the disarm step in the bundled \
+ recovery runbook (docker/README.md), then unlock the instance normally";
+
+/// The heal's disarm failure is a loud runbook refusal, never a false
+/// 401: the re-seal and the rotation have already landed, so the
+/// operator's answer must name the armed door — otherwise the retry
+/// unlocks normally and leaves the door silently armed. The live
+/// failure is not deterministically triggerable from outside a
+/// running heal (nothing a test can observe makes the disarm ALTER
+/// fail mid-heal), so this pins the error → 409 + copy mapping at the
+/// level the sibling refusal arms are pinned here: a stub build
+/// surfacing the exact wrapped copy.
+#[tokio::test]
+async fn the_unlock_refusal_names_the_disarm_failed_heal() {
+    let ui = Arc::new(SealedUi::new(Arc::new(
+        |_: &str, _: Option<&str>, _: Option<&str>| {
+            Box::pin(async move { Err(DOOR_DISARM_FAILED_REFUSAL.to_string()) })
+        },
+    )));
+    let keys_dir = temp_keys("refusal-disarm");
+    mint_db_credential(&keys_dir);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
+
+    let refused = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/unlock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "passphrase": "the-current-passphrase" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "the disarm failure answers 409, never the generic 401"
+    );
+    let body = axum::body::to_bytes(refused.into_body(), 1 << 10)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["code"], "door_disarm_failed",
+        "the body names the disarm failure, got: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"].as_str(),
+        Some(DOOR_DISARM_FAILED_REFUSAL),
+        "the body carries the runbook's disarm copy verbatim, got: {body}"
+    );
+
+    // The refusal is a refusal: the door stays sealed.
+    let still = router
+        .oneshot(
+            Request::builder()
+                .uri("/the-full-surface")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        still.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the refused heal leaves the instance sealed"
+    );
+}
+
 #[tokio::test]
 async fn the_unlocked_root_redirects_to_the_login_not_the_stale_form() {
     // G3 (the final review): the locked door registers "/" exactly, and

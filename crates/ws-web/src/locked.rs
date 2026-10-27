@@ -400,6 +400,21 @@ async fn unlock_handler(
             })),
         )
             .into_response(),
+        // The bundled heal's disarm failure: the re-seal and the
+        // rotation LANDED — only the door's re-close failed. The
+        // generic 401 below would claim the passphrase was refused
+        // and nothing changed, both false, and the operator's retry
+        // would unlock with the door still armed — so this arm is a
+        // loud 409 carrying the runbook's disarm copy: the refusal
+        // that names the door, never a silent open one.
+        Err(code) if code == door_disarm_failed_verdict() => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "door_disarm_failed",
+                    "message": code }
+            })),
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -420,6 +435,20 @@ fn heal_door_closed_verdict() -> String {
     format!(
         "the db re-seal: {}",
         crate::setup::SetupError::HealDoorClosed
+    )
+}
+
+/// The build's disarm-failed verdict: `unlocked_web_build` wraps the
+/// bundled heal's [`crate::setup::SetupError::DoorDisarmFailed`] copy
+/// in its `the db re-seal:` prefix, and this is the exact string the
+/// unlock POST matches to surface the runbook's disarm copy (a 409)
+/// instead of the generic refusal — the heal's re-seal and rotation
+/// have already landed when the disarm fails, so the answer must never
+/// read as a refused passphrase.
+fn door_disarm_failed_verdict() -> String {
+    format!(
+        "the db re-seal: {}",
+        crate::setup::SetupError::DoorDisarmFailed
     )
 }
 
