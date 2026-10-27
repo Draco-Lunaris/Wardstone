@@ -51,7 +51,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rand::{rngs::SysRng, TryRng};
-use sqlx::PgPool;
 use uuid::Uuid;
 use ws_ca::ca::{certificate_validity, create_root, CaLifetime, CaSpec, KeyType};
 use ws_ca::error::CaError;
@@ -60,6 +59,7 @@ use ws_ca::keystore::KeyStore;
 use ws_ca::leafkey::{generate_leaf_key, LeafKeyType};
 use ws_ca::serial::allocate_serial;
 use ws_core::crypto::{db_role_of, substitute_db_password, KeyEnvelope, PROD_KDF_PARAMS};
+use ws_core::db::DbMode;
 use ws_core::error::CoreError;
 use ws_core::models::audit::AuditEntry;
 use ws_core::models::ca::CaModel;
@@ -117,13 +117,17 @@ pub struct SetupFields {
     /// The server's own hostname: the SAN of the CA-issued leaf that
     /// replaces the setup certificate at the end of setup.
     pub server_hostname: String,
-    /// The database login password the operator typed — the credential
-    /// `DATABASE_URL`'s role carries TODAY (the compose bootstrap one,
-    /// or the fresh one the db-volume-recovery runbook set). It is
-    /// NEVER stored: setup connects with it exactly once, the rotation
-    /// ALTERs the role to a fresh random credential, and the typed
-    /// password dies with the zeroizing wrapper when the handler
-    /// returns — the sealed envelope holds only the fresh one.
+    /// The database login password the operator typed — the EXTERNAL
+    /// (TCP) deployment's credential, the one `DATABASE_URL`'s role
+    /// carries TODAY (the compose bootstrap one, or the fresh one the
+    /// db-volume-recovery runbook set). The BUNDLED (socket) deployment
+    /// has no database password at all: the peer door replaces the
+    /// typed credential, the page renders no field for it, and a POST
+    /// carrying one is refused before any dial. It is NEVER stored:
+    /// setup connects with it exactly once, the rotation ALTERs the
+    /// role to a fresh random credential, and the typed password dies
+    /// with the zeroizing wrapper when the handler returns — the sealed
+    /// envelope holds only the fresh one.
     #[serde(default)]
     pub db_password: Zeroizing<String>,
     /// The operator's master passphrase (entered twice on the page; the
@@ -149,7 +153,8 @@ pub struct SetupFields {
 /// and the instance's `DATABASE_URL` — the setup POST builds its OWN pool
 /// from that URL plus the form's typed `db_password` (the D2 direction:
 /// no boot-time database connection belongs to the setup surface at
-/// all).
+/// all). The bundled (socket) mode instead rides the peer door: the
+/// `db_mode` field decides which connect arm the POST takes.
 #[derive(Clone, Debug)]
 pub struct SetupState {
     /// The keys directory (`WARDSTONE_KEYS_DIR`).
@@ -179,6 +184,14 @@ pub struct SetupState {
     /// uses; the PASSWORD to connect with comes from the POST's typed
     /// `db_password` field, never from the URL itself.
     pub database_url: String,
+    /// The deployment mode `database_url` classifies into
+    /// (`ws_core::db::db_mode`): bundled (socket) setups render no
+    /// db-password field and run the POST through the peer door
+    /// ([`run_setup`]'s bundled arm); external (TCP) setups keep
+    /// exactly today's typed-password form. The router builders'
+    /// callers compute it once (the binary: after its URL gate; tests
+    /// construct it directly).
+    pub db_mode: DbMode,
 }
 
 /// The seal-at-creation setup's typed error vocabulary. No variant's
@@ -200,6 +213,38 @@ pub enum SetupError {
          volumes and run setup again"
     )]
     InstallExists,
+    /// The bundled database's peer door did not open: the connect as the
+    /// passwordless setup role over the URL's unix socket failed. ANY
+    /// connect failure takes this shape — a missing role, a missing
+    /// peer line, a dead socket — the operator's fix is bundle health,
+    /// not credentials. Nothing was generated or written.
+    #[error(
+        "the bundled database's setup door did not open: setup could not reach \
+         the peer-authenticated ws_setup role over the database socket — the db \
+         container must be healthy and the bundle's postgres files (pg_hba.conf, \
+         pg_ident.conf, the entrypoint wrapper) in place"
+    )]
+    DoorMissing,
+    /// The setup door did not close after the credential was sealed:
+    /// the door stays armed (a re-run of setup re-enters
+    /// passwordlessly), and the bundled recovery runbook's disarm step
+    /// closes it. Setup's tail and the unlock's heal share this refusal.
+    #[error(
+        "the database's setup door did not close after the credential was \
+         sealed: run the disarm step in the bundled recovery runbook \
+         (docker/README.md), then unlock the instance normally"
+    )]
+    DoorDisarmFailed,
+    /// The unlock's heal needs the peer door and it is closed (already
+    /// disarmed, or absent host-side): the bundled recovery runbook's
+    /// re-arm step must reopen it before the heal can run. Surfaced by
+    /// the heal flow — setup's own path never returns this.
+    #[error(
+        "the database's setup door is closed and the unlock's heal needs it: \
+         run the re-arm step in the bundled recovery runbook (docker/README.md), \
+         then retry the unlock"
+    )]
+    HealDoorClosed,
     /// The form failed its basic checks (blank fields, passphrase
     /// mismatch, a hostname the profile would not issue for).
     #[error("invalid setup form: {0}")]
@@ -267,10 +312,12 @@ pub fn setup_unmounted_router() -> axum::Router {
 
 /// Whether the default tenant exists — the check the caller performs
 /// before mounting [`setup_router`] (the Review Focus item 5: not routed
-/// once the tenant exists).
-pub async fn tenant_exists(pool: &PgPool) -> Result<bool, CaError> {
+/// once the tenant exists). Executor-generic: the front-door builders
+/// pass the pool, and the bundled setup arm passes its `SET ROLE`'d peer
+/// connection (the check runs as the URL's login role either way).
+pub async fn tenant_exists(executor: impl sqlx::PgExecutor<'_>) -> Result<bool, CaError> {
     let tenant = TenantRepo::new()
-        .get_by_name(pool, DEFAULT_TENANT_NAME)
+        .get_by_name(executor, DEFAULT_TENANT_NAME)
         .await
         .map_err(map_core)?;
     Ok(tenant.is_some())
@@ -290,19 +337,33 @@ type GeneratedKeys = (
 /// in plaintext on disk, and the volume's sealed state begins the moment
 /// the POST succeeds.
 ///
-/// The steps, in the exact durability order the design pins:
+/// The connect prologue and the tail fork on the deployment mode
+/// ([`ws_core::db::db_mode`], computed once from the URL's shape); the
+/// middle body — generation, the ONE setup transaction, the master
+/// envelope LAST — is shared and stays pool-based. The steps, in the
+/// exact durability order the design pins:
 ///
-/// 1. Validate the form (including the typed `db_password` and the
-///    confirmed master passphrase).
-/// 2. Build the pool from the TYPED password — connect, run the
-///    migrations, and refuse a Postgres `28P01`
-///    ([`SetupError::DbRejected`]) BEFORE anything exists: no file, no
-///    row, not even the keys directory.
-/// 3. Refuse an existing install ([`SetupError::InstallExists`]) before
-///    anything is generated or written: a restored database beside a
-///    fresh keys volume must never be half-overwritten by a second
-///    setup run.
-/// 4. Generate everything in protected memory, the memory-hard legs
+/// 1. Validate the form — the mode-shaped `db_password` policy (the
+///    external deployment requires the TYPED password; the bundled one
+///    has none at all and refuses a POST carrying one) and the confirmed
+///    master passphrase — before anything is generated or written.
+/// 2. Connect, migrate, and refuse an existing install
+///    ([`SetupError::InstallExists`]) BEFORE anything is generated or
+///    written: a restored database beside a fresh keys volume must
+///    never be half-overwritten by a second setup run.
+///     - External (TCP): build the pool from the TYPED password; a
+///       Postgres `28P01` is [`SetupError::DbRejected`], and both the
+///       migrations and the tenant check run on the pool.
+///     - Bundled (socket): open the peer door — connect as the
+///       passwordless `ws_setup` role over the unix socket, ANY
+///       failure [`SetupError::DoorMissing`] — then `SET ROLE` to the
+///       URL's login role, migrate, and check the tenant AS that role
+///       (object ownership byte-identical to a pool-based run); then
+///       `RESET ROLE`, rotate the login role's credential over the
+///       peer connection (sealing `db-credential.envelope` at the
+///       volume's zeroth generation), and build the pool with the
+///       fresh credential.
+/// 3. Generate everything in protected memory, the memory-hard legs
 ///    under `spawn_blocking` (Ruling 21: the admin's argon2id hash and
 ///    the key-envelope writes never park the async runtime): the master
 ///    key, the secret-encryption key, the JWT pair (born straight into
@@ -311,49 +372,133 @@ type GeneratedKeys = (
 ///    (the AEAD leg needs no argon2; the key-before-row contract: a
 ///    certificate row without its key is worse than an orphaned key
 ///    file a crashed run overwrites) — and the server leaf.
-/// 5. Write the non-master envelopes — `secret-encryption.envelope`,
+/// 4. Write the non-master envelopes — `secret-encryption.envelope`,
 ///    then `jwt-keys.envelope`, then the leaf's keystore envelope inside
 ///    the issuance transaction. Each write is a crash-atomic replace, so
 ///    stray files from a crashed earlier attempt are simply overwritten.
-/// 6. Write `master.envelope` LAST — the sealed marker — while the ONE
+/// 5. Write `master.envelope` LAST — the sealed marker — while the ONE
 ///    setup transaction (tenant, root CA row, admin, default profiles,
 ///    the leaf's certificate row, and every audit row, standing or
 ///    falling together) is still open, and THEN commit: a crash at any
 ///    earlier point leaves no tenant (the transaction rolls back) and
 ///    only overwritable strays; a crash after the marker leaves the
 ///    torn state the boot refuses loudly.
-/// 7. Rotate the database credential (the URL's login role — F5) over a
-///    dedicated connection and seal it at the volume's zeroth generation.
-///    The `db-credential.envelope` lands AFTER the marker on purpose:
-///    its absence is the D5 locked state the unlock's recovery arm
-///    heals, never a torn volume. The api relay (the page's step, after
-///    this rotation) therefore opens the rotated credential.
+/// 6. The tail: the EXTERNAL arm rotates the database credential (the
+///    URL's login role — F5) over a dedicated connection and seals it
+///    at the volume's zeroth generation — the `db-credential.envelope`
+///    lands AFTER the marker on purpose: its absence is the D5 locked
+///    state the unlock's recovery arm heals, never a torn volume. The
+///    api relay (the page's step, after the rotation) therefore opens
+///    the rotated credential. The BUNDLED arm rotated BEFORE the tenant
+///    work (a crashed setup re-runs passwordlessly through the
+///    still-armed door) and now closes the door
+///    (`ws_core::dbcred::disarm_setup_role`, a failure
+///    [`SetupError::DoorDisarmFailed`]) and drops the peer connection.
 pub async fn run_setup(
     fields: &SetupFields,
     database_url: &str,
     keys_dir: &Path,
 ) -> Result<SetupOutcome, SetupError> {
-    ensure_fields(fields)?;
+    // The deployment mode is computed once, from the URL's shape alone
+    // (the same parse-only split the boot's URL gate makes): it decides
+    // the connect prologue and the tail below, never the middle body.
+    let mode = ws_core::db::db_mode(database_url)?;
+    ensure_fields(fields, mode)?;
 
-    // The pool rides the TYPED password (never a boot-time credential —
-    // the D2 direction: the setup POST is the only thing that knows it,
-    // and the rotation below retires it). A wrong password refuses BEFORE
-    // anything exists: no envelope, no keystore file, no tenant, no
-    // profile, no cert row, not even the keys directory.
-    let connect_url = substitute_db_password(database_url, &fields.db_password);
-    let pool = match ws_core::db::connect(&connect_url).await {
-        Ok(pool) => pool,
-        Err(err) if db_rejected(&err) => return Err(SetupError::DbRejected),
-        Err(err) => return Err(SetupError::Core(err)),
+    // The connect prologue, forked on the mode. The EXTERNAL arm is
+    // exactly today's shape. The BUNDLED arm rides the peer door — the
+    // passwordless setup role the bundle's unix socket authenticates
+    // by peer credentials — and rotates the login role's credential
+    // BEFORE the tenant work, so a crashed setup re-enters
+    // passwordlessly through the still-armed door.
+    let (pool, peer) = match mode {
+        DbMode::External => {
+            // The pool rides the TYPED password (never a boot-time
+            // credential — the D2 direction: the setup POST is the only
+            // thing that knows it, and the rotation below retires it). A
+            // wrong password refuses BEFORE anything exists: no
+            // envelope, no keystore file, no tenant, no profile, no
+            // cert row, not even the keys directory.
+            let connect_url = substitute_db_password(database_url, &fields.db_password);
+            let pool = match ws_core::db::connect(&connect_url).await {
+                Ok(pool) => pool,
+                Err(err) if db_rejected(&err) => return Err(SetupError::DbRejected),
+                Err(err) => return Err(SetupError::Core(err)),
+            };
+
+            // An existing install refuses BEFORE anything is generated
+            // or written (the router never mounts this surface once the
+            // tenant exists; this check is the defense for direct
+            // library callers and every racing window).
+            if tenant_exists(&pool).await? {
+                return Err(SetupError::InstallExists);
+            }
+            (pool, None)
+        }
+        DbMode::Bundled => {
+            use sqlx::Connection as _;
+
+            // The peer door: the bundled URL's socket, authenticated
+            // by the connecting OS user (`SO_PEERCRED`), logged in as
+            // the passwordless setup role. ANY connect failure is the
+            // door-missing refusal — a missing role, a missing peer
+            // line, a dead socket: the operator's fix is bundle health,
+            // not credentials — and nothing has been generated or
+            // written yet.
+            let options = ws_core::db::peer_setup_connect_options(database_url)?;
+            let mut peer = sqlx::PgConnection::connect_with(&options)
+                .await
+                .map_err(|_| SetupError::DoorMissing)?;
+
+            // The pinned bundled order: SET ROLE to the URL's login
+            // role, migrate, and check the tenant AS that role — object
+            // ownership is byte-identical to today's pool-based run,
+            // and the existing-install refusal still precedes every
+            // write. `db_role_of` validates the identifier shape, so
+            // the SET carries no injection surface (the same gate the
+            // rotation's ALTER passes).
+            let db_role = db_role_of(database_url)?;
+            sqlx::query(&format!("SET ROLE {db_role}"))
+                .execute(&mut peer)
+                .await
+                .map_err(CaError::Db)?;
+            ws_core::db::migrate_and_check(&mut peer).await?;
+            if tenant_exists(&mut peer).await? {
+                return Err(SetupError::InstallExists);
+            }
+            sqlx::query("RESET ROLE")
+                .execute(&mut peer)
+                .await
+                .map_err(CaError::Db)?;
+
+            // Rotate FIRST, over the door's own connection: the fresh
+            // credential is minted, the login role ALTERed to it in
+            // verifier form (the peer options' statement-logging-off
+            // guarantee covers the ALTER's statement text), and the
+            // db-credential envelope sealed at the volume's zeroth
+            // generation — BEFORE the tenant work, so a crashed setup
+            // re-runs passwordlessly through the still-armed door. The
+            // door closes only after the commit below.
+            let fresh = ws_core::dbcred::rotate_db_credential(
+                &mut peer,
+                &db_role,
+                &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+                fields.master_passphrase.as_bytes(),
+                0,
+            )
+            .await?;
+
+            // The pool rides the fresh credential — the same reconnect
+            // idiom the unlock's recovery build uses — so the middle
+            // body below stays pool-based and untouched.
+            let pool = ws_core::db::connect(&substitute_db_password(
+                database_url,
+                &String::from_utf8_lossy(&fresh),
+            ))
+            .await?;
+            (pool, Some(peer))
+        }
     };
-
-    // An existing install refuses BEFORE anything is generated or
-    // written (the router never mounts this surface once the tenant
-    // exists; this check is the defense for direct library callers and
-    // every racing window).
-    if tenant_exists(&pool).await? {
-        return Err(SetupError::InstallExists);
-    }
 
     // The memory-hard generation legs run under spawn_blocking (Ruling
     // 21): fresh OS entropy for the master and secret-encryption keys,
@@ -816,29 +961,52 @@ pub async fn run_setup(
     // The commit: the tenant exists from exactly this line on.
     tx.commit().await.map_err(CaError::Db)?;
 
-    // The DB credential rotation (the shared crash-safe
-    // [`ws_core::dbcred::rotate_db_credential`]): fresh random, the
-    // ALTER in verifier form over a dedicated connection, the pending
-    // envelope promoted after the ALTER — sealed at the volume's
-    // zeroth generation, AFTER the marker on purpose (its absence is
-    // the D5 locked state the unlock's recovery arm heals, never a
-    // torn volume). The rotation runs on the async path's own
-    // connection: its internal envelope write is the one argon2
-    // exception (the crash-safe rotation routine is shared with the
-    // api's unlock and stays single-sourced; Ruling 21's
-    // spawn_blocking mandate covers setup's OWN envelope writes, which
-    // all block above). The typed bootstrap password retires with the
-    // ALTER.
-    let db_role = db_role_of(database_url)?;
-    let mut conn = pool.acquire().await.map_err(CaError::Db)?;
-    ws_core::dbcred::rotate_db_credential(
-        &mut conn,
-        &db_role,
-        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
-        fields.master_passphrase.as_bytes(),
-        0,
-    )
-    .await?;
+    // The tail forks with the prologue. The EXTERNAL arm rotates the
+    // login role's credential here — exactly today's order, the
+    // rotation following the commit. The BUNDLED arm already rotated
+    // over the peer door BEFORE the tenant work, and now closes the
+    // door behind the commit (the peer connection's presence IS the
+    // mode's tail: the prologue arms it only for the bundled dial).
+    if let Some(mut peer) = peer {
+        if let Err(reason) = ws_core::dbcred::disarm_setup_role(&mut peer).await {
+            // The door stays armed — a re-run of setup re-enters
+            // passwordlessly — and the runbook's disarm step closes it.
+            // The logged reason carries no credential material (the
+            // disarm statement has none).
+            tracing::warn!(
+                error = %reason,
+                "the bundled setup door's disarm failed; the door stays open \
+                 until the bundled recovery runbook's disarm step closes it"
+            );
+            return Err(SetupError::DoorDisarmFailed);
+        }
+        // The door is closed; the peer connection's work is done.
+        drop(peer);
+    } else {
+        // The DB credential rotation (the shared crash-safe
+        // [`ws_core::dbcred::rotate_db_credential`]): fresh random, the
+        // ALTER in verifier form over a dedicated connection, the
+        // pending envelope promoted after the ALTER — sealed at the
+        // volume's zeroth generation, AFTER the marker on purpose (its
+        // absence is the D5 locked state the unlock's recovery arm
+        // heals, never a torn volume). The rotation runs on the async
+        // path's own connection: its internal envelope write is the one
+        // argon2 exception (the crash-safe rotation routine is shared
+        // with the api's unlock and stays single-sourced; Ruling 21's
+        // spawn_blocking mandate covers setup's OWN envelope writes,
+        // which all block above). The typed bootstrap password retires
+        // with the ALTER.
+        let db_role = db_role_of(database_url)?;
+        let mut conn = pool.acquire().await.map_err(CaError::Db)?;
+        ws_core::dbcred::rotate_db_credential(
+            &mut conn,
+            &db_role,
+            &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+            fields.master_passphrase.as_bytes(),
+            0,
+        )
+        .await?;
+    }
 
     tracing::info!(
         "first-run setup complete: every key was sealed as it was created; \
@@ -908,18 +1076,32 @@ pub(crate) fn validate_hostname_permitted(fields: &SetupFields) -> Result<(), St
     }
 }
 
-/// The setup form's blank-field policy: the identity fields (including
-/// the typed database password) must be non-blank; CIDRs may be absent
-/// but not blank; the master passphrase is required and confirmed — the
-/// whole bootstrap refuses before anything is generated or written.
-fn ensure_fields(fields: &SetupFields) -> Result<(), SetupError> {
-    let required = [
+/// The setup form's blank-field policy: the identity fields must be
+/// non-blank; CIDRs may be absent but not blank; the master passphrase is
+/// required and confirmed — the whole bootstrap refuses before anything
+/// is generated or written. The `db_password` leg is mode-shaped: an
+/// external (TCP) deployment requires the TYPED password, while a
+/// bundled (socket) deployment has no database password AT ALL — a POST
+/// carrying one is refused with the pinned copy before any dial.
+fn ensure_fields(fields: &SetupFields, mode: DbMode) -> Result<(), SetupError> {
+    let mut required = vec![
         ("admin_username", fields.admin_username.as_str()),
         ("admin_password", fields.admin_password.as_str()),
         ("default_domain", fields.default_domain.as_str()),
         ("server_hostname", fields.server_hostname.as_str()),
-        ("db_password", fields.db_password.as_str()),
     ];
+    match mode {
+        DbMode::External => required.push(("db_password", fields.db_password.as_str())),
+        DbMode::Bundled => {
+            if !fields.db_password.trim().is_empty() {
+                return Err(SetupError::Validation(
+                    "the bundled deployment has no database password — remove \
+                     the db_password field"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
     for (name, value) in required {
         if value.trim().is_empty() {
             return Err(SetupError::Validation(format!("{name} must not be blank")));

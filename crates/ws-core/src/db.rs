@@ -9,6 +9,7 @@ use std::str::FromStr;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::ConnectOptions;
+use sqlx::PgConnection;
 use sqlx::PgPool;
 
 use crate::error::CoreError;
@@ -20,22 +21,9 @@ use crate::error::CoreError;
 /// Bump it exactly when a migration file is added.
 pub const REQUIRED_MIGRATION_COUNT: u16 = 12;
 
-/// Open a Postgres connection pool (max 10 connections) and bring the database
-/// up to date:
-///
-/// 1. Refuse a database where the schema exists but the migration bookkeeping
-///    does not: `_sqlx_migrations` with zero rows while `tenants` exists means
-///    the applied-migration history was lost (deleted by hand); re-running
-///    migrations would silently paper over that. A genuinely fresh database
-///    has neither table, so bootstrapping — including recovery from a crashed
-///    first bootstrap, which can leave an empty `_sqlx_migrations` behind —
-///    still works.
-/// 2. Run the embedded migrations (idempotent: applied versions are skipped,
-///    and upgrade gaps — e.g. one migration applied against a two-migration
-///    binary — are bridged forward).
-/// 3. Verify the bookkeeping count equals [`REQUIRED_MIGRATION_COUNT`],
-///    returning [`CoreError::Migration`] on mismatch (e.g. the database is
-///    ahead of this binary).
+/// Open a Postgres connection pool (max 10 connections) and bring the
+/// database up to date through [`migrate_and_check`] — the one home for
+/// the migration and bookkeeping-count policy (see its steps).
 pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
     let options = connect_options_with_statement_logging_off(url)?;
     let pool = PgPoolOptions::new()
@@ -43,15 +31,46 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
         .connect_with(options)
         .await?;
 
+    // One pooled connection carries the whole migration + count check
+    // (the same single-connection shape the migrator itself uses), then
+    // returns to the pool before serving.
+    let mut conn = pool.acquire().await?;
+    migrate_and_check(&mut conn).await?;
+    drop(conn);
+
+    Ok(pool)
+}
+
+/// Bring the database up to date over a Postgres connection and verify
+/// the bookkeeping — the ONE home for the migration + count policy,
+/// shared by [`connect`]'s pool-acquired connection and the bundled
+/// first-run setup's peer connection (which runs it `SET ROLE`'d to the
+/// URL's login role, so object ownership is byte-identical to a
+/// pool-based run):
+///
+/// 1. Refuse a database where the schema exists but the migration
+///    bookkeeping does not: `_sqlx_migrations` with zero rows while
+///    `tenants` exists means the applied-migration history was lost
+///    (deleted by hand); re-running migrations would silently paper over
+///    that. A genuinely fresh database has neither table, so
+///    bootstrapping — including recovery from a crashed first bootstrap,
+///    which can leave an empty `_sqlx_migrations` behind — still works.
+/// 2. Run the embedded migrations (idempotent: applied versions are
+///    skipped, and upgrade gaps — e.g. one migration applied against a
+///    two-migration binary — are bridged forward).
+/// 3. Verify the bookkeeping count equals [`REQUIRED_MIGRATION_COUNT`],
+///    returning [`CoreError::Migration`] on mismatch (e.g. the database
+///    is ahead of this binary).
+pub async fn migrate_and_check(conn: &mut PgConnection) -> Result<(), CoreError> {
     let migrations_table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
          AND tablename = '_sqlx_migrations')",
     )
-    .fetch_one(&pool)
+    .fetch_one(&mut *conn)
     .await?;
     if migrations_table_exists {
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-            .fetch_one(&pool)
+            .fetch_one(&mut *conn)
             .await?;
         if applied == 0 {
             // `tenants` is migration 001's root table (nothing references
@@ -61,7 +80,7 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
                 "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
                  AND tablename = 'tenants')",
             )
-            .fetch_one(&pool)
+            .fetch_one(&mut *conn)
             .await?;
             if schema_initialized {
                 return Err(CoreError::Migration {
@@ -72,13 +91,21 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
         }
     }
 
+    // `run_direct`, not `run`: the bundled setup arm awaits this inline
+    // inside a Send-required handler future, and `run`'s `Acquire` bound
+    // is lifetime-tied for `&mut PgConnection`
+    // (`impl<'c> Acquire<'c> for &'c mut C`), so the auto-trait check
+    // fails with "not general enough". The `&Pool` impl is
+    // lifetime-free, which is why `connect`'s own `run(&pool)` never
+    // hit this. `run_direct` is exactly what `run` does internally
+    // after acquiring: same migrations, same connection.
     sqlx::migrate!("./migrations")
-        .run(&pool)
+        .run_direct(&mut *conn)
         .await
         .map_err(migrate_error)?;
 
     let found: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-        .fetch_one(&pool)
+        .fetch_one(&mut *conn)
         .await?;
     let found = u16::try_from(found)
         .map_err(|_| CoreError::Config(format!("migration count {found} does not fit u16")))?;
@@ -89,7 +116,7 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
         });
     }
 
-    Ok(pool)
+    Ok(())
 }
 
 /// Parse `url` into [`PgConnectOptions`] with sqlx's statement logging

@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
+use ws_core::db::DbMode;
 
 use super::{run_setup, validate_hostname_permitted, SetupError, SetupFields, SetupState};
 
@@ -16,14 +17,14 @@ use super::{run_setup, validate_hostname_permitted, SetupError, SetupFields, Set
 /// [`SetupState`] — so the operator verifies the certificate out of band
 /// instead of clicking through a browser warning.
 pub async fn setup_page(State(state): State<SetupState>) -> Html<String> {
-    Html(render(&state.fingerprint, &state.hostname))
+    Html(render(&state.fingerprint, &state.hostname, state.db_mode))
 }
 
 /// The setup submit: validate, run the seal-at-creation bootstrap (the
-/// pool rides the typed `db_password`; the master envelope lands LAST;
-/// the DB credential rotation follows the commit), relay the unlock to
-/// the api, resume the listener onto the CA-issued leaf IN PLACE, and
-/// report.
+/// external arm's pool rides the typed `db_password`; the bundled arm
+/// rides the peer door and rotates before the tenant work; the master
+/// envelope lands LAST), relay the unlock to the api, resume the
+/// listener onto the CA-issued leaf IN PLACE, and report.
 ///
 /// The relay order is the design's (the D1 step list's successor): it
 /// runs AFTER the rotation inside [`run_setup`] — so the api's unlock
@@ -32,7 +33,7 @@ pub async fn submit_setup(
     State(state): State<SetupState>,
     Json(fields): Json<SetupFields>,
 ) -> Result<Json<serde_json::Value>, SubmitError> {
-    validate(&fields).map_err(SubmitError::BadRequest)?;
+    validate(&fields, state.db_mode).map_err(SubmitError::BadRequest)?;
 
     // The Plan-2 I-3 fix's primary seam: refuse a `server_hostname` the
     // built-in `web-server` profile's SAN patterns forbid BEFORE any
@@ -96,7 +97,8 @@ pub async fn submit_setup(
 
 /// A setup-submit failure: the typed vocabulary the seal-at-creation
 /// bootstrap produces. The page answers a 400 the operator can retry
-/// (form checks, a wrong database password), a 409 for an existing
+/// (form checks, a wrong database password, a bundled door that did
+/// not open or close), a 409 for an existing
 /// install (the state conflict — this pair of volumes cannot proceed at
 /// all), and a 500 for everything else (the server logs carry the typed
 /// message). No message ever carries key material, a passphrase, or a
@@ -131,6 +133,29 @@ impl IntoResponse for SubmitError {
                 Json(serde_json::json!({ "error": "the database rejected that password" })),
             )
                 .into_response(),
+            // The bundled peer door's failures are operator-fixable 400s
+            // (the DbRejected arm's shape): a door that did not open
+            // names the bundle's health, one that did not close names
+            // the runbook's disarm step.
+            SubmitError::Setup(SetupError::DoorMissing) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "the bundled database's setup door did not open: setup could not \
+                     reach the peer-authenticated ws_setup role over the database socket — the \
+                     db container must be healthy and the bundle's postgres files (pg_hba.conf, \
+                     pg_ident.conf, the entrypoint wrapper) in place"
+                })),
+            )
+                .into_response(),
+            SubmitError::Setup(SetupError::DoorDisarmFailed) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "the database's setup door did not close after the credential was \
+                     sealed: run the disarm step in the bundled recovery runbook \
+                     (docker/README.md), then unlock the instance normally"
+                })),
+            )
+                .into_response(),
             // The copy is the design's exact refusal — verbatim.
             SubmitError::Setup(SetupError::InstallExists) => (
                 StatusCode::CONFLICT,
@@ -152,7 +177,10 @@ impl IntoResponse for SubmitError {
 
 /// The server-side form checks (matching `run_setup`'s own policy) so a
 /// blank field is a 400 for the form user, not a 500 from the bootstrap.
-fn validate(fields: &SetupFields) -> Result<(), String> {
+/// The `db_password` leg is mode-shaped exactly like `run_setup`'s: an
+/// external (TCP) deployment requires the TYPED password, a bundled
+/// (socket) one has none at all and refuses a POST carrying one.
+fn validate(fields: &SetupFields, mode: DbMode) -> Result<(), String> {
     // The master passphrase: required, confirmed. The page warns it is
     // not recoverable — the validation refuses blanks and mismatches with
     // the same 400 shape as every other field.
@@ -163,13 +191,22 @@ fn validate(fields: &SetupFields) -> Result<(), String> {
     if fields.master_passphrase != fields.master_passphrase_confirm {
         return Err("the master passphrase and its confirmation do not match".to_string());
     }
-    let required = [
+    let mut required = vec![
         ("admin_username", fields.admin_username.as_str()),
         ("admin_password", fields.admin_password.as_str()),
         ("default_domain", fields.default_domain.as_str()),
         ("server_hostname", fields.server_hostname.as_str()),
-        ("db_password", fields.db_password.as_str()),
     ];
+    match mode {
+        DbMode::External => required.push(("db_password", fields.db_password.as_str())),
+        DbMode::Bundled => {
+            if !fields.db_password.trim().is_empty() {
+                return Err("the bundled deployment has no database password — remove \
+                     the db_password field"
+                    .to_string());
+            }
+        }
+    }
     for (name, value) in required {
         if value.trim().is_empty() {
             return Err(format!("{name} must not be blank"));
@@ -208,7 +245,10 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
     default_domain: form.default_domain.value,
     admin_cidrs: form.admin_cidrs.value.split(',').map(s => s.trim()).filter(Boolean),
     server_hostname: form.server_hostname.value,
-    db_password: form.db_password.value,
+    // The bundled page renders no db_password input, so the named
+    // access is absent there — the empty string is exactly what the
+    // bundled POST policy expects.
+    db_password: form.db_password ? form.db_password.value : '',
   };
   const note = document.getElementById('result');
   try {
@@ -243,10 +283,23 @@ document.getElementById('setup-form').addEventListener('submit', async (event) =
 });
 ";
 
-/// Render the setup page.
-fn render(fingerprint: &str, hostname: &str) -> String {
+/// Render the setup page. The `db_password` block renders only for an
+/// external (TCP) deployment: the bundled (socket) one has no database
+/// password at all — the peer door replaces the typed credential, so
+/// the page collects nothing and the POST carries no field.
+fn render(fingerprint: &str, hostname: &str, db_mode: DbMode) -> String {
     let fingerprint = html_escape(fingerprint);
     let hostname = html_escape(hostname);
+    let db_password_block = match db_mode {
+        DbMode::External => concat!(
+            "<label for=\"db_password\">Database password — the login credential DATABASE_URL's role carries today</label>\n",
+            "<input id=\"db_password\" name=\"db_password\" type=\"password\" autocomplete=\"current-password\" required>\n",
+            "<p class=\"hint\">Setup connects with this password exactly once, rotates the \
+             database role to a fresh random credential, and seals that one under the master \
+             passphrase — the password you type here is never stored.</p>\n",
+        ),
+        DbMode::Bundled => "",
+    };
     format!(
         concat!(
             "<!doctype html>\n",
@@ -293,11 +346,7 @@ fn render(fingerprint: &str, hostname: &str) -> String {
              will serve after setup — it is not derived from the default domain, but it MUST \
              fall under the default domain above (e.g. <code>wardstone.example.com</code> \
              with default domain <code>example.com</code>).</p>\n",
-            "<label for=\"db_password\">Database password — the login credential DATABASE_URL's role carries today</label>\n",
-            "<input id=\"db_password\" name=\"db_password\" type=\"password\" autocomplete=\"current-password\" required>\n",
-            "<p class=\"hint\">Setup connects with this password exactly once, rotates the \
-             database role to a fresh random credential, and seals that one under the master \
-             passphrase — the password you type here is never stored.</p>\n",
+            "{db_password_block}",
             "<button type=\"submit\">Complete setup</button>\n",
             "</form>\n",
             "<div id=\"result\"></div>\n",
@@ -308,6 +357,7 @@ fn render(fingerprint: &str, hostname: &str) -> String {
         style = STYLE,
         hostname = hostname,
         fingerprint = fingerprint,
+        db_password_block = db_password_block,
         script = SCRIPT,
     )
 }
@@ -334,11 +384,12 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{html_escape, render};
+    use ws_core::db::DbMode;
 
     /// The page shows the operator's fingerprint and hostname, escaped.
     #[test]
     fn test_render_escapes_and_shows_the_deployment_values() {
-        let page = render("aabbccdd", "wardstone-ui.example.com");
+        let page = render("aabbccdd", "wardstone-ui.example.com", DbMode::External);
         assert!(page.contains("<code class=\"fingerprint\">aabbccdd</code>"));
         assert!(page.contains("wardstone-ui.example.com"));
     }

@@ -951,6 +951,12 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     // local link, a TCP URL must carry sslmode=verify-full AND the
     // operator's sslrootcert.
     ws_core::db::check_database_url(&cfg.database_url)?;
+    // The deployment mode the setup surface forks on (the bundled arm
+    // rides the peer door; the external arm keeps the typed-password
+    // form). Computed here once with `?` propagation: a bad URL was
+    // already refused by the gate above, so this classification cannot
+    // fail in practice.
+    let db_mode = ws_core::db::db_mode(&cfg.database_url)?;
     if sealed_instance(&cfg.keys_dir) {
         return run_ui_sealed(cfg).await;
     }
@@ -984,6 +990,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
         &cfg.api_url,
         &cfg.relay_socket,
         cfg.database_url.clone(),
+        db_mode,
         ws_web::DEFAULT_SESSION_TTL,
         cfg.web_rate_limit,
     );
