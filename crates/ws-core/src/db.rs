@@ -119,6 +119,57 @@ pub fn connect_options_with_statement_logging_off(
         .log_slow_statements(log::LevelFilter::Off, std::time::Duration::from_secs(1)))
 }
 
+/// The deployment a database URL implies: the bundled Postgres that
+/// ships beside Wardstone in the compose image, or an external server
+/// reached over TCP. The connection shape IS the mode — the same
+/// transport split [`check_database_url`] makes — so first-run code
+/// can gate mode-specific doors without ever asking the database.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DbMode {
+    /// The database lives beside Wardstone and speaks over its shared
+    /// unix socket — the bundled deployment, where unix-socket peer
+    /// credentials are the protection and no TLS applies.
+    Bundled,
+    /// The database is a separate server reached over TCP — an
+    /// external deployment, which must be TLS-verified end to end.
+    External,
+}
+
+/// Classify `url` into [`DbMode`] by parsing it — no connection, no
+/// query: a socket host (the same `get_socket().is_some()` edge
+/// [`check_database_url`] splits on) is [`DbMode::Bundled`], anything
+/// else is [`DbMode::External`]. A URL that does not parse is
+/// [`CoreError::Config`], the same refusal the option builders give.
+pub fn db_mode(url: &str) -> Result<DbMode, CoreError> {
+    let options = PgConnectOptions::from_str(url)
+        .map_err(|e| CoreError::Config(format!("database URL does not parse: {e}")))?;
+    if options.get_socket().is_some() {
+        Ok(DbMode::Bundled)
+    } else {
+        Ok(DbMode::External)
+    }
+}
+
+/// The first-run setup door's connect options: build on
+/// [`connect_options_with_statement_logging_off`] (the role-rotation
+/// ALTER that rides this connection inherits that builder's
+/// statement-logging-off guarantee — see its WHY), refuse anything
+/// but the bundled shared-socket form, and log in as the passwordless
+/// [`SETUP_ROLE`](crate::dbcred::SETUP_ROLE), whose identity is the
+/// socket's own peer credential (`SO_PEERCRED` — the server trusts the
+/// connecting OS user, never a password). No password is ever set: the
+/// URL's own shape carries none, and a TCP URL is refused outright.
+pub fn peer_setup_connect_options(url: &str) -> Result<PgConnectOptions, CoreError> {
+    let options = connect_options_with_statement_logging_off(url)?;
+    if options.get_socket().is_none() {
+        return Err(CoreError::Config(
+            "the peer setup door is a bundled-only concept: the URL must be the shared-socket form"
+                .to_string(),
+        ));
+    }
+    Ok(options.username(crate::dbcred::SETUP_ROLE))
+}
+
 /// Map sqlx's migration failure set onto [`CoreError`]. `MigrateError::Execute`
 /// wraps a genuine [`sqlx::Error`] and keeps its typed source; every other
 /// variant (missing/edited migration, dirty state, source resolution) is a
@@ -187,4 +238,84 @@ fn ssl_root_cert_configured(url: &str) -> bool {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         matches!(key, "sslrootcert" | "ssl-root-cert" | "ssl-ca") && !value.is_empty()
     })
+}
+
+/// # Unit tests
+///
+/// Parse-level only: the connection shape IS the mode, and the option
+/// builders never connect. No database is touched here.
+#[cfg(test)]
+mod tests {
+    use super::{db_mode, peer_setup_connect_options, DbMode};
+    use crate::error::CoreError;
+
+    /// The bundled shared-socket form (the compose deployment's own URL).
+    const SOCKET_URL: &str = "postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone";
+
+    /// The external TCP form, carrying both mandated protections.
+    const TCP_URL: &str =
+        "postgres://wardstone@localhost:5432/wardstone?sslmode=verify-full&sslrootcert=/ca.pem";
+
+    #[test]
+    fn a_socket_url_is_the_bundled_mode() {
+        assert_eq!(
+            db_mode(SOCKET_URL).expect("the bundled URL parses"),
+            DbMode::Bundled
+        );
+    }
+
+    #[test]
+    fn a_tcp_url_is_the_external_mode() {
+        assert_eq!(
+            db_mode(TCP_URL).expect("the external URL parses"),
+            DbMode::External
+        );
+    }
+
+    #[test]
+    fn an_unparseable_url_is_a_config_error() {
+        let err = db_mode("not a url").expect_err("a URL-shaped string that is not a URL");
+        assert!(
+            matches!(err, CoreError::Config(_)),
+            "a parse failure is Config, got {err:?}"
+        );
+    }
+
+    /// The socket survives and the login is the setup role; the URL's
+    /// own shape carries no password (boot's gate refuses one), and no
+    /// builder step adds one — `PgConnectOptions` keeps its password
+    /// private with no getter, so the observable pins are the
+    /// username, the socket, and the database.
+    #[test]
+    fn peer_options_carry_the_setup_role_over_the_socket() {
+        let options = peer_setup_connect_options(SOCKET_URL).expect("the bundled URL parses");
+        assert_eq!(
+            options.get_username(),
+            crate::dbcred::SETUP_ROLE,
+            "the door logs in as the setup role"
+        );
+        assert_eq!(
+            options.get_socket().map(|path| path.display().to_string()),
+            Some("/run/wardstone/pg".to_string()),
+            "the socket survives the username swap"
+        );
+        assert_eq!(
+            options.get_database(),
+            Some("wardstone"),
+            "the built options stay connect-shaped"
+        );
+    }
+
+    #[test]
+    fn peer_options_refuse_an_external_url() {
+        let err = peer_setup_connect_options(TCP_URL).expect_err("a TCP URL is refused outright");
+        assert!(
+            matches!(err, CoreError::Config(_)),
+            "the refusal is Config, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("bundled-only concept"),
+            "the refusal names the door's constraint: {err}"
+        );
+    }
 }

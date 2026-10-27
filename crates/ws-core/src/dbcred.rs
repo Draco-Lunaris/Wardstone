@@ -293,6 +293,27 @@ pub async fn alter_role_password(
     Ok(())
 }
 
+/// The passwordless bootstrap role the first-run setup door connects
+/// as: it exists only in the bundled deployment, where the shared unix
+/// socket's peer credentials (`SO_PEERCRED`) are the whole
+/// authentication — the server trusts the connecting OS user and no
+/// password is ever set. The name is underscored, so it is SQL-unquoted
+/// everywhere (spec's call 1).
+pub const SETUP_ROLE: &str = "ws_setup";
+
+/// Close the setup door once first-run setup has rotated the
+/// `wardstone` role's credential: `ALTER ROLE … NOLOGIN` makes
+/// [`SETUP_ROLE`] unable to log in again. The statement is the same
+/// format-inlined shape [`alter_role_password`] uses (Postgres utility
+/// statements accept no bind parameters), carries no secret, and is
+/// idempotent — a role already `NOLOGIN` alters cleanly.
+pub async fn disarm_setup_role(executor: impl sqlx::PgExecutor<'_>) -> Result<(), CoreError> {
+    sqlx::query(&format!("ALTER ROLE {SETUP_ROLE} NOLOGIN"))
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// The advisory lock's lease over the rotation connection (Ruling 15: a
 /// SESSION-level `pg_advisory_lock` on a pooled connection that is
 /// never unlocked stalls every later rotation that lands on that
