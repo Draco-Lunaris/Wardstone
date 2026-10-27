@@ -227,8 +227,11 @@ services:
     command: ["wardstone", "api"]
     environment:
       # Password-less BY CONTRACT (sealed at rest): no database
-      # credential exists in this process's environment at all.
-      # The api boots as the sealed shell, and the unlock relay
+      # credential exists in this process's environment by design —
+      # the one thing that may sit there is an upgraded old bundle's
+      # stale `WARDSTONE_DB_PASSWORD`, and it stays only until the
+      # boot gate refuses it loudly (the variable below names it). The
+      # api boots as the sealed shell, and the unlock relay
       # (the ui, after the operator's passphrase, over the shared
       # socket) opens the db-credential envelope, rotates the
       # role's password, and connects with the fresh value — the

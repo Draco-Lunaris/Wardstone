@@ -447,7 +447,10 @@ sealing — remove both volumes and run setup again`) rather than
 half-serve. The reverse mismatch is refused by the setup POST itself
 (`the database already holds an install but the keys volume is empty —
 restore the matching keys volume, or remove both volumes and run setup
-again`). The credential takeover's crash windows are the variant's:
+again`). A bundled setup that fails after the door opened — this
+mismatch's refusal included, since the matching-keys-volume restore
+can never complete — leaves the setup door armed; the bundled recovery
+runbook's disarm step (below) closes it. The credential takeover's crash windows are the variant's:
 the bundled arm rotates the role BEFORE the tenant work, so a crash
 between the takeover and the commit leaves only overwritable strays —
 the door is still armed, the next boot serves the setup page again, and

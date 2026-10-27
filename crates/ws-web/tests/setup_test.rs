@@ -1162,14 +1162,17 @@ async fn a_fixture_dropped_mid_rotation_restores_the_shared_role() {
     sweep_tenant(&pool, setup::DEFAULT_TENANT_NAME).await;
 }
 
-/// The recovery runbook (spec §8): a re-initialized db volume leaves the
-/// sealed credential envelope pointing at a dead password. The
-/// operator's documented move — stop the stack, delete
-/// `db-credential.envelope`, set a fresh `WARDSTONE_DB_PASSWORD`, boot —
-/// must land on an unlock that RE-SEEDS: the ui's build mints a fresh
-/// credential over the recovery URL's connection, ALTERs the role to
-/// it, and seals it at the volume's generation, so the relayed api
-/// unlock finds a live envelope again.
+/// The external recovery arm (spec §8): a keys volume whose
+/// db-credential envelope is gone or points at a dead password is
+/// healed at unlock. The operator's documented move — install a fresh
+/// verifier on the database side, remove the stale envelope, unlock
+/// with the master passphrase plus the fresh password typed into the
+/// page's database-password field (the bundled arm grows no field at
+/// all: its heal rides the re-armed peer door) — must land on a heal
+/// that RE-SEEDS: the unlock's recovery mints a fresh credential over
+/// the typed password's connection, ALTERs the role to it, and seals
+/// it at the volume's generation, so the relayed api unlock finds a
+/// live envelope again.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
