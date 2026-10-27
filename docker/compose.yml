@@ -343,22 +343,32 @@ services:
       # password exists in this file or the environment.
       POSTGRES_USER: wardstone
       POSTGRES_DB: wardstone
-      # The trust init-window opt-in: the official image applies trust
-      # ONLY to the initdb temp server on a virgin volume — the same
-      # init window today's bundle already has (the temp server runs
-      # its own generated hba either way). The final server reads the
-      # pinned hba mounted below: zero trust lines, no TCP listener,
-      # so trust never outlives the init window.
+      # The trust opt-in stays because it is what passes the official
+      # image's minimum-env check without a POSTGRES_PASSWORD — but its
+      # trust line never reaches a live server: the image appends it
+      # to the hba it generates in PGDATA, and every server in this
+      # bundle runs with the pinned hba mounted below (the initdb temp
+      # server included — the entrypoint hands pg_ctl the FULL command
+      # list, the hba_file flag included), which has zero trust lines
+      # and no TCP listener. The real init window is peer-mapped: the
+      # pinned hba's recovery line (the container's postgres system
+      # user peer-mapped onto the wardstone role) carries the
+      # first-boot init — stronger than the trust line the variable
+      # was once believed to add.
       POSTGRES_HOST_AUTH_METHOD: trust
     # D8's local link (Task 10): the database binds NO TCP listener at
     # all (listen_addresses is empty) — the only way in is the shared
     # socket at /run/wardstone/pg, mode 0770 so ui/api (group_add'ed to
     # postgres's group) may connect. The pinned hba/ident (mounted
     # read-only at /etc/wardstone below) carry the ws_setup peer door,
-    # the app's SCRAM line, and the recovery peer+ident line; the
-    # initdb temp server the entrypoint runs on a virgin volume uses
-    # its OWN generated hba, so the first-init role creation is
-    # unaffected.
+    # the app's SCRAM line, and the recovery peer+ident line — and
+    # they govern the init phase too: the entrypoint hands pg_ctl the
+    # FULL command list (the hba_file and ident_file flags included),
+    # so the initdb temp server on a virgin volume reads the SAME
+    # pinned hba, and the init script's first-boot dial rides the
+    # recovery peer line (db `postgres`, the container's postgres
+    # system user peer-mapped onto the wardstone role) — the same
+    # line the stock entrypoint's own CREATE DATABASE dials.
     command: postgres -c listen_addresses='' -c unix_socket_directories=/run/wardstone/pg -c unix_socket_permissions=0770 -c hba_file=/etc/wardstone/pg_hba.conf -c ident_file=/etc/wardstone/pg_ident.conf
     volumes:
       # PERSISTENT, unlike the dev bundle: this volume holds the CA. It is

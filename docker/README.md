@@ -82,9 +82,14 @@ an EMPTY directory, and the db then fatal-loops (its wrapper and hba
 are empty directories, so postgres cannot start; the restart policy
 churns the container forever). If a fresh deploy's db never comes
 healthy, check the layout first. On a virgin volume `up` completes the
-database's init by itself: the wrapper bridges the image's default
-socket path onto the shared directory so the stock entrypoint's init
-phase runs, and the init script arms the door. The operator's only
+database's init by itself: the initdb temp server runs with the pinned
+`pg_hba.conf` in force (the stock entrypoint hands pg_ctl the full
+compose command, the `hba_file` flag included), the wrapper bridges the
+image's default socket path onto the shared directory so the
+entrypoint's init-phase dials reach it, and the init script arms the
+door over the pinned hba's recovery peer line — the container's
+postgres system user peer-mapped onto the `wardstone` role, the same
+line the entrypoint's own CREATE DATABASE rides. The operator's only
 first-run acts are the `/run` pre-step above and the setup form below.
 
 First run: browse `https://<host>:8443/` and accept the freshly minted
