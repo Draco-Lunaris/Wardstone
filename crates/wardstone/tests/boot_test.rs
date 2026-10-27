@@ -70,6 +70,11 @@ const TORN_REFUSAL: &str =
 /// The ui's password-URL refusal (Review Focus 5, the spec's exact copy).
 const UI_PASSWORD_REFUSAL: &str = "DATABASE_URL carries a password; Wardstone reads the database credential only from its sealed envelope or the setup page";
 
+/// The stale-variable refusal (the plan's pinned copy): an upgraded old
+/// bundle may still carry `WARDSTONE_DB_PASSWORD`, but the bundled
+/// database has no password at all.
+const STALE_DB_PASSWORD_REFUSAL: &str = "WARDSTONE_DB_PASSWORD is obsolete in the bundled deployment — the bundled database has no password (setup takes over the role through the peer-authenticated door); delete the variable from .env and run again";
+
 /// The bundled heal's pinned lede: the unlock page names the peer door
 /// (never a typed database password) when a bundled volume holds no
 /// db-credential envelope.
@@ -687,6 +692,61 @@ async fn a_password_in_the_ui_database_url_is_refused() {
     assert!(
         out.contains(UI_PASSWORD_REFUSAL),
         "the refusal carries the spec's exact copy, got:\n{out}"
+    );
+}
+
+/// A stale `WARDSTONE_DB_PASSWORD` from the old bundle's `.env`: the
+/// bundled deployment's database has no password at all, so the
+/// variable is dead weight that reads as live configuration — the ui
+/// refuses at boot with the plan's exact copy and exits non-zero,
+/// before any key or database work. The sibling pass case: the same
+/// boot WITHOUT the variable reaches the first-run setup page (unset
+/// and empty-string both pass; the empty-string variant needs no case
+/// of its own).
+#[tokio::test]
+#[ignore = "part of the DB-gated boot battery (--include-ignored)"]
+async fn a_stale_bundled_db_password_refuses_the_boot() {
+    let keys = scratch_keys_dir("stale-db-password");
+    let db_url = child_database_url();
+    let relay = scratch_relay_socket("stale-db-password");
+    let mut boot = Boot::start(
+        "ui",
+        &keys,
+        &db_url,
+        free_port(),
+        None,
+        relay.clone(),
+        &[("WARDSTONE_DB_PASSWORD".into(), "x".into())],
+    );
+    let status = boot.wait_exit();
+    std::thread::sleep(Duration::from_millis(300));
+    let out = boot.drain_output();
+    drop(boot);
+
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "a stale bundled WARDSTONE_DB_PASSWORD must refuse at boot, but it kept serving:\n{out}"
+        )
+    });
+    assert!(
+        !status.success(),
+        "the stale-variable refusal exits non-zero, got {status:?}"
+    );
+    assert!(
+        out.contains(STALE_DB_PASSWORD_REFUSAL),
+        "the refusal carries the plan's exact copy, got:\n{out}"
+    );
+
+    // The sibling pass case: the same boot WITHOUT the variable serves
+    // the first-run setup page — the gate is silent (the boot dials no
+    // database in this phase, so no lock is needed).
+    let clean = Boot::ui(&keys, &db_url, free_port(), None, relay);
+    let clean_out = clean.output_until(&[SETUP_PAGE_LOG]);
+    drop(clean);
+    let _ = std::fs::remove_dir_all(&keys);
+    assert!(
+        clean_out.contains(SETUP_PAGE_LOG),
+        "without the stale variable the boot serves the setup page, got:\n{clean_out}"
     );
 }
 

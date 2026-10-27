@@ -239,8 +239,9 @@ fn run_result(result: Result<(), BootError>) -> std::process::ExitCode {
 /// Postgres login material for the operator to install by hand.
 /// Default mode: a fresh 52-char typeable credential, its
 /// SCRAM-SHA-256 verifier, and the hint that only the VERIFIER belongs
-/// in `.env` (single-quoted; the plaintext behind it is what actually
-/// logs in). `--password-stdin`: the operator's own chosen password is
+/// in an external deployment's `.env` (single-quoted; the plaintext
+/// behind it is what actually logs in). `--password-stdin`: the
+/// operator's own chosen password is
 /// read from stdin (one line, trailing newline stripped) and NEVER
 /// echoed — only the verifier and the hint print. An empty chosen
 /// password is refused loudly (an empty login credential would lock the
@@ -315,12 +316,15 @@ fn run_db_verifier(second: Option<&str>) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// The operator hint both mint modes print: ONLY the verifier belongs
-/// in `.env`, single-quoted (Postgres stores the verifier as-is; the
-/// plaintext behind it — not the verifier — is what logs in).
+/// The operator hint both mint modes print: the mint's remaining
+/// customers are EXTERNAL deployments (the External bootstrap and the
+/// recovery runbook) — only the verifier belongs in an external
+/// deployment's `.env`, single-quoted (Postgres stores the verifier
+/// as-is; the plaintext behind it — not the verifier — is what logs
+/// in). The bundled deployment has no `WARDSTONE_DB_PASSWORD` at all.
 fn print_verifier_hint(verifier: &str) {
     println!(
-        "hint: put only the verifier in .env, single-quoted: WARDSTONE_DB_PASSWORD='{verifier}'"
+        "hint: for an external deployment, put only the verifier in .env, single-quoted: WARDSTONE_DB_PASSWORD='{verifier}'"
     );
 }
 
@@ -981,6 +985,12 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     // local link, a TCP URL must carry sslmode=verify-full AND the
     // operator's sslrootcert.
     ws_core::db::check_database_url(&cfg.database_url)?;
+    // Task 4's stale-variable gate: an old bundle's `.env` may still
+    // carry `WARDSTONE_DB_PASSWORD` after an upgrade — the bundled
+    // database has no password, so the variable is dead weight that
+    // reads as live configuration. Refused loudly before any key or
+    // database work (the identical call sits in the api).
+    refuse_stale_db_password(&cfg.database_url)?;
     // The deployment mode the setup surface forks on (the bundled arm
     // rides the peer door; the external arm keeps the typed-password
     // form). Computed here once with `?` propagation: a bad URL was
@@ -1065,6 +1075,34 @@ fn db_url_has_password(url: &str) -> bool {
         return false;
     };
     url[auth_start..at].rfind(':').is_some()
+}
+
+/// The stale-variable refusal's pinned copy (Task 4): a deployment
+/// upgrading from the old bundle may still carry
+/// `WARDSTONE_DB_PASSWORD` in `.env` — the bundled database has no
+/// password at all, so the variable is dead weight that reads as live
+/// configuration. The copy names the VARIABLE only, never a value (no
+/// secret reaches an error at any level).
+const STALE_DB_PASSWORD_REFUSAL: &str = "WARDSTONE_DB_PASSWORD is obsolete in the bundled \
+ deployment — the bundled database has no password (setup takes over the \
+ role through the peer-authenticated door); delete the variable from .env \
+ and run again";
+
+/// The stale-bundle gate BOTH boot modes run after
+/// [`ws_core::db::check_database_url`] (the URL already parses, so the
+/// mode classification cannot fail here): a BUNDLED deployment — the
+/// socket-URL form — that still sets a non-empty `WARDSTONE_DB_PASSWORD`
+/// is an upgraded old bundle and is refused. Unset and empty-string
+/// both pass (the variable is absent, not stale); an EXTERNAL
+/// deployment's variable is the operator's own bookkeeping (the spec's
+/// non-goal) and passes untouched.
+fn refuse_stale_db_password(url: &str) -> Result<(), BootError> {
+    if ws_core::db::db_mode(url)? == ws_core::db::DbMode::Bundled
+        && std::env::var("WARDSTONE_DB_PASSWORD").is_ok_and(|value| !value.is_empty())
+    {
+        return Err(BootError::Config(STALE_DB_PASSWORD_REFUSAL.to_owned()));
+    }
+    Ok(())
 }
 
 /// The `application_name` the ui process labels its database
@@ -1229,6 +1267,11 @@ async fn run_api(mut cfg: BootConfig) -> Result<(), BootError> {
     // local link, a TCP URL must carry sslmode=verify-full AND the
     // operator's sslrootcert.
     ws_core::db::check_database_url(&cfg.database_url)?;
+    // Task 4's stale-variable gate, the ui's twin: an old bundle's
+    // `.env` may still carry `WARDSTONE_DB_PASSWORD` after an upgrade
+    // — the bundled database has no password, so the boot refuses
+    // instead of serving beside a stale credential contract.
+    refuse_stale_db_password(&cfg.database_url)?;
     // The api's connections carry their process label (Task 11's
     // Postgres-side scans key off the ui/api `application_name`s, and
     // the label rides the query through every credential splice).
