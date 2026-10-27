@@ -22,8 +22,10 @@ use crate::error::CoreError;
 pub const REQUIRED_MIGRATION_COUNT: u16 = 12;
 
 /// Open a Postgres connection pool (max 10 connections) and bring the
-/// database up to date through [`migrate_and_check`] — the one home for
-/// the migration and bookkeeping-count policy (see its steps).
+/// database up to date — the migration and bookkeeping-count policy is
+/// inlined here (refuse a schema whose bookkeeping is missing, run the
+/// embedded migrations over the pool, then check the applied count);
+/// [`migrate_and_check`] carries the same policy for the bundled arm.
 pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
     let options = connect_options_with_statement_logging_off(url)?;
     let pool = PgPoolOptions::new()
@@ -64,11 +66,11 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
 }
 
 /// Bring the database up to date over a Postgres connection and verify
-/// the bookkeeping — the ONE home for the migration + count policy,
-/// shared by [`connect`]'s pool-acquired connection and the bundled
-/// first-run setup's peer connection (which runs it `SET ROLE`'d to the
-/// URL's login role, so object ownership is byte-identical to a
-/// pool-based run):
+/// the bookkeeping — the migration + count policy for the BUNDLED arm,
+/// run by the bundled first-run setup's peer connection (which runs it
+/// `SET ROLE`'d to the URL's login role, so object ownership is
+/// byte-identical to a pool-based run). [`connect`] does not call
+/// this: it inlines the same policy over its pool.
 ///
 /// 1. Refuse a database where the schema exists but the migration
 ///    bookkeeping does not: `_sqlx_migrations` with zero rows while
