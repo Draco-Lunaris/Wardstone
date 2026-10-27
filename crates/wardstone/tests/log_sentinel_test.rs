@@ -956,11 +956,12 @@ fn setup_fields() -> ws_web::setup::SetupFields {
 // The in-process arms' log capture (the reshape's log-net rule): the
 // setup and the recovery run in THIS process through the production
 // external arm, so their tracing events need a haystack net of their
-// own — a scoped fmt subscriber at TRACE writing into a buffer that
-// joins the captured-output haystack.
+// own — a thread-local fmt subscriber at TRACE plus a process-wide
+// registry-routed net, both writing into a buffer that joins the
+// captured-output haystack.
 // ---------------------------------------------------------------------------
 
-/// The shared byte buffer the scoped subscriber writes into.
+/// The shared byte buffer both capture nets write into.
 type LogBuffer = Arc<Mutex<Vec<u8>>>;
 
 /// One fmt-event `Write` sink over the shared buffer.
@@ -979,21 +980,130 @@ impl std::io::Write for BufferSink {
     }
 }
 
-/// A scoped TRACE fmt subscriber writing into a fresh buffer. The
-/// guard is thread-local and the suite's current-thread runtime drives
-/// every await from the installing thread, so the production code's
-/// events land in the returned buffer; the caller drops the guard and
-/// folds the buffer into the output haystack.
-fn scoped_log_capture() -> (tracing::subscriber::DefaultGuard, LogBuffer) {
+/// The open capture windows, innermost last: the process-global
+/// subscriber's writer consults this on every event, attributing it to
+/// the innermost open window; an event arriving while the registry is
+/// empty is outside every window and is dropped.
+static ACTIVE_LOG_WINDOWS: Mutex<Vec<LogBuffer>> = Mutex::new(Vec::new());
+
+/// Guards the one-time `set_global_default` install (once-per-process
+/// and permanent). The suite's two tests serialize on advisory key
+/// 0020 and share this process, so the global net is installed before
+/// the first window opens and stays for the second one.
+static GLOBAL_CAPTURE: std::sync::Once = std::sync::Once::new();
+
+/// One fmt-event `Write` sink over the innermost open window — the net
+/// for threads with no thread-local default of their own (tokio runs
+/// `spawn_blocking` closure bodies on blocking-pool threads, where a
+/// `set_default`-only net would silently miss the events).
+struct RegistrySink;
+
+impl std::io::Write for RegistrySink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let windows = ACTIVE_LOG_WINDOWS.lock().expect("the log window registry");
+        if let Some(buffer) = windows.last() {
+            buffer
+                .lock()
+                .expect("the log buffer")
+                .extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The `MakeWriter` handing the process-global subscriber a
+/// [`RegistrySink`] for every event it formats.
+struct RegistryMakeWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RegistryMakeWriter {
+    type Writer = RegistrySink;
+    fn make_writer(&'a self) -> Self::Writer {
+        RegistrySink
+    }
+}
+
+/// Install the process-global TRACE subscriber once per process: its
+/// events route through [`RegistrySink`], so they reach whichever
+/// window is open and are dropped outside every window. A global
+/// default someone else already installed is a hard error — the
+/// sentinel must not silently run without its process-wide net.
+fn install_global_capture_once() {
+    GLOBAL_CAPTURE.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(RegistryMakeWriter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the process-global capture installs once");
+    });
+}
+
+/// Closes the thread-local default and pops this test's window when
+/// dropped — the thread-local `DefaultGuard` is a field, so it closes
+/// with the window.
+struct ScopedLogGuard {
+    /// Held only for its `Drop` (closing the thread-local default),
+    /// never read.
+    #[allow(dead_code)]
+    thread_guard: tracing::subscriber::DefaultGuard,
+    buffer: LogBuffer,
+}
+
+impl Drop for ScopedLogGuard {
+    fn drop(&mut self) {
+        let mut windows = ACTIVE_LOG_WINDOWS.lock().expect("the log window registry");
+        if let Some(at) = windows
+            .iter()
+            .position(|open| Arc::ptr_eq(open, &self.buffer))
+        {
+            windows.remove(at);
+        }
+    }
+}
+
+/// A scoped TRACE capture over BOTH nets, writing into one fresh
+/// buffer:
+///
+/// - a thread-local `set_default` subscriber — the installing thread's
+///   events (the suite's current-thread tokio runtime drives the
+///   awaits from that thread), and
+/// - the process-global subscriber of [`install_global_capture_once`]
+///   — every other thread's events, `spawn_blocking` closure bodies
+///   included, which run on tokio's blocking pool where the
+///   thread-local default is unset and a `set_default`-only net would
+///   silently miss them.
+///
+/// An event dispatches to exactly one subscriber — the emitting
+/// thread's thread-local default when it has one, else the process
+/// global — so the two nets never double-write. Dropping the guard
+/// closes the thread-local default and pops the window; an event
+/// racing the pop is dropped, the same boundary a child process has
+/// at exit. The caller folds the buffer into the output haystack.
+fn scoped_log_capture() -> (ScopedLogGuard, LogBuffer) {
+    install_global_capture_once();
     let buffer: LogBuffer = Arc::new(Mutex::new(Vec::new()));
+    ACTIVE_LOG_WINDOWS
+        .lock()
+        .expect("the log window registry")
+        .push(buffer.clone());
     let sink = buffer.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || BufferSink(sink.clone()))
         .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    (guard, buffer)
+    let thread_guard = tracing::subscriber::set_default(subscriber);
+    (
+        ScopedLogGuard {
+            thread_guard,
+            buffer: buffer.clone(),
+        },
+        buffer,
+    )
 }
 
 /// Fold a captured in-process buffer into the output haystack under a
