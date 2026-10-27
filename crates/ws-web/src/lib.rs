@@ -49,6 +49,7 @@ use axum::Extension;
 use axum::Router;
 use sqlx::PgPool;
 use ws_ca::error::CaError;
+use ws_core::db::DbMode;
 
 use session::relay::relay_router;
 use session::store::SessionStore;
@@ -153,6 +154,11 @@ pub const DEFAULT_IDLE_EVICTION: Duration = Duration::from_secs(6 * 3600);
 /// surface mounts (no tenant yet): the binary passes `Some(clone)` on
 /// that boot path and `None` on the others; tests pass `None` (no
 /// listener to swap).
+///
+/// `db_mode` is the deployment mode the setup surface forks on
+/// (`ws_core::db::db_mode`'s classification of `database_url`): the
+/// binary computes it once after its URL gate; the router suites pass
+/// the external classification their TCP URLs carry.
 #[allow(clippy::too_many_arguments)]
 pub async fn web_router(
     pool: PgPool,
@@ -163,6 +169,7 @@ pub async fn web_router(
     api_base_url: &str,
     relay_socket: &std::path::Path,
     database_url: String,
+    db_mode: DbMode,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -176,6 +183,7 @@ pub async fn web_router(
         api_base_url,
         relay_socket,
         database_url,
+        db_mode,
         store,
         rate_limit,
     )
@@ -205,6 +213,7 @@ pub async fn web_router_with_store(
     api_base_url: &str,
     relay_socket: &std::path::Path,
     database_url: String,
+    db_mode: DbMode,
     store: std::sync::Arc<SessionStore>,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Result<Router, CaError> {
@@ -223,6 +232,7 @@ pub async fn web_router_with_store(
             tls_reload,
             relay_socket: relay_socket.to_path_buf(),
             database_url,
+            db_mode,
         }))
     } else {
         session_router_with_store(store, api_base_url, rate_limit).merge(setup_unmounted_router())
@@ -289,11 +299,12 @@ pub fn session_router_with_store(
 /// this router is built WITHOUT a pool: the RAM-only certificate, the
 /// setup page, the session relay, and the proxies are the whole
 /// surface, and the setup POST is the first thing that ever dials the
-/// database (with the operator's typed password, via
-/// [`setup::run_setup`]). A pool-less router is what makes the
-/// closed-port boot test pin real behavior: the process serves the
-/// page while `DATABASE_URL` points at a dead port, and a restart
-/// before setup writes nothing and accumulates nothing.
+/// database (with the operator's typed password — or over the bundled
+/// deployment's peer door — via [`setup::run_setup`]). A pool-less
+/// router is what makes the closed-port boot test pin real behavior:
+/// the process serves the page while `DATABASE_URL` points at a dead
+/// port, and a restart before setup writes nothing and accumulates
+/// nothing.
 ///
 /// `tls_reload` is the listener's serving-certificate RESOLVER — the
 /// handle the setup commit swaps onto the CA-issued leaf in place (the
@@ -308,6 +319,7 @@ pub fn first_run_web_router(
     api_base_url: &str,
     relay_socket: &std::path::Path,
     database_url: String,
+    db_mode: DbMode,
     session_access_ttl: Duration,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Router {
@@ -320,6 +332,7 @@ pub fn first_run_web_router(
             tls_reload,
             relay_socket: relay_socket.to_path_buf(),
             database_url,
+            db_mode,
         }))
         // The SPA rides LAST as always: the setup routes and the proxy
         // above are never masked.

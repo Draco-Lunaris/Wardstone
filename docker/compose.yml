@@ -55,12 +55,13 @@
 # Usage:
 #
 #   WARDSTONE_SERVER_HOSTNAME=ca.example.test \
-#   WARDSTONE_DB_PASSWORD=… \
 #   docker compose -f docker/compose.yml up -d
 #
-# The two `:?` variables are REQUIRED by design: without a real hostname
-# the setup certificate would serve a placeholder SAN, and without a
-# password the bundled Postgres would be guessable.
+# The `:?` variable is REQUIRED by design: without a real hostname
+# the setup certificate would serve a placeholder SAN. There is NO
+# password variable at all — the bundled Postgres boots passwordless
+# through the peer setup door (the db service below owns the
+# bootstrap).
 #
 # The image: compose does not build anything in this bundle — the image is
 # supplied by the release flow (see "The image and the keys volume" in
@@ -118,22 +119,29 @@ services:
     command: ["wardstone", "ui"]
     environment:
       # The Postgres URL, password-less BY CONTRACT (Task 10, ruling
-      # 28e): the compose bootstrap credential leaves DATABASE_URL
-      # entirely — WARDSTONE_DB_PASSWORD remains only the `db`
-      # service's POSTGRES_PASSWORD, and the FIRST-RUN boot's setup
-      # page reads it from the operator's typed db_password field (the
-      # conversion that ends setup seals the ROTATED credential, and
-      # every later ui boot substitutes the CURRENT one from the
-      # db-credential envelope). The socket-host form is the bundled
-      # link (D8): local traffic rides /run/wardstone/pg, no TCP; the
-      # External variant (docker/README.md) replaces this with the
-      # operator's own database, verify-full required. The socket
-      # rides the URL's authority percent-encoded: sqlx (and the
-      # binary's password splice) cannot parse the libpq empty-host
-      # spelling `user@/db?host=/path`, so the percent-encoded form is
-      # the one every consumer parses (Task 10 deviation from ruling
+      # 28e): no database credential ever sits in DATABASE_URL. The
+      # bundled form's credential story is the peer door: the db
+      # service's init script arms the ws_setup role, the FIRST-RUN
+      # setup takes the wardstone role over through it (peer
+      # authentication over the shared socket), rotates the
+      # credential, and seals it into the db-credential envelope —
+      # the conversion that ends setup — and every later ui boot
+      # substitutes the CURRENT one from that envelope. The
+      # socket-host form is the bundled link (D8): local traffic
+      # rides /run/wardstone/pg, no TCP; the External variant
+      # (docker/README.md) replaces this with the operator's own
+      # database, verify-full required. The socket rides the URL's
+      # authority percent-encoded: sqlx (and the binary's password
+      # splice) cannot parse the libpq empty-host spelling
+      # `user@/db?host=/path`, so the percent-encoded form is the
+      # one every consumer parses (Task 10 deviation from ruling
       # 28e — same role, database, and socket directory).
       DATABASE_URL: postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone
+      # Passed through ONLY so the binary can refuse a stale value
+      # loudly (Task 4's gate — an upgraded old bundle's .env may
+      # still carry the variable, and the bundled database has no
+      # password); the binary never logs the value.
+      WARDSTONE_DB_PASSWORD: ${WARDSTONE_DB_PASSWORD:-}
       # The keystore directory: master KEK, CA key envelopes, the setup
       # slot, the JWT key pair, and the secret-encryption key file all
       # live under it — the SAME volume for BOTH Wardstone services, so
@@ -219,17 +227,26 @@ services:
     command: ["wardstone", "api"]
     environment:
       # Password-less BY CONTRACT (sealed at rest): no database
-      # credential exists in this process's environment at all. The api
-      # boots as the sealed shell — on a fresh volume the absent password
-      # is itself the boot signal — and the unlock relay (the ui, after
-      # the operator's passphrase, over the shared socket) opens the
-      # db-credential envelope, rotates the role's password, and
-      # connects with the fresh value. This URL names only the ROLE and
-      # the local socket to authenticate at (Task 10, ruling 28e: the
-      # bundled form — D8's local link, no TCP), with the socket
-      # percent-encoded in the authority — the one spelling sqlx
-      # parses (see the ui service's DATABASE_URL note).
+      # credential exists in this process's environment by design —
+      # the one thing that may sit there is an upgraded old bundle's
+      # stale `WARDSTONE_DB_PASSWORD`, and it stays only until the
+      # boot gate refuses it loudly (the variable below names it). The
+      # api boots as the sealed shell, and the unlock relay
+      # (the ui, after the operator's passphrase, over the shared
+      # socket) opens the db-credential envelope, rotates the
+      # role's password, and connects with the fresh value — the
+      # bundled form's credential story is the peer door, not a
+      # compose-carried credential. This URL names only the ROLE
+      # and the local socket to authenticate at (Task 10, ruling
+      # 28e: the bundled form — D8's local link, no TCP), with the
+      # socket percent-encoded in the authority — the one spelling
+      # sqlx parses (see the ui service's DATABASE_URL note).
       DATABASE_URL: postgres://wardstone@%2Frun%2Fwardstone%2Fpg/wardstone
+      # Passed through ONLY so the binary can refuse a stale value
+      # loudly (Task 4's gate — an upgraded old bundle's .env may
+      # still carry the variable, and the bundled database has no
+      # password); the binary never logs the value.
+      WARDSTONE_DB_PASSWORD: ${WARDSTONE_DB_PASSWORD:-}
       WARDSTONE_KEYS_DIR: /var/lib/wardstone/keys
       WARDSTONE_SERVER_HOSTNAME: ${WARDSTONE_SERVER_HOSTNAME:?set WARDSTONE_SERVER_HOSTNAME (the certificate SAN, e.g. ca.example.test)}
       # No WARDSTONE_API_URL: the api mode has no proxy to point at, and
@@ -311,21 +328,50 @@ services:
     image: postgres:18-alpine
     container_name: wardstone-db
     restart: unless-stopped
+    # The bundle's db wrapper (mounted into the image's PATH slot
+    # below) runs at EVERY container start: it names the fixed uid
+    # 10001 as the ws_setup peer identity and bridges the
+    # image-default socket path onto the shared directory, then
+    # execs the stock entrypoint — docker/postgres/db-entrypoint.sh
+    # owns the why.
+    entrypoint: ["/usr/local/bin/wardstone-db-entrypoint.sh"]
     environment:
-      # The credentials the Wardstone services' DATABASE_URL above is
-      # built from; the password is the operator's `WARDSTONE_DB_PASSWORD`.
+      # The bundled bootstrap contract: POSTGRES_USER/POSTGRES_DB name
+      # the role and database the Wardstone services' DATABASE_URL
+      # dials, and the entrypoint's init creates them through the
+      # wrapper's socket bridge. The wardstone role is born with NO
+      # password: the init script below arms the peer-authenticated
+      # ws_setup door, and the first-run setup takes the role over
+      # through it, rotates the credential, and seals it — no
+      # password exists in this file or the environment.
       POSTGRES_USER: wardstone
-      POSTGRES_PASSWORD: ${WARDSTONE_DB_PASSWORD:?set WARDSTONE_DB_PASSWORD (the bundled Postgres password)}
       POSTGRES_DB: wardstone
+      # The trust opt-in stays because it is what passes the official
+      # image's minimum-env check without a POSTGRES_PASSWORD — but its
+      # trust line never reaches a live server: the image appends it
+      # to the hba it generates in PGDATA, and every server in this
+      # bundle runs with the pinned hba mounted below (the initdb temp
+      # server included — the entrypoint hands pg_ctl the FULL command
+      # list, the hba_file flag included), which has zero trust lines
+      # and no TCP listener. The real init window is peer-mapped: the
+      # pinned hba's recovery line (the container's postgres system
+      # user peer-mapped onto the wardstone role) carries the
+      # first-boot init — stronger than the trust line the variable
+      # was once believed to add.
+      POSTGRES_HOST_AUTH_METHOD: trust
     # D8's local link (Task 10): the database binds NO TCP listener at
     # all (listen_addresses is empty) — the only way in is the shared
     # socket at /run/wardstone/pg, mode 0770 so ui/api (group_add'ed to
     # postgres's group) may connect. The pinned hba/ident (mounted
-    # read-only at /etc/wardstone below) carry the app's SCRAM line and
-    # the recovery peer+ident line; the initdb temp server the
-    # entrypoint runs on a virgin volume uses its OWN generated hba,
-    # so the first-run POSTGRES_USER/POSTGRES_PASSWORD init is
-    # unaffected (ruling 28c).
+    # read-only at /etc/wardstone below) carry the ws_setup peer door,
+    # the app's SCRAM line, and the recovery peer+ident line — and
+    # they govern the init phase too: the entrypoint hands pg_ctl the
+    # FULL command list (the hba_file and ident_file flags included),
+    # so the initdb temp server on a virgin volume reads the SAME
+    # pinned hba, and the init script's first-boot dial rides the
+    # recovery peer line (db `postgres`, the container's postgres
+    # system user peer-mapped onto the wardstone role) — the same
+    # line the stock entrypoint's own CREATE DATABASE dials.
     command: postgres -c listen_addresses='' -c unix_socket_directories=/run/wardstone/pg -c unix_socket_permissions=0770 -c hba_file=/etc/wardstone/pg_hba.conf -c ident_file=/etc/wardstone/pg_ident.conf
     volumes:
       # PERSISTENT, unlike the dev bundle: this volume holds the CA. It is
@@ -347,12 +393,17 @@ services:
       # postgres at both; docker/postgres/ in the bundle is their home).
       - ./postgres/pg_hba.conf:/etc/wardstone/pg_hba.conf:ro
       - ./postgres/pg_ident.conf:/etc/wardstone/pg_ident.conf:ro
+      # The wrapper the entrypoint: line names (every container start)
+      # and the init directory the stock entrypoint runs on a virgin
+      # volume (first init only) to arm the ws_setup role.
+      - ./postgres/db-entrypoint.sh:/usr/local/bin/wardstone-db-entrypoint.sh:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # `pg_isready` over the SHARED SOCKET, deliberately auth-INDEPENDENT
       # (the sealed world rotates the `wardstone` role's password at
-      # every unlock, spec §5.6, so any check authenticating with the
-      # compose-known POSTGRES_PASSWORD would start failing the moment
-      # the first setup commits — and a healthcheck must never depend
+      # every unlock, spec §5.6, so any check authenticating with a
+      # compose-known password would start failing the moment the
+      # first setup commits — and a healthcheck must never depend
       # on a credential the product exists to retire). The socket, not
       # TCP: the final server binds NO TCP port (listen_addresses=''
       # above), so the shared socket IS the service's only listener —

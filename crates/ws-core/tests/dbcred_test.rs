@@ -1,11 +1,28 @@
-//! Fast (no database) coverage of `ws_core::dbcred`: the SCRAM-SHA-256
-//! verifier's shape and the generated credential's typeable form.
+//! Coverage of `ws_core::dbcred`: the fast (no database) shape pins —
+//! the SCRAM-SHA-256 verifier and the generated credential's typeable
+//! form — plus one DB-gated pin of the setup-role disarm.
 //!
-//! The Postgres-facing half of the module (the rotation itself, the
-//! crash-window recovery) lives in `rotation_test.rs` — DB-gated, advisory
-//! key `0x0018`.
+//! The rotation itself and the crash-window recovery live in
+//! `rotation_test.rs` — DB-gated, advisory key `0x0018`. The disarm pin
+//! here takes no advisory key: it mutates no shared state (the dev
+//! database has no setup role, so its ALTER refuses with `42704`), and
+//! the DB-gated suites run serialized and alone. Run it with:
+//!
+//! ```sh
+//! DATABASE_URL=postgres://wardstone:wardstone@localhost:5432/wardstone_test \
+//!     cargo test -p ws-core --test dbcred_test -- --include-ignored
+//! ```
 
-use ws_core::dbcred::{generate_db_password, scram_verifier};
+use sqlx::PgConnection;
+use ws_core::dbcred::{disarm_setup_role, generate_db_password, scram_verifier, SETUP_ROLE};
+use ws_core::error::CoreError;
+
+/// Test database URL; `DATABASE_URL` overrides it.
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://wardstone:wardstone@localhost:5432/wardstone_test".to_string()
+    })
+}
 
 /// The shape pin, regex-equivalent, piecewise: the brief pins
 /// `^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]{24}\$[A-Za-z0-9+/=]{44}:[A-Za-z0-9+/=]{44}$`
@@ -76,5 +93,48 @@ fn the_generated_password_is_52_lowercase_base32() {
         first.as_ref(),
         second.as_ref(),
         "two generations are two different credentials"
+    );
+}
+
+/// The disarm statement is a real `ALTER ROLE` against exactly the
+/// setup role. The dev database has no `ws_setup` role — the shared
+/// `wardstone` role is neither superuser nor createrole, and the plan
+/// forbids new host prerequisites — so the live server answers
+/// `42704` naming the role, which proves the statement's shape (an
+/// ALTER, not some softer utility call) and its target (the role the
+/// constant names, never the shared `wardstone` role). The pin is the
+/// refusal, not a successful disarm; the expected text is built from
+/// [`SETUP_ROLE`] itself, so the copy Task 2's `SetupError` mapping
+/// table carries references the same constant.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn the_disarm_statement_is_alter_role_against_the_setup_role() {
+    // The fully-qualified form: `connect` is a TRAIT associated
+    // function and inference alone cannot pick the impl here.
+    let mut conn = <PgConnection as sqlx::Connection>::connect(&database_url())
+        .await
+        .expect("connect to the test database");
+
+    let err = disarm_setup_role(&mut conn).await.expect_err(
+        "the dev database has no ws_setup role, so the disarm ALTER refuses with 42704",
+    );
+    let CoreError::Database(db) = err else {
+        panic!("the refusal is the server's, not a config error: {err:?}");
+    };
+    let db_err = db
+        .as_database_error()
+        .expect("the 42704 refusal is a database error");
+
+    let code = db_err.code().map(|code| code.into_owned());
+    let message = db_err.message().to_owned();
+
+    assert_eq!(
+        code.as_deref(),
+        Some("42704"),
+        "the undefined role is refused with SQLSTATE 42704: {code:?}"
+    );
+    assert!(
+        message.contains(&format!("role \"{SETUP_ROLE}\" does not exist")),
+        "the server names exactly the setup role: {message}"
     );
 }

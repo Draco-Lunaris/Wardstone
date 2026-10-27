@@ -43,8 +43,8 @@ use tower::ServiceExt;
 use x509_parser::pem::parse_x509_pem;
 
 use ws_ca::keystore::KeyStore;
-use ws_core::db::connect;
-use ws_web::setup::{tls, SetupFields, SetupState};
+use ws_core::db::{connect, DbMode};
+use ws_web::setup::{tls, SetupError, SetupFields, SetupState};
 use ws_web::{run_setup, setup};
 use zeroize::Zeroizing;
 
@@ -67,6 +67,13 @@ const LEAF_HOSTNAME: &str = "ui.wardstone.test";
 /// A display-only fingerprint placeholder (the real one comes from
 /// `first_run_certificate`; the page only echoes the state it was given).
 const PAGE_FINGERPRINT: &str = "abcd";
+
+/// The bundled shared-socket URL form, aimed at the live dev Postgres: the
+/// host has no `ws_setup` role and no peer line for it, so a bundled dial
+/// against it pins the door-missing refusal's SHAPE with no host
+/// prerequisite added — the door does not exist host-side, so nothing
+/// rotates and the shared role is never touched.
+const SOCKET_URL: &str = "postgres://wardstone@%2Fvar%2Frun%2Fpostgresql/wardstone_test";
 
 /// In-process serialization, the whole-body lock pattern of the ws-core
 /// and ws-api suites: the harness runs tests on separate threads. A tokio
@@ -200,6 +207,9 @@ fn setup_state(fixture: &Fixture) -> SetupState {
         // best-effort path, never a failed setup.
         relay_socket: no_relay_socket(),
         database_url: database_url(),
+        // The suite's world is the external (TCP) deployment: the tests
+        // exercise today's typed-password form end to end.
+        db_mode: DbMode::External,
     }
 }
 
@@ -743,6 +753,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         "http://127.0.0.1:9", // intentionally nothing listens here
         &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
+        DbMode::External,     // the suite's world is the external deployment
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -790,6 +801,7 @@ async fn setup_route_is_gone_after_setup_and_api_v1_proxies() {
         "http://127.0.0.1:9", // intentionally nothing listens here
         &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
+        DbMode::External,     // the suite's world is the external deployment
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -971,6 +983,7 @@ async fn setup_refuses_hostname_outside_profile_patterns() {
         "http://127.0.0.1:9", // intentionally nothing listens here
         &no_relay_socket(),   // the modeled no-api world's relay socket
         database_url(),       // the URL whose login role the conversion rotates
+        DbMode::External,     // the suite's world is the external deployment
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
@@ -1149,14 +1162,17 @@ async fn a_fixture_dropped_mid_rotation_restores_the_shared_role() {
     sweep_tenant(&pool, setup::DEFAULT_TENANT_NAME).await;
 }
 
-/// The recovery runbook (spec §8): a re-initialized db volume leaves the
-/// sealed credential envelope pointing at a dead password. The
-/// operator's documented move — stop the stack, delete
-/// `db-credential.envelope`, set a fresh `WARDSTONE_DB_PASSWORD`, boot —
-/// must land on an unlock that RE-SEEDS: the ui's build mints a fresh
-/// credential over the recovery URL's connection, ALTERs the role to
-/// it, and seals it at the volume's generation, so the relayed api
-/// unlock finds a live envelope again.
+/// The external recovery arm (spec §8): a keys volume whose
+/// db-credential envelope is gone or points at a dead password is
+/// healed at unlock. The operator's documented move — install a fresh
+/// verifier on the database side, remove the stale envelope, unlock
+/// with the master passphrase plus the fresh password typed into the
+/// page's database-password field (the bundled arm grows no field at
+/// all: its heal rides the re-armed peer door) — must land on a heal
+/// that RE-SEEDS: the unlock's recovery mints a fresh credential over
+/// the typed password's connection, ALTERs the role to it, and seals
+/// it at the volume's generation, so the relayed api unlock finds a
+/// live envelope again.
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
@@ -1235,6 +1251,62 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
         "the re-seed's rotation retires the recovery URL's credential"
     );
     assert!(fresh_connects, "the fresh credential connects");
+}
+
+/// The bundled heal's door-closed refusal (the unlock's peer recovery):
+/// a sealed bundled volume with no db-credential envelope re-seals
+/// through the re-armed peer door — and a door that is closed (the dev
+/// host has no `ws_setup` role and no peer line for it) refuses with the
+/// runbook's re-arm copy, sealing nothing and rotating nothing. The
+/// external heal coverage lives beside it above
+/// ([`the_recovery_boot_reseeds_the_db_credential_envelope`]) and stays
+/// byte-identical.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_bundled_heal_without_the_peer_door_names_the_rearm_step() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // A sealed volume whose db-credential envelope is gone (the heal's
+    // starting state): the master envelope only, nothing else sealed.
+    let keys_dir = fixture.keys_dir.clone();
+    std::fs::create_dir_all(&keys_dir).unwrap();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+        b"the-master-bytes",
+        ws_core::crypto::PROD_KDF_PARAMS,
+        0,
+    )
+    .unwrap();
+    assert!(!keys_dir
+        .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        .exists());
+
+    let err =
+        setup::recover_db_credential_via_peer(&keys_dir, b"the-master-passphrase", SOCKET_URL, 0)
+            .await
+            .expect_err("the closed peer door refuses the bundled heal");
+    assert!(
+        matches!(err, SetupError::HealDoorClosed),
+        "any peer-connect failure is the door-closed refusal, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the database's setup door is closed: run the bundled recovery runbook's \
+         re-arm step (docker/README.md) and unlock again",
+        "the refusal carries the pinned copy"
+    );
+    assert!(
+        !keys_dir
+            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+            .exists(),
+        "the refused heal seals nothing"
+    );
+    sqlx::PgPool::connect(&database_url())
+        .await
+        .expect("the wardstone role's password is untouched — nothing rotated");
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1686,5 +1758,136 @@ async fn setup_relays_after_rotation() {
     );
     let _ = std::fs::remove_dir_all(&relay_dir);
 
+    fixture.cleanup().await;
+}
+
+/// The setup state for a mode-driven page render — the render tests dial
+/// nothing, so they need no fixture: a throwaway keys-directory path the
+/// page never touches is all the [`SetupState`] shape requires.
+fn render_state(database_url: &str, db_mode: DbMode) -> SetupState {
+    SetupState {
+        keys_dir: std::env::temp_dir().join("ws-web-setup-render-keys"),
+        fingerprint: PAGE_FINGERPRINT.to_string(),
+        hostname: HOSTNAME.to_string(),
+        tls_reload: None,
+        relay_socket: no_relay_socket(),
+        database_url: database_url.to_string(),
+        db_mode,
+    }
+}
+
+/// The bundled (socket-URL) deployment's form drops the database-password
+/// field: the peer door replaces the typed credential, so the page renders
+/// no `db_password` input at all.
+#[tokio::test]
+async fn bundled_mode_omits_the_db_password_field() {
+    let router = setup::setup_router(render_state(SOCKET_URL, DbMode::Bundled));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup");
+    assert_eq!(response.status(), StatusCode::OK, "the page serves");
+    let html = body_string(response).await;
+    assert!(
+        !html.contains("id=\"db_password\""),
+        "the bundled form must not collect a database password: the \
+         peer-authenticated setup door is the whole credential"
+    );
+}
+
+/// The external (TCP-URL) deployment's form keeps the database-password
+/// field — today's page shape, pinned so the render fork cannot drop it
+/// from BOTH arms by accident.
+#[tokio::test]
+async fn external_mode_keeps_the_db_password_field() {
+    let router = setup::setup_router(render_state(&database_url(), DbMode::External));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/setup")
+                .body(Body::empty())
+                .expect("build the GET request"),
+        )
+        .await
+        .expect("in-process GET /setup");
+    assert_eq!(response.status(), StatusCode::OK, "the page serves");
+    let html = body_string(response).await;
+    assert!(
+        html.contains("id=\"db_password\""),
+        "the external form still collects the typed database password"
+    );
+}
+
+/// A bundled POST carrying a `db_password` is refused BEFORE any dial,
+/// with the pinned copy — and nothing is written to the keys volume.
+#[tokio::test]
+async fn a_bundled_post_with_a_db_password_is_refused() {
+    let keys_dir = std::env::temp_dir().join(format!(
+        "ws-web-bundled-refusal-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let fields = SetupFields {
+        db_password: Zeroizing::new("wardstone".to_string()),
+        ..test_fields()
+    };
+    match run_setup(&fields, SOCKET_URL, &keys_dir).await {
+        Err(SetupError::Validation(message)) => assert_eq!(
+            message,
+            "the bundled deployment has no database password — remove the db_password field",
+            "the refusal carries the pinned copy"
+        ),
+        other => panic!("a bundled POST with a db_password is a Validation refusal, got {other:?}"),
+    }
+    assert!(
+        !keys_dir.exists(),
+        "the refusal writes nothing to the keys volume — it precedes any dial"
+    );
+}
+
+/// A bundled POST against a database with no peer door: the dial as
+/// `ws_setup` over the socket fails (the dev Postgres has no such role
+/// and no peer line for it), the refusal is the door-missing shape with
+/// its pinned copy, and nothing was written or rotated — the `wardstone`
+/// role keeps its bootstrap password.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_bundled_setup_without_the_peer_door_is_refused() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+    let fields = SetupFields {
+        db_password: Zeroizing::new(String::new()),
+        ..test_fields()
+    };
+
+    let err = run_setup(&fields, SOCKET_URL, &fixture.keys_dir)
+        .await
+        .expect_err("the missing peer door refuses the bundled setup");
+    assert!(
+        matches!(err, SetupError::DoorMissing),
+        "any peer-connect failure is the door-missing refusal, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the bundled database's setup door did not open: setup could not reach \
+         the peer-authenticated ws_setup role over the database socket — the db \
+         container must be healthy and the bundle's postgres files (pg_hba.conf, \
+         pg_ident.conf, the entrypoint wrapper) in place",
+        "the refusal carries the pinned copy"
+    );
+    assert!(
+        !fixture.keys_dir.exists(),
+        "the refusal writes nothing to the keys volume"
+    );
+    sqlx::PgPool::connect(&database_url())
+        .await
+        .expect("the wardstone role's password is untouched — the refusal precedes the rotation");
     fixture.cleanup().await;
 }

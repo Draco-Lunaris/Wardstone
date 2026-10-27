@@ -10,12 +10,16 @@
 //! pool — the api's relayed unlock rotates the database credential, so
 //! the unlocked front door holds no database connection at all), and
 //! relays the passphrase to the api once over the Unix relay socket
-//! (Task 10, D8). A volume without `db-credential.envelope` grows the
-//! database-password field: the recovery runbook's typed password
-//! re-seals the credential before anything connects. A sealed volume
-//! whose database holds no default tenant is the torn state: the build
-//! reports [`INTERRUPTED_SETUP_REFUSAL`], this router answers the POST
-//! with the same copy, and the binary exits the process non-zero.
+//! (Task 10, D8). A volume without `db-credential.envelope` is the
+//! recovery state, and the recovery is mode-shaped: the EXTERNAL
+//! deployment grows the database-password field (the runbook's typed
+//! password re-seals the credential), while the BUNDLED deployment
+//! offers no typed field at all — its heal rides the re-armed peer
+//! door, and the page names the bundled runbook's re-arm step. A
+//! sealed volume whose database holds no default tenant is the torn
+//! state: the build reports [`INTERRUPTED_SETUP_REFUSAL`], this router
+//! answers the POST with the same copy, and the binary exits the
+//! process non-zero.
 
 use std::sync::{Arc, RwLock};
 
@@ -81,9 +85,11 @@ impl SealedUi {
     /// `next_passphrase` is present only on the mixed-state completion
     /// (spec §5.7 — the page re-offers the interrupted change, and the
     /// build closure converges the volume before it opens it); and
-    /// `db_password` is present only on the recovery runbook's boot
-    /// (Task 7): the volume holds no `db-credential.envelope`, so the
-    /// TYPED database password is what re-seals it.
+    /// `db_password` is present only on the EXTERNAL deployment's
+    /// recovery boot (Task 7): the volume holds no
+    /// `db-credential.envelope`, so the TYPED database password is
+    /// what re-seals it. The bundled heal ignores it — no typed
+    /// credential exists in the bundle; the peer door re-seals.
     pub async fn unlock(
         &self,
         passphrase: &str,
@@ -188,16 +194,20 @@ pub async fn relay_unlock(socket_path: &std::path::Path, passphrase: &str) -> Re
 /// POST, and the 503 delegate for everything else. Served by `main` while
 /// the instance is sealed; the delegate hands over to the full
 /// `web_router` the moment the unlock succeeds (no restart, no re-listen
-/// — the `resume` contract).
+/// — the `resume` contract). `db_mode` shapes the envelope-missing
+/// recovery the page offers: the EXTERNAL deployment grows the typed
+/// db-password field, the BUNDLED deployment names the peer-door
+/// runbook and renders no typed field at all.
 pub fn locked_router(
     ui: Arc<SealedUi>,
     keys_dir: &std::path::Path,
     hostname: &str,
+    db_mode: ws_core::db::DbMode,
     rate_limit: Option<ws_api::AuthRateLimit>,
 ) -> Router {
     let hostname = hostname.to_owned();
     let keys_dir = keys_dir.to_path_buf();
-    let state = (ui.clone(), keys_dir, hostname);
+    let state = (ui.clone(), keys_dir, hostname, db_mode);
     let unlock = crate::gcra(
         Router::new().route("/unlock", post(unlock_handler)),
         rate_limit,
@@ -212,9 +222,19 @@ pub fn locked_router(
         .fallback_service(SealedWebDelegate { ui: ui.clone() })
 }
 
-type UiState = (Arc<SealedUi>, std::path::PathBuf, String);
+/// The locked router's shared state: the sealed ui, the keys volume
+/// (the page probes its envelopes), the hostname (the page's title),
+/// and the deployment mode — the recovery fork's axis (an
+/// envelope-missing volume is the EXTERNAL typed re-seal or the
+/// BUNDLED peer-door heal).
+type UiState = (
+    Arc<SealedUi>,
+    std::path::PathBuf,
+    String,
+    ws_core::db::DbMode,
+);
 
-async fn healthz(State((ui, _, _)): State<UiState>) -> Response {
+async fn healthz(State((ui, _, _, _)): State<UiState>) -> Response {
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -224,7 +244,7 @@ async fn healthz(State((ui, _, _)): State<UiState>) -> Response {
         .into_response()
 }
 
-async fn unlock_page(State((ui, keys_dir, hostname)): State<UiState>) -> Response {
+async fn unlock_page(State((ui, keys_dir, hostname, db_mode)): State<UiState>) -> Response {
     // The unlocked process must not keep serving the passphrase form at
     // "/": the unlock POST's own success script sends the operator here,
     // and the spec routes them to the normal login instead (the final
@@ -233,20 +253,25 @@ async fn unlock_page(State((ui, keys_dir, hostname)): State<UiState>) -> Respons
     if ui.is_unlocked() {
         return axum::response::Redirect::to("/login").into_response();
     }
-    // The completion probe (spec §5.7) and the recovery probe (Task 7):
-    // a crashed passphrase change leaves the envelope generations
-    // disagreeing (the page re-offers the completion), and a volume
-    // WITHOUT `db-credential.envelope` grows the database-password field
-    // (the recovery runbook's typed re-seal). A volume the scan cannot
-    // read renders the plain form — the POST then names the real
-    // condition.
+    // The completion probe (spec §5.7) and the mode-shaped recovery
+    // probe (Task 7 + the bundled heal): a crashed passphrase change
+    // leaves the envelope generations disagreeing (the page re-offers
+    // the completion), and a volume WITHOUT `db-credential.envelope`
+    // offers the recovery the deployment's shape gives it — the
+    // EXTERNAL deployment grows the typed database-password field (the
+    // runbook's re-seal), the BUNDLED deployment names the peer-door
+    // runbook and renders no typed field at all. A volume the scan
+    // cannot read renders the plain form — the POST then names the
+    // real condition.
     let mixed = ws_core::crypto::scan_volume(&keys_dir)
         .map(|scan| scan.mixed)
         .unwrap_or(false);
-    let needs_db_password = !keys_dir
+    let envelope_missing = !keys_dir
         .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
         .exists();
-    let html = render_unlock_page(&hostname, mixed, needs_db_password);
+    let needs_db_password = envelope_missing && db_mode == ws_core::db::DbMode::External;
+    let bundled_heal = envelope_missing && db_mode == ws_core::db::DbMode::Bundled;
+    let html = render_unlock_page(&hostname, mixed, needs_db_password, bundled_heal);
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
@@ -262,26 +287,31 @@ struct UnlockBody {
     /// when the envelope generations disagree).
     #[serde(default)]
     next_passphrase: Option<String>,
-    /// Present only on the recovery runbook's boot (Task 7): the volume
-    /// holds no `db-credential.envelope`, so the TYPED database password
-    /// re-seals it before anything connects.
+    /// Present only on the EXTERNAL deployment's recovery runbook (Task
+    /// 7): the volume holds no `db-credential.envelope`, so the TYPED
+    /// database password re-seals it before anything connects. The
+    /// bundled heal never sends it — its credential re-seals through
+    /// the peer door.
     #[serde(default)]
     db_password: Option<String>,
 }
 
 async fn unlock_handler(
-    State((ui, keys_dir, _)): State<UiState>,
+    State((ui, keys_dir, _, db_mode)): State<UiState>,
     Json(body): Json<UnlockBody>,
 ) -> Response {
-    // The recovery runbook's pre-check (Task 7): without the sealed db
-    // credential the build needs the TYPED password — and refusing
-    // BEFORE the build spends neither the argon2 derive nor the
-    // unlock-window mutex on a request that could only fail. The 400
-    // names the field so the page (and the operator) learn exactly
-    // what to add.
+    // The EXTERNAL recovery's pre-check (Task 7): without the sealed db
+    // credential an external deployment needs the TYPED password — and
+    // refusing BEFORE the build spends neither the argon2 derive nor
+    // the unlock-window mutex on a request that could only fail. The
+    // 400 names the field so the page (and the operator) learn exactly
+    // what to add. The BUNDLED deployment demands nothing here: its
+    // heal rides the peer door, so a `db_password` a bundled POST
+    // carries is simply ignored downstream.
     if !keys_dir
         .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
         .exists()
+        && db_mode == ws_core::db::DbMode::External
         && body.db_password.is_none()
     {
         return (
@@ -356,6 +386,35 @@ async fn unlock_handler(
             })),
         )
             .into_response(),
+        // The bundled heal's door-closed refusal: the build's peer dial
+        // failed (the door is disarmed or absent host-side). The POST's
+        // answer carries the same wrapped copy so the operator's browser
+        // shows the runbook's re-arm step, not a generic refusal — and
+        // the process stays up and sealed: the re-arm step happens
+        // outside the instance.
+        Err(code) if code == heal_door_closed_verdict() => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "heal_door_closed",
+                    "message": code }
+            })),
+        )
+            .into_response(),
+        // The bundled heal's disarm failure: the re-seal and the
+        // rotation LANDED — only the door's re-close failed. The
+        // generic 401 below would claim the passphrase was refused
+        // and nothing changed, both false, and the operator's retry
+        // would unlock with the door still armed — so this arm is a
+        // loud 409 carrying the runbook's disarm copy: the refusal
+        // that names the door, never a silent open one.
+        Err(code) if code == door_disarm_failed_verdict() => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "door_disarm_failed",
+                    "message": code }
+            })),
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -365,6 +424,32 @@ async fn unlock_handler(
         )
             .into_response(),
     }
+}
+
+/// The build's heal-door-closed verdict: `unlocked_web_build` wraps the
+/// bundled heal's [`crate::setup::SetupError::HealDoorClosed`] copy in
+/// its `the db re-seal:` prefix, and this is the exact string the
+/// unlock POST matches to surface the runbook's re-arm copy (a 409)
+/// instead of the generic refusal.
+fn heal_door_closed_verdict() -> String {
+    format!(
+        "the db re-seal: {}",
+        crate::setup::SetupError::HealDoorClosed
+    )
+}
+
+/// The build's disarm-failed verdict: `unlocked_web_build` wraps the
+/// bundled heal's [`crate::setup::SetupError::DoorDisarmFailed`] copy
+/// in its `the db re-seal:` prefix, and this is the exact string the
+/// unlock POST matches to surface the runbook's disarm copy (a 409)
+/// instead of the generic refusal — the heal's re-seal and rotation
+/// have already landed when the disarm fails, so the answer must never
+/// read as a refused passphrase.
+fn door_disarm_failed_verdict() -> String {
+    format!(
+        "the db re-seal: {}",
+        crate::setup::SetupError::DoorDisarmFailed
+    )
 }
 
 /// The 503 delegate: sealed, everything except the mounted routes above
@@ -417,16 +502,25 @@ pub(crate) fn sealed_503() -> Response {
 /// locked mode cannot depend on it — the same reasoning the setup page
 /// uses). One passphrase field, one button, no JavaScript beyond the
 /// POST — plus, per the volume's probed state, the mixed completion's
-/// new-passphrase field (spec §5.7) and/or the recovery runbook's
+/// new-passphrase field (spec §5.7) and/or the EXTERNAL deployment's
 /// database-password field (Task 7: no `db-credential.envelope` means
-/// the typed password must re-seal it). The lede names whichever
-/// condition the page re-offers, so the operator is never left guessing
-/// which fields the instance wants.
-fn render_unlock_page(hostname: &str, mixed: bool, needs_db_password: bool) -> String {
+/// the typed password must re-seal it), while the BUNDLED deployment's
+/// envelope-missing page names the peer-door runbook and grows no
+/// typed field. The lede names whichever condition the page re-offers,
+/// so the operator is never left guessing which fields the instance
+/// wants.
+fn render_unlock_page(
+    hostname: &str,
+    mixed: bool,
+    needs_db_password: bool,
+    bundled_heal: bool,
+) -> String {
     // The lede names the condition by precedence: a crashed completion
     // outranks the recovery (a mixed volume still holds its
-    // db-credential envelope or it would not be mixed), and both
-    // outrank the plain sealed copy.
+    // db-credential envelope or it would not be mixed), the external
+    // typed re-seal and the bundled peer-door heal are the same
+    // envelope-missing state split by deployment mode, and all of it
+    // outranks the plain sealed copy.
     let lede = if mixed {
         "A passphrase change did not finish — the disks still hold \
          envelopes sealed under both passphrases. Enter the current \
@@ -437,6 +531,11 @@ fn render_unlock_page(hostname: &str, mixed: bool, needs_db_password: bool) -> S
          recovery runbook. Enter the master passphrase and the \
          database's password together: the typed password re-seals \
          the credential, and the unlock continues."
+    } else if bundled_heal {
+        "The keys volume holds no sealed database credential — the bundled \
+         recovery runbook. Run its re-arm step (docker/README.md), then \
+         enter the master passphrase: the instance re-seals the credential \
+         itself through the setup door and closes it again."
     } else {
         "Enter the master passphrase to unlock this instance. Everything \
          on its disks is inert until you do — that is the design, not an \

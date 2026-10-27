@@ -71,7 +71,7 @@ use ws_auth::jwt::JwtKeys;
 use ws_ca::ca::{create_root, CaLifetime, CaSpec};
 use ws_ca::keystore::KeyStore;
 use ws_ca::KeyType;
-use ws_core::db::connect;
+use ws_core::db::{connect, DbMode};
 use ws_core::models::acme::{
     AcmeAuthorizationStatus, AcmeChallengeStatus, AcmeChallengeType, AcmeOrderStatus,
 };
@@ -668,6 +668,7 @@ async fn env() -> Env {
         // unlock relay inert (Task 10, D8).
         &std::env::temp_dir().join("ws-web-acme-no-relay/relay.sock"),
         database_url(),
+        DbMode::External, // the suite's world is the external deployment
         store,
         None, // the front-door limiters key on ConnectInfo, absent for a oneshot
     )

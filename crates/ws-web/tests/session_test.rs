@@ -55,6 +55,7 @@ use uuid::Uuid;
 
 use ws_api::state::{ApiConfig, AppState};
 use ws_auth::jwt::{issue_access_token, AccessClaims, JwtKeys};
+use ws_core::db::DbMode;
 use ws_core::models::rbac::Role;
 use ws_core::models::user::UserModel;
 use ws_core::repo::user_repo::UserRepo;
@@ -324,6 +325,7 @@ async fn env(ttl: Duration) -> TestEnv {
         // unlock relay inert (Task 10, D8).
         &std::env::temp_dir().join("ws-web-session-no-relay/relay.sock"),
         database_url(),
+        DbMode::External, // the suite's world is the external deployment
         store.clone(),
         None, // the relay tests' requests carry no ConnectInfo for the per-IP limiter
     )

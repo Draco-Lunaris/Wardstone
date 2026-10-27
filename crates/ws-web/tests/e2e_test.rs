@@ -86,6 +86,7 @@ use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
 
 use ws_api::state::{ApiConfig, AppState};
+use ws_core::db::DbMode;
 use ws_web::session::store::SessionStore;
 use ws_web::session::{CSRF_HEADER_NAME, CSRF_HEADER_VALUE, SESSION_COOKIE};
 use ws_web::setup::{self, SetupFields, SetupState};
@@ -456,6 +457,7 @@ async fn front(
         api_base,
         relay_socket,
         database_url(),
+        DbMode::External, // this suite's world is the external deployment
         Arc::new(SessionStore::new(
             ws_web::DEFAULT_SESSION_TTL,
             ws_web::DEFAULT_IDLE_EVICTION,
@@ -724,6 +726,7 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         // directory keeps the setup commit's unlock relay inert.
         relay_socket: std::env::temp_dir().join("ws-e2e-no-relay/relay.sock"),
         database_url: database_url(),
+        db_mode: DbMode::External,
     });
     let fields = SetupFields {
         admin_username: "admin".to_string(),
@@ -1032,7 +1035,8 @@ async fn setup_login_issue_revoke_and_service_identity_work_end_to_end() {
         "http://127.0.0.1:9", // intentionally nothing listens here
         // The modeled no-api world's relay socket (Task 10, D8).
         &std::env::temp_dir().join("ws-e2e-no-relay/relay.sock"),
-        database_url(), // the URL whose login role the conversion rotates
+        database_url(),   // the URL whose login role the conversion rotates
+        DbMode::External, // this suite's world is the external deployment
         ws_web::DEFAULT_SESSION_TTL,
         None, // no rate limiter on the front-door suites' routers
     )
