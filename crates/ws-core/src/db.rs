@@ -31,12 +31,34 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
         .connect_with(options)
         .await?;
 
-    // One pooled connection carries the whole migration + count check
-    // (the same single-connection shape the migrator itself uses), then
-    // returns to the pool before serving.
-    let mut conn = pool.acquire().await?;
-    migrate_and_check(&mut conn).await?;
-    drop(conn);
+    // WHY each policy statement acquires through the pool instead of
+    // running the whole policy on one held connection: sqlx returns a
+    // dropped `PoolConnection` to the idle queue through a SPAWNED task
+    // (its Drop runs `rt::spawn(return_to_pool())`), so an
+    // acquire-hold-drop shape leaves the pool with `idle == 0` at
+    // return — its one live connection sits in a pending release task,
+    // and the pool's first user pays a fresh dial. Per-statement
+    // acquires cannot strand the pool: every dial awaits (letting the
+    // previous statement's release land), so the pool returns holding
+    // at least one LIVE idle connection. That is load-bearing for the
+    // api unlock's rebuild (ws-api's sealed unlock): it drops the
+    // pre-rotation pool and reconnects with the credential the rotation
+    // JUST minted — one no later dial can reissue — so the pool it
+    // hands the AppState must serve without a new dial.
+    if migrations_table_exists(&pool).await?
+        && applied_migration_count(&pool).await? == 0
+        && tenants_table_exists(&pool).await?
+    {
+        return Err(CoreError::Migration {
+            expected: REQUIRED_MIGRATION_COUNT,
+            found: 0,
+        });
+    }
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(migrate_error)?;
+    require_migration_count(&pool).await?;
 
     Ok(pool)
 }
@@ -62,33 +84,14 @@ pub async fn connect(url: &str) -> Result<PgPool, CoreError> {
 ///    returning [`CoreError::Migration`] on mismatch (e.g. the database
 ///    is ahead of this binary).
 pub async fn migrate_and_check(conn: &mut PgConnection) -> Result<(), CoreError> {
-    let migrations_table_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
-         AND tablename = '_sqlx_migrations')",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    if migrations_table_exists {
-        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-            .fetch_one(&mut *conn)
-            .await?;
-        if applied == 0 {
-            // `tenants` is migration 001's root table (nothing references
-            // other schemas here): its presence proves the schema was created,
-            // so the missing bookkeeping rows are damage, not a fresh start.
-            let schema_initialized: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
-                 AND tablename = 'tenants')",
-            )
-            .fetch_one(&mut *conn)
-            .await?;
-            if schema_initialized {
-                return Err(CoreError::Migration {
-                    expected: REQUIRED_MIGRATION_COUNT,
-                    found: 0,
-                });
-            }
-        }
+    if migrations_table_exists(&mut *conn).await?
+        && applied_migration_count(&mut *conn).await? == 0
+        && tenants_table_exists(&mut *conn).await?
+    {
+        return Err(CoreError::Migration {
+            expected: REQUIRED_MIGRATION_COUNT,
+            found: 0,
+        });
     }
 
     // `run_direct`, not `run`: the bundled setup arm awaits this inline
@@ -104,8 +107,49 @@ pub async fn migrate_and_check(conn: &mut PgConnection) -> Result<(), CoreError>
         .await
         .map_err(migrate_error)?;
 
+    require_migration_count(&mut *conn).await?;
+
+    Ok(())
+}
+
+/// Whether the migration bookkeeping table exists — the preflight's
+/// first probe (a genuinely fresh database has neither it nor
+/// `tenants`).
+async fn migrations_table_exists(executor: impl sqlx::PgExecutor<'_>) -> Result<bool, CoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
+         AND tablename = '_sqlx_migrations')",
+    )
+    .fetch_one(executor)
+    .await?)
+}
+
+/// How many migration rows the bookkeeping holds.
+async fn applied_migration_count(executor: impl sqlx::PgExecutor<'_>) -> Result<i64, CoreError> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(executor)
+        .await?)
+}
+
+/// Whether migration 001's root table exists (nothing references other
+/// schemas here): its presence proves the schema was created, so —
+/// with the bookkeeping empty — the missing rows are damage, not a
+/// fresh start.
+async fn tenants_table_exists(executor: impl sqlx::PgExecutor<'_>) -> Result<bool, CoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() \
+         AND tablename = 'tenants')",
+    )
+    .fetch_one(executor)
+    .await?)
+}
+
+/// The post-migration bookkeeping count check: the applied-migration
+/// rows must equal [`REQUIRED_MIGRATION_COUNT`], else the database is
+/// ahead of (or behind) this binary.
+async fn require_migration_count(executor: impl sqlx::PgExecutor<'_>) -> Result<(), CoreError> {
     let found: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-        .fetch_one(&mut *conn)
+        .fetch_one(executor)
         .await?;
     let found = u16::try_from(found)
         .map_err(|_| CoreError::Config(format!("migration count {found} does not fit u16")))?;
@@ -115,7 +159,6 @@ pub async fn migrate_and_check(conn: &mut PgConnection) -> Result<(), CoreError>
             found,
         });
     }
-
     Ok(())
 }
 
