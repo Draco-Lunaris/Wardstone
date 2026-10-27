@@ -588,8 +588,9 @@ fn rate_limit_from(
 /// The build closure ([`unlocked_web_build`]) is where the world comes
 /// up: it converges a mixed volume when the completion pair rides along,
 /// opens the envelopes (the master for the keystore, the DB credential
-/// for the pool — or the unlock form's typed database password on the
-/// recovery runbook), resolves the tenant and the serving leaf (the
+/// for the pool — or the envelope-missing recovery: the external form's
+/// typed database password, the bundled form's peer-door heal), resolves
+/// the tenant and the serving leaf (the
 /// newest ACTIVE `web-server` row whose key envelope the keystore
 /// actually holds — [`resolve_serving_leaf`]'s walk), and reloads the
 /// listener's TLS onto the CA-issued leaf in place (the resume
@@ -599,7 +600,7 @@ fn rate_limit_from(
 /// proxied API). A volume whose database holds NO tenant is the torn
 /// state: the build's fatal exits the process non-zero with the spec's
 /// copy.
-async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
+async fn run_ui_sealed(cfg: BootConfig, db_mode: ws_core::db::DbMode) -> Result<(), BootError> {
     let hostname = cfg
         .server_hostname
         .clone()
@@ -628,7 +629,8 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel::<BootError>();
     let build = unlocked_web_build(&cfg, reload_handle, fatal_tx);
     let ui = std::sync::Arc::new(ws_web::locked::SealedUi::new(build));
-    let router = ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname, cfg.web_rate_limit);
+    let router =
+        ws_web::locked::locked_router(ui, &cfg.keys_dir, &hostname, db_mode, cfg.web_rate_limit);
     tracing::info!(
         hostname = %hostname,
         fingerprint = %sealed_fingerprint,
@@ -649,8 +651,9 @@ async fn run_ui_sealed(cfg: BootConfig) -> Result<(), BootError> {
 /// The web build the sealed boot hands its `SealedUi`: it converges a
 /// mixed volume when the completion pair rides along, opens the
 /// envelopes, builds the ui's pool from the sealed DB credential (or
-/// re-seals a lost one from the unlock form's typed database password —
-/// the recovery runbook), resolves the tenant and the serving leaf,
+/// re-seals a lost one — the mode-shaped recovery: the external form's
+/// typed database password, the bundled form's peer-door heal), resolves
+/// the tenant and the serving leaf,
 /// RELEASES the pool, relays the passphrase to the api (best-effort,
 /// logged), and returns the pool-less unlocked router (Review Focus 1:
 /// the api's relayed unlock rotates the database credential, so any
@@ -750,11 +753,12 @@ fn unlocked_web_build(
                 // live on the database side) and falls to the current
                 // credential. One exception: the recovery runbook (spec §8)
                 // — an operator who lost the credential deletes the
-                // envelope, sets a fresh bootstrap password, and reboots; the
-                // envelope's absence is the ONLY thing distinguishing that
-                // boot, so the unlock form's TYPED database password re-seals
-                // it through the identical first-install step (the shared
-                // rotation) before anything else connects.
+                // envelope and reboots; the envelope's absence is the ONLY
+                // thing distinguishing that boot, and the re-seal is
+                // mode-shaped: the external form's TYPED database password,
+                // the bundled form's peer-door heal — both through the
+                // identical first-install step (the shared rotation) before
+                // anything else connects.
                 let db_credential_path = keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE);
                 let pool = if db_credential_path.exists() {
                     let candidates = ws_core::dbcred::open_db_credential(
@@ -794,31 +798,57 @@ fn unlocked_web_build(
                         .map_err(|e| err(format!("the database: {e}")))?,
                     }
                 } else {
-                    // The recovery runbook (spec §8): the unlock form's
-                    // typed database password IS the fresh bootstrap
-                    // credential the operator set; the rotation re-seals it
-                    // into the envelope before the pool connects with it.
-                    // The locked page's 400 has normally already refused a
-                    // missing field — this is the build's own guard for the
-                    // race where the envelope vanished mid-POST.
-                    let typed = db_password.ok_or_else(|| {
-                        err("the db_password field is required when the volume holds \
-                             no db-credential envelope (the recovery runbook)"
-                            .to_string())
-                    })?;
+                    // The recovery fork, mode-shaped (the same
+                    // ws_core::db::db_mode split the setup surface
+                    // threads): the generation read comes FIRST — both
+                    // arms seal at it. The BUNDLED arm heals through
+                    // the peer door: no typed credential exists at all
+                    // in the bundle, the door's passwordless setup
+                    // role is the only way in, and the heal re-closes
+                    // the door behind itself. The EXTERNAL arm is the
+                    // runbook's typed path verbatim: the unlock form's
+                    // TYPED database password is the fresh bootstrap
+                    // credential the operator set, and the rotation
+                    // re-seals it into the envelope before the pool
+                    // connects with it. The locked page's 400 has
+                    // normally already refused a missing field — the
+                    // external arm's guard is the build's own check
+                    // for the race where the envelope vanished
+                    // mid-POST.
                     let generation = ws_core::crypto::KeyEnvelope::read_generation(
                         &keys_dir.join(MASTER_ENVELOPE_FILE),
                     )
                     .map_err(|e| err(format!("the recovery generation: {e}")))?;
-                    let fresh = ws_web::setup::recover_db_credential(
-                        &keys_dir,
-                        passphrase.as_bytes(),
-                        &database_url,
-                        typed.as_bytes(),
-                        generation,
-                    )
-                    .await
-                    .map_err(|e| err(format!("the db re-seal: {e}")))?;
+                    let fresh = match ws_core::db::db_mode(&database_url)
+                        .map_err(|e| err(format!("the recovery mode: {e}")))?
+                    {
+                        ws_core::db::DbMode::Bundled => {
+                            ws_web::setup::recover_db_credential_via_peer(
+                                &keys_dir,
+                                passphrase.as_bytes(),
+                                &database_url,
+                                generation,
+                            )
+                            .await
+                            .map_err(|e| err(format!("the db re-seal: {e}")))?
+                        }
+                        ws_core::db::DbMode::External => {
+                            let typed = db_password.ok_or_else(|| {
+                                err("the db_password field is required when the volume holds \
+                                     no db-credential envelope (the recovery runbook)"
+                                    .to_string())
+                            })?;
+                            ws_web::setup::recover_db_credential(
+                                &keys_dir,
+                                passphrase.as_bytes(),
+                                &database_url,
+                                typed.as_bytes(),
+                                generation,
+                            )
+                            .await
+                            .map_err(|e| err(format!("the db re-seal: {e}")))?
+                        }
+                    };
                     ws_core::db::connect(&substitute_db_password(
                         &database_url,
                         &String::from_utf8_lossy(&fresh),
@@ -958,7 +988,7 @@ async fn run_ui(cfg: BootConfig) -> Result<(), BootError> {
     // fail in practice.
     let db_mode = ws_core::db::db_mode(&cfg.database_url)?;
     if sealed_instance(&cfg.keys_dir) {
-        return run_ui_sealed(cfg).await;
+        return run_ui_sealed(cfg, db_mode).await;
     }
     let hostname = cfg
         .server_hostname

@@ -11,12 +11,14 @@
 //! BEFORE the api relay and then releases its pool — the api's relayed
 //! unlock rotates the database credential, so any fresh ui connection
 //! after the relay fails `28P01` (Review Focus 1). A sealed volume
-//! without the default tenant is the torn state of a setup that
-//! crashed after sealing: the unlock recovers the db credential (the
-//! recovery runbook's shape — the volume holds no
-//! `db-credential.envelope`, so the typed database password re-seals
-//! it), finds no tenant, and the process EXITS non-zero with the
-//! spec's exact refusal copy.
+//! whose database holds no default tenant is the torn state of a setup
+//! that crashed after sealing, and the two recovery shapes are pinned
+//! separately: the bundled volume WITHOUT a `db-credential.envelope`
+//! heals only through the re-armed peer door (a closed door refuses
+//! with the runbook's re-arm copy and the process stays alive and
+//! sealed), while the volume WITH the envelope connects as the sealed
+//! credential, finds no tenant, and the process EXITS non-zero with
+//! the spec's exact refusal copy.
 //!
 //! Every database-backed test sweeps the default tenant before and after
 //! its body and holds a session-level advisory lock on [`ADVISORY_KEY`] (the
@@ -67,6 +69,22 @@ const TORN_REFUSAL: &str =
 
 /// The ui's password-URL refusal (Review Focus 5, the spec's exact copy).
 const UI_PASSWORD_REFUSAL: &str = "DATABASE_URL carries a password; Wardstone reads the database credential only from its sealed envelope or the setup page";
+
+/// The bundled heal's pinned lede: the unlock page names the peer door
+/// (never a typed database password) when a bundled volume holds no
+/// db-credential envelope.
+const BUNDLED_HEAL_LEDE: &str =
+    "The keys volume holds no sealed database credential — the bundled \
+ recovery runbook. Run its re-arm step (docker/README.md), then enter the \
+ master passphrase: the instance re-seals the credential itself through the \
+ setup door and closes it again.";
+
+/// The bundled heal's door-closed refusal, as the build surfaces it:
+/// `SetupError::HealDoorClosed`'s pinned copy wrapped in the build's
+/// `the db re-seal:` prefix — the words the unlock POST's answer
+/// carries.
+const HEAL_DOOR_REFUSAL: &str = "the db re-seal: the database's setup door is closed: run the \
+ bundled recovery runbook's re-arm step (docker/README.md) and unlock again";
 
 /// The master passphrase the hand-minted envelopes seal under.
 const PASSPHRASE: &str = "the-master-passphrase";
@@ -417,6 +435,7 @@ impl Boot {
         bind_port: u16,
         api_url: Option<String>,
         relay_socket: PathBuf,
+        extra_env: &[(String, String)],
     ) -> Boot {
         // The api mode binds the relay socket, so its parent directory
         // must exist by the time the child reaches the bind.
@@ -435,6 +454,12 @@ impl Boot {
             .stderr(Stdio::piped());
         if let Some(api_url) = api_url {
             command.env("WARDSTONE_API_URL", api_url);
+        }
+        // Case-specific environment (the compose-contract knobs a later
+        // boot case needs); applied last so an extra entry overrides the
+        // stock values above.
+        for (name, value) in extra_env {
+            command.env(name, value);
         }
         let mut child = command.spawn().expect("spawn the wardstone child");
         let (tx, lines) = mpsc::channel();
@@ -468,11 +493,19 @@ impl Boot {
         api_url: Option<String>,
         relay_socket: PathBuf,
     ) -> Boot {
-        Boot::start("ui", keys_dir, db_url, bind_port, api_url, relay_socket)
+        Boot::start(
+            "ui",
+            keys_dir,
+            db_url,
+            bind_port,
+            api_url,
+            relay_socket,
+            &[],
+        )
     }
 
     fn api(keys_dir: &Path, db_url: &str, bind_port: u16, relay_socket: PathBuf) -> Boot {
-        Boot::start("api", keys_dir, db_url, bind_port, None, relay_socket)
+        Boot::start("api", keys_dir, db_url, bind_port, None, relay_socket, &[])
     }
 
     /// The port the child's listener binds.
@@ -657,18 +690,19 @@ async fn a_password_in_the_ui_database_url_is_refused() {
     );
 }
 
-/// A sealed volume whose database holds no default tenant — the torn
-/// state of a setup that crashed after sealing (`master.envelope` is
-/// written LAST, so the marker implies the seal landed but not that
-/// the install did): the unlock page offers the database-password
-/// field (the volume holds no `db-credential.envelope` — the recovery
-/// runbook's shape), the unlock recovers the credential, and the
-/// process EXITS non-zero with the spec's exact refusal.
+/// A bundled volume with no db-credential envelope — the bundled
+/// deployment's heal state: the page offers NO database-password field
+/// (the re-armed peer door replaces the typed credential) and carries
+/// the bundled lede naming the runbook's re-arm step, and the
+/// passphrase-only POST heals through the peer door — which the dev
+/// host does not arm (no `ws_setup` role, no peer line), so the refusal
+/// is the door-closed copy and NOTHING else happens: the process stays
+/// alive and sealed, no envelope appears, and nothing rotates.
 #[tokio::test]
 #[ignore = "requires a live Postgres at DATABASE_URL"]
-async fn a_sealed_volume_without_a_tenant_is_refused() {
+async fn a_bundled_volume_without_a_credential_heals_only_through_the_rearmed_door() {
     let _guard = lock_db().await;
-    let mut fx = fixture("torn").await;
+    let mut fx = fixture("heal-door").await;
     sweep_default_tenant(&fx.pool).await;
 
     mint_envelope(&fx.keys_dir.join(MASTER_ENVELOPE_FILE), &[7u8; 32]);
@@ -677,34 +711,114 @@ async fn a_sealed_volume_without_a_tenant_is_refused() {
         &child_database_url(),
         free_port(),
         None,
-        scratch_relay_socket("torn"),
+        scratch_relay_socket("heal-door"),
     );
     let boot_out = ui.output_until(&[SEALED_DOOR_LOG]);
     wait_for_tcp(ui.port());
 
-    // The page grows the database-password field (no db-credential
-    // envelope on the volume).
+    // The page offers NO database-password field and carries the
+    // bundled lede: the peer door, not a typed password, is the heal.
     let page = https_get(ui.port(), "/")
         .await
         .expect("the unlock page answers over TLS");
     let html = page.text().await.expect("the page body");
     assert!(
-        html.contains(r#"id="db-password""#),
-        "the torn volume's page offers the database-password field, got: {html}"
+        !html.contains(r#"id="db-password""#),
+        "the bundled page offers no database-password field, got: {html}"
+    );
+    assert!(
+        html.contains(BUNDLED_HEAL_LEDE),
+        "the bundled lede names the runbook's re-arm step, got: {html}"
     );
 
-    // Unlock with the typed database password: the recovery rotation
-    // lands, the tenant lookup finds nothing, and the process exits.
-    let unlock = https_unlock(
-        ui.port(),
-        serde_json::json!({ "passphrase": PASSPHRASE, "db_password": "wardstone" }),
-    )
-    .await;
+    // The passphrase-only POST: the pre-check demands no typed password
+    // on a bundled volume, the build heals through the peer door, and
+    // the closed door's refusal is the re-arm copy wrapped in the
+    // build's db re-seal prefix.
+    let unlock = https_unlock(ui.port(), serde_json::json!({ "passphrase": PASSPHRASE }))
+        .await
+        .expect("the unlock POST must reach the ui");
+    assert_eq!(
+        unlock.status().as_u16(),
+        409,
+        "the refused heal answers the unlock POST with the build's refusal shape"
+    );
+    let refusal = unlock.text().await.expect("the refusal body");
+    assert!(
+        refusal.contains(HEAL_DOOR_REFUSAL),
+        "the refusal carries the door-closed copy wrapped in the db re-seal prefix, got: {refusal}"
+    );
+
+    // The verdict is a refusal, never a fatal: the process stays alive
+    // and sealed, and no envelope appeared on the volume.
+    std::thread::sleep(Duration::from_millis(500));
+    let alive = ui.is_alive();
+    let health = https_get(ui.port(), "/healthz")
+        .await
+        .expect("the refused heal keeps the health surface serving");
+    let health_body = health.text().await.expect("the health body");
+    let sealed = health_body.contains(r#""state":"sealed""#);
+    let nothing_sealed = !fx.keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE).exists();
+    let out = format!("{boot_out}{}", ui.drain_output());
+    // Restore the shared role before any assertion can panic (nothing
+    // rotated here — the refusal precedes any dial as the door's — the
+    // net is the suite's standing discipline).
+    fx.cleanup().await;
+    drop(ui);
+
+    assert!(
+        alive,
+        "the door-closed refusal is not fatal, but the ui exited, output:\n{out}"
+    );
+    assert!(
+        sealed,
+        "the front door stays sealed after the refused heal, health: {health_body}"
+    );
+    assert!(
+        !out.contains(TORN_REFUSAL),
+        "no torn refusal surfaced, got:\n{out}"
+    );
+    assert!(
+        nothing_sealed,
+        "the refused heal sealed no db-credential envelope on the volume"
+    );
+}
+
+/// The state the new ordering actually produces — the torn-fatal case:
+/// a sealed volume whose db-credential envelope EXISTS but whose
+/// database holds no default tenant (a setup that crashed after
+/// sealing, before the tenant row landed). The hand-minted envelope
+/// seals the dev role's live bootstrap password, so the unlock's pool
+/// connects as `wardstone`, the tenant lookup finds nothing, and the
+/// process EXITS non-zero with the spec's exact refusal copy while the
+/// POST answers the same copy with a 409.
+#[tokio::test]
+#[ignore = "requires a live Postgres at DATABASE_URL"]
+async fn a_sealed_volume_with_a_credential_and_no_tenant_is_refused() {
+    let _guard = lock_db().await;
+    let mut fx = fixture("torn-cred").await;
+    sweep_default_tenant(&fx.pool).await;
+
+    mint_envelope(&fx.keys_dir.join(MASTER_ENVELOPE_FILE), &[7u8; 32]);
+    // The credential the build connects with: the dev role's live
+    // bootstrap password, hand-sealed with the suite passphrase.
+    mint_envelope(&fx.keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE), b"wardstone");
+    let mut ui = Boot::ui(
+        &fx.keys_dir,
+        &child_database_url(),
+        free_port(),
+        None,
+        scratch_relay_socket("torn-cred"),
+    );
+    let boot_out = ui.output_until(&[SEALED_DOOR_LOG]);
+    wait_for_tcp(ui.port());
+
+    let unlock = https_unlock(ui.port(), serde_json::json!({ "passphrase": PASSPHRASE })).await;
     let status = ui.wait_exit();
     let out = format!("{boot_out}{}", ui.drain_output());
-    // The recovery ran before the refusal: its envelope is on the volume.
-    let recovered = fx.keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE).exists();
-    // Restore the shared role before any assertion can panic.
+    // Restore the shared role before any assertion can panic (the ui's
+    // unlock never rotates — only the api's relayed one does — but the
+    // net is the suite's standing discipline).
     fx.cleanup().await;
     drop(ui);
 
@@ -728,10 +842,6 @@ async fn a_sealed_volume_without_a_tenant_is_refused() {
             "the unlock POST's refusal is a 409 naming the torn state"
         );
     }
-    assert!(
-        recovered,
-        "the recovery re-sealed the db-credential envelope before the refusal"
-    );
 }
 
 /// The ui reads nothing after the api rotates (Review Focus 1): the

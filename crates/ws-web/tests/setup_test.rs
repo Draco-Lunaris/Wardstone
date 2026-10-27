@@ -1250,6 +1250,62 @@ async fn the_recovery_boot_reseeds_the_db_credential_envelope() {
     assert!(fresh_connects, "the fresh credential connects");
 }
 
+/// The bundled heal's door-closed refusal (the unlock's peer recovery):
+/// a sealed bundled volume with no db-credential envelope re-seals
+/// through the re-armed peer door — and a door that is closed (the dev
+/// host has no `ws_setup` role and no peer line for it) refuses with the
+/// runbook's re-arm copy, sealing nothing and rotating nothing. The
+/// external heal coverage lives beside it above
+/// ([`the_recovery_boot_reseeds_the_db_credential_envelope`]) and stays
+/// byte-identical.
+#[tokio::test]
+#[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
+async fn a_bundled_heal_without_the_peer_door_names_the_rearm_step() {
+    let _db = lock_db().await;
+    let mut fixture = fixture().await;
+
+    // A sealed volume whose db-credential envelope is gone (the heal's
+    // starting state): the master envelope only, nothing else sealed.
+    let keys_dir = fixture.keys_dir.clone();
+    std::fs::create_dir_all(&keys_dir).unwrap();
+    ws_core::crypto::KeyEnvelope::write_envelope(
+        &keys_dir.join(ws_core::crypto::MASTER_ENVELOPE_FILE),
+        "the-master-passphrase",
+        b"the-master-bytes",
+        ws_core::crypto::PROD_KDF_PARAMS,
+        0,
+    )
+    .unwrap();
+    assert!(!keys_dir
+        .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+        .exists());
+
+    let err =
+        setup::recover_db_credential_via_peer(&keys_dir, b"the-master-passphrase", SOCKET_URL, 0)
+            .await
+            .expect_err("the closed peer door refuses the bundled heal");
+    assert!(
+        matches!(err, SetupError::HealDoorClosed),
+        "any peer-connect failure is the door-closed refusal, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the database's setup door is closed: run the bundled recovery runbook's \
+         re-arm step (docker/README.md) and unlock again",
+        "the refusal carries the pinned copy"
+    );
+    assert!(
+        !keys_dir
+            .join(ws_core::crypto::DB_CREDENTIAL_ENVELOPE_FILE)
+            .exists(),
+        "the refused heal seals nothing"
+    );
+    sqlx::PgPool::connect(&database_url())
+        .await
+        .expect("the wardstone role's password is untouched — nothing rotated");
+    fixture.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres; run with --include-ignored and DATABASE_URL set"]
 async fn the_setup_connect_rides_the_urls_login_role_not_a_constant() {

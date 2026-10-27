@@ -240,9 +240,8 @@ pub enum SetupError {
     /// re-arm step must reopen it before the heal can run. Surfaced by
     /// the heal flow — setup's own path never returns this.
     #[error(
-        "the database's setup door is closed and the unlock's heal needs it: \
-         run the re-arm step in the bundled recovery runbook (docker/README.md), \
-         then retry the unlock"
+        "the database's setup door is closed: run the bundled recovery \
+         runbook's re-arm step (docker/README.md) and unlock again"
     )]
     HealDoorClosed,
     /// The form failed its basic checks (blank fields, passphrase
@@ -1290,6 +1289,70 @@ pub async fn recover_db_credential(
         generation,
     )
     .await?)
+}
+
+/// The bundled heal (the unlock's peer recovery): a sealed bundled
+/// instance whose volume lost `db-credential.envelope` re-seals it
+/// through the same peer door the setup flow armed — no typed password
+/// exists in the bundle at all, so the door is the only credential. The
+/// shape mirrors [`run_setup`]'s bundled arm's connection handling, with
+/// the setup-only legs dropped (no migrations, no tenant check — the
+/// instance is sealed, so the tenant already exists): connect as the
+/// passwordless setup role over the URL's socket (ANY connect failure is
+/// [`SetupError::HealDoorClosed`] — the door is closed, and the bundled
+/// recovery runbook's re-arm step must reopen it), rotate the login
+/// role's credential (sealing the envelope at the volume's generation),
+/// and re-close the door behind the heal ([`SetupError::DoorDisarmFailed`]
+/// when the disarm fails — the same refusal setup's tail gives). Returns
+/// the fresh credential so the caller connects with it, exactly like
+/// [`recover_db_credential`].
+pub async fn recover_db_credential_via_peer(
+    keys_dir: &Path,
+    passphrase: &[u8],
+    database_url: &str,
+    generation: u64,
+) -> Result<SecretBuf, SetupError> {
+    use sqlx::Connection as _;
+
+    // The re-armed peer door: the bundled URL's socket, logged in as
+    // the passwordless setup role. ANY connect failure is the
+    // door-closed refusal — the operator's fix is the runbook's
+    // re-arm step, not credentials — and nothing has been sealed or
+    // rotated.
+    let options = ws_core::db::peer_setup_connect_options(database_url)?;
+    let mut peer = sqlx::PgConnection::connect_with(&options)
+        .await
+        .map_err(|_| SetupError::HealDoorClosed)?;
+
+    // The rotation over the door's own connection (the shared
+    // crash-safe routine): the fresh credential is minted, the URL's
+    // login role ALTERed to it in verifier form (the peer options'
+    // statement-logging-off guarantee covers the ALTER's statement
+    // text), and the envelope sealed at the volume's generation.
+    let db_role = db_role_of(database_url)?;
+    let fresh = ws_core::dbcred::rotate_db_credential(
+        &mut peer,
+        &db_role,
+        &keys_dir.join(DB_CREDENTIAL_ENVELOPE_FILE),
+        passphrase,
+        generation,
+    )
+    .await?;
+
+    // The heal re-closes the door it opened (the spec's design): a
+    // left-armed door would re-admit passwordless setup connections.
+    if let Err(reason) = ws_core::dbcred::disarm_setup_role(&mut peer).await {
+        // The door stays armed — the runbook's disarm step closes it —
+        // and the logged reason carries no credential material (the
+        // disarm statement has none).
+        tracing::warn!(
+            error = %reason,
+            "the bundled heal's disarm failed; the door stays open until the \
+             bundled recovery runbook's disarm step closes it"
+        );
+        return Err(SetupError::DoorDisarmFailed);
+    }
+    Ok(fresh)
 }
 
 /// The sealed-at-rest envelope names, re-exported from ws-core's single

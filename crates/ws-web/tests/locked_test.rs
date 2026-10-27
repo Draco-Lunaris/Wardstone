@@ -22,7 +22,13 @@ async fn the_locked_door_serves_unlock_healthz_and_503s_the_rest() {
     let ui = Arc::new(SealedUi::new(Arc::new(
         |_: &str, _: Option<&str>, _: Option<&str>| Box::pin(async move { Ok(full_router()) }),
     )));
-    let router = locked_router(ui, &temp_keys("door"), "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &temp_keys("door"),
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let page = router
         .clone()
@@ -81,7 +87,13 @@ async fn the_unlock_resumes_the_full_router_in_place() {
     )));
     let keys_dir = temp_keys("resume");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let unlock = router
         .clone()
@@ -133,7 +145,13 @@ async fn a_refused_unlock_leaves_the_door_locked() {
     )));
     let keys_dir = temp_keys("refusal-door");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let refused = router
         .clone()
@@ -245,7 +263,13 @@ async fn the_unlock_page_offers_the_completion_on_a_mixed_volume() {
     let ui = Arc::new(SealedUi::new(Arc::new(
         |_: &str, _: Option<&str>, _: Option<&str>| Box::pin(async move { Ok(full_router()) }),
     )));
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let page = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -289,7 +313,13 @@ async fn the_unlock_page_stays_a_single_field_on_a_consistent_volume() {
     let ui = Arc::new(SealedUi::new(Arc::new(
         |_: &str, _: Option<&str>, _: Option<&str>| Box::pin(async move { Ok(full_router()) }),
     )));
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let page = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -351,7 +381,13 @@ async fn a_missing_db_credential_envelope_asks_for_the_db_password() {
             })
         },
     )));
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let page = router
         .clone()
@@ -470,7 +506,13 @@ async fn a_next_passphrase_reaches_the_build_closure() {
     )));
     let keys_dir = temp_keys("relay-closure");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let unlock = router
         .clone()
@@ -512,7 +554,13 @@ async fn the_unlock_refusal_names_the_completion_required() {
     )));
     let keys_dir = temp_keys("refusal-mixed");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let refused = router
         .oneshot(
@@ -550,7 +598,13 @@ async fn the_unlock_refusal_names_no_completion_pending() {
     )));
     let keys_dir = temp_keys("refusal-clean");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let refused = router
         .oneshot(
@@ -588,7 +642,13 @@ async fn the_unlocked_root_redirects_to_the_login_not_the_stale_form() {
     )));
     let keys_dir = temp_keys("root-redirect");
     mint_db_credential(&keys_dir);
-    let router = locked_router(ui, &keys_dir, "ca.example.test", None);
+    let router = locked_router(
+        ui,
+        &keys_dir,
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        None,
+    );
 
     let unlock = router
         .clone()
@@ -643,7 +703,13 @@ async fn the_unlock_post_is_rate_limited_per_ip() {
     let ui = Arc::new(SealedUi::new(Arc::new(
         |_: &str, _: Option<&str>, _: Option<&str>| Box::pin(async move { Ok(full_router()) }),
     )));
-    let router = locked_router(ui, &temp_keys("unlock-limit"), "ca.example.test", ONE_SHOT);
+    let router = locked_router(
+        ui,
+        &temp_keys("unlock-limit"),
+        "ca.example.test",
+        ws_core::db::DbMode::External,
+        ONE_SHOT,
+    );
 
     let first = router
         .clone()
