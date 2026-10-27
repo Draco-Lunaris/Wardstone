@@ -8,7 +8,8 @@
 //! attempt). Every secret the lifecycle mints, carries, or REJECTS is
 //! collected as a needle and searched — in every form: raw bytes, hex,
 //! base64, PEM body — through the captured stdout+stderr of both
-//! children: no needle may appear in the captured output at ANY level.
+//! children plus the in-process arms' captured log lines: no needle
+//! may appear in the captured output at ANY level.
 //! A hit is a leak in an earlier task, never a fixture problem: the
 //! failure names the needle, the haystack, and the offset, and the
 //! task contract stops there.
@@ -28,12 +29,20 @@
 //!    unlock relay would supersede the conversion's fresh credential
 //!    before it could ever be observed, so the api joins at step 3 and
 //!    the real unlock POST at step 4 relays it up): a WRONG typed
-//!    database password is POSTed first (the failed attempt; its value
-//!    joins the needles), then the real POST `/setup` runs the
-//!    conversion, which rotates the shared login role from the typed
-//!    password to a fresh sealed value. Needles: the master passphrase,
-//!    the admin password, both typed database passwords, and the
-//!    conversion's fresh credential (opened from
+//!    database password is POSTed first (the failed attempt; under the
+//!    bundled contract the POST is refused before any dial with the
+//!    400 that names the field — the wrong value is
+//!    submitted-and-rejected material exactly as before, and its value
+//!    joins the needles), then the fieldless POST meets the absent peer
+//!    door (`DoorMissing`, its 400 pinned), and the volume is then
+//!    sealed IN-PROCESS through the production external arm
+//!    (`ws_web::setup::run_setup` with the same fields the POST
+//!    carried and the TCP `DATABASE_URL`): the conversion rotates the
+//!    shared login role from the typed password to a fresh sealed
+//!    value, and a scoped TRACE subscriber captures the in-process
+//!    arm's log lines into the captured-output haystack. Needles: the
+//!    master passphrase, the admin password, both typed database
+//!    passwords, and the conversion's fresh credential (opened from
 //!    `db-credential.envelope`), the master key, the secret-encryption
 //!    key, the JWT signing key (DER, via `ws_auth::jwt::load_sealed`),
 //!    and the root-CA and serving-leaf private keys (DER, via the
@@ -53,7 +62,12 @@
 //!    children stopped, `db-credential.envelope` is removed, the ui
 //!    restarts, and the unlock page's typed database password (the
 //!    CURRENT role password, opened from the envelope BEFORE its
-//!    removal) drives `recover_db_credential`'s fresh rotation. The
+//!    removal) is POSTed — under the bundled contract the heal rides
+//!    the peer door this host does not carry, so the POST is pinned to
+//!    its 409 `heal_door_closed` refusal — and the re-seal then runs
+//!    IN-PROCESS through the production external arm
+//!    (`ws_web::setup::recover_db_credential`, captured by the scoped
+//!    subscriber too); the ui unlocks normally over the socket. The
 //!    restarted api child is then unlocked through the production relay
 //!    (`ws_web::locked::relay_unlock`), whose own rotation is collected
 //!    too.
@@ -93,6 +107,7 @@ use ws_core::crypto::{
     KeyEnvelope, DB_CREDENTIAL_ENVELOPE_FILE, JWT_ENVELOPE_FILE, MASTER_ENVELOPE_FILE,
     SECRET_ENVELOPE_FILE,
 };
+use zeroize::Zeroizing;
 
 /// Postgres advisory-lock key for this suite: ASCII "WARDST"
 /// (0x5741445354) plus the suite marker 0x0020.
@@ -143,6 +158,28 @@ const WRONG_PASSPHRASE: &str = "task11-wrong-master-passphrase";
 
 /// The OIDC provider config's known client secret.
 const OIDC_CLIENT_SECRET: &str = "task11-oidc-client-secret-77bd2e";
+
+/// The bundled setup POST's pinned refusal copy: a bundled POST
+/// carrying a `db_password` is refused BEFORE any dial (the dev host
+/// cannot complete a bundled first-run setup — the peer door needs an
+/// OS user this host does not carry — so the refusal is the contract
+/// the wire pins).
+const BUNDLED_PASSWORD_REFUSAL: &str = "the bundled deployment has no database \
+     password — remove the db_password field";
+
+/// The bundled setup POST's pinned DoorMissing copy: the fieldless POST
+/// dials the peer-authenticated setup role, which this host does not
+/// carry.
+const SETUP_DOOR_MISSING: &str = "the bundled database's setup door did not open: \
+     setup could not reach the peer-authenticated ws_setup role over the database \
+     socket — the db container must be healthy and the bundle's postgres files \
+     (pg_hba.conf, pg_ident.conf, the entrypoint wrapper) in place";
+
+/// The bundled unlock heal's pinned door-closed copy (the recovery
+/// POST's 409 message).
+const HEAL_DOOR_CLOSED: &str = "the db re-seal: the database's setup door is \
+     closed: run the bundled recovery runbook's re-arm step (docker/README.md) \
+     and unlock again";
 
 /// The failed OIDC probe's unreachable discovery URL (connection
 /// refused, fast, and `https` — the wire shape's requirement).
@@ -888,6 +925,88 @@ fn setup_body(db_password: &str) -> serde_json::Value {
     })
 }
 
+/// The bundled setup POST's body: the same form with NO `db_password`
+/// field at all — the bundled page renders no field, so the wire shape
+/// is the absent key, not an empty value.
+fn bundled_setup_body() -> serde_json::Value {
+    let mut body = setup_body("");
+    body.as_object_mut()
+        .expect("the setup body is an object")
+        .remove("db_password");
+    body
+}
+
+/// The production `SetupFields` the in-process external arm carries:
+/// the same values the setup POST held (the typed database password is
+/// the role's CURRENT password — the fixture set its verifier).
+fn setup_fields() -> ws_web::setup::SetupFields {
+    ws_web::setup::SetupFields {
+        admin_username: "admin".to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        default_domain: DEFAULT_DOMAIN.to_owned(),
+        admin_cidrs: vec!["127.0.0.0/8".to_owned()],
+        server_hostname: SERVER_HOSTNAME.to_owned(),
+        db_password: Zeroizing::new(TYPED_DB_PASSWORD.to_owned()),
+        master_passphrase: PASSPHRASE_1.to_owned(),
+        master_passphrase_confirm: PASSPHRASE_1.to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The in-process arms' log capture (the reshape's log-net rule): the
+// setup and the recovery run in THIS process through the production
+// external arm, so their tracing events need a haystack net of their
+// own — a scoped fmt subscriber at TRACE writing into a buffer that
+// joins the captured-output haystack.
+// ---------------------------------------------------------------------------
+
+/// The shared byte buffer the scoped subscriber writes into.
+type LogBuffer = Arc<Mutex<Vec<u8>>>;
+
+/// One fmt-event `Write` sink over the shared buffer.
+struct BufferSink(LogBuffer);
+
+impl std::io::Write for BufferSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("the log buffer")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A scoped TRACE fmt subscriber writing into a fresh buffer. The
+/// guard is thread-local and the suite's current-thread runtime drives
+/// every await from the installing thread, so the production code's
+/// events land in the returned buffer; the caller drops the guard and
+/// folds the buffer into the output haystack.
+fn scoped_log_capture() -> (tracing::subscriber::DefaultGuard, LogBuffer) {
+    let buffer: LogBuffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || BufferSink(sink.clone()))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (guard, buffer)
+}
+
+/// Fold a captured in-process buffer into the output haystack under a
+/// naming header (the in-process arm's log lines are hunted like a
+/// child's).
+fn fold_into_output(output: &OutputLog, header: &str, buffer: &LogBuffer) {
+    let captured = String::from_utf8_lossy(&buffer.lock().expect("the log buffer")).into_owned();
+    let mut sink = output.lock().expect("the output accumulator");
+    sink.push_str(header);
+    sink.push_str(&captured);
+    sink.push('\n');
+}
+
 /// THE log sentinel: the full lifecycle plus the failed attempts, at
 /// `RUST_LOG=trace`, and no needle — nor any SCRAM verifier — anywhere
 /// in the captured output of either child.
@@ -910,20 +1029,68 @@ async fn no_secret_appears_in_process_output() {
         boot_out.contains(SETUP_PAGE_LOG),
         "the first-run boot serves the setup page, got:\n{boot_out}"
     );
-    // The failed attempt: a WRONG typed database password, rejected by
-    // the database (28P01 → the page's 400). The submitted value joins
-    // the needles: an error path that echoes it is a leak.
+    // The failed attempt (the submitted-rejected discipline): a WRONG
+    // typed database password. Under the bundled contract the POST is
+    // refused BEFORE any dial with the 400 that names the field — the
+    // wrong value is submitted-and-rejected material exactly as before,
+    // and its value joins the needles: an error path that echoes it is
+    // a leak.
     let wrong_setup = https_post_json(ui1.port(), "/setup", setup_body(WRONG_DB_PASSWORD)).await;
+    let wrong_status = wrong_setup.status().as_u16();
+    let wrong_body = wrong_setup
+        .text()
+        .await
+        .expect("the wrong-password refusal body");
+    {
+        let mut sink = output.lock().expect("the output accumulator");
+        sink.push_str("the bundled setup POST's refusal body: ");
+        sink.push_str(&wrong_body);
+        sink.push('\n');
+    }
     assert_eq!(
-        wrong_setup.status().as_u16(),
-        400,
-        "the setup page rejects a wrong typed database password"
+        wrong_status, 400,
+        "the bundled setup POST refuses a db_password: {wrong_body}"
     );
-    let setup = https_post_json(ui1.port(), "/setup", setup_body(TYPED_DB_PASSWORD)).await;
+    let wrong_refusal: serde_json::Value =
+        serde_json::from_str(&wrong_body).expect("the refusal body is JSON");
     assert_eq!(
-        setup.status().as_u16(),
-        200,
-        "the setup POST completes the seal-at-creation bootstrap"
+        wrong_refusal["error"], BUNDLED_PASSWORD_REFUSAL,
+        "the refusal copy pins the bundled contract"
+    );
+    // The doorless pin: the bundled POST WITHOUT the field reaches the
+    // peer door, which this host does not carry — the DoorMissing 400
+    // names the bundle's health, and nothing was generated or written.
+    let doorless = https_post_json(ui1.port(), "/setup", bundled_setup_body()).await;
+    let doorless_status = doorless.status().as_u16();
+    let doorless_body = doorless.text().await.expect("the door-missing body");
+    {
+        let mut sink = output.lock().expect("the output accumulator");
+        sink.push_str("the doorless setup POST's refusal body: ");
+        sink.push_str(&doorless_body);
+        sink.push('\n');
+    }
+    assert_eq!(
+        doorless_status, 400,
+        "the doorless bundled setup POST meets the absent peer door: {doorless_body}"
+    );
+    let door_refusal: serde_json::Value =
+        serde_json::from_str(&doorless_body).expect("the door-missing body is JSON");
+    assert_eq!(
+        door_refusal["error"], SETUP_DOOR_MISSING,
+        "the DoorMissing copy pins the peer door's absence"
+    );
+    // The real seal, IN-PROCESS through the production external arm
+    // (the reshape's fixture rule), with the scoped TRACE subscriber
+    // capturing the production code's log lines into the haystack.
+    let (log_guard, log_buffer) = scoped_log_capture();
+    ws_web::setup::run_setup(&setup_fields(), &database_url(), &fx.keys_dir)
+        .await
+        .expect("the in-process setup completes the seal-at-creation bootstrap");
+    drop(log_guard);
+    fold_into_output(
+        &output,
+        "the in-process setup's captured log lines:\n",
+        &log_buffer,
     );
     add_needle(
         &mut needles,
@@ -1122,7 +1289,12 @@ async fn no_secret_appears_in_process_output() {
     let ui4 = Boot::ui(&fx.keys_dir, Some(api2_url), relay.clone(), &output);
     ui4.output_until(&[SEALED_DOOR_LOG], &output);
     wait_for_tcp(ui4.port());
-    let recovery = https_post_json(
+    // The bundled heal's wire pin: the bundled unlock ignores the typed
+    // field and rides the peer door, which this host does not carry —
+    // the 409 names the runbook's re-arm step, the process stays up and
+    // sealed, and neither the response nor the child's output may echo
+    // the typed value the body carried.
+    let heal = https_post_json(
         ui4.port(),
         "/unlock",
         serde_json::json!({
@@ -1131,15 +1303,68 @@ async fn no_secret_appears_in_process_output() {
         }),
     )
     .await;
+    let heal_status = heal.status().as_u16();
+    let heal_body = heal.text().await.expect("the heal refusal body");
+    {
+        let mut sink = output.lock().expect("the output accumulator");
+        sink.push_str("the bundled heal's refusal body: ");
+        sink.push_str(&heal_body);
+        sink.push('\n');
+    }
     assert_eq!(
-        recovery.status().as_u16(),
-        200,
-        "the recovery unlock re-seals the credential with the typed password"
+        heal_status, 409,
+        "the bundled heal refuses while the peer door is closed: {heal_body}"
+    );
+    let heal_refusal: serde_json::Value =
+        serde_json::from_str(&heal_body).expect("the heal refusal body is JSON");
+    assert_eq!(
+        heal_refusal["error"]["code"], "heal_door_closed",
+        "the heal refusal names the re-arm code"
+    );
+    assert_eq!(
+        heal_refusal["error"]["message"], HEAL_DOOR_CLOSED,
+        "the heal refusal pins the runbook's re-arm copy"
+    );
+    // The real recovery, IN-PROCESS through the production external
+    // arm (the same `recover_db_credential` the external ui's build
+    // calls), with the scoped TRACE subscriber capturing its lines.
+    let recovery_generation = KeyEnvelope::read_generation(&fx.keys_dir.join(MASTER_ENVELOPE_FILE))
+        .expect("read the master envelope's generation for the recovery");
+    let (recovery_guard, recovery_buffer) = scoped_log_capture();
+    ws_web::setup::recover_db_credential(
+        &fx.keys_dir,
+        PASSPHRASE_2.as_bytes(),
+        &database_url(),
+        typed_recovery.as_bytes(),
+        recovery_generation,
+    )
+    .await
+    .expect("the in-process recovery re-seals the credential");
+    drop(recovery_guard);
+    fold_into_output(
+        &output,
+        "the in-process recovery's captured log lines:\n",
+        &recovery_buffer,
     );
     add_needle(
         &mut needles,
         "the recovery database credential",
         open_db_credential_value(&fx.keys_dir, PASSPHRASE_2).as_bytes(),
+    );
+    // The recovery ui is still sealed (the 409 leaves the process
+    // up): the envelope is back, so the NORMAL bundled unlock — scram
+    // over the socket, no peer door — brings the front door up for the
+    // OIDC phase.
+    let reunlock = https_post_json(
+        ui4.port(),
+        "/unlock",
+        serde_json::json!({ "passphrase": PASSPHRASE_2 }),
+    )
+    .await;
+    assert_eq!(
+        reunlock.status().as_u16(),
+        200,
+        "the re-unlock opens the recovered volume over the socket"
     );
 
     // -- Phase 6: the api rejoins and is unlocked through the production
